@@ -1,0 +1,39 @@
+[Unit]
+Description=Agent-Trading Streamlit dashboard (localhost-only)
+Documentation=https://github.com/aleexxr94/agent-trading
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{AGENT_USER}}
+Group={{AGENT_USER}}
+WorkingDirectory={{REPO_DIR}}
+EnvironmentFile={{REPO_DIR}}/.env
+# Bind to 127.0.0.1 only. Phone access goes through Tailscale (preferred)
+# or an SSH tunnel — never expose 8501 to the public internet.
+ExecStart={{REPO_DIR}}/.venv/bin/streamlit run {{REPO_DIR}}/dashboard.py \
+    --server.address 127.0.0.1 \
+    --server.port 8501 \
+    --server.headless true \
+    --browser.gatherUsageStats false
+Restart=on-failure
+RestartSec=10s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths={{REPO_DIR}}/state
+ReadOnlyPaths={{REPO_DIR}}
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

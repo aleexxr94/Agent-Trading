@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily fallback trigger for the Agent-Trading orchestrator
+Documentation=https://github.com/aleexxr94/agent-trading
+# The orchestrator wrapper schedules the *real* next run as a transient
+# timer from state/next_run.json. This static OnCalendar entry only acts
+# as a daily safety net if a previous run failed to set next_run.json.
+
+[Timer]
+OnCalendar=*-*-* 13:30:00 UTC
+RandomizedDelaySec=2min
+# OnBootSec gives a 5-min grace after VM startup so we don't fire mid-boot.
+OnBootSec=5min
+Persistent=true
+Unit=agent-orchestrator.service
+
+[Install]
+WantedBy=timers.target

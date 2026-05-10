@@ -37,6 +37,8 @@ Windows Task Scheduler ──▶ orchestrator.py
 
 ## Setup (Windows 10/11, PowerShell)
 
+> **Linux VPS users**: skip this section and follow [`deploy/README.md`](./deploy/README.md) instead — that's the recommended deployment for unattended autonomous running. The Windows path below works for laptop / desktop use.
+
 ### 1. Clone and enter the repo
 
 ```powershell

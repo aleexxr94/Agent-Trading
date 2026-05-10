@@ -1,0 +1,15 @@
+[Unit]
+Description=Kill-condition monitor every 15 minutes during US market hours
+
+[Timer]
+# US regular session is 14:30–21:00 UTC (winter) / 13:30–20:00 UTC (summer).
+# Run every 15 min between 13:00 and 21:59 UTC to cover both. Two extra runs
+# pre-open is harmless; the monitor short-circuits cheaply if there's nothing
+# to evaluate.
+OnCalendar=*-*-* 13..21:0/15
+RandomizedDelaySec=30s
+Persistent=true
+Unit=agent-monitor.service
+
+[Install]
+WantedBy=timers.target
