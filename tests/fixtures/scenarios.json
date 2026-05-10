@@ -1,0 +1,37 @@
+{
+  "run_id": "fixture",
+  "generated_at": "2026-05-10T12:02:00Z",
+  "candidates": [
+    {
+      "symbol": "TQQQ",
+      "instrument_kind": "etf",
+      "horizon_days": 21,
+      "cases": [
+        {"label": "base", "probability": 0.50, "expected_return_pct": 6.0,  "narrative": "Range continuation, mild uptrend."},
+        {"label": "bull", "probability": 0.30, "expected_return_pct": 18.0, "narrative": "Breadth expansion + soft macro print."},
+        {"label": "bear", "probability": 0.20, "expected_return_pct": -14.0,"narrative": "Vol spike, 3x decay accelerates."}
+      ],
+      "expected_value_pct": 5.6,
+      "option_rationale": null
+    },
+    {
+      "symbol": "SPY",
+      "instrument_kind": "option",
+      "horizon_days": 30,
+      "cases": [
+        {"label": "base", "probability": 0.55, "expected_return_pct":  10.0, "narrative": "ATM call captures trend; theta tolerable."},
+        {"label": "bull", "probability": 0.25, "expected_return_pct":  60.0, "narrative": "Trend + IV uptick on event."},
+        {"label": "bear", "probability": 0.20, "expected_return_pct": -90.0, "narrative": "Range-bound + IV crush."}
+      ],
+      "expected_value_pct": 2.5,
+      "option_rationale": {
+        "type": "call",
+        "strike": 530.0,
+        "expiry": "2026-06-19",
+        "dte": 40,
+        "dte_rationale": "Through CPI + FOMC; minimal weekend exposure.",
+        "strike_rationale": "ATM-ish for delta exposure with manageable theta."
+      }
+    }
+  ]
+}

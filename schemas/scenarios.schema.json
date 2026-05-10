@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-trading.local/schemas/scenarios.schema.json",
+  "title": "Scenarios",
+  "description": "Output of Stage 3 (Scenario Modeling). Probability-weighted base/bull/bear cases with explicit horizon. Probabilities must sum to 1.0 (±0.01).",
+  "type": "object",
+  "properties": {
+    "run_id": {"type": "string", "minLength": 1},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "candidates": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/candidate"}
+    }
+  },
+  "required": ["run_id", "generated_at", "candidates"],
+  "additionalProperties": false,
+  "$defs": {
+    "case": {
+      "type": "object",
+      "properties": {
+        "label": {"enum": ["base", "bull", "bear"]},
+        "probability": {"type": "number", "minimum": 0, "maximum": 1},
+        "expected_return_pct": {"type": "number"},
+        "narrative": {"type": "string", "minLength": 1}
+      },
+      "required": ["label", "probability", "expected_return_pct", "narrative"],
+      "additionalProperties": false
+    },
+    "option_rationale": {
+      "type": "object",
+      "properties": {
+        "type": {"enum": ["call", "put"]},
+        "strike": {"type": "number", "exclusiveMinimum": 0},
+        "expiry": {"type": "string", "format": "date"},
+        "dte": {"type": "integer", "minimum": 0, "maximum": 365},
+        "dte_rationale": {"type": "string", "minLength": 1},
+        "strike_rationale": {"type": "string", "minLength": 1}
+      },
+      "required": ["type", "strike", "expiry", "dte",
+                    "dte_rationale", "strike_rationale"],
+      "additionalProperties": false
+    },
+    "candidate": {
+      "type": "object",
+      "properties": {
+        "symbol": {"type": "string", "pattern": "^[A-Z][A-Z0-9.\\-]{0,9}$"},
+        "instrument_kind": {"enum": ["etf", "option"]},
+        "horizon_days": {"type": "integer", "minimum": 0, "maximum": 365,
+                          "description": "Agent-chosen holding horizon (no hard-coded calendar rules)."},
+        "cases": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/case"},
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "expected_value_pct": {"type": "number"},
+        "option_rationale": {
+          "anyOf": [
+            {"$ref": "#/$defs/option_rationale"},
+            {"type": "null"}
+          ]
+        }
+      },
+      "required": ["symbol", "instrument_kind", "horizon_days",
+                    "cases", "expected_value_pct"],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"instrument_kind": {"const": "option"}},
+                  "required": ["instrument_kind"]},
+          "then": {"required": ["option_rationale"],
+                    "properties": {"option_rationale": {"$ref": "#/$defs/option_rationale"}}}
+        }
+      ]
+    }
+  }
+}

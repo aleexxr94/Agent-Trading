@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-trading.local/schemas/research.schema.json",
+  "title": "Research",
+  "description": "Output of Stage 2 (Adversarial Research). Bull and bear sub-agents run in parallel per candidate. Bear must steel-man bull before disagreeing.",
+  "type": "object",
+  "properties": {
+    "run_id": {"type": "string", "minLength": 1},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "candidates": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/candidate"}
+    }
+  },
+  "required": ["run_id", "generated_at", "candidates"],
+  "additionalProperties": false,
+  "$defs": {
+    "side": {
+      "type": "object",
+      "properties": {
+        "thesis": {"type": "string", "minLength": 1},
+        "key_drivers": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "counterarguments": {
+          "type": "array",
+          "items": {"type": "string"},
+          "minItems": 1,
+          "description": "Bull lists strongest bear counters; bear steel-mans bull first."
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      },
+      "required": ["thesis", "key_drivers", "counterarguments", "confidence"],
+      "additionalProperties": false
+    },
+    "greeks_snapshot": {
+      "type": "object",
+      "properties": {
+        "iv": {"type": "number", "minimum": 0},
+        "iv_percentile": {"type": "number", "minimum": 0, "maximum": 100},
+        "iv_vs_hv": {"type": "number"},
+        "atm_delta": {"type": ["number", "null"]},
+        "atm_theta": {"type": ["number", "null"]}
+      },
+      "required": ["iv", "iv_percentile", "iv_vs_hv"],
+      "additionalProperties": false
+    },
+    "candidate": {
+      "type": "object",
+      "properties": {
+        "symbol": {"type": "string", "pattern": "^[A-Z][A-Z0-9.\\-]{0,9}$"},
+        "instrument_kind": {"enum": ["etf", "option"]},
+        "bull": {"$ref": "#/$defs/side"},
+        "bear": {"$ref": "#/$defs/side"},
+        "confidence_delta": {
+          "type": "number",
+          "minimum": -1,
+          "maximum": 1,
+          "description": "bull.confidence - bear.confidence (positive favours long bias)."
+        },
+        "greeks": {"$ref": "#/$defs/greeks_snapshot"},
+        "abstain": {"type": "boolean",
+                     "description": "True if either side flagged 'if uncertain, abstain'."}
+      },
+      "required": ["symbol", "instrument_kind", "bull", "bear",
+                    "confidence_delta", "abstain"],
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,110 @@
+{
+  "run_id": "fixture",
+  "generated_at": "2026-05-10T12:03:00Z",
+  "nav_usd": 2500.0,
+  "cash_usd": 280.0,
+  "cash_buffer_pct": 11.2,
+  "all_cash": false,
+  "all_cash_rationale": null,
+  "construction_rationale": "9 positions: 6 leveraged ETF longs across 3 sectors, 1 leveraged ETF inverse hedge, 2 defined-risk SPY/QQQ options. Sized for 8–12 band; concentration capped at 12% per leg.",
+  "positions": [
+    {
+      "kind": "etf",
+      "symbol": "TQQQ",
+      "shares": 4,
+      "avg_cost": 70.00,
+      "leverage_factor": 3.0,
+      "entry_thesis": "Trend-following long Nasdaq into supportive macro window.",
+      "kill_conditions": {"max_loss_pct": 25, "underlying_price_below": null, "underlying_price_above": null, "iv_collapse_pct": null, "time_stop_utc": null, "notes": ""},
+      "position_pct": 11.2
+    },
+    {
+      "kind": "etf",
+      "symbol": "SOXL",
+      "shares": 5,
+      "avg_cost": 25.00,
+      "leverage_factor": 3.0,
+      "entry_thesis": "Semi capex cycle still expanding; 3x semis within risk budget.",
+      "kill_conditions": {"max_loss_pct": 25, "underlying_price_below": null, "underlying_price_above": null, "iv_collapse_pct": null, "time_stop_utc": null, "notes": ""},
+      "position_pct": 5.0
+    },
+    {
+      "kind": "etf",
+      "symbol": "TNA",
+      "shares": 4,
+      "avg_cost": 40.00,
+      "leverage_factor": 3.0,
+      "entry_thesis": "Small-cap mean-reversion catalyst; high beta convexity.",
+      "kill_conditions": {"max_loss_pct": 25, "underlying_price_below": null, "underlying_price_above": null, "iv_collapse_pct": null, "time_stop_utc": null, "notes": ""},
+      "position_pct": 6.4
+    },
+    {
+      "kind": "etf",
+      "symbol": "UPRO",
+      "shares": 3,
+      "avg_cost": 70.00,
+      "leverage_factor": 3.0,
+      "entry_thesis": "S&P 3x for broad-market trend exposure within sleeve cap.",
+      "kill_conditions": {"max_loss_pct": 25, "underlying_price_below": null, "underlying_price_above": null, "iv_collapse_pct": null, "time_stop_utc": null, "notes": ""},
+      "position_pct": 8.4
+    },
+    {
+      "kind": "etf",
+      "symbol": "FAS",
+      "shares": 3,
+      "avg_cost": 90.00,
+      "leverage_factor": 3.0,
+      "entry_thesis": "Financials breakout on yield curve normalisation.",
+      "kill_conditions": {"max_loss_pct": 25, "underlying_price_below": null, "underlying_price_above": null, "iv_collapse_pct": null, "time_stop_utc": null, "notes": ""},
+      "position_pct": 10.8
+    },
+    {
+      "kind": "etf",
+      "symbol": "URTY",
+      "shares": 3,
+      "avg_cost": 60.00,
+      "leverage_factor": 3.0,
+      "entry_thesis": "Russell 3x complementing TNA with different basket weights.",
+      "kill_conditions": {"max_loss_pct": 25, "underlying_price_below": null, "underlying_price_above": null, "iv_collapse_pct": null, "time_stop_utc": null, "notes": ""},
+      "position_pct": 7.2
+    },
+    {
+      "kind": "etf",
+      "symbol": "SQQQ",
+      "shares": 6,
+      "avg_cost": 8.50,
+      "leverage_factor": 3.0,
+      "entry_thesis": "Inverse hedge; small allocation against the long Nasdaq leg.",
+      "kill_conditions": {"max_loss_pct": 25, "underlying_price_below": null, "underlying_price_above": null, "iv_collapse_pct": null, "time_stop_utc": null, "notes": ""},
+      "position_pct": 2.0
+    },
+    {
+      "kind": "option",
+      "underlying": "SPY",
+      "type": "call",
+      "strike": 530.00,
+      "expiry": "2026-06-19",
+      "dte": 40,
+      "contracts": 1,
+      "premium_paid": 6.50,
+      "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04, "vega": 0.18, "iv": 0.18, "iv_percentile": 35},
+      "entry_thesis": "Defined-risk long delta on broad-market trend continuation.",
+      "kill_conditions": {"max_loss_pct": 100, "underlying_price_below": 510, "underlying_price_above": null, "iv_collapse_pct": 30, "time_stop_utc": null, "notes": "Premium-defined risk."},
+      "position_pct": 2.6
+    },
+    {
+      "kind": "option",
+      "underlying": "QQQ",
+      "type": "put",
+      "strike": 440.00,
+      "expiry": "2026-06-05",
+      "dte": 26,
+      "contracts": 1,
+      "premium_paid": 4.20,
+      "greeks": {"delta": -0.35, "gamma": 0.025, "theta": -0.05, "vega": 0.16, "iv": 0.20, "iv_percentile": 42},
+      "entry_thesis": "Asymmetric tail hedge against the leveraged-long sleeve.",
+      "kill_conditions": {"max_loss_pct": 100, "underlying_price_below": null, "underlying_price_above": 470, "iv_collapse_pct": 30, "time_stop_utc": null, "notes": "Premium-defined risk."},
+      "position_pct": 1.7
+    }
+  ]
+}
