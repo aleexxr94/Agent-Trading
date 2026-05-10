@@ -62,26 +62,53 @@ _STRUCTURED_OUTPUT_UNSUPPORTED_KEYS: frozenset[str] = frozenset({
     "minProperties", "maxProperties",
 })
 
+# Root-level metadata that confuses the structured-outputs validator after
+# inlining (they only make sense on the outermost schema). Strip everywhere
+# to be safe — they carry no validation semantics.
+_STRUCTURED_OUTPUT_METADATA_TO_STRIP: frozenset[str] = frozenset({
+    "$id", "$schema",
+})
 
-def sanitize_schema_for_structured_output(schema):
+
+def sanitize_schema_for_structured_output(
+    schema,
+    *,
+    ref_registry: dict[str, dict] | None = None,
+):
     """Return a new schema with unsupported keywords recursively removed.
 
-    Anthropic's structured-outputs feature rejects standard JSON Schema
-    constraints like minimum/maximum/minLength/minItems/if-then-else. This
-    helper strips them so the network call succeeds; local validation keeps
-    using the unmodified schema via lib.state.validate().
+    Anthropic's structured-outputs feature rejects:
+      - Standard JSON Schema constraints (minimum/maximum/minLength/...).
+      - External `$ref` URIs — only internal `#/$defs/...` refs are allowed.
 
-    Does NOT mutate the input. Handles dicts, lists, and primitive leaves.
+    Pass `ref_registry` to inline external refs by their `$id`:
+        registry = {schema["$id"]: schema for schema in sibling_schemas}
+        sanitize_schema_for_structured_output(root, ref_registry=registry)
+
+    Internal `$ref` values (anything starting with `#`) pass through unchanged.
+
+    Local validation still uses the unmodified original via lib.state.validate(),
+    so removing these does not weaken anything structural.
     """
-    if isinstance(schema, dict):
-        return {
-            k: sanitize_schema_for_structured_output(v)
-            for k, v in schema.items()
-            if k not in _STRUCTURED_OUTPUT_UNSUPPORTED_KEYS
-        }
-    if isinstance(schema, list):
-        return [sanitize_schema_for_structured_output(v) for v in schema]
-    return schema
+    registry = ref_registry or {}
+
+    def _walk(node):
+        if isinstance(node, dict):
+            # External $ref → inline from registry, then walk the inlined content.
+            ref = node.get("$ref")
+            if isinstance(ref, str) and not ref.startswith("#") and ref in registry:
+                return _walk(registry[ref])
+            return {
+                k: _walk(v)
+                for k, v in node.items()
+                if k not in _STRUCTURED_OUTPUT_UNSUPPORTED_KEYS
+                and k not in _STRUCTURED_OUTPUT_METADATA_TO_STRIP
+            }
+        if isinstance(node, list):
+            return [_walk(v) for v in node]
+        return node
+
+    return _walk(schema)
 
 
 def _strip_markdown_fences(text: str) -> str:
