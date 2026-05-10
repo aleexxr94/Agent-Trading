@@ -164,3 +164,131 @@ def test_cache_read_pricing():
     )
     # ~0.1x base input on Opus 4.7: $5 → $0.50
     assert llm.estimate_cost_usd("claude-opus-4-7", usage) == pytest.approx(0.50)
+
+
+# ---------- schema sanitizer for Anthropic structured outputs ----------
+
+
+def test_sanitize_strips_numeric_constraints():
+    schema = {
+        "type": "object",
+        "properties": {
+            "p": {"type": "number", "minimum": 0, "maximum": 1, "multipleOf": 0.01},
+        },
+    }
+    out = llm.sanitize_schema_for_structured_output(schema)
+    assert out["properties"]["p"] == {"type": "number"}
+
+
+def test_sanitize_strips_string_array_constraints():
+    schema = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "minLength": 1, "maxLength": 50, "pattern": "^[A-Z]+$"},
+            "tags": {"type": "array", "minItems": 1, "maxItems": 5, "uniqueItems": True, "items": {"type": "string"}},
+        },
+    }
+    out = llm.sanitize_schema_for_structured_output(schema)
+    assert out["properties"]["name"] == {"type": "string"}
+    assert out["properties"]["tags"] == {"type": "array", "items": {"type": "string"}}
+
+
+def test_sanitize_strips_conditional_if_then_else():
+    schema = {
+        "type": "object",
+        "if": {"properties": {"x": {"const": True}}},
+        "then": {"required": ["y"]},
+        "else": {"required": ["z"]},
+    }
+    out = llm.sanitize_schema_for_structured_output(schema)
+    assert "if" not in out and "then" not in out and "else" not in out
+    assert out["type"] == "object"
+
+
+def test_sanitize_preserves_supported_keywords():
+    schema = {
+        "type": "object",
+        "properties": {
+            "kind": {"enum": ["etf", "option"]},
+            "ref": {"$ref": "#/$defs/x"},
+            "fmt": {"type": "string", "format": "date-time"},
+        },
+        "required": ["kind"],
+        "additionalProperties": False,
+        "$defs": {"x": {"type": "string"}},
+    }
+    out = llm.sanitize_schema_for_structured_output(schema)
+    assert out["properties"]["kind"] == {"enum": ["etf", "option"]}
+    assert out["properties"]["ref"] == {"$ref": "#/$defs/x"}
+    assert out["properties"]["fmt"]["format"] == "date-time"
+    assert out["additionalProperties"] is False
+    assert out["required"] == ["kind"]
+
+
+def test_sanitize_recurses_into_oneof_anyof_allof():
+    schema = {
+        "oneOf": [
+            {"type": "number", "minimum": 0},
+            {"type": "string", "minLength": 1},
+        ],
+        "allOf": [{"properties": {"n": {"type": "integer", "maximum": 10}}}],
+    }
+    out = llm.sanitize_schema_for_structured_output(schema)
+    assert out["oneOf"][0] == {"type": "number"}
+    assert out["oneOf"][1] == {"type": "string"}
+    assert out["allOf"][0]["properties"]["n"] == {"type": "integer"}
+
+
+def test_sanitize_does_not_mutate_input():
+    schema = {"type": "number", "minimum": 0, "maximum": 1}
+    out = llm.sanitize_schema_for_structured_output(schema)
+    assert "minimum" in schema  # original untouched
+    assert "minimum" not in out
+
+
+def test_sanitize_on_real_portfolio_schema():
+    """The actual portfolio.schema.json must produce a sanitized version with
+    no banned keywords anywhere in the tree."""
+    import json
+    from pathlib import Path
+    schema = json.loads((Path(__file__).parent.parent / "schemas" / "portfolio.schema.json").read_text())
+    out = llm.sanitize_schema_for_structured_output(schema)
+    banned = llm._STRUCTURED_OUTPUT_UNSUPPORTED_KEYS
+
+    def walk(node):
+        if isinstance(node, dict):
+            for k in node:
+                assert k not in banned, f"banned key {k!r} survived in sanitized schema"
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(out)
+
+
+# ---------- markdown fence stripping ----------
+
+
+def test_strip_fences_with_json_lang_tag():
+    assert llm._strip_markdown_fences('```json\n{"a": 1}\n```') == '{"a": 1}'
+
+
+def test_strip_fences_without_lang_tag():
+    assert llm._strip_markdown_fences('```\n{"a": 1}\n```') == '{"a": 1}'
+
+
+def test_strip_fences_no_op_when_no_fence():
+    assert llm._strip_markdown_fences('{"a": 1}') == '{"a": 1}'
+    assert llm._strip_markdown_fences('  {"a": 1}  ') == '{"a": 1}'
+
+
+def test_structured_call_parses_fenced_response(tmp_state):
+    """Even if the model wraps JSON in markdown fences, structured_call should
+    parse it cleanly instead of triggering the schema-retry path."""
+    fenced = '```json\n' + json.dumps(_DECISION_PAYLOAD) + '\n```'
+    fm = FakeMessages([fenced])
+    res = llm.structured_call(_call(), client_factory=lambda: _fake_client(fm))
+    assert res.payload["stage"] == "screen"
+    assert fm.calls == 1  # no retry needed

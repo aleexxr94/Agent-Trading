@@ -80,13 +80,20 @@ def _system_blocks(cfg: stages.StageConfig) -> list[dict]:
 
 
 def _output_config(cfg: stages.StageConfig) -> dict | None:
-    """Merge stage effort (if any) with structured-output format (if schema set)."""
+    """Merge stage effort (if any) with structured-output format (if schema set).
+
+    Anthropic's structured-outputs feature only accepts a restricted JSON
+    Schema subset — numerical / string / array constraints and conditional
+    if/then/else are rejected with a 400. The full schema still drives local
+    validation via lib.state.validate(); only the network-bound copy is
+    sanitized. See lib.llm.sanitize_schema_for_structured_output.
+    """
     out: dict = dict(cfg.output_config_extras)
     if cfg.schema_filename:
-        # Structured outputs replace assistant-prefill prompts (which 400 on 4.6/4.7).
+        full = json.loads((ROOT / "schemas" / cfg.schema_filename).read_text())
         out["format"] = {
             "type": "json_schema",
-            "schema": json.loads((ROOT / "schemas" / cfg.schema_filename).read_text()),
+            "schema": llm.sanitize_schema_for_structured_output(full),
         }
     return out or None
 
