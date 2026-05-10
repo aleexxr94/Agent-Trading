@@ -1,0 +1,18 @@
+{
+  "generated_at": "2026-05-10T12:00:00Z",
+  "universe_size": 12,
+  "passed": [
+    {"symbol": "TQQQ", "kind": "etf", "leverage_factor": 3.0, "adv": 50000000, "hv_annualised": 0.45},
+    {"symbol": "SOXL", "kind": "etf", "leverage_factor": 3.0, "adv": 30000000, "hv_annualised": 0.65},
+    {"symbol": "TNA",  "kind": "etf", "leverage_factor": 3.0, "adv": 9000000,  "hv_annualised": 0.55},
+    {"symbol": "UPRO", "kind": "etf", "leverage_factor": 3.0, "adv": 4500000,  "hv_annualised": 0.40},
+    {"symbol": "SQQQ", "kind": "etf", "leverage_factor": 3.0, "adv": 70000000, "hv_annualised": 0.45},
+    {"symbol": "SPY",  "kind": "option_underlying", "adv": 90000000, "hv_annualised": 0.13},
+    {"symbol": "QQQ",  "kind": "option_underlying", "adv": 50000000, "hv_annualised": 0.18},
+    {"symbol": "IWM",  "kind": "option_underlying", "adv": 25000000, "hv_annualised": 0.20}
+  ],
+  "rejected": [
+    {"symbol": "FNGU", "reason": "ADV < 1M"},
+    {"symbol": "BOIL", "reason": "spread > 15%"}
+  ]
+}
