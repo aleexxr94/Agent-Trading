@@ -1,0 +1,11 @@
+anthropic>=0.40.0
+alpaca-py>=0.30.0
+yfinance>=0.2.40
+pandas>=2.2.0
+httpx>=0.27.0
+pydantic>=2.7.0
+python-dotenv>=1.0.1
+jsonschema>=4.22.0
+streamlit>=1.36.0
+plotly>=5.22.0
+pytest>=8.2.0
