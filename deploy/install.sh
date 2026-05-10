@@ -44,6 +44,10 @@ if [ ! -d "$REPO_DIR/.git" ]; then
     sudo -u "$AGENT_USER" git clone --branch "$GIT_BRANCH" "$GIT_REMOTE" "$REPO_DIR"
 else
     log "Repo present — pulling latest on $GIT_BRANCH..."
+    # Self-heal ownership: if the repo was pre-cloned by another user (e.g. root
+    # ran `git clone` before this installer), `sudo -u $AGENT_USER git ...`
+    # would fail with "dubious ownership". chown here is idempotent.
+    chown -R "$AGENT_USER:$AGENT_USER" "$REPO_DIR"
     sudo -u "$AGENT_USER" git -C "$REPO_DIR" fetch --quiet origin
     sudo -u "$AGENT_USER" git -C "$REPO_DIR" checkout --quiet "$GIT_BRANCH"
     sudo -u "$AGENT_USER" git -C "$REPO_DIR" reset --hard --quiet "origin/$GIT_BRANCH"
