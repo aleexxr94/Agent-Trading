@@ -82,6 +82,55 @@ def cost_for_run_usd(run_id: str) -> float:
     return sum(r.get("cost_usd", 0.0) for r in state.read_costs_for_run(run_id))
 
 
+def total_token_cost() -> dict:
+    """All-time totals across this project's state/costs.jsonl. Project-scoped
+    (the SDK only writes to this file from this codebase)."""
+    rows = load_costs(limit=10**9)
+    sums = {
+        "calls": len(rows),
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cost_usd": 0.0,
+    }
+    for r in rows:
+        for k in sums:
+            if k == "calls":
+                continue
+            sums[k] += r.get(k, 0) or 0
+    sums["total_tokens"] = (
+        sums["input_tokens"]
+        + sums["output_tokens"]
+        + sums["cache_creation_input_tokens"]
+        + sums["cache_read_input_tokens"]
+    )
+    return sums
+
+
+def cost_by_month() -> list[dict]:
+    """Return sorted list of {month: 'YYYY-MM', cost_usd, total_tokens, calls}."""
+    rows = load_costs(limit=10**9)
+    by_month: dict[str, dict] = {}
+    for r in rows:
+        at = r.get("at", "")
+        if len(at) < 7:
+            continue
+        key = at[:7]
+        bucket = by_month.setdefault(
+            key, {"month": key, "cost_usd": 0.0, "total_tokens": 0, "calls": 0}
+        )
+        bucket["calls"] += 1
+        bucket["cost_usd"] += r.get("cost_usd", 0.0) or 0
+        bucket["total_tokens"] += (
+            (r.get("input_tokens") or 0)
+            + (r.get("output_tokens") or 0)
+            + (r.get("cache_creation_input_tokens") or 0)
+            + (r.get("cache_read_input_tokens") or 0)
+        )
+    return sorted(by_month.values(), key=lambda x: x["month"])
+
+
 def latest_run_id() -> str | None:
     if not state.DECISIONS_LOG.exists():
         return None

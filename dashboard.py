@@ -23,6 +23,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from lib import dashboard_data as dd
+from lib import pnl as pnl_lib
 from lib import state
 
 ROOT = Path(__file__).resolve().parent
@@ -143,23 +144,55 @@ with tabs[1]:
 # ----- Tab 3: Performance -----
 with tabs[2]:
     _banner()
-    st.subheader("Performance")
+    st.subheader("P&L (gross / modelled costs / net)")
+
+    # Gross / Net cards. `marks` aren't wired in until the broker connection
+    # lands, so we render placeholder cards with the modelled cost still
+    # populated (entry leg already paid).
+    pnl_break = pnl_lib.compute_portfolio_pnl(portfolio=portfolio, marks=None)
+    p1, p2, p3 = st.columns(3)
+    p1.metric("Gross P&L (USD)", "—" if pnl_break.gross_pnl_usd == 0 else f"${pnl_break.gross_pnl_usd:+,.2f}")
+    p2.metric("Modelled trading costs", f"${pnl_break.modelled_costs_usd:,.2f}")
+    p3.metric("Net P&L (USD)", "—" if pnl_break.gross_pnl_usd == 0 else f"${pnl_break.net_pnl_usd:+,.2f}")
     st.caption(
-        "Equity curve and drawdown. Populated once orchestrator runs accumulate; "
-        "SPY benchmark overlay TBD when broker history wires in."
+        "Trading costs are modelled (Alpaca paper has none) using ~5 bps half-spread on "
+        "ETFs and \\$0.65/contract + 25 bps spread on options — calibrated to a UK retail "
+        "broker (IBKR) so paper Sharpe is honest before any live promotion. "
+        "Gross P&L populates once current marks are wired in via the broker."
     )
-    nav_series = []
-    for r in costs:
-        nav_series.append({"at": r.get("at", ""), "cost_usd": r.get("cost_usd", 0)})
-    if nav_series:
-        df = pd.DataFrame(nav_series)
+
+    st.subheader("LLM cost over time")
+    if costs:
+        df = pd.DataFrame([
+            {"at": r.get("at", ""), "cost_usd": r.get("cost_usd", 0.0)} for r in costs
+        ])
         df["cum_cost"] = df["cost_usd"].cumsum()
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df["at"], y=df["cum_cost"], mode="lines", name="Cumulative LLM cost"))
-        fig.update_layout(template="plotly_dark", height=420, yaxis_title="USD")
+        fig.update_layout(template="plotly_dark", height=360, yaxis_title="USD",
+                          margin=dict(l=10, r=10, t=20, b=10))
         st.plotly_chart(fig, width="stretch")
     else:
-        st.info("No cost or NAV history yet.")
+        st.info("No LLM cost history yet — run the orchestrator (live mode) to populate.")
+
+    st.subheader("Cost & tokens by month (this project only)")
+    by_month = dd.cost_by_month()
+    if by_month:
+        df_m = pd.DataFrame(by_month)
+        df_m["cost_usd"] = df_m["cost_usd"].map(lambda v: f"${v:,.4f}")
+        df_m["total_tokens"] = df_m["total_tokens"].map(lambda v: f"{v:,}")
+        st.dataframe(
+            df_m.rename(columns={
+                "month": "Month",
+                "calls": "Calls",
+                "total_tokens": "Tokens",
+                "cost_usd": "Cost (USD)",
+            }),
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.info("No monthly cost data yet.")
 
 # ----- Tab 4: Agent Logs -----
 with tabs[3]:
@@ -201,9 +234,26 @@ with tabs[4]:
     st.subheader("Cost")
     today = dd.cost_today_usd()
     this_run = dd.cost_for_run_usd(latest_rid) if latest_rid else 0.0
-    cc1, cc2 = st.columns(2)
-    cc1.metric("Cost today (USD)", f"${today:.4f}", delta=None)
-    cc2.metric("Cost this run (USD)", f"${this_run:.4f}", delta=None)
+    totals = dd.total_token_cost()
+    cc1, cc2, cc3 = st.columns(3)
+    cc1.metric("Cost today (USD)", f"${today:.4f}")
+    cc2.metric("Cost this run (USD)", f"${this_run:.4f}")
+    cc3.metric("Cost all time (USD)", f"${totals['cost_usd']:.4f}")
+
+    cc4, cc5, cc6 = st.columns(3)
+    cc4.metric("Tokens all time", f"{totals['total_tokens']:,}")
+    cc5.metric("LLM calls all time", f"{totals['calls']:,}")
+    cc6.metric(
+        "Cache hit rate",
+        (
+            f"{100.0 * totals['cache_read_input_tokens'] / max(1, totals['total_tokens']):.1f}%"
+            if totals["total_tokens"] else "—"
+        ),
+    )
+    st.caption(
+        "All-time totals are scoped to **this project** — they aggregate "
+        "`state/costs.jsonl` only (not your Anthropic console total)."
+    )
 
     st.subheader("Halt flag")
     if halted:
