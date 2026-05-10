@@ -2,7 +2,7 @@
 
 > **PAPER TRADING — Experimental autonomous AI agent. Leveraged ETFs and listed options on a small account are high-risk. Not financial advice.**
 
-Autonomous multi-agent trading system that screens leveraged ETFs and listed options, runs adversarial bull/bear research, builds scenario-weighted views, constructs an **8–12 position portfolio (or all-cash)**, and executes via **Alpaca paper**. Runs on Windows under Task Scheduler with a Streamlit dashboard.
+Autonomous multi-agent trading system that screens leveraged ETFs and listed options, runs adversarial bull/bear research, builds scenario-weighted views, constructs an **8–12 position portfolio (or all-cash)**, and executes via **Alpaca paper**. Runs unattended on a Linux VPS (or on Windows under Task Scheduler) with a Streamlit dashboard.
 
 The canonical build spec is [CLAUDE.md](./CLAUDE.md). This README is the operator's manual.
 
@@ -17,27 +17,160 @@ The canonical build spec is [CLAUDE.md](./CLAUDE.md). This README is the operato
 ## Architecture at a glance
 
 ```
-Windows Task Scheduler ──▶ orchestrator.py
-                            ├─ Stage 1: screen      (Haiku 4.5)
-                            ├─ Stage 2: research    (Sonnet 4.6, bull+bear in parallel)
-                            ├─ Stage 3: scenarios   (Sonnet 4.6)
-                            ├─ Stage 4: construct   (Sonnet 4.6, 8–12 or all-cash)
-                            └─ Stage 5: execute     (Alpaca paper) + write next_run.json
-                                  │
-                                  ▼
-                         state/ (JSON, append-only)
-                                  │
-                                  ▼
-                         dashboard.py (Streamlit, dark mode)
+systemd timer (Linux) / Task Scheduler (Windows) ──▶ orchestrator.py
+                                                      ├─ Stage 1: screen      (Haiku 4.5)
+                                                      ├─ Stage 2: research    (Sonnet 4.6, bull+bear in parallel)
+                                                      ├─ Stage 3: scenarios   (Sonnet 4.6)
+                                                      ├─ Stage 4: construct   (Sonnet 4.6, 8–12 or all-cash)
+                                                      └─ Stage 5: execute     (Alpaca paper) + write next_run.json
+                                                            │
+                                                            ▼
+                                                   state/ (JSON, append-only)
+                                                            │
+                                                            ▼
+                                                   dashboard.py (Streamlit, dark mode)
 ```
 
 `monitor.py` runs more frequently and only checks kill conditions; it can flatten a position but cannot open new ones.
 
 ---
 
-## Setup (Windows 10/11, PowerShell)
+## Pick your deployment
 
-> **Linux VPS users**: skip this section and follow [`deploy/README.md`](./deploy/README.md) instead — that's the recommended deployment for unattended autonomous running. The Windows path below works for laptop / desktop use.
+| | **Linux VPS** *(recommended)* | **Windows 10/11** |
+|---|---|---|
+| **When to use** | Unattended autonomous running. Box doesn't sleep. Best for the spec's "let the agent run for weeks" model. | Manual / interactive use on a desktop. Laptop must stay awake when the timer fires. |
+| **Cost** | ~£4.50/mo (Hetzner CX23, 2 vCPU / 4 GB) | Already-owned hardware |
+| **Scheduler** | systemd timers | Windows Task Scheduler |
+| **Dashboard reach** | Tailscale Serve (HTTPS, no public ports) or SSH tunnel | localhost or LAN with Defender Firewall rule |
+| **Setup section below** | [Linux VPS setup](#linux-vps-setup-recommended) | [Windows setup](#windows-setup-alternative) |
+
+Both paths share the same `orchestrator.py` / `monitor.py` / `dashboard.py` — only the wrapper scripts and scheduling layer differ.
+
+---
+
+# Linux VPS setup (recommended)
+
+The full operator playbook for Linux is [`deploy/README.md`](./deploy/README.md), including Tailscale phone access ([`deploy/tailscale.md`](./deploy/tailscale.md)). The summary below is enough to get from a fresh Hetzner Ubuntu 24.04 box to a running dashboard in ~10 minutes.
+
+### 1. Provision a VPS
+
+| Provider | Spec | Cost |
+|---|---|---|
+| **Hetzner CX23** | 2 vCPU / 4 GB / 40 GB SSD, Ubuntu 24.04 LTS, primary IPv4, Helsinki | €4.49/mo |
+| Other | Anything 1+ vCPU, 2+ GB RAM, Ubuntu 24.04 LTS | varies |
+
+Upload your SSH **public key** (from `ssh-keygen -t ed25519` on your laptop) when creating the server. Disable password auth.
+
+### 2. Bootstrap on the VPS
+
+```bash
+ssh root@<your-server-ip>
+apt-get update && apt-get install -y git
+git clone https://github.com/aleexxr94/agent-trading.git /opt/agent-trading
+bash /opt/agent-trading/deploy/install.sh
+```
+
+The installer is idempotent — re-running it pulls the latest commit, refreshes the venv, and preserves `.env` and `state/`.
+
+What it does:
+- Installs `python3` (3.12 on 24.04), `python3-venv`, `git`, `jq`, `build-essential`.
+- Creates a non-root system user `agent` (no shell, no sudo).
+- Clones the repo to `/opt/agent-trading`, owned by `agent:agent`.
+- Provisions `.venv` and installs `requirements.txt`.
+- Seeds `.env` from `.env.example` at mode 600 (preserves existing).
+- Installs five systemd units (orchestrator + monitor service+timer, dashboard service).
+- Drops a logrotate config for `state/*.log`.
+
+### 3. Configure secrets
+
+```bash
+sudo -u agent nano /opt/agent-trading/.env
+```
+
+Fill in:
+
+| Variable                     | Notes                                                                 |
+| ---------------------------- | --------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`          | From [console.anthropic.com](https://console.anthropic.com).           |
+| `ALPACA_API_KEY` / `_SECRET` | **Paper** keys from [alpaca.markets](https://alpaca.markets) — never live. |
+| `ALPACA_BASE_URL`            | `https://paper-api.alpaca.markets` (default).                         |
+| `MODEL_*`                    | Override the per-stage model IDs if needed (defaults are Claude 4.X). |
+| `PER_RUN_COST_CAP_USD`       | Default `2.00`. Per-run hard cap.                                     |
+| `DAILY_COST_CAP_USD`         | Default `10.00`. Daily hard cap (resets at 00:00 UTC).                |
+| `LIVE_TRADING_ENABLED`       | **Leave `false`.** See [Promotion to live](./CLAUDE.md#promotion-to-live-documented-only--do-not-enable-in-code). |
+
+### 4. Manual smoke (do this BEFORE enabling timers)
+
+```bash
+sudo -u agent /opt/agent-trading/.venv/bin/python /opt/agent-trading/orchestrator.py --dry-run
+sudo -u agent /opt/agent-trading/.venv/bin/python /opt/agent-trading/orchestrator.py
+sudo -u agent tail -n 5 /opt/agent-trading/state/decisions.jsonl
+sudo -u agent tail -n 5 /opt/agent-trading/state/costs.jsonl
+```
+
+A live run typically costs ~$0.03–$0.50 depending on candidate count, well under the $2 per-run cap.
+
+### 5. Start the dashboard
+
+```bash
+systemctl enable --now agent-dashboard.service
+systemctl status agent-dashboard.service
+```
+
+Bound to `127.0.0.1:8501` only — **never** exposed to the public internet. Two ways to reach it from your laptop:
+
+**Tailscale Serve** (cleanest, also works from your phone). After installing Tailscale on both the VPS and your laptop:
+```bash
+# On the VPS
+tailscale serve --bg http://localhost:8501
+tailscale serve status   # prints the https://<host>.<tailnet>.ts.net URL
+```
+Open that URL in your laptop browser. See [`deploy/tailscale.md`](./deploy/tailscale.md) for the full setup.
+
+**SSH local port forward** (no Tailscale needed). On your laptop:
+```powershell
+ssh -L 8501:127.0.0.1:8501 root@<your-server-ip>
+```
+Then `http://localhost:8501`.
+
+### 6. Enable autonomous timers
+
+Once the smoke run looks clean and the dashboard renders:
+
+```bash
+systemctl enable --now agent-orchestrator.timer agent-monitor.timer
+systemctl list-timers --all 'agent-*'
+journalctl -u agent-orchestrator.service -f
+```
+
+The orchestrator timer has a daily 13:30 UTC fallback and self-reschedules from `state/next_run.json` after each run. The monitor fires every 15 minutes during US market hours.
+
+### Update the deployment
+
+When new code lands on `main`:
+```bash
+ssh root@<your-server-ip>
+bash /opt/agent-trading/deploy/install.sh
+systemctl restart agent-dashboard.service
+# Timers pick up changes automatically on the next fire.
+```
+
+### Uninstall
+
+```bash
+systemctl disable --now agent-orchestrator.timer agent-monitor.timer agent-dashboard.service
+rm /etc/systemd/system/agent-{orchestrator,monitor,dashboard}.{service,timer}
+systemctl daemon-reload
+rm /etc/logrotate.d/agent-trading
+# Keep /opt/agent-trading/state — that's your run history.
+```
+
+---
+
+# Windows setup (alternative)
+
+For users who prefer to run on a personal Windows 10/11 PC. Note the laptop must stay on and awake when the orchestrator timer fires (or the run is missed) — see CLAUDE.md §Critical preconditions for the spec rationale.
 
 ### 1. Clone and enter the repo
 
@@ -74,17 +207,7 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-Fill in:
-
-| Variable                     | Notes                                                                 |
-| ---------------------------- | --------------------------------------------------------------------- |
-| `ANTHROPIC_API_KEY`          | From [console.anthropic.com](https://console.anthropic.com).           |
-| `ALPACA_API_KEY` / `_SECRET` | **Paper** keys from [alpaca.markets](https://alpaca.markets) — never live. |
-| `ALPACA_BASE_URL`            | `https://paper-api.alpaca.markets` (default).                         |
-| `MODEL_*`                    | Override the per-stage model IDs if needed (defaults are Claude 4.X). |
-| `PER_RUN_COST_CAP_USD`       | Default `2.00`. Per-run hard cap.                                     |
-| `DAILY_COST_CAP_USD`         | Default `10.00`. Daily hard cap (resets at 00:00 UTC).                |
-| `LIVE_TRADING_ENABLED`       | **Leave `false`.** See [Promotion to live](./CLAUDE.md#promotion-to-live-documented-only--do-not-enable-in-code). |
+(Same env-var table as Linux above.)
 
 ### 5. Verify the install
 
@@ -93,11 +216,7 @@ pytest
 python orchestrator.py --dry-run
 ```
 
-Both should exit 0. The dry-run writes a full set of stage artifacts under `state\runs\{run_id}\` without any LLM or order calls.
-
----
-
-## Manual run
+### 6. Manual run
 
 ```powershell
 # Dry-run — no LLM, no orders, exercises the full 5-stage pipeline against fixtures
@@ -107,29 +226,22 @@ python orchestrator.py --dry-run
 python orchestrator.py
 ```
 
-The orchestrator picks its own next-run window and writes it to `state\next_run.json`.
-
----
-
-## Dashboard
+### 7. Dashboard
 
 ```powershell
 # Local only (recommended)
 streamlit run dashboard.py
 
-# Phone access on the same Wi-Fi
+# Phone access on the same Wi-Fi (no auth — see firewall note below)
 streamlit run dashboard.py --server.address 0.0.0.0
 ```
 
-The dashboard reads from `state/`. On a fresh checkout it falls back to the bundled fixture so every tab renders even before the first run.
-
-To pin a specific known-good portfolio for dashboard development, drop it at `state\seed_portfolio.json` — the dashboard prefers it over the bundled fixture (and live data overrides both):
-
+To pin a specific known-good portfolio for dashboard development, drop it at `state\seed_portfolio.json`:
 ```powershell
 Copy-Item tests\fixtures\portfolio.json state\seed_portfolio.json
 ```
 
-### Phone access (Windows Defender Firewall)
+#### Phone access (Windows Defender Firewall)
 
 `--server.address 0.0.0.0` binds Streamlit to every network interface but **adds no authentication**. Only enable on a trusted home network and add a firewall rule restricted to your local subnet:
 
@@ -145,34 +257,22 @@ New-NetFirewallRule `
     -RemoteAddress LocalSubnet
 ```
 
-To remove the rule later:
-
-```powershell
-Remove-NetFirewallRule -DisplayName "Agent-Trading Streamlit (LAN only)"
-```
+Remove later with `Remove-NetFirewallRule -DisplayName "Agent-Trading Streamlit (LAN only)"`.
 
 > Do not enable `--server.address 0.0.0.0` on public Wi-Fi or expose port 8501 outside your LAN. The dashboard has no auth and can write `state/halt.flag`.
 
----
-
-## Windows Task Scheduler (orchestrator + monitor)
-
-The orchestrator and monitor are designed to run unattended via Task Scheduler. Two scripts under `scheduling\` import (and remove) the bundled task definitions.
-
-### Install
+### 8. Windows Task Scheduler (orchestrator + monitor)
 
 ```powershell
 .\scheduling\register_task.ps1
 ```
 
-This validates that `.venv\Scripts\python.exe` exists, then registers two tasks under the `\Agent-Trading\` folder:
+Registers two tasks under `\Agent-Trading\`:
 
 | Task                              | What it runs                            | Cadence                                                   |
 | --------------------------------- | --------------------------------------- | --------------------------------------------------------- |
 | `\Agent-Trading\Orchestrator`     | `scheduling\run_orchestrator.ps1`       | Daily 13:30 UTC fallback + login trigger; **the orchestrator overwrites the next-run trigger after each run** based on `state\next_run.json`. |
 | `\Agent-Trading\Monitor`          | `scheduling\run_monitor.ps1`            | Every 15 minutes for an 8-hour window starting 13:30 UTC. |
-
-Both run under your interactive token at LeastPrivilege (no admin required to run, only to register).
 
 Useful inspections:
 
@@ -182,44 +282,35 @@ Get-ScheduledTaskInfo -TaskPath '\Agent-Trading\' -TaskName 'Orchestrator'
 Start-ScheduledTask   -TaskPath '\Agent-Trading\' -TaskName 'Orchestrator'   # run on demand
 ```
 
-### Update (re-import after pulling new task XML)
-
-Re-run the same script — `Register-ScheduledTask -Force` updates the existing registration in place:
-
+Update / uninstall / dry-run:
 ```powershell
-.\scheduling\register_task.ps1
-```
-
-### Uninstall
-
-```powershell
-.\scheduling\unregister_task.ps1
-```
-
-### Selective install / dry-run
-
-```powershell
+.\scheduling\register_task.ps1                    # update existing registration
+.\scheduling\unregister_task.ps1                  # remove
 .\scheduling\register_task.ps1 -SkipMonitor       # orchestrator task only
-.\scheduling\register_task.ps1 -SkipOrchestrator  # monitor task only
 .\scheduling\register_task.ps1 -WhatIf            # show what would change
 ```
 
+> **Heads-up on laptops**: with `WakeToRun=false` (the bundled default) plus `DisallowStartIfOnBatteries=true`, a closed-lid laptop on battery will miss runs. Either change the lid behaviour to "Do nothing" while plugged in, or move to the [Linux VPS path](#linux-vps-setup-recommended) for true autonomy.
+
 ---
 
-## Halt procedure
+## Halt procedure (both platforms)
 
-To stop the orchestrator immediately:
+The halt flag is checked before every LLM API call and before any order. Both wrappers (`run_orchestrator.{sh,ps1}`) short-circuit before activating the venv when it's present.
 
-```powershell
-# Creates state\halt.flag — checked before any LLM API call and any order
-New-Item -Path state\halt.flag -ItemType File -Force
+**Linux:**
+```bash
+sudo -u agent touch /opt/agent-trading/state/halt.flag    # halt
+sudo -u agent rm    /opt/agent-trading/state/halt.flag    # resume
 ```
 
-Or click **Emergency stop** on the dashboard's Settings tab. Both the orchestrator and the monitor exit cleanly while the flag exists, and `run_orchestrator.ps1` / `run_monitor.ps1` short-circuit before activating the venv. Delete the file (or click "Clear halt flag" on the dashboard) to resume:
-
+**Windows:**
 ```powershell
-Remove-Item state\halt.flag
+New-Item -Path state\halt.flag -ItemType File -Force      # halt
+Remove-Item state\halt.flag                               # resume
 ```
+
+Or click **Emergency stop** on the dashboard's Settings tab.
 
 ---
 
@@ -227,17 +318,25 @@ Remove-Item state\halt.flag
 
 | Location                         | Contents                                                             |
 | -------------------------------- | -------------------------------------------------------------------- |
-| `state\runs\{run_id}\`           | Per-run JSON: `screen.json`, `research.json`, `scenarios.json`, `portfolio.json`, `next_run.json` |
-| `state\decisions.jsonl`          | Append-only decision log (one row per stage, schema-validated)        |
-| `state\costs.jsonl`              | Per-LLM-call cost ledger; daily and per-run caps enforced from this file |
-| `state\current_portfolio.json`   | Latest known portfolio (consumed by `monitor.py` and the dashboard)   |
-| `state\next_run.json`            | Orchestrator-chosen next-run timestamp; consumed by `run_orchestrator.ps1` |
-| `state\halt.flag`                | Presence = stop                                                       |
+| `state/runs/{run_id}/`           | Per-run JSON: `screen.json`, `research.json`, `scenarios.json`, `portfolio.json`, `next_run.json` |
+| `state/decisions.jsonl`          | Append-only decision log (one row per stage, schema-validated)        |
+| `state/costs.jsonl`              | Per-LLM-call cost ledger; daily and per-run caps enforced from this file |
+| `state/current_portfolio.json`   | Latest known portfolio (consumed by `monitor.py` and the dashboard)   |
+| `state/next_run.json`            | Orchestrator-chosen next-run timestamp                                |
+| `state/halt.flag`                | Presence = stop                                                       |
 
 Quick inspection:
 
+**Linux:**
+```bash
+sudo -u agent tail -n 20 /opt/agent-trading/state/decisions.jsonl
+sudo -u agent tail -n 20 /opt/agent-trading/state/costs.jsonl
+journalctl -u agent-orchestrator.service -n 200 --no-pager
+journalctl -u agent-dashboard.service    -n 200 --no-pager
+```
+
+**Windows:**
 ```powershell
-# Last 20 decisions
 Get-Content state\decisions.jsonl -Tail 20 | ForEach-Object { ConvertFrom-Json $_ }
 
 # Cost today
@@ -249,6 +348,8 @@ Get-Content state\costs.jsonl |
     Select-Object -ExpandProperty Sum
 ```
 
+The dashboard's Performance and Settings tabs surface the same numbers without the JSON wrangling.
+
 ---
 
 ## Repo hygiene
@@ -256,7 +357,7 @@ Get-Content state\costs.jsonl |
 - `.env` is gitignored. **Never** commit secrets.
 - `state/` is gitignored — runtime artifacts only.
 - All schemas under `schemas/` are validated on every write. Schema-failed agent outputs retry once with the validation error fed back; second failure aborts the run.
-- Conventional commits. Open a draft PR against `main`; do not push to `main` directly.
+- Conventional commits. Open a PR against `main`; do not push to `main` directly.
 - `lib/broker.py` is the only abstraction layer over the broker — swapping to IBKR is a one-file change behind that interface.
 
 ---
@@ -275,4 +376,4 @@ The full set of pre-conditions (≥ 4 weeks paper, Sharpe ≥ 0.5, max DD ≤ 25
 
 ## Status
 
-Active development. The 5-stage pipeline runs end-to-end on paper data; the dashboard renders against fixtures or live state. See [CLAUDE.md](./CLAUDE.md) for the full spec, and the `/state` directory (when populated) for current behaviour.
+Active development. The 5-stage pipeline runs end-to-end on paper data; the dashboard renders against fixtures or live state. See [CLAUDE.md](./CLAUDE.md) for the full spec, [`deploy/README.md`](./deploy/README.md) for the Linux operator playbook, and the `state/` directory (when populated) for current behaviour.
