@@ -11,6 +11,10 @@ User={{AGENT_USER}}
 Group={{AGENT_USER}}
 WorkingDirectory={{REPO_DIR}}
 EnvironmentFile={{REPO_DIR}}/.env
+# ProtectHome=true hides /home/agent. Libraries (anthropic SDK, yfinance,
+# streamlit) read $HOME/.* on startup — point HOME at the per-service
+# PrivateTmp /tmp so they get a writable scratch dir without re-opening home.
+Environment=HOME=/tmp
 ExecStart=/bin/bash {{REPO_DIR}}/deploy/run_orchestrator.sh
 TimeoutStartSec=30min
 Nice=10

@@ -10,6 +10,10 @@ User={{AGENT_USER}}
 Group={{AGENT_USER}}
 WorkingDirectory={{REPO_DIR}}
 EnvironmentFile={{REPO_DIR}}/.env
+# ProtectHome=true hides /home/agent. Streamlit (and yfinance, anthropic SDK)
+# read $HOME/.* on startup — point HOME at the per-service PrivateTmp /tmp
+# so they get a writable scratch dir without re-opening home.
+Environment=HOME=/tmp
 # Bind to 127.0.0.1 only. Phone access goes through Tailscale (preferred)
 # or an SSH tunnel — never expose 8501 to the public internet.
 ExecStart={{REPO_DIR}}/.venv/bin/streamlit run {{REPO_DIR}}/dashboard.py \
