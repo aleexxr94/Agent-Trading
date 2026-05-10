@@ -45,6 +45,60 @@ PRICING: dict[str, dict[str, float]] = {
 }
 
 
+# JSON-Schema keywords that Anthropic's structured-outputs feature rejects
+# with a 400 ("not supported"). Local validation still uses the full schema;
+# only the network-bound copy passed via output_config.format is sanitized.
+# Source: Anthropic structured-outputs docs (2026-04 snapshot).
+_STRUCTURED_OUTPUT_UNSUPPORTED_KEYS: frozenset[str] = frozenset({
+    # Numerical
+    "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+    # String
+    "minLength", "maxLength", "pattern",
+    # Array
+    "minItems", "maxItems", "uniqueItems",
+    # Conditional
+    "if", "then", "else",
+    # Property-count
+    "minProperties", "maxProperties",
+})
+
+
+def sanitize_schema_for_structured_output(schema):
+    """Return a new schema with unsupported keywords recursively removed.
+
+    Anthropic's structured-outputs feature rejects standard JSON Schema
+    constraints like minimum/maximum/minLength/minItems/if-then-else. This
+    helper strips them so the network call succeeds; local validation keeps
+    using the unmodified schema via lib.state.validate().
+
+    Does NOT mutate the input. Handles dicts, lists, and primitive leaves.
+    """
+    if isinstance(schema, dict):
+        return {
+            k: sanitize_schema_for_structured_output(v)
+            for k, v in schema.items()
+            if k not in _STRUCTURED_OUTPUT_UNSUPPORTED_KEYS
+        }
+    if isinstance(schema, list):
+        return [sanitize_schema_for_structured_output(v) for v in schema]
+    return schema
+
+
+def _strip_markdown_fences(text: str) -> str:
+    """Sonnet sometimes wraps JSON in ```json … ``` fences despite explicit
+    instructions to the contrary. Strip them defensively before json.loads."""
+    t = text.strip()
+    if t.startswith("```"):
+        # Drop the opening fence (with optional language tag) and the closing fence.
+        nl = t.find("\n")
+        if nl != -1:
+            t = t[nl + 1:]
+        if t.endswith("```"):
+            t = t[: -3]
+        t = t.strip()
+    return t
+
+
 class CostCapExceeded(RuntimeError):
     """Raised between calls when per-run or daily caps would be breached."""
 
@@ -184,8 +238,9 @@ def structured_call(
         })
 
         if call.schema_filename is not None:
+            cleaned = _strip_markdown_fences(text)
             try:
-                payload = json.loads(text)
+                payload = json.loads(cleaned)
             except json.JSONDecodeError as e:
                 raise ValidationError(f"non-JSON response: {e}") from e
             state.validate(payload, call.schema_filename)
