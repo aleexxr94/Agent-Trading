@@ -75,39 +75,74 @@ def sanitize_schema_for_structured_output(
     *,
     ref_registry: dict[str, dict] | None = None,
 ):
-    """Return a new schema with unsupported keywords recursively removed.
+    """Return a new schema acceptable to Anthropic's structured-outputs feature.
 
-    Anthropic's structured-outputs feature rejects:
-      - Standard JSON Schema constraints (minimum/maximum/minLength/...).
-      - External `$ref` URIs — only internal `#/$defs/...` refs are allowed.
+    Discovered constraints (each surfaced by a separate 400 from the API):
+      - Numerical / string / array constraints not allowed (PR #5).
+      - External `$ref` URIs not allowed (PR #6).
+      - `oneOf` not allowed — rewrite to `anyOf` (PR #7).
+      - `$defs` blocks not allowed alongside `anyOf` — fully inline internal
+        `#/$defs/foo` refs and strip every `$defs` block (this PR).
 
-    Pass `ref_registry` to inline external refs by their `$id`:
+    Pass `ref_registry` to resolve external refs by their `$id`:
         registry = {schema["$id"]: schema for schema in sibling_schemas}
         sanitize_schema_for_structured_output(root, ref_registry=registry)
 
-    Internal `$ref` values (anything starting with `#`) pass through unchanged.
-
     Local validation still uses the unmodified original via lib.state.validate(),
-    so removing these does not weaken anything structural.
+    so the schema sent to Anthropic is intentionally weaker than what we
+    enforce locally — just enough for server-side structural validation while
+    keeping our richer constraints on the client side.
     """
     registry = ref_registry or {}
 
-    def _walk(node):
+    # --- Phase 1: inline external refs into a working copy.
+    def _inline_external(node):
         if isinstance(node, dict):
-            # External $ref → inline from registry, then walk the inlined content.
             ref = node.get("$ref")
             if isinstance(ref, str) and not ref.startswith("#") and ref in registry:
-                return _walk(registry[ref])
+                return _inline_external(registry[ref])
+            return {k: _inline_external(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [_inline_external(v) for v in node]
+        return node
+
+    inlined = _inline_external(schema)
+
+    # --- Phase 2: harvest every $defs entry across the inlined tree into a
+    # single map. Forward refs (anyOf [{$ref:#/$defs/x}] appearing before
+    # $defs.x in tree order) are handled correctly because collection is
+    # complete before any substitution happens.
+    defs: dict[str, dict] = {}
+
+    def _collect_defs(node):
+        if isinstance(node, dict):
+            for k, v in node.get("$defs", {}).items():
+                defs[k] = v
+            for v in node.values():
+                _collect_defs(v)
+        elif isinstance(node, list):
+            for v in node:
+                _collect_defs(v)
+
+    _collect_defs(inlined)
+
+    # --- Phase 3: sanitize + rewrite oneOf→anyOf + inline internal $refs +
+    # strip every $defs block.
+    def _walk(node):
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                name = ref[len("#/$defs/"):]
+                if name in defs:
+                    return _walk(defs[name])
             out: dict = {}
             for k, v in node.items():
                 if k in _STRUCTURED_OUTPUT_UNSUPPORTED_KEYS:
                     continue
                 if k in _STRUCTURED_OUTPUT_METADATA_TO_STRIP:
                     continue
-                # Anthropic structured outputs supports anyOf/allOf but NOT oneOf.
-                # For discriminated unions (etf | option, kind discriminator), the
-                # cardinality difference is moot — keep anyOf so server-side
-                # validation still enforces "matches one of the branches".
+                if k == "$defs":
+                    continue
                 if k == "oneOf":
                     out["anyOf"] = _walk(v)
                 else:
@@ -117,7 +152,7 @@ def sanitize_schema_for_structured_output(
             return [_walk(v) for v in node]
         return node
 
-    return _walk(schema)
+    return _walk(inlined)
 
 
 def _strip_markdown_fences(text: str) -> str:

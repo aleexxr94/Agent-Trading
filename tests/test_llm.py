@@ -219,7 +219,9 @@ def test_sanitize_preserves_supported_keywords():
     }
     out = llm.sanitize_schema_for_structured_output(schema)
     assert out["properties"]["kind"] == {"enum": ["etf", "option"]}
-    assert out["properties"]["ref"] == {"$ref": "#/$defs/x"}
+    # Internal $ref now inlined (Anthropic rejects $defs alongside anyOf/etc.)
+    assert out["properties"]["ref"] == {"type": "string"}
+    assert "$defs" not in out
     assert out["properties"]["fmt"]["format"] == "date-time"
     assert out["additionalProperties"] is False
     assert out["required"] == ["kind"]
@@ -273,10 +275,21 @@ def test_sanitize_on_real_portfolio_schema():
 # ---------- $ref inlining ----------
 
 
-def test_internal_ref_passes_through_unchanged():
+def test_internal_ref_resolved_when_defs_present():
+    """Internal #/$defs/foo refs get inlined; the $defs block is stripped."""
     schema = {"properties": {"x": {"$ref": "#/$defs/x"}}, "$defs": {"x": {"type": "string"}}}
     out = llm.sanitize_schema_for_structured_output(schema)
-    assert out["properties"]["x"] == {"$ref": "#/$defs/x"}
+    assert out["properties"]["x"] == {"type": "string"}
+    assert "$defs" not in out
+
+
+def test_internal_ref_left_alone_when_target_missing():
+    """An internal $ref pointing nowhere stays as-is — we don't silently
+    corrupt the schema by dropping it. Anthropic will reject, but at least
+    the failure mode is obvious."""
+    schema = {"properties": {"x": {"$ref": "#/$defs/missing"}}}
+    out = llm.sanitize_schema_for_structured_output(schema)
+    assert out["properties"]["x"] == {"$ref": "#/$defs/missing"}
 
 
 def test_external_ref_inlined_from_registry():
@@ -335,9 +348,62 @@ def test_oneof_inside_array_items_converted():
     assert "oneOf" not in out["items"]
 
 
-def test_real_portfolio_schema_inlined_no_external_refs():
-    """The actual portfolio + position schemas must, after sanitisation with
-    the schema registry, contain NO external $refs and NO oneOf anywhere."""
+def test_internal_ref_inlined_and_defs_stripped():
+    """#/$defs/foo refs get fully inlined; the $defs block is dropped."""
+    schema = {
+        "anyOf": [{"$ref": "#/$defs/etf"}, {"$ref": "#/$defs/option"}],
+        "$defs": {
+            "etf":    {"type": "object", "properties": {"kind": {"const": "etf"}}},
+            "option": {"type": "object", "properties": {"kind": {"const": "option"}}},
+        },
+    }
+    out = llm.sanitize_schema_for_structured_output(schema)
+    assert "$defs" not in out
+    assert out["anyOf"][0]["properties"]["kind"] == {"const": "etf"}
+    assert out["anyOf"][1]["properties"]["kind"] == {"const": "option"}
+    # No $ref values anywhere
+    def has_ref(node):
+        if isinstance(node, dict):
+            if "$ref" in node:
+                return True
+            return any(has_ref(v) for v in node.values())
+        if isinstance(node, list):
+            return any(has_ref(v) for v in node)
+        return False
+    assert not has_ref(out)
+
+
+def test_internal_ref_resolves_transitively():
+    """A $defs entry that itself uses $ref to another $defs entry inlines through."""
+    schema = {
+        "properties": {"a": {"$ref": "#/$defs/etf"}},
+        "$defs": {
+            "etf": {
+                "type": "object",
+                "properties": {"kill": {"$ref": "#/$defs/killConditions"}},
+            },
+            "killConditions": {"type": "object", "properties": {"max": {"type": "number"}}},
+        },
+    }
+    out = llm.sanitize_schema_for_structured_output(schema)
+    assert "$defs" not in out
+    assert out["properties"]["a"]["properties"]["kill"]["properties"]["max"] == {"type": "number"}
+
+
+def test_internal_ref_resolves_forward_in_tree_order():
+    """A ref appearing before its $defs entry in document order still resolves."""
+    schema = {
+        "anyOf": [{"$ref": "#/$defs/x"}],
+        "$defs": {"x": {"type": "string"}},
+    }
+    out = llm.sanitize_schema_for_structured_output(schema)
+    assert out["anyOf"][0] == {"type": "string"}
+
+
+def test_real_portfolio_schema_fully_inlined():
+    """The actual portfolio + position schemas must, after sanitisation,
+    contain NO external $refs, NO internal $refs, NO $defs, NO oneOf
+    anywhere — the structured-outputs-acceptable subset."""
     import json
     from pathlib import Path
     schema_dir = Path(__file__).parent.parent / "schemas"
@@ -351,11 +417,15 @@ def test_real_portfolio_schema_inlined_no_external_refs():
 
     def find_violations(node, found):
         if isinstance(node, dict):
-            ref = node.get("$ref")
-            if isinstance(ref, str) and not ref.startswith("#"):
-                found.append(("external_ref", ref))
+            if "$ref" in node:
+                found.append(("ref", node["$ref"]))
+            if "$defs" in node:
+                found.append(("$defs", "present"))
             if "oneOf" in node:
                 found.append(("oneOf", "present"))
+            for k in llm._STRUCTURED_OUTPUT_UNSUPPORTED_KEYS:
+                if k in node:
+                    found.append((k, "present"))
             for v in node.values():
                 find_violations(v, found)
         elif isinstance(node, list):
