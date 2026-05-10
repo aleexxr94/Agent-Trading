@@ -121,6 +121,12 @@ streamlit run dashboard.py --server.address 0.0.0.0
 
 The dashboard reads from `state/`. On a fresh checkout it falls back to the bundled fixture so every tab renders even before the first run.
 
+To pin a specific known-good portfolio for dashboard development, drop it at `state\seed_portfolio.json` — the dashboard prefers it over the bundled fixture (and live data overrides both):
+
+```powershell
+Copy-Item tests\fixtures\portfolio.json state\seed_portfolio.json
+```
+
 ### Phone access (Windows Defender Firewall)
 
 `--server.address 0.0.0.0` binds Streamlit to every network interface but **adds no authentication**. Only enable on a trusted home network and add a firewall rule restricted to your local subnet:
