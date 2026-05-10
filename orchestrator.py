@@ -79,21 +79,35 @@ def _system_blocks(cfg: stages.StageConfig) -> list[dict]:
     ]
 
 
+def _schema_ref_registry() -> dict[str, dict]:
+    """Build a $id → schema map from schemas/*.schema.json so external $refs
+    can be inlined by lib.llm.sanitize_schema_for_structured_output."""
+    registry: dict[str, dict] = {}
+    for path in (ROOT / "schemas").glob("*.schema.json"):
+        s = json.loads(path.read_text())
+        if isinstance(s.get("$id"), str):
+            registry[s["$id"]] = s
+    return registry
+
+
 def _output_config(cfg: stages.StageConfig) -> dict | None:
     """Merge stage effort (if any) with structured-output format (if schema set).
 
     Anthropic's structured-outputs feature only accepts a restricted JSON
-    Schema subset — numerical / string / array constraints and conditional
-    if/then/else are rejected with a 400. The full schema still drives local
-    validation via lib.state.validate(); only the network-bound copy is
-    sanitized. See lib.llm.sanitize_schema_for_structured_output.
+    Schema subset — numerical / string / array constraints, conditional
+    if/then/else, and external $ref URIs are rejected with a 400. The full
+    schema still drives local validation via lib.state.validate(); only the
+    network-bound copy is sanitized + inlined. See
+    lib.llm.sanitize_schema_for_structured_output.
     """
     out: dict = dict(cfg.output_config_extras)
     if cfg.schema_filename:
         full = json.loads((ROOT / "schemas" / cfg.schema_filename).read_text())
         out["format"] = {
             "type": "json_schema",
-            "schema": llm.sanitize_schema_for_structured_output(full),
+            "schema": llm.sanitize_schema_for_structured_output(
+                full, ref_registry=_schema_ref_registry()
+            ),
         }
     return out or None
 

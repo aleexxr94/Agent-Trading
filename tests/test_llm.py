@@ -268,6 +268,69 @@ def test_sanitize_on_real_portfolio_schema():
     walk(out)
 
 
+# ---------- $ref inlining ----------
+
+
+def test_internal_ref_passes_through_unchanged():
+    schema = {"properties": {"x": {"$ref": "#/$defs/x"}}, "$defs": {"x": {"type": "string"}}}
+    out = llm.sanitize_schema_for_structured_output(schema)
+    assert out["properties"]["x"] == {"$ref": "#/$defs/x"}
+
+
+def test_external_ref_inlined_from_registry():
+    target = {"$id": "https://x.local/foo.json", "type": "string", "minLength": 3}
+    schema = {"type": "object", "properties": {"name": {"$ref": "https://x.local/foo.json"}}}
+    out = llm.sanitize_schema_for_structured_output(
+        schema, ref_registry={target["$id"]: target}
+    )
+    # Inlined and sanitized (minLength + $id stripped):
+    assert out["properties"]["name"] == {"type": "string"}
+
+
+def test_external_ref_not_in_registry_left_intact():
+    schema = {"properties": {"x": {"$ref": "https://x.local/missing.json"}}}
+    out = llm.sanitize_schema_for_structured_output(schema, ref_registry={})
+    # We pass it through unchanged — Anthropic will 400, but we don't silently
+    # corrupt by dropping the ref.
+    assert out["properties"]["x"] == {"$ref": "https://x.local/missing.json"}
+
+
+def test_metadata_id_and_schema_stripped():
+    schema = {"$schema": "https://...", "$id": "https://x.local/y.json", "type": "object"}
+    out = llm.sanitize_schema_for_structured_output(schema)
+    assert "$id" not in out and "$schema" not in out
+    assert out["type"] == "object"
+
+
+def test_real_portfolio_schema_inlined_no_external_refs():
+    """The actual portfolio + position schemas must, after sanitisation with
+    the schema registry, contain NO external $refs anywhere in the tree."""
+    import json
+    from pathlib import Path
+    schema_dir = Path(__file__).parent.parent / "schemas"
+    registry = {}
+    for f in schema_dir.glob("*.schema.json"):
+        s = json.loads(f.read_text())
+        if "$id" in s:
+            registry[s["$id"]] = s
+    portfolio = json.loads((schema_dir / "portfolio.schema.json").read_text())
+    out = llm.sanitize_schema_for_structured_output(portfolio, ref_registry=registry)
+
+    def find_external_refs(node, found):
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and not ref.startswith("#"):
+                found.append(ref)
+            for v in node.values():
+                find_external_refs(v, found)
+        elif isinstance(node, list):
+            for v in node:
+                find_external_refs(v, found)
+        return found
+
+    assert find_external_refs(out, []) == []
+
+
 # ---------- markdown fence stripping ----------
 
 
