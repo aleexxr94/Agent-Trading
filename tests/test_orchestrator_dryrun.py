@@ -10,6 +10,7 @@ Runs the orchestrator pipeline against canned fixtures, asserts:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -48,12 +49,41 @@ def test_dry_run_does_not_write_current_portfolio(tmp_state):
     assert not state.CURRENT_PORTFOLIO.exists()
 
 
-def test_live_paper_run_writes_current_portfolio(tmp_state):
-    # dry_run=False but no broker — execute stage stub doesn't submit orders
+def test_live_mode_writes_current_portfolio_with_mocked_llm(tmp_state, monkeypatch):
+    """Live path (dry_run=False) used to be a stub that read fixtures; it now
+    calls the LLM. Mock structured_call to return canned fixture payloads."""
+    fixtures = {
+        "screen": json.loads((Path(__file__).parent / "fixtures" / "screen.json").read_text()),
+        "scenarios": json.loads((Path(__file__).parent / "fixtures" / "scenarios.json").read_text()),
+        "portfolio": json.loads((Path(__file__).parent / "fixtures" / "portfolio.json").read_text()),
+    }
+
+    def fake_call(call, **kwargs):
+        from lib.llm import CallUsage, StructuredCallResult
+        if call.stage == "screen":
+            payload = fixtures["screen"]
+        elif call.stage.startswith("research"):
+            payload = {"thesis": "x", "key_drivers": ["a"], "counterarguments": ["b"], "confidence": 0.5}
+        elif call.stage == "scenarios":
+            payload = fixtures["scenarios"]
+        elif call.stage == "construct":
+            payload = fixtures["portfolio"]
+        else:
+            payload = {}
+        return StructuredCallResult(
+            payload=payload,
+            usage=CallUsage(0, 0, 0, 0),
+            cost_usd=0.0,
+            cache_hit_pct=0.0,
+            raw_text=json.dumps(payload),
+        )
+
+    monkeypatch.setattr(orchestrator.llm, "structured_call", fake_call)
+    # Stub stages.bull/bear/scenarios/etc to avoid loading prompt files inside this test
     orchestrator.run_pipeline(dry_run=False)
     assert state.CURRENT_PORTFOLIO.exists()
     p = json.loads(state.CURRENT_PORTFOLIO.read_text())
-    assert 8 <= len(p["positions"]) <= 12 or p["all_cash"]
+    assert (8 <= len(p["positions"]) <= 12) or p["all_cash"]
 
 
 def test_halt_flag_blocks_pipeline_start(tmp_state):

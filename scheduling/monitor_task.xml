@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Windows Task Scheduler definition for the Agent-Trading monitor.
+  Runs scheduling/run_monitor.ps1, which activates the .venv and calls
+  python monitor.py. The monitor evaluates kill conditions; it can flatten
+  positions but cannot open new ones (see CLAUDE.md §5-stage pipeline).
+
+  Cadence: every 15 minutes during US market hours roughly mapped to UTC,
+  with a daily-at-boot safety trigger.
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>{{USER_UPN}}</Author>
+    <Description>Agent-Trading kill-condition monitor (paper-only)</Description>
+    <URI>\Agent-Trading\Monitor</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-05-10T13:30:00Z</StartBoundary>
+      <Repetition>
+        <Interval>PT15M</Interval>
+        <Duration>PT8H</Duration>
+        <StopAtDurationEnd>true</StopAtDurationEnd>
+      </Repetition>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{{USER_SID}}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+    <ExecutionTimeLimit>PT3M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>-NoProfile -ExecutionPolicy Bypass -File "{{REPO_ROOT}}\scheduling\run_monitor.ps1"</Arguments>
+      <WorkingDirectory>{{REPO_ROOT}}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

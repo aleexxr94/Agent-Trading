@@ -9,6 +9,17 @@ Spec invariants:
     back; second failure aborts the run.
   - Halt flag (state/halt.flag) checked before every API call.
 
+Claude 4.X feature support:
+  - Adaptive thinking via thinking={"type": "adaptive"} (Opus 4.7, Sonnet 4.6)
+  - Effort via output_config={"effort": "..."} (low/medium/high/xhigh/max).
+    xhigh is Opus 4.7 only; max is Opus-tier only. Sonnet 4.6 supports
+    low/medium/high. Haiku 4.5 does NOT accept effort and will 400.
+  - Structured outputs via output_config={"format": {"type": "json_schema",
+    "schema": {...}}} — server-validated, replaces assistant-prefill prompts
+    (which 400 on 4.6/4.7).
+  - Sampling params (temperature/top_p/top_k) are removed on Opus 4.7. Don't
+    pass them.
+
 This is the only file that imports `anthropic` and the only file that touches
 state/costs.jsonl directly via lib.state.
 """
@@ -16,19 +27,21 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from jsonschema import ValidationError
 
 from . import state
 
-# USD per million tokens — published list prices for the Claude 4.X family.
-# Override via env var if Anthropic adjusts pricing.
+# USD per million tokens — Claude 4.X published list prices.
+# Cache writes at 1.25x base input (5min TTL); cache reads at ~0.1x base input.
 PRICING: dict[str, dict[str, float]] = {
-    "claude-opus-4-7":               {"in": 15.00, "in_cache_write": 18.75, "in_cache_read": 1.50, "out": 75.00},
-    "claude-sonnet-4-6":             {"in":  3.00, "in_cache_write":  3.75, "in_cache_read": 0.30, "out": 15.00},
-    "claude-haiku-4-5-20251001":     {"in":  1.00, "in_cache_write":  1.25, "in_cache_read": 0.10, "out":  5.00},
+    "claude-opus-4-7":            {"in": 5.00, "in_cache_write": 6.25, "in_cache_read": 0.50, "out": 25.00},
+    "claude-opus-4-6":            {"in": 5.00, "in_cache_write": 6.25, "in_cache_read": 0.50, "out": 25.00},
+    "claude-sonnet-4-6":          {"in": 3.00, "in_cache_write": 3.75, "in_cache_read": 0.30, "out": 15.00},
+    "claude-haiku-4-5":           {"in": 1.00, "in_cache_write": 1.25, "in_cache_read": 0.10, "out":  5.00},
+    "claude-haiku-4-5-20251001":  {"in": 1.00, "in_cache_write": 1.25, "in_cache_read": 0.10, "out":  5.00},
 }
 
 
@@ -60,9 +73,8 @@ class CallUsage:
 def estimate_cost_usd(model: str, usage: CallUsage) -> float:
     p = PRICING.get(model)
     if p is None:
-        # Unknown model — conservative fallback at Sonnet rates so we don't
-        # silently undercount costs.
-        p = PRICING["claude-sonnet-4-6"]
+        # Unknown model — fall back to Opus pricing so we don't undercount.
+        p = PRICING["claude-opus-4-7"]
     return (
         usage.input_tokens / 1_000_000 * p["in"]
         + usage.cache_creation_input_tokens / 1_000_000 * p["in_cache_write"]
@@ -80,8 +92,8 @@ def _daily_cap() -> float:
 
 
 def check_caps_or_raise(run_id: str) -> None:
-    """Call before every API call. Raises CostCapExceeded if either cap would
-    be at or beyond limit."""
+    """Call before every API call. Raises CostCapExceeded if either cap is at
+    or beyond limit (mid-call enforcement happens between stages, per spec)."""
     run_total = sum(r["cost_usd"] for r in state.read_costs_for_run(run_id))
     if run_total >= _per_run_cap():
         raise CostCapExceeded(f"per-run cap ${_per_run_cap():.2f} reached (run_total=${run_total:.4f})")
@@ -104,48 +116,65 @@ class StructuredCallResult:
     raw_text: str
 
 
+@dataclass
+class StageCall:
+    """All inputs needed for one schema-validated LLM call."""
+    run_id: str
+    stage: str
+    model: str
+    system_blocks: list[dict]
+    user_messages: list[dict]
+    schema_filename: str | None = None
+    max_tokens: int = 4096
+    thinking: dict | None = None         # e.g. {"type": "adaptive"}
+    output_config: dict | None = None    # e.g. {"effort": "high", "format": {...}}
+    extra: dict = field(default_factory=dict)
+
+
 def structured_call(
+    call: StageCall,
     *,
-    run_id: str,
-    stage: str,
-    model: str,
-    system_blocks: list[dict],
-    user_messages: list[dict],
-    schema_filename: str | None,
-    max_tokens: int = 2048,
     client_factory: Callable[[], Any] | None = None,
 ) -> StructuredCallResult:
     """One LLM call with prompt caching, schema validation + one retry, cost record.
 
-    `system_blocks` is a list of {type:"text", text:..., cache_control?:...}
-    objects in the Anthropic format — the caller is responsible for marking
-    static blocks with `{"type":"ephemeral"}` cache_control.
+    `call.system_blocks` is the Anthropic-format list — caller marks static
+    blocks with `cache_control: {"type": "ephemeral"}` for prompt caching.
     """
     if state.is_halted():
         raise HaltFlagSet("halt.flag present; refusing to call LLM")
-    check_caps_or_raise(run_id)
+    check_caps_or_raise(call.run_id)
 
     cli = (client_factory or _client)()
 
     def _one_call(messages: list[dict]) -> StructuredCallResult:
-        resp = cli.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system_blocks,
-            messages=messages,
-        )
+        kwargs: dict[str, Any] = {
+            "model": call.model,
+            "max_tokens": call.max_tokens,
+            "system": call.system_blocks,
+            "messages": messages,
+        }
+        if call.thinking is not None:
+            kwargs["thinking"] = call.thinking
+        if call.output_config is not None:
+            kwargs["output_config"] = call.output_config
+        kwargs.update(call.extra)
+
+        resp = cli.messages.create(**kwargs)
         usage = CallUsage(
             input_tokens=getattr(resp.usage, "input_tokens", 0),
             output_tokens=getattr(resp.usage, "output_tokens", 0),
             cache_creation_input_tokens=getattr(resp.usage, "cache_creation_input_tokens", 0),
             cache_read_input_tokens=getattr(resp.usage, "cache_read_input_tokens", 0),
         )
-        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-        cost = estimate_cost_usd(model, usage)
+        text = "".join(
+            b.text for b in resp.content if getattr(b, "type", "") == "text"
+        )
+        cost = estimate_cost_usd(call.model, usage)
         state.append_cost({
-            "run_id": run_id,
-            "stage": stage,
-            "model": model,
+            "run_id": call.run_id,
+            "stage": call.stage,
+            "model": call.model,
             "cost_usd": cost,
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
@@ -154,13 +183,12 @@ def structured_call(
             "at": state.utcnow_iso(),
         })
 
-        payload: Any = None
-        if schema_filename is not None:
+        if call.schema_filename is not None:
             try:
                 payload = json.loads(text)
             except json.JSONDecodeError as e:
                 raise ValidationError(f"non-JSON response: {e}") from e
-            state.validate(payload, schema_filename)
+            state.validate(payload, call.schema_filename)
         else:
             payload = text
 
@@ -173,23 +201,22 @@ def structured_call(
         )
 
     try:
-        return _one_call(user_messages)
+        return _one_call(call.user_messages)
     except (ValidationError, json.JSONDecodeError) as first_err:
-        # Spec: retry once, feed the error back, then abort.
-        retry_messages = list(user_messages) + [
+        retry_messages = list(call.user_messages) + [
             {
                 "role": "user",
                 "content": (
                     f"Your previous response failed schema validation against "
-                    f"{schema_filename}: {first_err}. Re-emit ONLY valid JSON "
-                    f"that conforms to the schema. No prose."
+                    f"{call.schema_filename}: {first_err}. Re-emit ONLY valid "
+                    f"JSON that conforms to the schema. No prose."
                 ),
             }
         ]
-        check_caps_or_raise(run_id)
+        check_caps_or_raise(call.run_id)
         try:
             return _one_call(retry_messages)
         except (ValidationError, json.JSONDecodeError) as second_err:
             raise SchemaRetryFailed(
-                f"two consecutive schema failures for {schema_filename}: {second_err}"
+                f"two consecutive schema failures for {call.schema_filename}: {second_err}"
             ) from second_err
