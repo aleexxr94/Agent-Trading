@@ -114,3 +114,19 @@ def test_run_orchestrator_uses_state_next_run_for_rescheduling():
     raw = (DEPLOY / "run_orchestrator.sh").read_text(encoding="utf-8")
     assert "state/next_run.json" in raw
     assert "systemd-run" in raw
+
+
+@pytest.mark.parametrize("name", [
+    "agent-orchestrator.service",
+    "agent-monitor.service",
+    "agent-dashboard.service",
+])
+def test_service_units_redirect_home_to_tmp(name):
+    """ProtectHome=true hides /home; libraries that read $HOME/.* on startup
+    (streamlit secrets.toml, anthropic SDK config, yfinance cache) need a
+    writable HOME or they crash. Point HOME at the per-service PrivateTmp."""
+    raw = (DEPLOY / "systemd" / name).read_text(encoding="utf-8")
+    assert "Environment=HOME=/tmp" in raw, (
+        f"{name}: redirect HOME so streamlit/anthropic/yfinance can write "
+        f"under PrivateTmp instead of hitting the ProtectHome wall"
+    )
