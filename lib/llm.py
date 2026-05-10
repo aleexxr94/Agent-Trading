@@ -98,12 +98,21 @@ def sanitize_schema_for_structured_output(
             ref = node.get("$ref")
             if isinstance(ref, str) and not ref.startswith("#") and ref in registry:
                 return _walk(registry[ref])
-            return {
-                k: _walk(v)
-                for k, v in node.items()
-                if k not in _STRUCTURED_OUTPUT_UNSUPPORTED_KEYS
-                and k not in _STRUCTURED_OUTPUT_METADATA_TO_STRIP
-            }
+            out: dict = {}
+            for k, v in node.items():
+                if k in _STRUCTURED_OUTPUT_UNSUPPORTED_KEYS:
+                    continue
+                if k in _STRUCTURED_OUTPUT_METADATA_TO_STRIP:
+                    continue
+                # Anthropic structured outputs supports anyOf/allOf but NOT oneOf.
+                # For discriminated unions (etf | option, kind discriminator), the
+                # cardinality difference is moot — keep anyOf so server-side
+                # validation still enforces "matches one of the branches".
+                if k == "oneOf":
+                    out["anyOf"] = _walk(v)
+                else:
+                    out[k] = _walk(v)
+            return out
         if isinstance(node, list):
             return [_walk(v) for v in node]
         return node

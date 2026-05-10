@@ -225,7 +225,8 @@ def test_sanitize_preserves_supported_keywords():
     assert out["required"] == ["kind"]
 
 
-def test_sanitize_recurses_into_oneof_anyof_allof():
+def test_sanitize_recurses_into_anyof_oneof_allof():
+    """Recursion is applied even when oneOf is rewritten to anyOf."""
     schema = {
         "oneOf": [
             {"type": "number", "minimum": 0},
@@ -234,8 +235,9 @@ def test_sanitize_recurses_into_oneof_anyof_allof():
         "allOf": [{"properties": {"n": {"type": "integer", "maximum": 10}}}],
     }
     out = llm.sanitize_schema_for_structured_output(schema)
-    assert out["oneOf"][0] == {"type": "number"}
-    assert out["oneOf"][1] == {"type": "string"}
+    assert "oneOf" not in out
+    assert out["anyOf"][0] == {"type": "number"}
+    assert out["anyOf"][1] == {"type": "string"}
     assert out["allOf"][0]["properties"]["n"] == {"type": "integer"}
 
 
@@ -302,9 +304,40 @@ def test_metadata_id_and_schema_stripped():
     assert out["type"] == "object"
 
 
+def test_oneof_converted_to_anyof():
+    """Anthropic structured outputs supports anyOf/allOf but NOT oneOf.
+    Discriminated unions get rewritten to anyOf — local validation keeps oneOf."""
+    schema = {
+        "oneOf": [
+            {"type": "object", "properties": {"kind": {"const": "etf"}}},
+            {"type": "object", "properties": {"kind": {"const": "option"}}},
+        ]
+    }
+    out = llm.sanitize_schema_for_structured_output(schema)
+    assert "oneOf" not in out
+    assert "anyOf" in out
+    assert len(out["anyOf"]) == 2
+    assert out["anyOf"][0]["properties"]["kind"] == {"const": "etf"}
+
+
+def test_oneof_inside_array_items_converted():
+    schema = {
+        "type": "array",
+        "items": {
+            "oneOf": [
+                {"$ref": "#/$defs/etf"},
+                {"$ref": "#/$defs/option"},
+            ]
+        },
+    }
+    out = llm.sanitize_schema_for_structured_output(schema)
+    assert "anyOf" in out["items"]
+    assert "oneOf" not in out["items"]
+
+
 def test_real_portfolio_schema_inlined_no_external_refs():
     """The actual portfolio + position schemas must, after sanitisation with
-    the schema registry, contain NO external $refs anywhere in the tree."""
+    the schema registry, contain NO external $refs and NO oneOf anywhere."""
     import json
     from pathlib import Path
     schema_dir = Path(__file__).parent.parent / "schemas"
@@ -316,19 +349,21 @@ def test_real_portfolio_schema_inlined_no_external_refs():
     portfolio = json.loads((schema_dir / "portfolio.schema.json").read_text())
     out = llm.sanitize_schema_for_structured_output(portfolio, ref_registry=registry)
 
-    def find_external_refs(node, found):
+    def find_violations(node, found):
         if isinstance(node, dict):
             ref = node.get("$ref")
             if isinstance(ref, str) and not ref.startswith("#"):
-                found.append(ref)
+                found.append(("external_ref", ref))
+            if "oneOf" in node:
+                found.append(("oneOf", "present"))
             for v in node.values():
-                find_external_refs(v, found)
+                find_violations(v, found)
         elif isinstance(node, list):
             for v in node:
-                find_external_refs(v, found)
+                find_violations(v, found)
         return found
 
-    assert find_external_refs(out, []) == []
+    assert find_violations(out, []) == []
 
 
 # ---------- markdown fence stripping ----------
