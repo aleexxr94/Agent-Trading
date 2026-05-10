@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-trading.local/schemas/position.schema.json",
+  "title": "Position",
+  "description": "A single open position. Discriminated union on `kind`: leveraged ETF or listed option.",
+  "oneOf": [
+    {"$ref": "#/$defs/etf"},
+    {"$ref": "#/$defs/option"}
+  ],
+  "$defs": {
+    "killConditions": {
+      "type": "object",
+      "description": "Explicit conditions under which monitor.py should flatten this position.",
+      "properties": {
+        "max_loss_pct": {
+          "type": "number",
+          "description": "Position-level stop in percent of position NAV. Spec cap is 25; long options may use 100.",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "underlying_price_below": {"type": ["number", "null"]},
+        "underlying_price_above": {"type": ["number", "null"]},
+        "iv_collapse_pct": {"type": ["number", "null"]},
+        "time_stop_utc": {"type": ["string", "null"], "format": "date-time"},
+        "notes": {"type": "string"}
+      },
+      "required": ["max_loss_pct"],
+      "additionalProperties": false
+    },
+    "etf": {
+      "type": "object",
+      "properties": {
+        "kind": {"const": "etf"},
+        "symbol": {"type": "string", "pattern": "^[A-Z][A-Z0-9.\\-]{0,9}$"},
+        "shares": {"type": "number", "exclusiveMinimum": 0},
+        "avg_cost": {"type": "number", "exclusiveMinimum": 0},
+        "leverage_factor": {"type": "number", "minimum": 1.5, "maximum": 3.5},
+        "entry_thesis": {"type": "string", "minLength": 1},
+        "kill_conditions": {"$ref": "#/$defs/killConditions"},
+        "position_pct": {"type": "number", "minimum": 0, "maximum": 15}
+      },
+      "required": ["kind", "symbol", "shares", "avg_cost", "leverage_factor",
+                   "entry_thesis", "kill_conditions", "position_pct"],
+      "additionalProperties": false
+    },
+    "option": {
+      "type": "object",
+      "properties": {
+        "kind": {"const": "option"},
+        "underlying": {"type": "string", "pattern": "^[A-Z][A-Z0-9.\\-]{0,9}$"},
+        "type": {"enum": ["call", "put"]},
+        "strike": {"type": "number", "exclusiveMinimum": 0},
+        "expiry": {"type": "string", "format": "date"},
+        "dte": {"type": "integer", "minimum": 0, "maximum": 365},
+        "contracts": {"type": "integer", "exclusiveMinimum": 0},
+        "premium_paid": {"type": "number", "exclusiveMinimum": 0,
+                          "description": "Per-contract premium paid at entry (USD)."},
+        "greeks": {
+          "type": "object",
+          "properties": {
+            "delta": {"type": "number", "minimum": -1, "maximum": 1},
+            "gamma": {"type": "number"},
+            "theta": {"type": "number"},
+            "vega": {"type": "number"},
+            "iv": {"type": "number", "minimum": 0},
+            "iv_percentile": {"type": "number", "minimum": 0, "maximum": 100}
+          },
+          "required": ["delta", "gamma", "theta", "vega", "iv", "iv_percentile"],
+          "additionalProperties": false
+        },
+        "entry_thesis": {"type": "string", "minLength": 1},
+        "kill_conditions": {"$ref": "#/$defs/killConditions"},
+        "position_pct": {"type": "number", "minimum": 0, "maximum": 15}
+      },
+      "required": ["kind", "underlying", "type", "strike", "expiry", "dte",
+                   "contracts", "premium_paid", "greeks",
+                   "entry_thesis", "kill_conditions", "position_pct"],
+      "additionalProperties": false
+    }
+  }
+}

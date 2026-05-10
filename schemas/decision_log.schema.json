@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-trading.local/schemas/decision_log.schema.json",
+  "title": "DecisionLogEntry",
+  "description": "One row appended to state/decisions.jsonl per pipeline stage.",
+  "type": "object",
+  "properties": {
+    "run_id": {"type": "string", "minLength": 1},
+    "stage": {
+      "enum": ["screen", "research", "scenarios", "construct", "execute", "monitor"]
+    },
+    "model": {"type": "string", "minLength": 1},
+    "inputs_hash": {"type": "string", "pattern": "^[a-f0-9]{16,64}$"},
+    "output_ref": {"type": "string", "minLength": 1,
+                    "description": "Relative path under state/runs/{run_id}/ to the artifact this entry describes."},
+    "prompt_cache_hit_pct": {"type": "number", "minimum": 0, "maximum": 100},
+    "cost_usd": {"type": "number", "minimum": 0},
+    "started_at": {"type": "string", "format": "date-time"},
+    "ended_at": {"type": "string", "format": "date-time"},
+    "status": {"enum": ["ok", "schema_retry", "aborted", "skipped"]},
+    "risk_warning": {"type": "string", "minLength": 1,
+                      "description": "Mandatory warning string injected by lib/llm.py per spec."}
+  },
+  "required": ["run_id", "stage", "model", "inputs_hash", "output_ref",
+                "prompt_cache_hit_pct", "cost_usd",
+                "started_at", "ended_at", "status", "risk_warning"],
+  "additionalProperties": false
+}

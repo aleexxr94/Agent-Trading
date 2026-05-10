@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-trading.local/schemas/portfolio.schema.json",
+  "title": "Portfolio",
+  "description": "Output of Stage 4 (Portfolio Construction). The agent may converge to 8–12 positions OR output an all-cash portfolio (empty positions) with rationale. Sum of position_pct must be ≤ 100.",
+  "type": "object",
+  "properties": {
+    "run_id": {"type": "string", "minLength": 1},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "nav_usd": {"type": "number", "exclusiveMinimum": 0,
+                 "description": "Portfolio NAV at write time (USD)."},
+    "cash_usd": {"type": "number", "minimum": 0},
+    "cash_buffer_pct": {"type": "number", "minimum": 0, "maximum": 100,
+                          "description": "Target cash held back from full deployment."},
+    "all_cash": {"type": "boolean",
+                  "description": "True when conviction was insufficient to take any position. Spec mandate: do not force-fill if conviction is low."},
+    "all_cash_rationale": {"type": ["string", "null"],
+                             "description": "Required when all_cash=true; null otherwise."},
+    "positions": {
+      "type": "array",
+      "items": {"$ref": "https://agent-trading.local/schemas/position.schema.json"}
+    },
+    "construction_rationale": {"type": "string", "minLength": 1,
+                                 "description": "Why this set of positions, why this count within 8–12, why now."}
+  },
+  "required": ["run_id", "generated_at", "nav_usd", "cash_usd",
+                "cash_buffer_pct", "all_cash", "positions",
+                "construction_rationale"],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"properties": {"all_cash": {"const": true}}, "required": ["all_cash"]},
+      "then": {
+        "properties": {
+          "positions": {"type": "array", "maxItems": 0},
+          "all_cash_rationale": {"type": "string", "minLength": 1}
+        },
+        "required": ["all_cash_rationale"]
+      },
+      "else": {
+        "properties": {
+          "positions": {"type": "array", "minItems": 8, "maxItems": 12}
+        }
+      }
+    }
+  ]
+}
