@@ -23,6 +23,15 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+# Load .env so manual `python orchestrator.py` invocations pick up API keys.
+# systemd services use EnvironmentFile= and don't strictly need this, but it
+# makes operator smoke runs from the shell work without a separate `source`.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+except ImportError:
+    pass
 from typing import Callable
 
 from lib import llm, risk, stages, state
