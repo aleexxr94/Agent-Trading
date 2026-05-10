@@ -1,0 +1,34 @@
+[Unit]
+Description=Agent-Trading kill-condition monitor (paper-only)
+Documentation=https://github.com/aleexxr94/agent-trading
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!{{REPO_DIR}}/state/halt.flag
+
+[Service]
+Type=oneshot
+User={{AGENT_USER}}
+Group={{AGENT_USER}}
+WorkingDirectory={{REPO_DIR}}
+EnvironmentFile={{REPO_DIR}}/.env
+ExecStart=/bin/bash {{REPO_DIR}}/deploy/run_monitor.sh
+TimeoutStartSec=3min
+Nice=10
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths={{REPO_DIR}}/state
+ReadOnlyPaths={{REPO_DIR}}
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
