@@ -17,6 +17,7 @@ try:
 except ImportError:
     pass
 
+from lib import marks as marks_lib
 from lib import risk, state
 from lib.broker import Broker
 
@@ -85,6 +86,18 @@ def execute_actions(actions: list[dict], *, broker: Broker | None) -> None:
         # halt_new_orders is observed by the orchestrator at next start
 
 
+def _try_load_broker() -> Broker | None:
+    """Best-effort AlpacaBroker construction. Returns None if creds are
+    missing or the SDK isn't installed — monitor still runs (just can't
+    fetch live marks or flatten)."""
+    try:
+        from lib.alpaca_client import AlpacaBroker
+        return AlpacaBroker()
+    except Exception as e:
+        print(f"broker unavailable ({type(e).__name__}: {e}); monitor will skip mark-based checks")
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Kill-condition monitor")
     parser.add_argument("--dry-run", action="store_true")
@@ -99,11 +112,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     portfolio = state.read_json(state.CURRENT_PORTFOLIO)
-    # Real broker wiring (and live mark sourcing) lands with Phase 4.
-    actions = evaluate_portfolio(portfolio=portfolio, marks={})
-    print(f"monitor: {len(actions)} actions (dry_run={args.dry_run})")
+    broker = _try_load_broker()
+    marks = marks_lib.marks_from_broker(broker) if broker is not None else {}
+    actions = evaluate_portfolio(portfolio=portfolio, marks=marks)
+    print(
+        f"monitor: {len(marks)} marks, {len(actions)} actions "
+        f"(dry_run={args.dry_run}, broker={'on' if broker else 'off'})"
+    )
     if not args.dry_run:
-        execute_actions(actions, broker=None)
+        execute_actions(actions, broker=broker)
     return 0
 
 

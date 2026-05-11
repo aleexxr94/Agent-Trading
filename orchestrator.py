@@ -34,7 +34,7 @@ except ImportError:
     pass
 from typing import Callable
 
-from lib import llm, risk, stages, state
+from lib import llm, market_data, risk, stages, state, universe
 from lib.broker import Broker
 
 ROOT = Path(__file__).resolve().parent
@@ -126,6 +126,12 @@ def stage_screen(ctx: StageContext) -> dict:
     if ctx.dry_run:
         return _load_fixture("screen.json")
     cfg = stages.screener()
+    # Fetch live ADV / HV / price for every entry in the static universe.
+    # Per-symbol failures surface as {error: ...} rows rather than crashing.
+    snapshot = market_data.universe_snapshot(
+        universe.all_symbols(), run_id=ctx.run_id
+    )
+    universe_block = json.dumps(snapshot, separators=(",", ":"))
     res = llm.structured_call(llm.StageCall(
         run_id=ctx.run_id,
         stage=cfg.stage,
@@ -134,9 +140,13 @@ def stage_screen(ctx: StageContext) -> dict:
         user_messages=[{
             "role": "user",
             "content": (
-                f"Screen the leveraged-ETF + listed-options universe for the "
-                f"current session. UTC: {state.utcnow_iso()}. Apply liquidity "
-                f"filters strictly. Return JSON only."
+                f"Screen this universe for the current session. "
+                f"UTC: {state.utcnow_iso()}\n\n"
+                f"Universe data (last_close in USD, adv_30d in shares, "
+                f"hv_30d_annualised as decimal e.g. 0.45 = 45%):\n"
+                f"{universe_block}\n\n"
+                f"Apply liquidity filters strictly against these numbers, "
+                f"not training-data priors. Return JSON only."
             ),
         }],
         schema_filename=None,
@@ -288,23 +298,75 @@ def _account_nav(ctx: StageContext) -> float:
     return 2500.0  # £2k paper baseline
 
 
+def _default_next_run_at(portfolio: dict) -> str:
+    """Heuristic next-run cadence until orchestrator-meta is wired (Phase 9.3):
+       - all-cash: 6 hours (no urgency — just sample the universe again)
+       - positions held: 4 hours (faster, to monitor kill conditions)
+    Both well above rate-limit windows, both produce a strictly future
+    timestamp so systemd-run will accept the schedule."""
+    from datetime import timedelta
+    hours = 6 if portfolio.get("all_cash") else 4
+    return (state.utcnow() + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def stage_execute(ctx: StageContext, portfolio: dict) -> dict:
     """Submit paper orders to converge actual positions on `portfolio`, then plan
     the next run. Order submission is a no-op when broker is None."""
     next_run = {
         "run_id": ctx.run_id,
-        "next_run_at": state.utcnow_iso(),
+        "next_run_at": _default_next_run_at(portfolio),
         "rationale": (
-            "Skeleton next-run planner: in production the orchestrator-meta call "
-            "will pick a window in minutes/hours from regime + portfolio state."
+            f"Heuristic cadence (all_cash={portfolio.get('all_cash', False)}, "
+            f"positions={len(portfolio.get('positions', []))}). "
+            f"Orchestrator-meta will override this once wired (Phase 9.3)."
         ),
     }
-    if ctx.broker is not None and not ctx.dry_run and not portfolio.get("all_cash"):
-        # Position reconciliation deliberately minimal here — full delta logic
-        # lands when a broker is wired in for live paper runs.
-        pass
+    # Order submission — gated behind ORDERS_ENABLED=true env var. Default
+    # OFF so this code can ride to main behind a flag and the operator opts
+    # in explicitly (the spec mandates paper-only and every iteration before
+    # promotion has to be deliberate).
+    from lib import orders
+    next_run["orders_enabled"] = orders.is_enabled()
+    if (
+        ctx.broker is not None
+        and not ctx.dry_run
+        and orders.is_enabled()
+    ):
+        try:
+            current = ctx.broker.get_positions()
+        except Exception as e:
+            next_run["order_plan_error"] = f"get_positions: {type(e).__name__}: {e}"
+            current = []
+        plan = orders.diff_portfolio(portfolio, current)
+        results = orders.submit_plan(plan, broker=ctx.broker)
+        next_run["order_plan"] = {
+            "total_legs": plan.total_legs,
+            "closes": len(plan.closes),
+            "opens": len(plan.requests),
+            "options_skipped": len(plan.skipped),
+            "results": [
+                {"symbol": r.symbol, "qty": r.qty, "side": r.side, "status": r.status}
+                for r in results
+            ],
+        }
     if not ctx.dry_run:
         state.write_json(state.NEXT_RUN, next_run)
+        # NAV history: one row per run for the dashboard equity curve.
+        # Marks aren't wired in yet, so gross/net P&L only includes the
+        # modelled-cost entry-leg estimate. Real marks land in Phase 10a.
+        from lib import pnl as pnl_lib
+        breakdown = pnl_lib.compute_portfolio_pnl(portfolio=portfolio, marks=None)
+        state.append_nav({
+            "run_id": ctx.run_id,
+            "at": state.utcnow_iso(),
+            "nav_usd": portfolio.get("nav_usd", 0.0),
+            "cash_usd": portfolio.get("cash_usd", 0.0),
+            "positions_count": len(portfolio.get("positions", [])),
+            "all_cash": portfolio.get("all_cash", False),
+            "gross_pnl_usd": breakdown.gross_pnl_usd,
+            "modelled_costs_usd": breakdown.modelled_costs_usd,
+            "net_pnl_usd": breakdown.net_pnl_usd,
+        })
     return next_run
 
 

@@ -146,20 +146,54 @@ with tabs[2]:
     _banner()
     st.subheader("P&L (gross / modelled costs / net)")
 
-    # Gross / Net cards. `marks` aren't wired in until the broker connection
-    # lands, so we render placeholder cards with the modelled cost still
-    # populated (entry leg already paid).
-    pnl_break = pnl_lib.compute_portfolio_pnl(portfolio=portfolio, marks=None)
+    # Pull live marks from Alpaca paper. Falls back to empty dict if the
+    # broker isn't reachable (alpaca-py missing, no creds, network blip) —
+    # the dashboard still renders, P&L cards just stay "—".
+    broker_marks = dd.try_load_broker_marks()
+    pnl_break = pnl_lib.compute_portfolio_pnl(portfolio=portfolio, marks=broker_marks or None)
+
     p1, p2, p3 = st.columns(3)
-    p1.metric("Gross P&L (USD)", "—" if pnl_break.gross_pnl_usd == 0 else f"${pnl_break.gross_pnl_usd:+,.2f}")
+    has_gross = broker_marks and pnl_break.gross_pnl_usd != 0
+    p1.metric("Gross P&L (USD)", f"${pnl_break.gross_pnl_usd:+,.2f}" if has_gross else "—")
     p2.metric("Modelled trading costs", f"${pnl_break.modelled_costs_usd:,.2f}")
-    p3.metric("Net P&L (USD)", "—" if pnl_break.gross_pnl_usd == 0 else f"${pnl_break.net_pnl_usd:+,.2f}")
-    st.caption(
-        "Trading costs are modelled (Alpaca paper has none) using ~5 bps half-spread on "
-        "ETFs and \\$0.65/contract + 25 bps spread on options — calibrated to a UK retail "
-        "broker (IBKR) so paper Sharpe is honest before any live promotion. "
-        "Gross P&L populates once current marks are wired in via the broker."
+    p3.metric("Net P&L (USD)", f"${pnl_break.net_pnl_usd:+,.2f}" if has_gross else "—")
+
+    marks_status = (
+        f"Live marks from Alpaca paper ({len(broker_marks)} positions matched)."
+        if broker_marks else
+        "No live marks yet — connect Alpaca paper keys to populate Gross / Net P&L. "
+        "Cards stay '—' until then."
     )
+    st.caption(
+        marks_status + " Trading costs are modelled (Alpaca paper has none) using "
+        "~5 bps half-spread on ETFs and \\$0.65/contract + 25 bps spread on options — "
+        "calibrated to UK retail (IBKR) so paper Sharpe is honest pre-promotion."
+    )
+
+    st.subheader("Equity curve")
+    nav_history = dd.load_nav_history()
+    if nav_history:
+        nav_df = pd.DataFrame(nav_history)
+        fig_nav = go.Figure()
+        fig_nav.add_trace(go.Scatter(
+            x=nav_df["at"], y=nav_df["nav_usd"], mode="lines+markers",
+            name="NAV (USD)", line=dict(width=2),
+        ))
+        if "net_pnl_usd" in nav_df.columns:
+            fig_nav.add_trace(go.Scatter(
+                x=nav_df["at"], y=nav_df["net_pnl_usd"], mode="lines",
+                name="Cumulative Net P&L (USD)", yaxis="y2", line=dict(dash="dot"),
+            ))
+            fig_nav.update_layout(
+                yaxis2=dict(title="Net P&L (USD)", overlaying="y", side="right", showgrid=False),
+            )
+        fig_nav.update_layout(
+            template="plotly_dark", height=360, yaxis_title="NAV (USD)",
+            margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h"),
+        )
+        st.plotly_chart(fig_nav, width="stretch")
+    else:
+        st.info("No NAV history yet — the equity curve populates once orchestrator runs accumulate.")
 
     st.subheader("LLM cost over time")
     if costs:

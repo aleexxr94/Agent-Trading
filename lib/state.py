@@ -27,6 +27,7 @@ DECISIONS_LOG = STATE_DIR / "decisions.jsonl"
 COSTS_LOG = STATE_DIR / "costs.jsonl"
 CURRENT_PORTFOLIO = STATE_DIR / "current_portfolio.json"
 NEXT_RUN = STATE_DIR / "next_run.json"
+NAV_HISTORY_LOG = STATE_DIR / "nav_history.jsonl"
 
 
 # --------- run_id ---------
@@ -164,3 +165,35 @@ def read_costs_for_run(run_id: str) -> list[dict]:
         if row.get("run_id") == run_id:
             out.append(row)
     return out
+
+
+def append_nav(entry: dict) -> None:
+    """Append one row to state/nav_history.jsonl for the equity curve.
+
+    Required keys: run_id, at, nav_usd. Optional but recommended: cash_usd,
+    gross_pnl_usd, modelled_costs_usd, net_pnl_usd, positions_count, all_cash.
+    """
+    required = {"run_id", "at", "nav_usd"}
+    missing = required - entry.keys()
+    if missing:
+        raise ValueError(f"nav entry missing keys: {sorted(missing)}")
+    NAV_HISTORY_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with NAV_HISTORY_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, sort_keys=False) + "\n")
+
+
+def read_nav_history(limit: int | None = None) -> list[dict]:
+    """Return all NAV history rows (oldest first). Pass `limit` to cap."""
+    if not NAV_HISTORY_LOG.exists():
+        return []
+    rows = []
+    for line in NAV_HISTORY_LOG.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    if limit is not None:
+        return rows[-limit:]
+    return rows

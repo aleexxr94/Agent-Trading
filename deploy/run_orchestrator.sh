@@ -37,16 +37,22 @@ if [ -f "$NEXT_RUN_FILE" ] && command -v jq >/dev/null 2>&1; then
     if [ -n "$NEXT_AT" ]; then
         # Convert ISO-8601 to a value systemd-run accepts. systemd accepts
         # "yyyy-mm-dd HH:MM:SS" UTC; jq output is "yyyy-mm-ddTHH:MM:SSZ".
-        SD_TIME=$(echo "$NEXT_AT" | sed 's/T/ /; s/Z$//' )
-        # systemd-run --on-calendar=... requires root or user-bus access; in
-        # the system service context we use the system bus.
-        if systemd-run --on-calendar="$SD_TIME UTC" \
+        SD_TIME=$(echo "$NEXT_AT" | sed 's/T/ /; s/Z$//')
+
+        # Defensive: refuse to schedule into the past. systemd-run errors out
+        # with a confusing message and the daily fallback kicks in anyway, so
+        # we'd rather log a clear reason here.
+        NEXT_EPOCH=$(date -u -d "$SD_TIME UTC" +%s 2>/dev/null || echo 0)
+        NOW_EPOCH=$(date -u +%s)
+        if [ "$NEXT_EPOCH" -le "$NOW_EPOCH" ]; then
+            echo "next_run_at $NEXT_AT is not strictly in the future; daily fallback will run." >&2
+        elif systemd-run --on-calendar="$SD_TIME UTC" \
                        --unit="agent-orchestrator-next-$(date -u +%s)" \
                        /bin/systemctl start agent-orchestrator.service \
                        >/dev/null 2>&1; then
             echo "Next run scheduled at $SD_TIME UTC."
         else
-            echo "Could not schedule transient timer for $SD_TIME UTC; daily fallback will run." >&2
+            echo "systemd-run rejected $SD_TIME UTC; daily fallback will run." >&2
         fi
     fi
 fi

@@ -1,17 +1,21 @@
-"""yfinance wrappers — daily/intraday history, ADV, basic fundamentals.
+"""yfinance wrappers — daily/intraday history, ADV, HV, full universe snapshot.
 
 Lazy-imports yfinance so unit tests can run without it. Caches per-run under
 state/runs/{run_id}/cache/ to avoid re-fetching the same series within a single
-pipeline run.
+pipeline run. Universe snapshot fans out per-symbol fetches across threads
+(yfinance releases the GIL during network IO) so a 16-symbol universe finishes
+in ~5 seconds instead of ~30 sequentially.
 """
 from __future__ import annotations
 
-import json
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
-from .state import RUNS_DIR
+from . import state as _state
+from .universe import by_symbol
 
 if TYPE_CHECKING:
     import pandas as pd  # noqa: F401
@@ -25,9 +29,12 @@ class HistoryRequest:
 
 
 def _cache_path(run_id: str | None, key: str) -> Path | None:
+    """Look up RUNS_DIR dynamically through the state module so tmp_state's
+    monkeypatch is honoured in tests (a direct `from .state import RUNS_DIR`
+    captures the path at import-time, before the fixture runs)."""
     if run_id is None:
         return None
-    d = RUNS_DIR / run_id / "cache"
+    d = _state.RUNS_DIR / run_id / "cache"
     d.mkdir(parents=True, exist_ok=True)
     return d / f"{key}.parquet"
 
@@ -79,15 +86,75 @@ def passes_liquidity_filter(
     return average_daily_volume(symbol, run_id=run_id) >= min_adv
 
 
-def universe_snapshot(symbols: Iterable[str], *, run_id: str | None = None) -> list[dict]:
-    """Compact per-symbol summary for prompt-cached universe block."""
-    out = []
-    for s in symbols:
-        try:
-            adv = average_daily_volume(s, run_id=run_id)
-            hv = historical_volatility(s, run_id=run_id)
-        except Exception as e:
-            out.append({"symbol": s, "error": str(e)})
-            continue
-        out.append({"symbol": s, "adv": adv, "hv_annualised": hv})
-    return out
+def _snapshot_one(symbol: str, *, run_id: str | None) -> dict:
+    """Per-symbol live data block. Tolerant — partial failures leave the
+    affected field as None rather than crashing the whole universe fetch."""
+    meta = by_symbol(symbol)
+    entry: dict = {
+        "symbol": symbol,
+        "kind": meta.kind if meta else "unknown",
+        "leverage_factor": meta.leverage_factor if meta else 1.0,
+        "family": meta.family if meta else "",
+    }
+    try:
+        df = history(
+            HistoryRequest(symbol=symbol, period="6mo"), run_id=run_id
+        )
+        if df.empty:
+            entry.update({
+                "last_close": None, "adv_30d": None, "hv_30d_annualised": None,
+                "high_52w": None, "low_52w": None, "error": "no history",
+            })
+            return entry
+        closes = df["Close"]
+        vols = df["Volume"]
+        last = float(closes.iloc[-1])
+        adv = float(vols.tail(30).mean()) if "Volume" in df.columns else None
+        rets = closes.pct_change().tail(30).dropna()
+        hv = float(rets.std() * math.sqrt(252)) if not rets.empty else None
+        hi = float(closes.tail(252).max())
+        lo = float(closes.tail(252).min())
+        entry.update({
+            "last_close": round(last, 2),
+            "adv_30d": int(adv) if adv is not None else None,
+            "hv_30d_annualised": round(hv, 4) if hv is not None else None,
+            "high_52w": round(hi, 2),
+            "low_52w": round(lo, 2),
+            "pct_off_52w_high": round((last / hi - 1) * 100, 2),
+        })
+    except Exception as e:
+        entry["error"] = f"{type(e).__name__}: {e}"
+    return entry
+
+
+def universe_snapshot(
+    symbols: Iterable[str],
+    *,
+    run_id: str | None = None,
+    max_workers: int = 8,
+) -> list[dict]:
+    """Compact per-symbol summary for the screener's universe block.
+
+    Fans out yfinance calls across `max_workers` threads. yfinance releases
+    the GIL during network IO, so threading is genuinely parallel. Results
+    are returned in the SAME order as the input `symbols` so the screener
+    sees a stable list across runs (helps with prompt caching downstream).
+
+    Per-symbol failures are surfaced as {symbol, kind, error: "..."} rather
+    than raising — one flaky ticker shouldn't kill the whole screen.
+    """
+    syms = list(symbols)
+    if not syms:
+        return []
+
+    results: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_snapshot_one, s, run_id=run_id): s for s in syms}
+        for fut in as_completed(futures):
+            s = futures[fut]
+            try:
+                results[s] = fut.result()
+            except Exception as e:
+                results[s] = {"symbol": s, "error": f"{type(e).__name__}: {e}"}
+
+    return [results[s] for s in syms]
