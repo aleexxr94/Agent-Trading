@@ -2,12 +2,7 @@
 
 This file is the canonical audit handoff between Codex (review/audit) and Claude (implementation).
 
-codex/audit-trading-system-codebase-for-strategic-evaluation-iqjjlr
 **Single source of truth:** All audit findings and updates must be recorded in this file only.
-=======
-## Related Documents
-- Audit index: `docs/CODEX_AUDIT_INDEX.md`
-main
 
 ## How to use
 - Ask Codex to append new audit entries to this file.
@@ -64,7 +59,6 @@ main
 
 ## Entries
 
-codex/audit-trading-system-codebase-for-strategic-evaluation-iqjjlr
 ### Audit Entry
 - **Entry ID:** `2026-05-11-pipeline-handoff-risk-audit`
 - **Timestamp (UTC):** `2026-05-11T15:47:27Z`
@@ -139,6 +133,4 @@ codex/audit-trading-system-codebase-for-strategic-evaluation-iqjjlr
 - Should unresolved bull/bear conflicts force abstain/all-cash paths by policy?
 - What telemetry threshold should trigger automatic halt on schema retry failures?
 
-
-main
 > Add newest entries at the top of this section.
