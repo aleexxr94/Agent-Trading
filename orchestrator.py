@@ -321,10 +321,34 @@ def stage_execute(ctx: StageContext, portfolio: dict) -> dict:
             f"Orchestrator-meta will override this once wired (Phase 9.3)."
         ),
     }
-    if ctx.broker is not None and not ctx.dry_run and not portfolio.get("all_cash"):
-        # Position reconciliation deliberately minimal here — full delta logic
-        # lands when a broker is wired in for live paper runs.
-        pass
+    # Order submission — gated behind ORDERS_ENABLED=true env var. Default
+    # OFF so this code can ride to main behind a flag and the operator opts
+    # in explicitly (the spec mandates paper-only and every iteration before
+    # promotion has to be deliberate).
+    from lib import orders
+    next_run["orders_enabled"] = orders.is_enabled()
+    if (
+        ctx.broker is not None
+        and not ctx.dry_run
+        and orders.is_enabled()
+    ):
+        try:
+            current = ctx.broker.get_positions()
+        except Exception as e:
+            next_run["order_plan_error"] = f"get_positions: {type(e).__name__}: {e}"
+            current = []
+        plan = orders.diff_portfolio(portfolio, current)
+        results = orders.submit_plan(plan, broker=ctx.broker)
+        next_run["order_plan"] = {
+            "total_legs": plan.total_legs,
+            "closes": len(plan.closes),
+            "opens": len(plan.requests),
+            "options_skipped": len(plan.skipped),
+            "results": [
+                {"symbol": r.symbol, "qty": r.qty, "side": r.side, "status": r.status}
+                for r in results
+            ],
+        }
     if not ctx.dry_run:
         state.write_json(state.NEXT_RUN, next_run)
         # NAV history: one row per run for the dashboard equity curve.
