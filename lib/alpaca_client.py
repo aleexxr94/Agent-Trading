@@ -83,6 +83,11 @@ class AlpacaBroker(Broker):
     def get_positions(self) -> list[BrokerPosition]:
         out: list[BrokerPosition] = []
         for p in self._client.get_all_positions():
+            # current_price + qty_available are optional in alpaca-py's Position
+            # model; guard with getattr so we don't crash on older SDK versions
+            # or test stubs that haven't bothered.
+            cp = getattr(p, "current_price", None)
+            qa = getattr(p, "qty_available", None)
             out.append(
                 BrokerPosition(
                     symbol=p.symbol,
@@ -91,6 +96,8 @@ class AlpacaBroker(Broker):
                     market_value=float(p.market_value),
                     unrealized_pl_usd=float(p.unrealized_pl),
                     asset_class=_normalize_asset_class(p.asset_class),
+                    current_price=float(cp) if cp is not None else None,
+                    qty_available=float(qa) if qa is not None else None,
                 )
             )
         return out

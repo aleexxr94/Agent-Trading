@@ -40,16 +40,23 @@ def marks_from_broker(broker: Broker) -> dict[str, float]:
     for p in positions:
         if p.qty == 0:
             continue
-        # market_value / qty gives the per-share (ETF) or per-contract-dollar
-        # (option, where Alpaca's market_value already absorbs the 100x).
-        try:
-            per_unit = p.market_value / p.qty
-        except ZeroDivisionError:
-            continue
-        # For options: pnl.compute_position_pnl expects per-share premium
-        # (matches the schema's premium_paid units), so divide by the 100x.
-        if p.asset_class == "us_option":
-            per_unit = per_unit / 100.0
+        # Prefer current_price when Alpaca reports it — that's the live
+        # per-share (ETF) or per-share-premium (option) quote, direct from
+        # the position object, no rounding hazard. Older alpaca-py SDKs and
+        # test stubs may not populate it, so keep the market_value/qty
+        # fallback for those paths.
+        if p.current_price is not None:
+            per_unit = p.current_price
+        else:
+            try:
+                per_unit = p.market_value / p.qty
+            except ZeroDivisionError:
+                continue
+            # market_value bakes in the 100x option multiplier; strip it so
+            # downstream pnl.compute_position_pnl sees per-share premium
+            # (same units as schema's premium_paid).
+            if p.asset_class == "us_option":
+                per_unit = per_unit / 100.0
         out[_key_for_broker_position(p)] = per_unit
     return out
 

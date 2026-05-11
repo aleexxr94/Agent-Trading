@@ -5,7 +5,7 @@ from lib import marks
 from lib.broker import BrokerPosition
 
 
-def _bp(symbol, qty, market_value, asset_class="us_equity") -> BrokerPosition:
+def _bp(symbol, qty, market_value, asset_class="us_equity", current_price=None) -> BrokerPosition:
     return BrokerPosition(
         symbol=symbol,
         qty=qty,
@@ -13,6 +13,7 @@ def _bp(symbol, qty, market_value, asset_class="us_equity") -> BrokerPosition:
         market_value=market_value,
         unrealized_pl_usd=0.0,
         asset_class=asset_class,
+        current_price=current_price,
     )
 
 
@@ -84,6 +85,39 @@ def test_broker_error_returns_empty_not_crash():
         def get_positions(self):
             raise RuntimeError("network down")
     assert marks.marks_from_broker(_BrokenBroker([])) == {}
+
+
+def test_current_price_preferred_over_derived():
+    """When Alpaca reports current_price, use it directly — bypasses the
+    market_value / qty derivation which would lose precision on options
+    with the 100x multiplier."""
+    # If we DERIVE: 4 × 80.50 = 322.00, then 322/4 = 80.5. But say market_value
+    # comes in as 322.01 (rounding). Derived = 80.5025 — slightly off.
+    # current_price=80.55 says "the live quote is 80.55", and that's what we use.
+    out = marks.marks_from_broker(_FakeBroker([
+        _bp("TQQQ", 4, 322.01, current_price=80.55),
+    ]))
+    assert out == {"TQQQ": 80.55}
+
+
+def test_current_price_preferred_for_options_no_100x_division():
+    """For options, current_price is already per-share premium — no /100
+    needed. The market_value-derived path would divide; current_price
+    path must not."""
+    out = marks.marks_from_broker(_FakeBroker([
+        _bp("SPY261219C00530000", 1, 650.0, asset_class="us_option",
+            current_price=6.50),
+    ]))
+    assert out == {"SPY261219C00530000": 6.50}
+
+
+def test_falls_back_to_derived_when_current_price_missing():
+    """When current_price is None (test stub, older SDK), the existing
+    market_value / qty / (100 if option) derivation still works."""
+    out = marks.marks_from_broker(_FakeBroker([
+        _bp("TQQQ", 10, 750.0, current_price=None),
+    ]))
+    assert out == {"TQQQ": 75.0}
 
 
 def test_portfolio_to_mark_keys_etf_and_option():
