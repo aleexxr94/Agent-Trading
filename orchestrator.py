@@ -299,7 +299,8 @@ def _account_nav(ctx: StageContext) -> float:
 
 
 def _default_next_run_at(portfolio: dict) -> str:
-    """Heuristic next-run cadence until orchestrator-meta is wired (Phase 9.3):
+    """Heuristic next-run cadence — used as the fallback when the
+    orchestrator-meta LLM call doesn't return a usable timestamp:
        - all-cash: 6 hours (no urgency — just sample the universe again)
        - positions held: 4 hours (faster, to monitor kill conditions)
     Both well above rate-limit windows, both produce a strictly future
@@ -309,17 +310,91 @@ def _default_next_run_at(portfolio: dict) -> str:
     return (state.utcnow() + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def stage_execute(ctx: StageContext, portfolio: dict) -> dict:
+# Orchestrator-meta runs after construct and decides cadence. Hard bounds
+# match the prompt — any returned timestamp outside this window falls back
+# to the heuristic.
+META_MIN_HOURS = 1.0
+META_MAX_HOURS = 24.0
+
+
+def _compute_next_run_at(
+    *, ctx: StageContext, portfolio: dict, scenarios_out: dict,
+) -> tuple[str, str]:
+    """Ask the orchestrator-meta agent for a regime-adaptive cadence.
+
+    Returns (next_run_at_iso, rationale). On any failure — schema retry
+    blown, JSON malformed, timestamp out of bounds, or `ctx.dry_run=True`
+    — falls back to `_default_next_run_at(portfolio)` with an explanatory
+    rationale. Never propagates exceptions to the caller.
+    """
+    if ctx.dry_run:
+        return _default_next_run_at(portfolio), "dry-run: heuristic only"
+
+    from datetime import datetime, timedelta, timezone
+    cfg = stages.orchestrator_meta()
+    now = state.utcnow()
+    nav_history = state.read_nav_history(limit=3)
+
+    user_msg = {
+        "role": "user",
+        "content": (
+            f"Current UTC: {state.utcnow_iso()}\n"
+            f"Portfolio summary:\n"
+            f"  positions: {len(portfolio.get('positions', []))}\n"
+            f"  all_cash: {portfolio.get('all_cash', False)}\n"
+            f"  nav_usd: {portfolio.get('nav_usd', 0.0):.2f}\n"
+            f"  cash_buffer_pct: {portfolio.get('cash_buffer_pct', 0.0):.1f}\n"
+            f"Recent NAV history (last {len(nav_history)} rows):\n"
+            f"  {json.dumps(nav_history, separators=(',', ':'))}\n"
+            f"Scenarios horizon hints:\n"
+            f"  {json.dumps([{'symbol': c.get('symbol'), 'horizon_days': c.get('horizon_days')} for c in scenarios_out.get('candidates', [])], separators=(',', ':'))}\n\n"
+            "Choose the next-run window. Return JSON only."
+        ),
+    }
+    try:
+        res = llm.structured_call(llm.StageCall(
+            run_id=ctx.run_id,
+            stage=cfg.stage,
+            model=cfg.model,
+            system_blocks=_system_blocks(cfg),
+            user_messages=[user_msg],
+            schema_filename=None,
+            max_tokens=cfg.max_tokens,
+            thinking=cfg.thinking,
+            output_config=_output_config(cfg),
+        ))
+        payload = json.loads(res.raw_text)
+    except Exception as e:
+        return _default_next_run_at(portfolio), f"meta call failed ({type(e).__name__}); using heuristic"
+
+    # Sanity-check the returned timestamp before we trust it.
+    try:
+        at = datetime.strptime(payload["next_run_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return _default_next_run_at(portfolio), "meta returned malformed next_run_at; using heuristic"
+
+    delta_hours = (at - now).total_seconds() / 3600.0
+    if delta_hours < META_MIN_HOURS or delta_hours > META_MAX_HOURS:
+        return _default_next_run_at(portfolio), (
+            f"meta returned out-of-bounds cadence ({delta_hours:.1f}h, "
+            f"allowed {META_MIN_HOURS}-{META_MAX_HOURS}h); using heuristic"
+        )
+
+    rationale = (payload.get("rationale") or "")[:300]  # cap length so it stays log-friendly
+    return payload["next_run_at"], f"orchestrator-meta: {rationale}"
+
+
+def stage_execute(ctx: StageContext, portfolio: dict, scenarios_out: dict | None = None) -> dict:
     """Submit paper orders to converge actual positions on `portfolio`, then plan
     the next run. Order submission is a no-op when broker is None."""
+    scenarios_out = scenarios_out or {"candidates": []}
+    next_at, meta_rationale = _compute_next_run_at(
+        ctx=ctx, portfolio=portfolio, scenarios_out=scenarios_out,
+    )
     next_run = {
         "run_id": ctx.run_id,
-        "next_run_at": _default_next_run_at(portfolio),
-        "rationale": (
-            f"Heuristic cadence (all_cash={portfolio.get('all_cash', False)}, "
-            f"positions={len(portfolio.get('positions', []))}). "
-            f"Orchestrator-meta will override this once wired (Phase 9.3)."
-        ),
+        "next_run_at": next_at,
+        "rationale": meta_rationale,
     }
     # Order submission — gated behind ORDERS_ENABLED=true env var. Default
     # OFF so this code can ride to main behind a flag and the operator opts
@@ -453,7 +528,7 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
 
     next_run = _run_stage(
         ctx=ctx, stage_id="execute", schema="", output_filename="next_run.json",
-        runner=lambda: stage_execute(ctx, portfolio),
+        runner=lambda: stage_execute(ctx, portfolio, scenarios_out),
         inputs_hash_parts=(rid, json.dumps(portfolio, sort_keys=True)),
         model="local",
     )
