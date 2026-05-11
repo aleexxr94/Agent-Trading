@@ -21,7 +21,7 @@ systemd timer (Linux) / Task Scheduler (Windows) ──▶ orchestrator.py
                                                       ├─ Stage 1: screen      (Haiku 4.5)
                                                       ├─ Stage 2: research    (Sonnet 4.6, bull+bear in parallel)
                                                       ├─ Stage 3: scenarios   (Sonnet 4.6)
-                                                      ├─ Stage 4: construct   (Sonnet 4.6, 8–12 or all-cash)
+                                                      ├─ Stage 4: construct   (Opus 4.6, 8–12 or all-cash)
                                                       └─ Stage 5: execute     (Alpaca paper) + write next_run.json
                                                             │
                                                             ▼
@@ -32,6 +32,20 @@ systemd timer (Linux) / Task Scheduler (Windows) ──▶ orchestrator.py
 ```
 
 `monitor.py` runs more frequently and only checks kill conditions; it can flatten a position but cannot open new ones.
+
+### Model tiering rationale
+
+Per-stage model assignment matches the cost/quality demand of each decision. All defaults overridable via `.env` (`MODEL_*` vars).
+
+| Stage | Model | Why |
+|---|---|---|
+| **screen** | `claude-haiku-4-5` | Structured liquidity-filter step. Cheap, fast, sufficient. |
+| **research** (bull + bear, parallel) | `claude-sonnet-4-6` | Fans out 2× per candidate (~16 calls/run). Sonnet is the right cost/quality sweet spot at this fan-out. |
+| **scenarios** | `claude-sonnet-4-6` | Probability-weighted base/bull/bear case modelling. Well-defined output shape. |
+| **construct** | `claude-opus-4-6` | **The actual trade decision** — picks positions, sizing, kill conditions. Highest-stakes call on a £2k account where each trade matters disproportionately; gets the Opus tier. |
+| **orchestrator-meta** *(timing only, not yet wired)* | `claude-opus-4-6` | Decides next-run window from regime + portfolio state. Wires in Phase 9.1. |
+
+Typical cost per orchestrator run on a real universe: **~$0.10–$0.50** (most of it in `construct`). Per-run cap defaults to $2; daily cap defaults to $10.
 
 ---
 
