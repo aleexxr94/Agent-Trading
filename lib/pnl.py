@@ -11,20 +11,20 @@ Components modelled per round-trip:
 
   ETFs (per leg):
     + half-spread:    5 bps of notional (each side, ~10 bps RT)
-    + commission:     max(\$1, qty × \$0.005), capped at 0.5% of notional
-                      (IBKR Pro: \$0.005/share, \$1 min, 0.5% max)
+    + commission:     max($1, qty × $0.005), capped at 0.5% of notional
+                      (IBKR Pro: $0.005/share, $1 min, 0.5% max)
   ETFs (sell-side only, added once):
     + SEC fee:        $0.0000278 × sale notional
-    + FINRA TAF:      \$0.000166/share, capped at \$9.90/trade
+    + FINRA TAF:      $0.000166/share, capped at $9.90/trade
 
   Options (per leg):
     + half-spread:    25 bps of premium (each side, ~50 bps RT)
-    + commission:     \$0.65/contract (IBKR Pro)
-    + OCC fee:        \$0.04/contract
+    + commission:     $0.65/contract (IBKR Pro)
+    + OCC fee:        $0.04/contract
   Options (sell-side only, added once):
     + SEC fee:        $0.0000278 × premium notional sold
 
-Why this matters on a $2.5k account: the \$1 IBKR minimum commission dominates
+Why this matters on a $2.5k account: the $1 IBKR minimum commission dominates
 small positions. On a $250 trade, commission alone is **40 bps** — 4× the
 modelled half-spread. Ignoring it makes paper Sharpe ~0.5 too generous.
 
