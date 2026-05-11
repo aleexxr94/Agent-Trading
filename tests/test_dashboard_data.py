@@ -132,6 +132,14 @@ def test_cost_by_month_empty(tmp_state):
     assert dd.cost_by_month() == []
 
 
+def test_try_load_broker_marks_no_keys_returns_empty(tmp_state, monkeypatch):
+    """Without ALPACA_API_KEY / SECRET in env, AlpacaBroker init raises and
+    the dashboard helper must absorb the failure so the page still renders."""
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    monkeypatch.delenv("ALPACA_API_SECRET", raising=False)
+    assert dd.try_load_broker_marks() == {}
+
+
 def test_load_nav_history_round_trip(tmp_state):
     assert dd.load_nav_history() == []
     state.append_nav({"run_id": "r1", "at": state.utcnow_iso(), "nav_usd": 2500.0})

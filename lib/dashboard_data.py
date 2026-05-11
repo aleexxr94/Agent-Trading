@@ -135,6 +135,25 @@ def load_nav_history(limit: int | None = None) -> list[dict]:
     return state.read_nav_history(limit=limit)
 
 
+def try_load_broker_marks() -> dict[str, float]:
+    """Best-effort fetch of current marks from Alpaca paper.
+
+    Returns {} on any failure path so the dashboard renders even when:
+      - alpaca-py isn't installed
+      - .env doesn't have ALPACA_API_KEY / SECRET
+      - the broker call errors at the network level
+
+    The dashboard is read-only — never blocks rendering on broker issues.
+    """
+    try:
+        from .alpaca_client import AlpacaBroker
+        from .marks import marks_from_broker
+        broker = AlpacaBroker()
+        return marks_from_broker(broker)
+    except Exception:
+        return {}
+
+
 def latest_run_id() -> str | None:
     if not state.DECISIONS_LOG.exists():
         return None
