@@ -290,6 +290,15 @@ def stage_construct(ctx: StageContext, scenarios_out: dict) -> dict:
 
 
 def _account_nav(ctx: StageContext) -> float:
+    # Alpaca paper accounts ship with $100k by default. The £2k experimental
+    # account in CLAUDE.md is what sizing must respect — VIRTUAL_NAV_USD lets
+    # the operator pin the agent to a smaller notional than the broker reports.
+    override = os.environ.get("VIRTUAL_NAV_USD")
+    if override:
+        try:
+            return float(override)
+        except ValueError:
+            pass
     if ctx.broker is not None:
         try:
             return ctx.broker.get_account().equity_usd

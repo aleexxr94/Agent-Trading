@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from . import pnl as pnl_lib
 from . import state
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -161,14 +162,23 @@ def latest_run_id() -> str | None:
     return rows[-1]["run_id"] if rows else None
 
 
-def position_table_rows(portfolio: dict) -> list[dict]:
-    """Flatten ETF + option rows into uniform columns for st.dataframe."""
+def position_table_rows(
+    portfolio: dict, marks: dict[str, float] | None = None,
+) -> list[dict]:
+    """Flatten ETF + option rows into uniform columns for st.dataframe.
+
+    When `marks` is provided (keys: ETF symbol, or
+    f"{underlying}|{strike}|{expiry}|{type}" for options — same convention as
+    monitor.py / compute_portfolio_pnl), each row gets Mark / Gross P&L /
+    Net P&L columns. Without marks those columns stay '—'.
+    """
+    marks = marks or {}
     out: list[dict] = []
-    nav = portfolio.get("nav_usd", 0.0) or 0.0
     for p in portfolio.get("positions", []):
         if p["kind"] == "etf":
             shares = p["shares"]
-            out.append({
+            mark = marks.get(p["symbol"])
+            row = {
                 "Symbol": p["symbol"],
                 "Kind": "ETF",
                 "Leverage": f"{p.get('leverage_factor', 1):g}x",
@@ -178,12 +188,14 @@ def position_table_rows(portfolio: dict) -> list[dict]:
                 "% NAV": p["position_pct"],
                 "Greeks": "—",
                 "Kill": f"≤{p['kill_conditions']['max_loss_pct']}%",
-            })
+            }
         else:
             contracts = p["contracts"]
             premium_usd = p["premium_paid"] * 100 * contracts
             g = p["greeks"]
-            out.append({
+            key = f"{p['underlying']}|{p['strike']}|{p['expiry']}|{p['type']}"
+            mark = marks.get(key)
+            row = {
                 "Symbol": f"{p['underlying']} {p['type'].upper()} {p['strike']} {p['expiry']}",
                 "Kind": "OPT",
                 "Leverage": "—",
@@ -196,7 +208,12 @@ def position_table_rows(portfolio: dict) -> list[dict]:
                     f"IV {g['iv']*100:.0f}% (p{int(g['iv_percentile'])})"
                 ),
                 "Kill": f"≤{p['kill_conditions']['max_loss_pct']}%",
-            })
+            }
+        breakdown = pnl_lib.compute_position_pnl(position=p, current_mark_usd=mark)
+        row["Mark"] = mark if mark is not None else None
+        row["Gross P&L"] = breakdown.gross_pnl_usd if mark is not None else None
+        row["Net P&L"] = breakdown.net_pnl_usd if mark is not None else None
+        out.append(row)
     return out
 
 
