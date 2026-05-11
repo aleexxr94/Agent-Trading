@@ -1,62 +1,119 @@
 """Modelled trading costs + gross/net P&L.
 
-Alpaca paper charges nothing, but CLAUDE.md §Promotion to live requires
-"Sharpe ≥ 0.5 on paper after modelled costs" before any live promotion.
-This module is where that modelled cost lives — calibrated to roughly what
-a UK retail broker (IBKR) would charge once the broker swap-point in
-lib/broker.py is wired up.
+Alpaca paper charges nothing, but the spec is to **paper-trade with costs
+that mirror live**, so paper Sharpe is honest and the promote-to-live
+decision (CLAUDE.md §Promotion to live) isn't built on inflated numbers.
 
-Defaults are deliberately conservative — better to over-estimate friction
-than under-estimate it on a £2k account where 1 bp matters.
+Calibration target: **IBKR Pro tier, UK retail, USD-funded account** —
+that's the most realistic live broker once promote-to-live triggers.
+
+Components modelled per round-trip:
+
+  ETFs (per leg):
+    + half-spread:    5 bps of notional (each side, ~10 bps RT)
+    + commission:     max(\$1, qty × \$0.005), capped at 0.5% of notional
+                      (IBKR Pro: \$0.005/share, \$1 min, 0.5% max)
+  ETFs (sell-side only, added once):
+    + SEC fee:        $0.0000278 × sale notional
+    + FINRA TAF:      \$0.000166/share, capped at \$9.90/trade
+
+  Options (per leg):
+    + half-spread:    25 bps of premium (each side, ~50 bps RT)
+    + commission:     \$0.65/contract (IBKR Pro)
+    + OCC fee:        \$0.04/contract
+  Options (sell-side only, added once):
+    + SEC fee:        $0.0000278 × premium notional sold
+
+Why this matters on a £2k account: the \$1 IBKR minimum commission dominates
+small positions. On a $250 trade, commission alone is **40 bps** — 4× the
+modelled half-spread. Ignoring it makes paper Sharpe ~0.5 too generous.
+
+All constants are module-level so they're easy to override for a different
+broker profile (Lite, retail US broker, etc.) without env-var plumbing.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Round-trip half-spread on liquid leveraged ETFs (~5 bps each side, 10 bps RT).
-# Configurable via CLAUDE.md if real fills come in tighter.
-ETF_HALF_SPREAD_BPS = 5.0
-ETF_COMMISSION_BPS = 0.0  # Alpaca paper / IBKR Pro tier are effectively free.
+# ---- ETF cost model (IBKR Pro retail USD) ----
+ETF_HALF_SPREAD_BPS = 5.0            # 5 bps each side on liquid leveraged ETFs
+ETF_PER_SHARE_COMMISSION = 0.005     # IBKR Pro: $0.005/share
+ETF_MIN_COMMISSION_USD = 1.00        # IBKR Pro: $1 minimum per trade
+ETF_MAX_COMMISSION_PCT = 0.5         # IBKR Pro: max 0.5% of trade value
 
-# Per-contract option fee (IBKR fixed: $0.70/contract; rounded down for SPY/QQQ
-# liquidity). Both legs of an open+close round-trip count.
-OPTION_PER_CONTRACT_USD = 0.65
-OPTION_HALF_SPREAD_BPS = 25.0  # options chains are wider than equities
+# ---- Options cost model (IBKR Pro retail) ----
+OPTION_HALF_SPREAD_BPS = 25.0        # options chains are wider than equities
+OPTION_PER_CONTRACT_USD = 0.65       # IBKR Pro: $0.65/contract
+OPTION_OCC_FEE_PER_CONTRACT = 0.04   # OCC exchange clearing fee
+
+# ---- Regulatory fees (sell-side only) ----
+SEC_FEE_PER_USD_SOLD = 0.0000278     # SEC §31 fee on sales (equities + options)
+FINRA_TAF_PER_SHARE_SOLD = 0.000166  # FINRA Trading Activity Fee, equities
+FINRA_TAF_MAX_USD = 9.90             # FINRA TAF per-trade cap
 
 BPS = 10_000
 
 
 @dataclass(frozen=True)
 class TradeCost:
+    """Per-position trading-cost breakdown. round_trip_usd sums everything
+    needed for the full open-then-close cycle: 2× spread + 2× commission +
+    sell-side regulatory fees (which only apply once)."""
     notional_usd: float
-    half_spread_usd: float
-    commission_usd: float
+    half_spread_usd: float           # per leg (×2 for round-trip)
+    commission_usd: float            # per leg (×2 for round-trip)
+    reg_fees_usd: float = 0.0        # total for round-trip (sell-side only)
 
     @property
     def round_trip_usd(self) -> float:
-        return 2.0 * (self.half_spread_usd + self.commission_usd)
+        return 2.0 * (self.half_spread_usd + self.commission_usd) + self.reg_fees_usd
+
+
+def _ibkr_etf_commission_per_leg(*, shares: float, notional: float) -> float:
+    """IBKR Pro tier: per_share × shares, floored at $1, capped at 0.5%."""
+    raw = shares * ETF_PER_SHARE_COMMISSION
+    capped = min(raw, notional * (ETF_MAX_COMMISSION_PCT / 100.0))
+    return max(ETF_MIN_COMMISSION_USD, capped)
 
 
 def model_etf_cost(*, shares: float, price_usd: float) -> TradeCost:
-    """One leg of an ETF trade. Round-trip is 2× the returned cost."""
+    """Per-leg cost for one ETF position. Use `.round_trip_usd` for full
+    open+close; the round-trip includes sell-side regulatory fees once."""
     notional = shares * price_usd
     half_spread = notional * (ETF_HALF_SPREAD_BPS / BPS)
-    commission = notional * (ETF_COMMISSION_BPS / BPS)
-    return TradeCost(notional_usd=notional, half_spread_usd=half_spread, commission_usd=commission)
+    commission = _ibkr_etf_commission_per_leg(shares=shares, notional=notional)
+    # Reg fees only on the sell side; rough approximation assumes sell at
+    # entry price (the trade-level fee is small compared to spread anyway).
+    sec_fee = notional * SEC_FEE_PER_USD_SOLD
+    taf_fee = min(shares * FINRA_TAF_PER_SHARE_SOLD, FINRA_TAF_MAX_USD)
+    return TradeCost(
+        notional_usd=notional,
+        half_spread_usd=half_spread,
+        commission_usd=commission,
+        reg_fees_usd=sec_fee + taf_fee,
+    )
 
 
 def model_option_cost(*, contracts: int, premium_usd: float) -> TradeCost:
-    """One leg of an option trade. Premium is per-contract dollar value (already
-    inclusive of the 100x multiplier). Round-trip is 2× the returned cost."""
+    """Per-leg cost for one option position. premium_usd is per-contract
+    dollar value (already inclusive of the 100x multiplier)."""
     notional = contracts * premium_usd
     half_spread = notional * (OPTION_HALF_SPREAD_BPS / BPS)
-    commission = contracts * OPTION_PER_CONTRACT_USD
-    return TradeCost(notional_usd=notional, half_spread_usd=half_spread, commission_usd=commission)
+    # IBKR Pro options: $0.65/contract + OCC clearing $0.04/contract
+    commission = contracts * (OPTION_PER_CONTRACT_USD + OPTION_OCC_FEE_PER_CONTRACT)
+    sec_fee = notional * SEC_FEE_PER_USD_SOLD  # SEC §31 also applies to options sales
+    return TradeCost(
+        notional_usd=notional,
+        half_spread_usd=half_spread,
+        commission_usd=commission,
+        reg_fees_usd=sec_fee,
+    )
 
 
 def model_position_cost(position: dict) -> TradeCost:
     """Per-leg cost for one position from the position.schema.json shape.
-    Multiply by 2 (or use `.round_trip_usd`) for a full open+close round-trip."""
+    Multiply by 2 (or use `.round_trip_usd`) for a full open+close round-trip
+    — the round_trip_usd property already accounts for sell-side reg fees."""
     if position["kind"] == "etf":
         return model_etf_cost(shares=position["shares"], price_usd=position["avg_cost"])
     return model_option_cost(
@@ -90,7 +147,9 @@ def compute_position_pnl(
     """
     cost = model_position_cost(position)
     if current_mark_usd is None:
-        return PnLBreakdown(gross_pnl_usd=0.0, modelled_costs_usd=cost.round_trip_usd / 2)
+        # Entry leg already paid: half-spread + commission (no sell-side fees yet).
+        entry_leg_cost = cost.half_spread_usd + cost.commission_usd
+        return PnLBreakdown(gross_pnl_usd=0.0, modelled_costs_usd=entry_leg_cost)
     if position["kind"] == "etf":
         gross = (current_mark_usd - position["avg_cost"]) * position["shares"]
     else:

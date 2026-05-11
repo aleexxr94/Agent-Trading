@@ -165,9 +165,11 @@ with tabs[2]:
         "Cards stay '—' until then."
     )
     st.caption(
-        marks_status + " Trading costs are modelled (Alpaca paper has none) using "
-        "~5 bps half-spread on ETFs and \\$0.65/contract + 25 bps spread on options — "
-        "calibrated to UK retail (IBKR) so paper Sharpe is honest pre-promotion."
+        marks_status + " Trading costs are modelled to mirror **IBKR Pro retail** "
+        "(USD account): \\$1 min commission + \\$0.005/share on ETFs (capped 0.5%), "
+        "\\$0.65/contract + \\$0.04 OCC on options, ~5 bps / 25 bps half-spread, "
+        "plus SEC + FINRA TAF on sell side. So Net P&L tracks what live would "
+        "actually cost — capital preservation honesty pre-promotion."
     )
 
     st.subheader("Equity curve")
