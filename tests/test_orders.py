@@ -124,21 +124,120 @@ def test_diff_multi_symbol_mix():
     assert by_sym["FAS"].side  == "sell" and by_sym["FAS"].qty  == 5
 
 
+# ---------- OSI symbol builder ----------
+
+
+def test_osi_symbol_spy_call():
+    assert orders.osi_symbol(
+        underlying="SPY", expiry="2026-06-19", type="call", strike=530.0
+    ) == "SPY260619C00530000"
+
+
+def test_osi_symbol_qqq_put():
+    assert orders.osi_symbol(
+        underlying="QQQ", expiry="2026-06-05", type="put", strike=440.0
+    ) == "QQQ260605P00440000"
+
+
+def test_osi_symbol_fractional_strike():
+    """Half-strikes encode correctly: 437.5 → 00437500."""
+    assert orders.osi_symbol(
+        underlying="IWM", expiry="2026-12-19", type="call", strike=437.5
+    ) == "IWM261219C00437500"
+
+
+@pytest.mark.parametrize("bad_type", ["put_spread", "iron_condor", "", "C"])
+def test_osi_symbol_rejects_bad_type(bad_type):
+    with pytest.raises(ValueError):
+        orders.osi_symbol(underlying="SPY", expiry="2026-06-19", type=bad_type, strike=530.0)
+
+
+def test_osi_symbol_rejects_invalid_expiry_format():
+    with pytest.raises(ValueError):
+        orders.osi_symbol(underlying="SPY", expiry="19-06-2026", type="call", strike=530.0)
+
+
 # ---------- diff_portfolio (option handling) ----------
 
 
-def test_options_in_target_are_skipped_with_reason():
+def _bpo(osi, qty=1) -> BrokerPosition:
+    return BrokerPosition(
+        symbol=osi, qty=qty, avg_cost=6.50,
+        market_value=qty * 650.0, unrealized_pl_usd=0.0,
+        asset_class="us_option",
+    )
+
+
+def test_option_fresh_open():
+    """Target has 1 SPY call, broker has nothing → buy 1 contract."""
+    plan = orders.diff_portfolio({"positions": [_option("SPY")]}, [])
+    assert len(plan.requests) == 1
+    req = plan.requests[0]
+    assert req.symbol == "SPY260619C00530000"
+    assert req.qty == 1 and req.side == "buy"
+    assert plan.skipped == []
+
+
+def test_option_full_close_when_held_but_not_in_target():
+    """Holding 2 contracts, target wants none → sell 2."""
+    osi = "SPY260619C00530000"
+    plan = orders.diff_portfolio({"positions": []}, [_bpo(osi, qty=2)])
+    assert plan.closes[0].symbol == osi
+    assert plan.closes[0].qty == 2 and plan.closes[0].side == "sell"
+
+
+def test_option_no_change_when_matches():
+    osi = "SPY260619C00530000"
     plan = orders.diff_portfolio(
-        {"positions": [_etf("TQQQ", 4), _option("SPY")]},
+        {"positions": [_option("SPY", contracts=1)]},
+        [_bpo(osi, qty=1)],
+    )
+    assert plan.total_legs == 0
+
+
+def test_option_buy_more_when_under_target():
+    osi = "SPY260619C00530000"
+    plan = orders.diff_portfolio(
+        {"positions": [_option("SPY", contracts=3)]},
+        [_bpo(osi, qty=1)],
+    )
+    assert len(plan.requests) == 1
+    assert plan.requests[0].symbol == osi
+    assert plan.requests[0].qty == 2 and plan.requests[0].side == "buy"
+
+
+def test_option_trim_when_over_target():
+    osi = "SPY260619C00530000"
+    plan = orders.diff_portfolio(
+        {"positions": [_option("SPY", contracts=1)]},
+        [_bpo(osi, qty=3)],
+    )
+    assert len(plan.requests) == 1
+    assert plan.requests[0].qty == 2 and plan.requests[0].side == "sell"
+
+
+def test_mixed_etf_and_option_plan():
+    plan = orders.diff_portfolio(
+        {"positions": [_etf("TQQQ", 4), _option("SPY"), _option("QQQ", type="put", strike=440.0, expiry="2026-06-05")]},
         [],
     )
-    # ETF still placed
-    assert len(plan.requests) == 1 and plan.requests[0].symbol == "TQQQ"
-    # Option surfaced as skipped
+    symbols = {r.symbol for r in plan.requests}
+    assert "TQQQ" in symbols
+    assert "SPY260619C00530000" in symbols
+    assert "QQQ260605P00440000" in symbols
+    assert len(plan.requests) == 3
+
+
+def test_malformed_option_target_surfaces_as_skipped():
+    """Missing 'strike' field → can't build OSI → surfaced as skipped."""
+    bad = {"kind": "option", "underlying": "SPY", "type": "call",
+            "expiry": "2026-06-19", "contracts": 1, "premium_paid": 6.50,
+            "greeks": {}, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 100}, "position_pct": 5.0}
+    plan = orders.diff_portfolio({"positions": [bad]}, [])
     assert len(plan.skipped) == 1
-    sk = plan.skipped[0]
-    assert sk["underlying"] == "SPY"
-    assert "Phase 10d" in sk["reason"]
+    assert "OSI" in plan.skipped[0]["reason"]
+    assert plan.requests == []
 
 
 # ---------- submit_plan ----------
