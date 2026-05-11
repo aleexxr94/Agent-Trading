@@ -79,7 +79,15 @@ def test_live_mode_writes_current_portfolio_with_mocked_llm(tmp_state, monkeypat
         )
 
     monkeypatch.setattr(orchestrator.llm, "structured_call", fake_call)
-    # Stub stages.bull/bear/scenarios/etc to avoid loading prompt files inside this test
+    # Live mode now calls market_data.universe_snapshot() before the screener
+    # LLM call. Stub it so the test doesn't hit the network.
+    monkeypatch.setattr(
+        orchestrator.market_data, "universe_snapshot",
+        lambda symbols, run_id=None, **kw: [
+            {"symbol": s, "kind": "etf", "last_close": 50.0, "adv_30d": 5_000_000,
+             "hv_30d_annualised": 0.4} for s in symbols
+        ],
+    )
     orchestrator.run_pipeline(dry_run=False)
     assert state.CURRENT_PORTFOLIO.exists()
     p = json.loads(state.CURRENT_PORTFOLIO.read_text())

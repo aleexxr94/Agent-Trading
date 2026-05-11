@@ -34,7 +34,7 @@ except ImportError:
     pass
 from typing import Callable
 
-from lib import llm, risk, stages, state
+from lib import llm, market_data, risk, stages, state, universe
 from lib.broker import Broker
 
 ROOT = Path(__file__).resolve().parent
@@ -126,6 +126,12 @@ def stage_screen(ctx: StageContext) -> dict:
     if ctx.dry_run:
         return _load_fixture("screen.json")
     cfg = stages.screener()
+    # Fetch live ADV / HV / price for every entry in the static universe.
+    # Per-symbol failures surface as {error: ...} rows rather than crashing.
+    snapshot = market_data.universe_snapshot(
+        universe.all_symbols(), run_id=ctx.run_id
+    )
+    universe_block = json.dumps(snapshot, separators=(",", ":"))
     res = llm.structured_call(llm.StageCall(
         run_id=ctx.run_id,
         stage=cfg.stage,
@@ -134,9 +140,13 @@ def stage_screen(ctx: StageContext) -> dict:
         user_messages=[{
             "role": "user",
             "content": (
-                f"Screen the leveraged-ETF + listed-options universe for the "
-                f"current session. UTC: {state.utcnow_iso()}. Apply liquidity "
-                f"filters strictly. Return JSON only."
+                f"Screen this universe for the current session. "
+                f"UTC: {state.utcnow_iso()}\n\n"
+                f"Universe data (last_close in USD, adv_30d in shares, "
+                f"hv_30d_annualised as decimal e.g. 0.45 = 45%):\n"
+                f"{universe_block}\n\n"
+                f"Apply liquidity filters strictly against these numbers, "
+                f"not training-data priors. Return JSON only."
             ),
         }],
         schema_filename=None,
