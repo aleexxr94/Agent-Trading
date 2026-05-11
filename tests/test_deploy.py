@@ -116,6 +116,16 @@ def test_run_orchestrator_uses_state_next_run_for_rescheduling():
     assert "systemd-run" in raw
 
 
+def test_run_orchestrator_refuses_past_next_run_time():
+    """systemd-run errors if --on-calendar is in the past. The wrapper now
+    short-circuits and logs a clear reason instead of letting systemd-run
+    emit a confusing error."""
+    raw = (DEPLOY / "run_orchestrator.sh").read_text(encoding="utf-8")
+    # Comparison of NEXT_EPOCH ≤ NOW_EPOCH means "skip if not strictly future"
+    assert "NEXT_EPOCH" in raw and "NOW_EPOCH" in raw
+    assert "in the future" in raw
+
+
 @pytest.mark.parametrize("name", [
     "agent-orchestrator.service",
     "agent-monitor.service",

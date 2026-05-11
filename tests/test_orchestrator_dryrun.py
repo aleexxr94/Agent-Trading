@@ -107,3 +107,64 @@ def test_position_band_and_total_pct(tmp_state):
     p = result["portfolio"]
     assert 8 <= len(p["positions"]) <= 12
     assert sum(pos["position_pct"] for pos in p["positions"]) <= 100.0
+
+
+def test_next_run_at_is_strictly_future(tmp_state):
+    """systemd-run refuses to schedule into the past. The stub had been
+    emitting the current UTC time, which produced the operator's
+    'Could not schedule transient timer' warning. Verify _default_next_run_at
+    always pushes ≥ a couple of hours forward."""
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    for all_cash in (True, False):
+        at = orchestrator._default_next_run_at({"all_cash": all_cash, "positions": []})
+        parsed = datetime.strptime(at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        assert parsed > now + timedelta(hours=3), (
+            f"next_run_at {at} not far enough in the future (all_cash={all_cash})"
+        )
+
+
+def test_run_pipeline_writes_future_next_run_at(tmp_state):
+    """End-to-end: state/next_run.json carries a future timestamp after a live
+    (non-dry-run) call. Uses mocked LLM + universe."""
+    fixtures = {
+        "portfolio": json.loads((Path(__file__).parent / "fixtures" / "portfolio.json").read_text()),
+        "scenarios": json.loads((Path(__file__).parent / "fixtures" / "scenarios.json").read_text()),
+        "screen": json.loads((Path(__file__).parent / "fixtures" / "screen.json").read_text()),
+    }
+
+    def fake_call(call, **kw):
+        from lib.llm import CallUsage, StructuredCallResult
+        if call.stage == "screen":
+            payload = fixtures["screen"]
+        elif call.stage.startswith("research"):
+            payload = {"thesis": "x", "key_drivers": ["a"], "counterarguments": ["b"], "confidence": 0.5}
+        elif call.stage == "scenarios":
+            payload = fixtures["scenarios"]
+        elif call.stage == "construct":
+            payload = fixtures["portfolio"]
+        else:
+            payload = {}
+        return StructuredCallResult(payload=payload, usage=CallUsage(0, 0, 0, 0),
+                                     cost_usd=0.0, cache_hit_pct=0.0, raw_text=json.dumps(payload))
+
+    import pytest
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(orchestrator.llm, "structured_call", fake_call)
+        monkeypatch.setattr(
+            orchestrator.market_data, "universe_snapshot",
+            lambda symbols, run_id=None, **kw: [
+                {"symbol": s, "kind": "etf", "last_close": 50.0, "adv_30d": 5_000_000,
+                 "hv_30d_annualised": 0.4} for s in symbols
+            ],
+        )
+        orchestrator.run_pipeline(dry_run=False)
+    finally:
+        monkeypatch.undo()
+
+    assert state.NEXT_RUN.exists()
+    nr = json.loads(state.NEXT_RUN.read_text())
+    from datetime import datetime, timezone
+    parsed = datetime.strptime(nr["next_run_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    assert parsed > datetime.now(timezone.utc), "next_run_at must be future"

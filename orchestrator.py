@@ -298,15 +298,27 @@ def _account_nav(ctx: StageContext) -> float:
     return 2500.0  # £2k paper baseline
 
 
+def _default_next_run_at(portfolio: dict) -> str:
+    """Heuristic next-run cadence until orchestrator-meta is wired (Phase 9.3):
+       - all-cash: 6 hours (no urgency — just sample the universe again)
+       - positions held: 4 hours (faster, to monitor kill conditions)
+    Both well above rate-limit windows, both produce a strictly future
+    timestamp so systemd-run will accept the schedule."""
+    from datetime import timedelta
+    hours = 6 if portfolio.get("all_cash") else 4
+    return (state.utcnow() + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def stage_execute(ctx: StageContext, portfolio: dict) -> dict:
     """Submit paper orders to converge actual positions on `portfolio`, then plan
     the next run. Order submission is a no-op when broker is None."""
     next_run = {
         "run_id": ctx.run_id,
-        "next_run_at": state.utcnow_iso(),
+        "next_run_at": _default_next_run_at(portfolio),
         "rationale": (
-            "Skeleton next-run planner: in production the orchestrator-meta call "
-            "will pick a window in minutes/hours from regime + portfolio state."
+            f"Heuristic cadence (all_cash={portfolio.get('all_cash', False)}, "
+            f"positions={len(portfolio.get('positions', []))}). "
+            f"Orchestrator-meta will override this once wired (Phase 9.3)."
         ),
     }
     if ctx.broker is not None and not ctx.dry_run and not portfolio.get("all_cash"):
