@@ -5,19 +5,21 @@ Gated behind ORDERS_ENABLED=true. Orchestrator.stage_execute imports this
 and only submits orders when the env flag is on; default-off until the
 operator opts in.
 
-Scope (Phase 10c):
-  - ETF orders: integer-share market orders.
-  - Option orders: deliberately SKIPPED — options orders need an OSI symbol
-    (e.g. SPY261219C00530000) plus contract qty + leg semantics. That
-    lands in Phase 10d once we wire a quote helper and a contract-OSI
-    builder. For now options positions in the target portfolio are surfaced
-    as a `skipped_reason` row in the diff output so the orchestrator can
-    flag them in the decision log.
+Scope:
+  - ETF orders: integer-share market orders (Phase 10c).
+  - Option orders: OSI-symbol market orders for opening + closing legs
+    (Phase 10d). Single legs only — no multi-leg combos yet (spreads,
+    straddles etc. would need a separate request shape).
+
+OSI symbol convention used (matches Alpaca paper):
+    {UNDERLYING}{YYMMDD}{C|P}{STRIKE*1000:08d}
+  e.g.  SPY  call, $530 strike, 2026-06-19  →  SPY260619C00530000
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from .broker import Broker, BrokerPosition, OrderRequest, OrderResult
 
@@ -38,9 +40,47 @@ class OrderPlan:
         return len(self.requests) + len(self.closes)
 
 
+def osi_symbol(*, underlying: str, expiry: str, type: str, strike: float) -> str:
+    """Build an OCC OSI-format option symbol that Alpaca accepts.
+
+    Args:
+        underlying: e.g. "SPY"
+        expiry: ISO date "YYYY-MM-DD"
+        type: "call" or "put"
+        strike: strike price in USD, e.g. 530.0 or 437.5
+
+    Returns: e.g. "SPY260619C00530000"
+    """
+    if type not in ("call", "put"):
+        raise ValueError(f"option type must be 'call' or 'put', got {type!r}")
+    yymmdd = datetime.strptime(expiry, "%Y-%m-%d").strftime("%y%m%d")
+    cp = "C" if type == "call" else "P"
+    # Strike encoding: strike × 1000, zero-padded to 8 digits. $530.00 → 530000.
+    strike_int = int(round(strike * 1000))
+    if strike_int < 0 or strike_int > 99_999_999:
+        raise ValueError(f"strike {strike} out of OSI range")
+    return f"{underlying}{yymmdd}{cp}{strike_int:08d}"
+
+
+def _osi_for_target_option(option_pos: dict) -> str:
+    return osi_symbol(
+        underlying=option_pos["underlying"],
+        expiry=option_pos["expiry"],
+        type=option_pos["type"],
+        strike=option_pos["strike"],
+    )
+
+
 def _current_etf_qty(positions: list[BrokerPosition]) -> dict[str, float]:
     return {
         p.symbol: p.qty for p in positions if p.asset_class == "us_equity"
+    }
+
+
+def _current_option_qty(positions: list[BrokerPosition]) -> dict[str, float]:
+    """Map OSI-symbol → contract qty for option holdings."""
+    return {
+        p.symbol: p.qty for p in positions if p.asset_class == "us_option"
     }
 
 
@@ -49,59 +89,78 @@ def diff_portfolio(target_portfolio: dict, broker_positions: list[BrokerPosition
     broker actually holds; return an OrderPlan.
 
     Algorithm:
-      1. For each ETF in target, compare to current qty. Submit a buy/sell
-         to converge to the target qty.
-      2. For each ETF in broker positions but NOT in target, submit a sell
-         for the full quantity (full close).
-      3. For each option in target, append a skipped row (Phase 10d will
-         handle these).
+      1. ETFs: target_qty - current_qty drives buy/sell/skip; symbols held
+         but not in target → full close.
+      2. Options: same algorithm, but symbols are OSI-format (underlying+
+         expiry+type+strike). Target options OSIs are derived from the
+         portfolio's option-position fields.
+      3. `skipped` is now only used for malformed positions (e.g. missing
+         OSI fields); fully-specified options go through the normal flow.
     """
     requests: list[OrderRequest] = []
     closes: list[OrderRequest] = []
     skipped: list[dict] = []
 
+    # ---- ETFs ----
     target_etfs = {
         p["symbol"]: p["shares"]
         for p in target_portfolio.get("positions", [])
         if p["kind"] == "etf"
     }
-    current = _current_etf_qty(broker_positions)
+    current_etfs = _current_etf_qty(broker_positions)
 
-    # 1. converge held → target, and 2. close anything not in target
-    all_symbols = set(target_etfs) | set(current)
-    for sym in sorted(all_symbols):
+    for sym in sorted(set(target_etfs) | set(current_etfs)):
         target_qty = target_etfs.get(sym, 0)
-        current_qty = current.get(sym, 0)
+        current_qty = current_etfs.get(sym, 0)
         delta = target_qty - current_qty
         if delta == 0:
             continue
         if target_qty == 0:
-            # full close
             closes.append(OrderRequest(
                 symbol=sym, qty=abs(current_qty),
                 side="sell" if current_qty > 0 else "buy",
                 order_type="market",
             ))
         elif delta > 0:
-            # buy more
-            requests.append(OrderRequest(
-                symbol=sym, qty=abs(delta), side="buy", order_type="market",
-            ))
+            requests.append(OrderRequest(symbol=sym, qty=abs(delta), side="buy", order_type="market"))
         else:
-            # trim down
-            requests.append(OrderRequest(
-                symbol=sym, qty=abs(delta), side="sell", order_type="market",
-            ))
+            requests.append(OrderRequest(symbol=sym, qty=abs(delta), side="sell", order_type="market"))
 
-    # 3. Options — deferred to Phase 10d
+    # ---- Options ----
+    target_options: dict[str, int] = {}
     for p in target_portfolio.get("positions", []):
-        if p["kind"] == "option":
+        if p["kind"] != "option":
+            continue
+        try:
+            osi = _osi_for_target_option(p)
+        except (KeyError, ValueError) as e:
             skipped.append({
-                "underlying": p["underlying"], "type": p["type"],
-                "strike": p["strike"], "expiry": p["expiry"],
-                "contracts": p["contracts"],
-                "reason": "options ordering deferred to Phase 10d",
+                "underlying": p.get("underlying"), "type": p.get("type"),
+                "strike": p.get("strike"), "expiry": p.get("expiry"),
+                "contracts": p.get("contracts"),
+                "reason": f"could not build OSI symbol: {e}",
             })
+            continue
+        target_options[osi] = p["contracts"]
+
+    current_options = _current_option_qty(broker_positions)
+
+    for osi in sorted(set(target_options) | set(current_options)):
+        target_qty = target_options.get(osi, 0)
+        current_qty = current_options.get(osi, 0)
+        delta = target_qty - current_qty
+        if delta == 0:
+            continue
+        if target_qty == 0:
+            closes.append(OrderRequest(
+                symbol=osi, qty=abs(current_qty),
+                side="sell" if current_qty > 0 else "buy",
+                order_type="market",
+            ))
+        elif delta > 0:
+            requests.append(OrderRequest(symbol=osi, qty=abs(delta), side="buy", order_type="market"))
+        else:
+            requests.append(OrderRequest(symbol=osi, qty=abs(delta), side="sell", order_type="market"))
 
     return OrderPlan(requests=requests, skipped=skipped, closes=closes)
 
