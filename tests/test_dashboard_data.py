@@ -69,25 +69,44 @@ def test_position_table_rows_etf_pnl_with_marks(tmp_state):
     assert r["Net P&L"] < r["Gross P&L"]
 
 
+def _option_pos():
+    return {
+        "kind": "option", "underlying": "SPY", "type": "call",
+        "strike": 530.0, "expiry": "2026-06-19", "dte": 40,
+        "contracts": 1, "premium_paid": 6.50,
+        "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04, "vega": 0.18,
+                    "iv": 0.18, "iv_percentile": 35},
+        "entry_thesis": "x", "kill_conditions": {"max_loss_pct": 100},
+        "position_pct": 5.0,
+    }
+
+
 def test_position_table_rows_option_pnl_uses_synthetic_key(tmp_state):
     """Option marks use 'underlying|strike|expiry|type' key, same as monitor.py."""
-    portfolio = {
-        "positions": [{
-            "kind": "option", "underlying": "SPY", "type": "call",
-            "strike": 530.0, "expiry": "2026-06-19", "dte": 40,
-            "contracts": 1, "premium_paid": 6.50,
-            "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04, "vega": 0.18,
-                        "iv": 0.18, "iv_percentile": 35},
-            "entry_thesis": "x", "kill_conditions": {"max_loss_pct": 100},
-            "position_pct": 5.0,
-        }],
-    }
     rows = dd.position_table_rows(
-        portfolio, marks={"SPY|530.0|2026-06-19|call": 8.00},
+        {"positions": [_option_pos()]},
+        marks={"SPY|530.0|2026-06-19|call": 8.00},
     )
     r = rows[0]
     assert r["Mark"] == 8.00
     # 1 contract × 100 × (8.00 - 6.50) = $150 gross
+    assert r["Gross P&L"] == pytest.approx(150.0)
+
+
+def test_position_table_rows_option_pnl_falls_back_to_osi_key(tmp_state):
+    """marks_from_broker currently keys options by OSI symbol. Until that
+    aligns with the synthetic key, the dashboard must accept either so live
+    option marks actually flow into the Mark / Gross / Net columns.
+
+    Regression test for the P1 Codex flagged on PR #21: without this fallback,
+    option P&L stays blank in any portfolio holding options.
+    """
+    rows = dd.position_table_rows(
+        {"positions": [_option_pos()]},
+        marks={"SPY260619C00530000": 8.00},
+    )
+    r = rows[0]
+    assert r["Mark"] == 8.00
     assert r["Gross P&L"] == pytest.approx(150.0)
 
 

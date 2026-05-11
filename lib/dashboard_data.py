@@ -11,6 +11,7 @@ from typing import Any
 
 from . import pnl as pnl_lib
 from . import state
+from .orders import osi_symbol
 
 ROOT = Path(__file__).resolve().parent.parent
 SEED_PORTFOLIO_FALLBACK = ROOT / "tests" / "fixtures" / "portfolio.json"
@@ -193,8 +194,22 @@ def position_table_rows(
             contracts = p["contracts"]
             premium_usd = p["premium_paid"] * 100 * contracts
             g = p["greeks"]
-            key = f"{p['underlying']}|{p['strike']}|{p['expiry']}|{p['type']}"
-            mark = marks.get(key)
+            # marks_from_broker currently keys options by OSI symbol; the
+            # rest of the codebase uses the synthetic underlying|strike|expiry|type
+            # key. Try the synthetic key first (forward-compatible with the
+            # PR-#20 alignment fix), then fall back to the OSI key so live
+            # marks match today on main.
+            synth_key = f"{p['underlying']}|{p['strike']}|{p['expiry']}|{p['type']}"
+            mark = marks.get(synth_key)
+            if mark is None:
+                try:
+                    osi = osi_symbol(
+                        underlying=p["underlying"], expiry=p["expiry"],
+                        type=p["type"], strike=p["strike"],
+                    )
+                    mark = marks.get(osi)
+                except (ValueError, KeyError):
+                    pass
             row = {
                 "Symbol": f"{p['underlying']} {p['type'].upper()} {p['strike']} {p['expiry']}",
                 "Kind": "OPT",
