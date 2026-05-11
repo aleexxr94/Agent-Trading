@@ -1,6 +1,8 @@
 """Tests for lib.marks — broker positions → per-unit mark dict."""
 from __future__ import annotations
 
+import pytest
+
 from lib import marks
 from lib.broker import BrokerPosition
 
@@ -63,12 +65,13 @@ def test_multiple_etfs():
 
 def test_option_per_share_premium_strips_100x_multiplier():
     """Alpaca option market_value already includes the 100x multiplier;
-    pnl.compute_position_pnl expects per-share premium, so divide back out."""
-    # 1 contract, market_value = $650 = $6.50/share × 100
+    pnl.compute_position_pnl expects per-share premium, so divide back out.
+    Note: marks_from_broker now keys options by the synthetic shape,
+    not the raw OSI — see test_marks_key_for_option_uses_synthetic."""
     out = marks.marks_from_broker(_FakeBroker([
         _bp("SPY261219C00530000", 1, 650.0, asset_class="us_option")
     ]))
-    assert out == {"SPY261219C00530000": 6.5}
+    assert out == {"SPY|530.0|2026-12-19|call": 6.5}
 
 
 def test_zero_qty_position_skipped():
@@ -108,7 +111,7 @@ def test_current_price_preferred_for_options_no_100x_division():
         _bp("SPY261219C00530000", 1, 650.0, asset_class="us_option",
             current_price=6.50),
     ]))
-    assert out == {"SPY261219C00530000": 6.50}
+    assert out == {"SPY|530.0|2026-12-19|call": 6.50}
 
 
 def test_falls_back_to_derived_when_current_price_missing():
@@ -131,3 +134,63 @@ def test_portfolio_to_mark_keys_etf_and_option():
     keys = marks.portfolio_to_mark_keys(portfolio)
     assert keys["0"] == "TQQQ"
     assert keys["1"] == "SPY|530.0|2026-06-19|call"
+
+
+# ---------- OSI ↔ synthetic key translation ----------
+
+
+def test_osi_to_synthetic_round_trip_spy_call():
+    # 261219 = 2026-12-19, 530.0 strike, call
+    assert marks._osi_to_synthetic("SPY261219C00530000") == "SPY|530.0|2026-12-19|call"
+
+
+def test_osi_to_synthetic_qqq_put():
+    assert marks._osi_to_synthetic("QQQ260605P00440000") == "QQQ|440.0|2026-06-05|put"
+
+
+def test_osi_to_synthetic_fractional_strike():
+    assert marks._osi_to_synthetic("IWM261219C00437500") == "IWM|437.5|2026-12-19|call"
+
+
+@pytest.mark.parametrize("bad", [
+    "",            # empty
+    "SPY",         # too short
+    "SPYXXXXXXC00530000",  # date not digits
+    "SPY261219X00530000",  # type not C/P
+    "SPY261219C0053XXXX",  # strike not digits
+])
+def test_osi_to_synthetic_returns_none_on_bad(bad):
+    assert marks._osi_to_synthetic(bad) is None
+
+
+def test_marks_key_for_option_uses_synthetic():
+    """Critical: pnl + monitor look up option marks by the synthetic key
+    'SPY|530.0|YYYY-MM-DD|call' — NOT the OSI symbol. marks_from_broker
+    must produce keys consumers can actually find."""
+    out = marks.marks_from_broker(_FakeBroker([
+        _bp("SPY261219C00530000", 1, 650.0, asset_class="us_option",
+            current_price=6.50),
+    ]))
+    # OSI 261219 = 2026-12-19
+    assert "SPY|530.0|2026-12-19|call" in out
+    assert out["SPY|530.0|2026-12-19|call"] == 6.50
+    # OSI key NOT used directly (would silently mismatch with consumers)
+    assert "SPY261219C00530000" not in out
+
+
+def test_marks_key_for_etf_still_bare_symbol():
+    """Regression — ETF keys stay bare symbol; only options use synthetic."""
+    out = marks.marks_from_broker(_FakeBroker([_bp("TQQQ", 10, 750.0)]))
+    assert "TQQQ" in out
+    assert out["TQQQ"] == 75.0
+
+
+def test_marks_key_falls_back_to_osi_when_parse_fails():
+    """A malformed option symbol shouldn't crash — fall back to using the
+    raw symbol as the key. Better to mis-match than to lose data."""
+    out = marks.marks_from_broker(_FakeBroker([
+        _bp("BAD_OPTION_SYMBOL", 1, 100.0, asset_class="us_option",
+            current_price=1.00),
+    ]))
+    # No synthetic-key match possible; raw symbol preserved
+    assert "BAD_OPTION_SYMBOL" in out

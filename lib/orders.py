@@ -165,6 +165,28 @@ def diff_portfolio(target_portfolio: dict, broker_positions: list[BrokerPosition
     return OrderPlan(requests=requests, skipped=skipped, closes=closes)
 
 
+def _alpaca_error_label(e: Exception) -> str:
+    """Build a diagnostic label from an Alpaca API error.
+
+    Per Alpaca's error spec, REST 4xx/5xx responses carry structured
+    {"code": <int>, "message": "..."} bodies. The alpaca-py SDK surfaces
+    these as APIError exceptions with .code / .message attributes. When
+    they're present we render a short, log-friendly label like
+        error[40010001]: time_in_force must be valid
+    so the operator can pinpoint cause without grep'ing the SDK source.
+
+    Falls back to the generic <TypeName>: <repr> shape for everything
+    else (network errors, mocked test exceptions, etc.).
+    """
+    code = getattr(e, "code", None)
+    message = getattr(e, "message", None)
+    if code is not None and message:
+        return f"error[{code}]: {message}"
+    if message:
+        return f"error: {type(e).__name__}: {message}"
+    return f"error: {type(e).__name__}: {e}"
+
+
 def submit_plan(plan: OrderPlan, *, broker: Broker) -> list[OrderResult]:
     """Submit every OrderRequest in the plan via the broker, in close → open
     order (frees cash before sizing new positions). Returns the result list
@@ -182,6 +204,6 @@ def submit_plan(plan: OrderPlan, *, broker: Broker) -> list[OrderResult]:
                 qty=req.qty,
                 side=req.side,
                 submitted_at="",
-                status=f"error: {type(e).__name__}: {e}",
+                status=_alpaca_error_label(e),
             ))
     return results

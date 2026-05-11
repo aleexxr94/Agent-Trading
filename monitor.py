@@ -72,7 +72,18 @@ def evaluate_portfolio(
             spot_price=spots.get(symbol),
         )
         if kill:
-            actions.append({"symbol": symbol, "action": "flatten", "reason": reason})
+            # For options, flatten by the OCC OSI symbol — broker.flatten('SPY')
+            # for a SPY call would try to close the ETF position, not the
+            # specific contract. Build the OSI from the position fields.
+            if is_option:
+                from lib.orders import osi_symbol
+                flatten_sym = osi_symbol(
+                    underlying=pos["underlying"], expiry=pos["expiry"],
+                    type=pos["type"], strike=pos["strike"],
+                )
+            else:
+                flatten_sym = symbol
+            actions.append({"symbol": flatten_sym, "action": "flatten", "reason": reason})
 
     return actions
 
