@@ -21,6 +21,23 @@ from .broker import (
 PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 
 
+def _normalize_asset_class(raw) -> str:
+    """Map whatever Alpaca returns into our internal canonical values.
+
+    Per Alpaca docs (2026-Q2 reference): REST asset_class can be
+    'us_equity', 'option', or 'crypto'. The alpaca-py SDK enum
+    AssetClass.US_OPTION evaluates to 'us_option' (str-Enum mixin).
+    Both forms — bare 'option' and 'us_option' — show up in the wild
+    depending on whether we're consuming the SDK object or a raw dict.
+    Normalise both to 'us_option' so downstream code (lib.marks,
+    lib.orders, monitor) only has to check one value.
+    """
+    s = str(raw).lower()
+    if "option" in s:
+        return "us_option"
+    return "us_equity"
+
+
 class AlpacaBroker(Broker):
     """Wraps alpaca-py's TradingClient. Paper-only unless LIVE explicitly enabled."""
 
@@ -66,6 +83,11 @@ class AlpacaBroker(Broker):
     def get_positions(self) -> list[BrokerPosition]:
         out: list[BrokerPosition] = []
         for p in self._client.get_all_positions():
+            # current_price + qty_available are optional in alpaca-py's Position
+            # model; guard with getattr so we don't crash on older SDK versions
+            # or test stubs that haven't bothered.
+            cp = getattr(p, "current_price", None)
+            qa = getattr(p, "qty_available", None)
             out.append(
                 BrokerPosition(
                     symbol=p.symbol,
@@ -73,7 +95,9 @@ class AlpacaBroker(Broker):
                     avg_cost=float(p.avg_entry_price),
                     market_value=float(p.market_value),
                     unrealized_pl_usd=float(p.unrealized_pl),
-                    asset_class="us_option" if p.asset_class == "us_option" else "us_equity",
+                    asset_class=_normalize_asset_class(p.asset_class),
+                    current_price=float(cp) if cp is not None else None,
+                    qty_available=float(qa) if qa is not None else None,
                 )
             )
         return out

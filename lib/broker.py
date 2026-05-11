@@ -35,6 +35,11 @@ class BrokerPosition:
     market_value: float
     unrealized_pl_usd: float
     asset_class: Literal["us_equity", "us_option"]
+    # Optional Alpaca-derived fields — present when the broker reports them,
+    # None for stub / test fixtures that don't bother. See lib/marks.py for
+    # why we prefer current_price over deriving it from market_value/qty.
+    current_price: float | None = None
+    qty_available: float | None = None
 
 
 @dataclass(frozen=True)

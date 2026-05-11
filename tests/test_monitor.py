@@ -127,6 +127,29 @@ def test_monitor_dry_run_evaluates_but_does_not_flatten(tmp_state, monkeypatch):
     assert flat_log == []
 
 
+def test_monitor_option_flatten_uses_osi_symbol(tmp_state):
+    """Bug: a SPY-call kill action was emitting symbol='SPY' (the
+    underlying). broker.flatten('SPY') would try to close the ETF,
+    not the contract. Verify the action now carries the OSI symbol."""
+    option_pos = {
+        "kind": "option", "underlying": "SPY", "type": "call",
+        "strike": 530.0, "expiry": "2026-06-19", "dte": 40,
+        "contracts": 1, "premium_paid": 6.50,
+        "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04,
+                    "vega": 0.18, "iv": 0.18, "iv_percentile": 35},
+        "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 100},
+        "position_pct": 5.0,
+    }
+    portfolio = {"nav_usd": 2500.0, "positions": [option_pos]}
+    # Kill scenario: mark is 0.0 (premium went to zero — 100% loss)
+    marks_dict = {"SPY|530.0|2026-06-19|call": 0.0}
+    actions = monitor.evaluate_portfolio(portfolio=portfolio, marks=marks_dict)
+    assert len(actions) == 1
+    assert actions[0]["action"] == "flatten"
+    assert actions[0]["symbol"] == "SPY260619C00530000"
+
+
 def test_monitor_skips_position_with_no_mark(tmp_state, monkeypatch):
     """Position present in portfolio but broker reports no holding → can't
     evaluate, must skip rather than crash."""

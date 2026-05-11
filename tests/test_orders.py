@@ -298,3 +298,51 @@ def test_submit_plan_isolates_per_order_failures():
     statuses = {r.symbol: r.status for r in results}
     assert statuses["TQQQ"].startswith("error:")
     assert statuses["SOXL"] == "accepted"
+
+
+# ---------- Alpaca structured error parsing ----------
+
+
+class _AlpacaAPIError(Exception):
+    """Stand-in for alpaca-py's APIError shape (.code + .message)."""
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def test_alpaca_error_label_prefers_code_and_message():
+    e = _AlpacaAPIError(40010001, "time_in_force must be valid")
+    assert orders._alpaca_error_label(e) == "error[40010001]: time_in_force must be valid"
+
+
+def test_alpaca_error_label_falls_back_with_message_only():
+    class _PartialError(Exception):
+        message = "subscription does not permit querying recent SIP data"
+    label = orders._alpaca_error_label(_PartialError())
+    assert "_PartialError" in label
+    assert "subscription does not permit" in label
+
+
+def test_alpaca_error_label_falls_back_with_neither():
+    label = orders._alpaca_error_label(RuntimeError("simulated 500"))
+    assert label == "error: RuntimeError: simulated 500"
+
+
+def test_submit_plan_renders_structured_alpaca_error():
+    """End-to-end: an APIError-shaped exception lands as 'error[code]: msg'
+    in the OrderResult.status, not a generic 'error: TypeError: ...'."""
+    class _BrokerThatRejects:
+        @property
+        def name(self): return "fake"
+        def get_account(self): raise NotImplementedError
+        def get_positions(self): return []
+        def submit_order(self, req):
+            raise _AlpacaAPIError(40010001, "qty must be an integer")
+        def cancel_all(self): return 0
+        def flatten(self, sym): return None
+
+    plan = orders.diff_portfolio({"positions": [_etf("TQQQ", 4)]}, [])
+    results = orders.submit_plan(plan, broker=_BrokerThatRejects())
+    assert len(results) == 1
+    assert results[0].status == "error[40010001]: qty must be an integer"
