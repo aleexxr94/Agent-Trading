@@ -92,7 +92,7 @@ def scenarios() -> StageConfig:
 def constructor() -> StageConfig:
     return StageConfig(
         stage="construct",
-        model=_model("MODEL_CONSTRUCTOR", "claude-sonnet-4-6"),
+        model=_model("MODEL_CONSTRUCTOR", "claude-opus-4-6"),
         system_prompt=_load("constructor.md"),
         schema_filename="portfolio.schema.json",
         max_tokens=8192,
@@ -105,7 +105,7 @@ def orchestrator_meta() -> StageConfig:
     """Used for the next-run scheduling / meta-decision call (Opus tier)."""
     return StageConfig(
         stage="meta",
-        model=_model("MODEL_ORCHESTRATOR", "claude-opus-4-7"),
+        model=_model("MODEL_ORCHESTRATOR", "claude-opus-4-6"),
         system_prompt=_load("orchestrator.md"),
         schema_filename=None,
         max_tokens=2048,
