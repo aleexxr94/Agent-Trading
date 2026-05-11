@@ -75,3 +75,34 @@ def test_append_cost_filters_today_and_run(tmp_state, monkeypatch):
 def test_append_cost_rejects_missing_keys(tmp_state):
     with pytest.raises(ValueError):
         state.append_cost({"run_id": "r1"})
+
+
+def test_append_and_read_nav_history(tmp_state):
+    assert state.read_nav_history() == []
+    state.append_nav({
+        "run_id": "r1", "at": state.utcnow_iso(), "nav_usd": 2500.0,
+        "cash_usd": 280.0, "positions_count": 9, "all_cash": False,
+        "gross_pnl_usd": 0.0, "modelled_costs_usd": 4.55, "net_pnl_usd": -4.55,
+    })
+    state.append_nav({
+        "run_id": "r2", "at": state.utcnow_iso(), "nav_usd": 2540.0,
+        "positions_count": 9, "all_cash": False,
+        "gross_pnl_usd": 50.0, "modelled_costs_usd": 4.55, "net_pnl_usd": 45.45,
+    })
+    hist = state.read_nav_history()
+    assert len(hist) == 2
+    assert hist[0]["run_id"] == "r1"
+    assert hist[1]["nav_usd"] == 2540.0
+
+
+def test_read_nav_history_limit(tmp_state):
+    for i in range(5):
+        state.append_nav({"run_id": f"r{i}", "at": state.utcnow_iso(), "nav_usd": 2500.0 + i})
+    assert len(state.read_nav_history()) == 5
+    assert len(state.read_nav_history(limit=2)) == 2
+    assert state.read_nav_history(limit=2)[-1]["run_id"] == "r4"
+
+
+def test_append_nav_rejects_missing_keys(tmp_state):
+    with pytest.raises(ValueError):
+        state.append_nav({"run_id": "r1", "at": state.utcnow_iso()})  # missing nav_usd

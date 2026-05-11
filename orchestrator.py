@@ -327,6 +327,22 @@ def stage_execute(ctx: StageContext, portfolio: dict) -> dict:
         pass
     if not ctx.dry_run:
         state.write_json(state.NEXT_RUN, next_run)
+        # NAV history: one row per run for the dashboard equity curve.
+        # Marks aren't wired in yet, so gross/net P&L only includes the
+        # modelled-cost entry-leg estimate. Real marks land in Phase 10a.
+        from lib import pnl as pnl_lib
+        breakdown = pnl_lib.compute_portfolio_pnl(portfolio=portfolio, marks=None)
+        state.append_nav({
+            "run_id": ctx.run_id,
+            "at": state.utcnow_iso(),
+            "nav_usd": portfolio.get("nav_usd", 0.0),
+            "cash_usd": portfolio.get("cash_usd", 0.0),
+            "positions_count": len(portfolio.get("positions", [])),
+            "all_cash": portfolio.get("all_cash", False),
+            "gross_pnl_usd": breakdown.gross_pnl_usd,
+            "modelled_costs_usd": breakdown.modelled_costs_usd,
+            "net_pnl_usd": breakdown.net_pnl_usd,
+        })
     return next_run
 
 

@@ -130,3 +130,12 @@ def test_cost_by_month_buckets_correctly(tmp_state):
 
 def test_cost_by_month_empty(tmp_state):
     assert dd.cost_by_month() == []
+
+
+def test_load_nav_history_round_trip(tmp_state):
+    assert dd.load_nav_history() == []
+    state.append_nav({"run_id": "r1", "at": state.utcnow_iso(), "nav_usd": 2500.0})
+    state.append_nav({"run_id": "r2", "at": state.utcnow_iso(), "nav_usd": 2520.0})
+    hist = dd.load_nav_history()
+    assert len(hist) == 2
+    assert hist[1]["nav_usd"] == 2520.0

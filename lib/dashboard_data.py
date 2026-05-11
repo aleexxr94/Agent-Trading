@@ -131,6 +131,10 @@ def cost_by_month() -> list[dict]:
     return sorted(by_month.values(), key=lambda x: x["month"])
 
 
+def load_nav_history(limit: int | None = None) -> list[dict]:
+    return state.read_nav_history(limit=limit)
+
+
 def latest_run_id() -> str | None:
     if not state.DECISIONS_LOG.exists():
         return None

@@ -161,6 +161,31 @@ with tabs[2]:
         "Gross P&L populates once current marks are wired in via the broker."
     )
 
+    st.subheader("Equity curve")
+    nav_history = dd.load_nav_history()
+    if nav_history:
+        nav_df = pd.DataFrame(nav_history)
+        fig_nav = go.Figure()
+        fig_nav.add_trace(go.Scatter(
+            x=nav_df["at"], y=nav_df["nav_usd"], mode="lines+markers",
+            name="NAV (USD)", line=dict(width=2),
+        ))
+        if "net_pnl_usd" in nav_df.columns:
+            fig_nav.add_trace(go.Scatter(
+                x=nav_df["at"], y=nav_df["net_pnl_usd"], mode="lines",
+                name="Cumulative Net P&L (USD)", yaxis="y2", line=dict(dash="dot"),
+            ))
+            fig_nav.update_layout(
+                yaxis2=dict(title="Net P&L (USD)", overlaying="y", side="right", showgrid=False),
+            )
+        fig_nav.update_layout(
+            template="plotly_dark", height=360, yaxis_title="NAV (USD)",
+            margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h"),
+        )
+        st.plotly_chart(fig_nav, width="stretch")
+    else:
+        st.info("No NAV history yet — the equity curve populates once orchestrator runs accumulate.")
+
     st.subheader("LLM cost over time")
     if costs:
         df = pd.DataFrame([
