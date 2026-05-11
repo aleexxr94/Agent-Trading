@@ -58,6 +58,19 @@ st.markdown(
         font-weight: 500;
         text-align: center;
     }
+    .halt-banner {
+        position: sticky;
+        top: 0;
+        z-index: 999;
+        background: #b91c1c;
+        color: #fff5f5;
+        padding: 0.6rem 1rem;
+        border-radius: 6px;
+        margin-bottom: 1rem;
+        font-weight: 700;
+        text-align: center;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    }
     .small-muted { color: #9ca3af; font-size: 0.85rem; }
     </style>
     """,
@@ -77,6 +90,21 @@ decisions = dd.load_decisions(limit=200)
 costs = dd.load_costs(limit=2000)
 latest_rid = dd.latest_run_id()
 halted = state.is_halted()
+# Pull live marks once at the top so the Portfolio tab can show per-position
+# P&L and the Performance tab can compute aggregate Gross/Net P&L from the
+# same source — keeps the two tabs internally consistent.
+broker_marks = dd.try_load_broker_marks()
+
+
+# Sticky halt banner — visible across every tab when the orchestrator is
+# halted, so an operator on any tab sees it without scrolling back.
+if halted:
+    st.markdown(
+        '<div class="halt-banner">🛑 ORCHESTRATOR HALTED — '
+        f'halt.flag is set ({state.HALT_FLAG.name}). New orders disabled. '
+        'Clear via Settings tab.</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ---------- tabs ----------
@@ -101,22 +129,66 @@ with tabs[0]:
     if portfolio.get("all_cash"):
         st.warning("All-cash portfolio. Rationale: " + (portfolio.get("all_cash_rationale") or "—"))
 
-    rows = dd.position_table_rows(portfolio)
+    rows = dd.position_table_rows(portfolio, marks=broker_marks or None)
     if rows:
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-
-        pie_data = dd.allocation_pie(portfolio)
-        fig = go.Figure(go.Pie(
-            labels=[r["label"] for r in pie_data],
-            values=[r["value"] for r in pie_data],
-            hole=0.45,
-        ))
-        fig.update_layout(
-            template="plotly_dark",
-            height=420,
-            margin=dict(l=10, r=10, t=20, b=10),
+        df_pos = pd.DataFrame(rows)
+        st.dataframe(
+            df_pos,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Cost": st.column_config.NumberColumn("Cost", format="$%.2f"),
+                "Mark": st.column_config.NumberColumn("Mark", format="$%.2f"),
+                "Notional": st.column_config.NumberColumn("Notional", format="$%,.0f"),
+                "% NAV": st.column_config.NumberColumn("% NAV", format="%.1f%%"),
+                "Gross P&L": st.column_config.NumberColumn("Gross P&L", format="$%+,.2f"),
+                "Net P&L": st.column_config.NumberColumn("Net P&L", format="$%+,.2f"),
+            },
         )
-        st.plotly_chart(fig, width="stretch")
+        if not broker_marks:
+            st.caption(
+                "Mark / Gross P&L / Net P&L columns stay blank until Alpaca paper "
+                "keys are configured — see README §Setup."
+            )
+
+        col_pie, col_bar = st.columns([1, 1])
+        with col_pie:
+            pie_data = dd.allocation_pie(portfolio)
+            fig = go.Figure(go.Pie(
+                labels=[r["label"] for r in pie_data],
+                values=[r["value"] for r in pie_data],
+                hole=0.45,
+            ))
+            fig.update_layout(
+                template="plotly_dark",
+                height=380,
+                margin=dict(l=10, r=10, t=30, b=10),
+                title="Allocation (% NAV)",
+            )
+            st.plotly_chart(fig, width="stretch")
+        with col_bar:
+            # Per-position Net P&L bar — green/red colouring so the worst
+            # position is visible at a glance without reading the table.
+            bar_rows = [r for r in rows if r.get("Net P&L") is not None]
+            if bar_rows:
+                bar_rows = sorted(bar_rows, key=lambda r: r["Net P&L"])
+                fig_bar = go.Figure(go.Bar(
+                    x=[r["Symbol"] for r in bar_rows],
+                    y=[r["Net P&L"] for r in bar_rows],
+                    marker_color=[
+                        "#16a34a" if r["Net P&L"] >= 0 else "#dc2626" for r in bar_rows
+                    ],
+                ))
+                fig_bar.update_layout(
+                    template="plotly_dark",
+                    height=380,
+                    margin=dict(l=10, r=10, t=30, b=10),
+                    title="Net P&L per position (USD)",
+                    yaxis_title="Net P&L (USD)",
+                )
+                st.plotly_chart(fig_bar, width="stretch")
+            else:
+                st.info("Per-position P&L bar populates once marks are available.")
     else:
         st.write("No open positions.")
 
@@ -146,10 +218,9 @@ with tabs[2]:
     _banner()
     st.subheader("P&L (gross / modelled costs / net)")
 
-    # Pull live marks from Alpaca paper. Falls back to empty dict if the
-    # broker isn't reachable (alpaca-py missing, no creds, network blip) —
-    # the dashboard still renders, P&L cards just stay "—".
-    broker_marks = dd.try_load_broker_marks()
+    # Marks were fetched at page top so the Portfolio tab and Performance
+    # tab stay consistent. Falls back to empty dict on any broker error
+    # (alpaca-py missing, no creds, network blip) — the dashboard always renders.
     pnl_break = pnl_lib.compute_portfolio_pnl(portfolio=portfolio, marks=broker_marks or None)
 
     p1, p2, p3 = st.columns(3)

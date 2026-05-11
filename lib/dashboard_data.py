@@ -9,7 +9,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+from . import pnl as pnl_lib
 from . import state
+from .orders import osi_symbol
 
 ROOT = Path(__file__).resolve().parent.parent
 SEED_PORTFOLIO_FALLBACK = ROOT / "tests" / "fixtures" / "portfolio.json"
@@ -161,14 +163,23 @@ def latest_run_id() -> str | None:
     return rows[-1]["run_id"] if rows else None
 
 
-def position_table_rows(portfolio: dict) -> list[dict]:
-    """Flatten ETF + option rows into uniform columns for st.dataframe."""
+def position_table_rows(
+    portfolio: dict, marks: dict[str, float] | None = None,
+) -> list[dict]:
+    """Flatten ETF + option rows into uniform columns for st.dataframe.
+
+    When `marks` is provided (keys: ETF symbol, or
+    f"{underlying}|{strike}|{expiry}|{type}" for options — same convention as
+    monitor.py / compute_portfolio_pnl), each row gets Mark / Gross P&L /
+    Net P&L columns. Without marks those columns stay '—'.
+    """
+    marks = marks or {}
     out: list[dict] = []
-    nav = portfolio.get("nav_usd", 0.0) or 0.0
     for p in portfolio.get("positions", []):
         if p["kind"] == "etf":
             shares = p["shares"]
-            out.append({
+            mark = marks.get(p["symbol"])
+            row = {
                 "Symbol": p["symbol"],
                 "Kind": "ETF",
                 "Leverage": f"{p.get('leverage_factor', 1):g}x",
@@ -178,12 +189,28 @@ def position_table_rows(portfolio: dict) -> list[dict]:
                 "% NAV": p["position_pct"],
                 "Greeks": "—",
                 "Kill": f"≤{p['kill_conditions']['max_loss_pct']}%",
-            })
+            }
         else:
             contracts = p["contracts"]
             premium_usd = p["premium_paid"] * 100 * contracts
             g = p["greeks"]
-            out.append({
+            # marks_from_broker currently keys options by OSI symbol; the
+            # rest of the codebase uses the synthetic underlying|strike|expiry|type
+            # key. Try the synthetic key first (forward-compatible with the
+            # PR-#20 alignment fix), then fall back to the OSI key so live
+            # marks match today on main.
+            synth_key = f"{p['underlying']}|{p['strike']}|{p['expiry']}|{p['type']}"
+            mark = marks.get(synth_key)
+            if mark is None:
+                try:
+                    osi = osi_symbol(
+                        underlying=p["underlying"], expiry=p["expiry"],
+                        type=p["type"], strike=p["strike"],
+                    )
+                    mark = marks.get(osi)
+                except (ValueError, KeyError):
+                    pass
+            row = {
                 "Symbol": f"{p['underlying']} {p['type'].upper()} {p['strike']} {p['expiry']}",
                 "Kind": "OPT",
                 "Leverage": "—",
@@ -196,7 +223,12 @@ def position_table_rows(portfolio: dict) -> list[dict]:
                     f"IV {g['iv']*100:.0f}% (p{int(g['iv_percentile'])})"
                 ),
                 "Kill": f"≤{p['kill_conditions']['max_loss_pct']}%",
-            })
+            }
+        breakdown = pnl_lib.compute_position_pnl(position=p, current_mark_usd=mark)
+        row["Mark"] = mark if mark is not None else None
+        row["Gross P&L"] = breakdown.gross_pnl_usd if mark is not None else None
+        row["Net P&L"] = breakdown.net_pnl_usd if mark is not None else None
+        out.append(row)
     return out
 
 
