@@ -10,7 +10,7 @@ The canonical build spec is [CLAUDE.md](./CLAUDE.md). This README is the operato
 
 ## Mandatory risk warning
 
-> Leveraged ETFs decay path-dependently in volatile markets and are not buy-and-hold instruments. Long options can expire worthless; theta works against long premium daily. A £2k account cannot diversify options positions meaningfully — concentration risk is structural, not a flaw to fix. This system is an experiment in autonomous AI trading agents, not a path to reliable returns. Expect losses. Do not deploy capital you cannot afford to lose entirely. None of this is financial advice.
+> Leveraged ETFs decay path-dependently in volatile markets and are not buy-and-hold instruments. Long options can expire worthless; theta works against long premium daily. A $2,500 account cannot diversify options positions meaningfully — concentration risk is structural, not a flaw to fix. This system is an experiment in autonomous AI trading agents, not a path to reliable returns. Expect losses. Do not deploy capital you cannot afford to lose entirely. None of this is financial advice.
 
 ---
 
@@ -42,7 +42,7 @@ Per-stage model assignment matches the cost/quality demand of each decision. All
 | **screen** | `claude-haiku-4-5` | Structured liquidity-filter step. Cheap, fast, sufficient. |
 | **research** (bull + bear, parallel) | `claude-sonnet-4-6` | Fans out 2× per candidate (~16 calls/run). Sonnet is the right cost/quality sweet spot at this fan-out. |
 | **scenarios** | `claude-sonnet-4-6` | Probability-weighted base/bull/bear case modelling. Well-defined output shape. |
-| **construct** | `claude-opus-4-6` | **The actual trade decision** — picks positions, sizing, kill conditions. Highest-stakes call on a £2k account where each trade matters disproportionately; gets the Opus tier. |
+| **construct** | `claude-opus-4-6` | **The actual trade decision** — picks positions, sizing, kill conditions. Highest-stakes call on a $2,500 account where each trade matters disproportionately; gets the Opus tier. |
 | **orchestrator-meta** *(timing only, not yet wired)* | `claude-opus-4-6` | Decides next-run window from regime + portfolio state. Wires in Phase 9.1. |
 
 Typical cost per orchestrator run on a real universe: **~$0.10–$0.50** (most of it in `construct`). Per-run cap defaults to $2; daily cap defaults to $10.
@@ -54,7 +54,7 @@ Typical cost per orchestrator run on a real universe: **~$0.10–$0.50** (most o
 | | **Linux VPS** *(recommended)* | **Windows 10/11** |
 |---|---|---|
 | **When to use** | Unattended autonomous running. Box doesn't sleep. Best for the spec's "let the agent run for weeks" model. | Manual / interactive use on a desktop. Laptop must stay awake when the timer fires. |
-| **Cost** | ~£4.50/mo (Hetzner CX23, 2 vCPU / 4 GB) | Already-owned hardware |
+| **Cost** | ~$5/mo (Hetzner CX23, 2 vCPU / 4 GB) | Already-owned hardware |
 | **Scheduler** | systemd timers | Windows Task Scheduler |
 | **Dashboard reach** | Tailscale Serve (HTTPS, no public ports) or SSH tunnel | localhost or LAN with Defender Firewall rule |
 | **Setup section below** | [Linux VPS setup](#linux-vps-setup-recommended) | [Windows setup](#windows-setup-alternative) |

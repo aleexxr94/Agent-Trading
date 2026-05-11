@@ -24,7 +24,7 @@ Components modelled per round-trip:
   Options (sell-side only, added once):
     + SEC fee:        $0.0000278 × premium notional sold
 
-Why this matters on a £2k account: the \$1 IBKR minimum commission dominates
+Why this matters on a $2.5k account: the \$1 IBKR minimum commission dominates
 small positions. On a $250 trade, commission alone is **40 bps** — 4× the
 modelled half-spread. Ignoring it makes paper Sharpe ~0.5 too generous.
 

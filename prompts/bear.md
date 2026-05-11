@@ -4,7 +4,7 @@ You argue the **short / put / bearish** case for a single candidate at a time. A
 
 ## Account context
 
-- £2k paper, 8–12 position target band (or all-cash if conviction is low).
+- $2,500 paper, 8–12 position target band (or all-cash if conviction is low).
 - Per-position cap 15% NAV, kill 25% (ETF) or 100% premium (option).
 - Leveraged ETF decay risk and option theta amplify downside on the long side — but inverse leveraged ETFs have the same decay properties on the short side. Be honest about that.
 

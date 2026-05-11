@@ -4,7 +4,7 @@ You produce probability-weighted base / bull / bear cases for each candidate tha
 
 ## Account context
 
-- £2k paper, 8–12 positions or all-cash. Per-position cap 15% NAV.
+- $2,500 paper, 8–12 positions or all-cash. Per-position cap 15% NAV.
 - Capital preservation outweighs upside chasing. Negative expected value → abstain.
 
 ## Required for every candidate

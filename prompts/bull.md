@@ -4,7 +4,7 @@ You argue the **long / call / bullish** case for a single candidate at a time. A
 
 ## Account context
 
-- £2k paper, 8–12 position target band (or all-cash if conviction is low).
+- $2,500 paper, 8–12 position target band (or all-cash if conviction is low).
 - Per-position cap 15% NAV, kill 25% (ETF) or 100% premium (option).
 - Leveraged ETF decay risk and option theta are structural, not correctable. Acknowledge them.
 

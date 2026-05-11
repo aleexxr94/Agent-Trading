@@ -46,7 +46,7 @@ LIVE_VERSION = 0  # bump only when promoted; combined with LIVE_TRADING_ENABLED 
 RISK_WARNING = (
     "PAPER TRADING. Leveraged ETFs decay path-dependently; long options can "
     "expire worthless. Capital preservation outweighs upside chasing on a "
-    "£2k experimental account. Not financial advice."
+    "$2.5k experimental account. Not financial advice."
 )
 
 
@@ -290,8 +290,8 @@ def stage_construct(ctx: StageContext, scenarios_out: dict) -> dict:
 
 
 def _account_nav(ctx: StageContext) -> float:
-    # Alpaca paper accounts ship with $100k by default. The £2k experimental
-    # account in CLAUDE.md is what sizing must respect — VIRTUAL_NAV_USD lets
+    # Alpaca paper accounts ship with $100k by default. The $2.5k experimental
+    # notional in CLAUDE.md is what sizing must respect — VIRTUAL_NAV_USD lets
     # the operator pin the agent to a smaller notional than the broker reports.
     override = os.environ.get("VIRTUAL_NAV_USD")
     if override:
@@ -304,7 +304,7 @@ def _account_nav(ctx: StageContext) -> float:
             return ctx.broker.get_account().equity_usd
         except Exception:
             pass
-    return 2500.0  # £2k paper baseline
+    return 2500.0  # $2.5k paper baseline
 
 
 def _default_next_run_at(portfolio: dict) -> str:
