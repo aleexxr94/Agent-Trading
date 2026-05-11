@@ -8,7 +8,7 @@ You are a senior quant systems engineer. Build a complete, **paper-trading-only*
 ## Critical preconditions (read and confirm before writing any code)
 1. **Paper trading only** until I explicitly promote it via the criteria in §11. Live mode must be gated behind both an env var and a hard-coded version flag. Do not build a UI button that toggles live.
 2. **I am UK-based.** Alpaca **paper** is fine. Alpaca **live** brokerage is not available to UK retail. Do not assume live USD funding via Alpaca will ever happen. Add a TODO and an interface seam in `lib/broker.py` so the broker can be swapped to IBKR later without rewriting the orchestrator.
-3. **Account size:** USD equivalent of £2,000 (~$2,500 paper). Every sizing calculation must respect this. The orchestrator must be willing to hold cash if conviction is insufficient — do not force-fill 10 slots.
+3. **Account size:** $2,500 paper (all sizing in USD). Every sizing calculation must respect this. The orchestrator must be willing to hold cash if conviction is insufficient — do not force-fill 10 slots.
 4. **Environment:** Windows 10/11 on a personal PC. Schedule the orchestrator with **Windows Task Scheduler** (provide an importable `.xml` task definition and a `register_task.ps1` PowerShell script). Do not use Claude Code Routines for production runtime. Assume Python 3.11+ installed via the official installer (`py` launcher available); use a project-local `.venv`.
 5. **Runtime architecture:** local Python service calling the **Anthropic API directly** with prompt caching. Claude Code is for development only. Pro-plan usage limits make routine-driven production execution unreliable.
 6. If anything below is ambiguous, bundle all clarifying questions into one message before starting. Do not guess on capital allocation, position counts, kill switches, or broker behaviour.
@@ -146,7 +146,7 @@ Each prompt under `prompts/` must include:
 - "If uncertain, abstain" rule — outputs may be empty if conviction is low.
 
 Orchestrator prompt must state explicitly:
-> You manage a £2k experimental paper account. Capital preservation outweighs upside chasing. If conviction is insufficient, output an all-cash portfolio with rationale rather than forcing 10 positions.
+> You manage a $2,500 experimental paper account. Capital preservation outweighs upside chasing. If conviction is insufficient, output an all-cash portfolio with rationale rather than forcing 10 positions.
 
 ## Acceptance criteria (all must pass before I run live cycles)
 1. `pytest` green. All schemas validate against representative fixtures.
@@ -166,7 +166,7 @@ All of:
 - `LIVE_TRADING_ENABLED=true` env var **and** a hard-coded `LIVE_VERSION` constant bumped in code.
 
 ## Mandatory risk warnings (in README, dashboard banner, and every decision log)
-> Leveraged ETFs decay path-dependently in volatile markets and are not buy-and-hold instruments. Long options can expire worthless; theta works against long premium daily. A £2k account cannot diversify options positions meaningfully — concentration risk is structural, not a flaw to fix. This system is an experiment in autonomous AI trading agents, not a path to reliable returns. Expect losses. Do not deploy capital you cannot afford to lose entirely. None of this is financial advice.
+> Leveraged ETFs decay path-dependently in volatile markets and are not buy-and-hold instruments. Long options can expire worthless; theta works against long premium daily. A $2,500 account cannot diversify options positions meaningfully — concentration risk is structural, not a flaw to fix. This system is an experiment in autonomous AI trading agents, not a path to reliable returns. Expect losses. Do not deploy capital you cannot afford to lose entirely. None of this is financial advice.
 
 ## Working style
 - Conventional commits. Open a draft PR against `main`; do not push to `main` directly.

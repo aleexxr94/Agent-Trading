@@ -1,9 +1,9 @@
 """Tests for orchestrator._account_nav — VIRTUAL_NAV_USD override.
 
 Alpaca paper accounts ship with $100k of fake equity. CLAUDE.md sizes for a
-£2k experimental account, so the agent must size against the smaller virtual
-NAV rather than the broker-reported equity when the operator sets the
-override. Falls back to broker equity, then to the $2,500 baseline.
+$2,500 experimental account, so the agent must size against the smaller
+virtual NAV rather than the broker-reported equity when the operator sets
+the override. Falls back to broker equity, then to the $2,500 baseline.
 """
 from __future__ import annotations
 

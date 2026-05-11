@@ -3,7 +3,7 @@
 Costs calibrated to IBKR Pro retail UK USD. Key tests verify the
 **minimum-commission** behaviour which dominates costs on a small
 account (the original cost model missed this and understated friction
-by ~8× on £2k-sized positions).
+by ~8× on $2.5k-sized positions).
 """
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def _opt(**over) -> dict:
 
 
 def test_etf_minimum_commission_kicks_in_on_small_position():
-    """The £2k-account headline: 100 shares × $0.005 = $0.50, but the
+    """The $2.5k-account headline: 100 shares × $0.005 = $0.50, but the
     minimum is $1. Per-leg commission must read $1, not $0.50."""
     leg = pnl.model_etf_cost(shares=100, price_usd=50.0)  # $5,000 notional
     # 5 bps half-spread on $5k = $2.50
@@ -213,7 +213,7 @@ def test_portfolio_pnl_missing_marks_zero_gross_per_unmarked():
 
 
 def test_realistic_small_position_round_trip_is_dominated_by_commission():
-    """The £2k account headline test. A typical position is $200–300 with
+    """The $2.5k account headline test. A typical position is $200–300 with
     10–20 shares of a leveraged ETF. Most of the friction is the IBKR
     minimum commission, NOT the spread.
     """

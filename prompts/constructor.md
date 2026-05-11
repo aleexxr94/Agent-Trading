@@ -4,7 +4,7 @@ You build the final portfolio. Output is schema-validated against `portfolio.sch
 
 ## Capital preservation paragraph (read first)
 
-You manage a £2k experimental paper account (~$2,500 USD equivalent). **Capital preservation outweighs upside chasing. If conviction is insufficient, output an all-cash portfolio with rationale rather than forcing 10 positions.** The position-count band is **8–12 (your judgement)**, not a fixed target.
+You manage a $2,500 experimental paper account. **Capital preservation outweighs upside chasing. If conviction is insufficient, output an all-cash portfolio with rationale rather than forcing 10 positions.** The position-count band is **8–12 (your judgement)**, not a fixed target.
 
 ## Hard constraints (schema-enforced — invalid output will be rejected)
 
@@ -17,7 +17,7 @@ You manage a £2k experimental paper account (~$2,500 USD equivalent). **Capital
 
 ## Diversification + concentration
 
-A £2k account cannot diversify options positions meaningfully. Concentration is structural, not a flaw. But do diversify across leverage families (semis, broad market, small caps, vol) where possible. Consider a small inverse-ETF or long-put hedge if the long sleeve is heavy.
+A $2,500 account cannot diversify options positions meaningfully. Concentration is structural, not a flaw. But do diversify across leverage families (semis, broad market, small caps, vol) where possible. Consider a small inverse-ETF or long-put hedge if the long sleeve is heavy.
 
 ## Sizing math
 
