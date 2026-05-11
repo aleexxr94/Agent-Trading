@@ -136,6 +136,64 @@ def test_meta_out_of_bounds_falls_back(tmp_state, monkeypatch, hours_away):
     assert "out-of-bounds" in why
 
 
+def test_meta_at_exactly_min_boundary_accepted(tmp_state, monkeypatch):
+    """Regression: Codex review on PR #19 flagged that the model picking
+    its documented minimum of 1h, in second-precision ISO format, was
+    systematically rejected by the bounds check because state.utcnow()
+    is microsecond-precision. Verify the tolerance fix accepts it.
+
+    Reproduces the failure mode by snapping the target to whole-second
+    ISO format AFTER capturing a microsecond `now` from inside the
+    helper's clock source.
+    """
+    # state.utcnow() returns microseconds; the model's `next_run_at` is
+    # second-precision, so even an honest "now + exactly 1h" pick lands
+    # ~0.5s short of 3600s when measured against the captured `now`.
+    now_mu = state.utcnow()
+    target = now_mu + timedelta(hours=1)
+    iso = target.strftime("%Y-%m-%dT%H:%M:%SZ")  # drops the fractional second
+    monkeypatch.setattr(
+        orchestrator.llm, "structured_call",
+        _fake_call_factory({"next_run_at": iso, "rationale": "tight cadence ok"}),
+    )
+    at, why = orchestrator._compute_next_run_at(
+        ctx=_ctx(), portfolio=_portfolio(), scenarios_out={"candidates": []},
+    )
+    assert at == iso, f"1h boundary should be accepted, got fallback: {why}"
+    assert "orchestrator-meta" in why
+
+
+def test_meta_at_exactly_max_boundary_accepted(tmp_state, monkeypatch):
+    """Symmetric to above — the 24h documented max should also pass even
+    with second-precision truncation."""
+    target = state.utcnow() + timedelta(hours=24)
+    iso = target.strftime("%Y-%m-%dT%H:%M:%SZ")
+    monkeypatch.setattr(
+        orchestrator.llm, "structured_call",
+        _fake_call_factory({"next_run_at": iso, "rationale": "max cadence ok"}),
+    )
+    at, why = orchestrator._compute_next_run_at(
+        ctx=_ctx(), portfolio=_portfolio(), scenarios_out={"candidates": []},
+    )
+    assert at == iso
+    assert "orchestrator-meta" in why
+
+
+def test_meta_just_below_min_boundary_still_rejected(tmp_state, monkeypatch):
+    """The tolerance (30s) doesn't open the floodgates — something
+    materially below 1h still falls back."""
+    target = state.utcnow() + timedelta(hours=1) - timedelta(seconds=120)
+    iso = target.strftime("%Y-%m-%dT%H:%M:%SZ")
+    monkeypatch.setattr(
+        orchestrator.llm, "structured_call",
+        _fake_call_factory({"next_run_at": iso, "rationale": "too tight"}),
+    )
+    _, why = orchestrator._compute_next_run_at(
+        ctx=_ctx(), portfolio=_portfolio(), scenarios_out={"candidates": []},
+    )
+    assert "out-of-bounds" in why
+
+
 def test_meta_rationale_truncated_to_300_chars(tmp_state, monkeypatch):
     """Defence vs an LLM that returns a wall of text in 'rationale'."""
     target = state.utcnow() + timedelta(hours=3)

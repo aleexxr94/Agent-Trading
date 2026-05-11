@@ -316,6 +316,18 @@ def _default_next_run_at(portfolio: dict) -> str:
 META_MIN_HOURS = 1.0
 META_MAX_HOURS = 24.0
 
+# Tolerance applied to both bounds, accounting for:
+#   - second-precision ISO output ('YYYY-MM-DDTHH:MM:SSZ') vs microsecond `now`
+#     (model's "1 hour from now" rounds down to whole seconds, making the
+#     delta come in at 0.9998h)
+#   - LLM round-trip latency between captured `now` and the response
+#   - small clock drift between this host and the model's reference time
+#
+# 30 seconds is invisible at hour-scale cadence but absorbs all three.
+# Without it, the documented minimum (1h) is systematically rejected — see
+# Codex review on PR #19.
+META_BOUND_TOLERANCE_SECONDS = 30.0
+
 
 def _compute_next_run_at(
     *, ctx: StageContext, portfolio: dict, scenarios_out: dict,
@@ -373,11 +385,14 @@ def _compute_next_run_at(
     except Exception:
         return _default_next_run_at(portfolio), "meta returned malformed next_run_at; using heuristic"
 
-    delta_hours = (at - now).total_seconds() / 3600.0
-    if delta_hours < META_MIN_HOURS or delta_hours > META_MAX_HOURS:
+    delta_seconds = (at - now).total_seconds()
+    min_seconds = META_MIN_HOURS * 3600 - META_BOUND_TOLERANCE_SECONDS
+    max_seconds = META_MAX_HOURS * 3600 + META_BOUND_TOLERANCE_SECONDS
+    if delta_seconds < min_seconds or delta_seconds > max_seconds:
         return _default_next_run_at(portfolio), (
-            f"meta returned out-of-bounds cadence ({delta_hours:.1f}h, "
-            f"allowed {META_MIN_HOURS}-{META_MAX_HOURS}h); using heuristic"
+            f"meta returned out-of-bounds cadence ({delta_seconds/3600:.2f}h, "
+            f"allowed {META_MIN_HOURS}-{META_MAX_HOURS}h ±{META_BOUND_TOLERANCE_SECONDS:g}s); "
+            f"using heuristic"
         )
 
     rationale = (payload.get("rationale") or "")[:300]  # cap length so it stays log-friendly
