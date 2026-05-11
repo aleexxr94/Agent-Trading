@@ -83,7 +83,13 @@ def scenarios() -> StageConfig:
         model=_model("MODEL_SCENARIOS", "claude-sonnet-4-6"),
         system_prompt=_load("scenarios.md"),
         schema_filename="scenarios.schema.json",
-        max_tokens=8192,
+        # 16384 (was 8192): each candidate emits 600-800 tokens of base/bull/bear
+        # scenarios with narratives. With 8 research-pair candidates feeding in,
+        # the first paper run hit exactly 8192 output tokens mid-JSON and the
+        # retry-with-error-feedback shrank itself to 2 candidates to fit.
+        # Result: portfolio constructor saw only 2 correlated 3x bull ETFs and
+        # correctly abstained to all-cash — but for the wrong reason.
+        max_tokens=16384,
         thinking={"type": "adaptive"},
         output_config_extras={"effort": "high"},
     )
@@ -95,7 +101,12 @@ def constructor() -> StageConfig:
         model=_model("MODEL_CONSTRUCTOR", "claude-opus-4-6"),
         system_prompt=_load("constructor.md"),
         schema_filename="portfolio.schema.json",
-        max_tokens=8192,
+        # 16384 (was 8192): same headroom rationale as scenarios — constructor
+        # outputs 8-12 positions each with entry_thesis, kill_conditions,
+        # sizing math, plus a portfolio-level construction_rationale and
+        # all_cash_rationale envelope. Defensive bump to match scenarios so the
+        # construct stage doesn't become the next bottleneck.
+        max_tokens=16384,
         thinking={"type": "adaptive"},
         output_config_extras={"effort": "high"},
     )
