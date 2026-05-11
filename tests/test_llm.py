@@ -440,16 +440,16 @@ def test_real_portfolio_schema_fully_inlined():
 
 
 def test_strip_fences_with_json_lang_tag():
-    assert llm._strip_markdown_fences('```json\n{"a": 1}\n```') == '{"a": 1}'
+    assert llm.strip_markdown_fences('```json\n{"a": 1}\n```') == '{"a": 1}'
 
 
 def test_strip_fences_without_lang_tag():
-    assert llm._strip_markdown_fences('```\n{"a": 1}\n```') == '{"a": 1}'
+    assert llm.strip_markdown_fences('```\n{"a": 1}\n```') == '{"a": 1}'
 
 
 def test_strip_fences_no_op_when_no_fence():
-    assert llm._strip_markdown_fences('{"a": 1}') == '{"a": 1}'
-    assert llm._strip_markdown_fences('  {"a": 1}  ') == '{"a": 1}'
+    assert llm.strip_markdown_fences('{"a": 1}') == '{"a": 1}'
+    assert llm.strip_markdown_fences('  {"a": 1}  ') == '{"a": 1}'
 
 
 def test_structured_call_parses_fenced_response(tmp_state):

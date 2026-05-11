@@ -154,9 +154,13 @@ def stage_screen(ctx: StageContext) -> dict:
         thinking=cfg.thinking,
         output_config=_output_config(cfg),
     ))
-    # Best-effort JSON parse (Haiku, no schema). Free-form fallback to raw text.
+    # Best-effort JSON parse (Haiku, no schema). Strip any ```json fences the
+    # model added despite the "JSON only — no markdown fences" prompt: without
+    # this, the bare json.loads fails and every candidate gets dumped into a
+    # silent `raw` envelope — downstream stages see {"passed": []} and the
+    # agent abstains to all-cash even though the screener found candidates.
     try:
-        return json.loads(res.raw_text)
+        return json.loads(llm.strip_markdown_fences(res.raw_text))
     except json.JSONDecodeError:
         return {"generated_at": state.utcnow_iso(), "raw": res.raw_text, "passed": [], "rejected": []}
 
@@ -195,8 +199,10 @@ async def _research_one(ctx: StageContext, candidate: dict) -> dict:
     bull_res, bear_res = await asyncio.gather(_call(bull_cfg), _call(bear_cfg))
 
     def _parse(r) -> dict:
+        # Same defensive fence-stripping as stage_screen — Sonnet too will
+        # occasionally wrap its JSON in ```json fences despite the prompt.
         try:
-            return json.loads(r.raw_text)
+            return json.loads(llm.strip_markdown_fences(r.raw_text))
         except json.JSONDecodeError:
             return {"thesis": r.raw_text[:200], "key_drivers": ["[parse_failed]"],
                     "counterarguments": ["[parse_failed]"], "confidence": 0.0}
@@ -384,7 +390,7 @@ def _compute_next_run_at(
             thinking=cfg.thinking,
             output_config=_output_config(cfg),
         ))
-        payload = json.loads(res.raw_text)
+        payload = json.loads(llm.strip_markdown_fences(res.raw_text))
     except Exception as e:
         return _default_next_run_at(portfolio), f"meta call failed ({type(e).__name__}); using heuristic"
 

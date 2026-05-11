@@ -155,7 +155,7 @@ def sanitize_schema_for_structured_output(
     return _walk(inlined)
 
 
-def _strip_markdown_fences(text: str) -> str:
+def strip_markdown_fences(text: str) -> str:
     """Sonnet sometimes wraps JSON in ```json … ``` fences despite explicit
     instructions to the contrary. Strip them defensively before json.loads."""
     t = text.strip()
@@ -309,7 +309,7 @@ def structured_call(
         })
 
         if call.schema_filename is not None:
-            cleaned = _strip_markdown_fences(text)
+            cleaned = strip_markdown_fences(text)
             try:
                 payload = json.loads(cleaned)
             except json.JSONDecodeError as e:

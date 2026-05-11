@@ -94,6 +94,41 @@ def test_live_mode_writes_current_portfolio_with_mocked_llm(tmp_state, monkeypat
     assert (8 <= len(p["positions"]) <= 12) or p["all_cash"]
 
 
+def test_screener_strips_markdown_fences_from_haiku_output(tmp_state, monkeypatch):
+    """Regression: Haiku occasionally wraps its JSON in ```json fences despite
+    the 'no markdown fences' prompt directive. Bare json.loads chokes and the
+    screener silently buries every candidate in a `raw` envelope — downstream
+    stages see {"passed": []} and the agent abstains to all-cash even though
+    real candidates were found. Observed in first live paper run.
+    """
+    fence_wrapped = (
+        "```json\n"
+        '{"generated_at": "2026-05-11T22:18:20Z", "universe_size": 1, '
+        '"passed": [{"symbol": "TQQQ", "kind": "etf", "leverage_factor": 3.0, '
+        '"adv": 84130606, "hv_annualised": 0.5098}], "rejected": []}'
+        "\n```"
+    )
+
+    def fake_call(call, **kwargs):
+        from lib.llm import CallUsage, StructuredCallResult
+        return StructuredCallResult(
+            payload={}, usage=CallUsage(0, 0, 0, 0), cost_usd=0.0,
+            cache_hit_pct=0.0, raw_text=fence_wrapped,
+        )
+
+    monkeypatch.setattr(orchestrator.llm, "structured_call", fake_call)
+    monkeypatch.setattr(
+        orchestrator.market_data, "universe_snapshot",
+        lambda symbols, run_id=None, **kw: [],
+    )
+    ctx = orchestrator.StageContext(run_id="t", dry_run=False, broker=None)
+    out = orchestrator.stage_screen(ctx)
+    assert len(out["passed"]) == 1
+    assert out["passed"][0]["symbol"] == "TQQQ"
+    # And the unused `raw` fallback envelope is absent on the happy path.
+    assert "raw" not in out
+
+
 def test_halt_flag_blocks_pipeline_start(tmp_state):
     state.set_halt("test")
     with pytest.raises(Exception):
