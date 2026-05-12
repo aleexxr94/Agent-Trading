@@ -138,6 +138,33 @@ class AlpacaBroker(Broker):
             status=str(r.status),
         )
 
+    def option_contract_tradable(self, symbol: str) -> bool:
+        """Query Alpaca for a single option contract by OSI symbol.
+
+        Uses TradingClient.get_option_contract(symbol_or_id), which accepts
+        the full OSI string and returns the OptionContract or raises a 404.
+        Direct lookup bypasses the 50-row pagination of get_option_contracts
+        — useful because the constructor sometimes picks an expiry that
+        isn't on the first page of the chain listing.
+
+        Returns False on:
+          - any exception (404 'asset not found', auth, network)
+          - status != 'active'
+          - tradable == False
+        True only when the contract is present AND marked tradable.
+        """
+        try:
+            c = self._client.get_option_contract(symbol)
+        except Exception:
+            return False
+        status = getattr(c, "status", None)
+        tradable = getattr(c, "tradable", None)
+        if tradable is False:
+            return False
+        if status is not None and str(status).lower() != "active":
+            return False
+        return True
+
     def cancel_all(self) -> int:
         return len(self._client.cancel_orders())
 

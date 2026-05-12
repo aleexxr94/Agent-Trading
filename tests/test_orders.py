@@ -244,9 +244,11 @@ def test_malformed_option_target_surfaces_as_skipped():
 
 
 class _FakeBroker:
-    def __init__(self, fail_symbols=()):
+    def __init__(self, fail_symbols=(), untradable_options=()):
         self.submitted: list = []
         self.fail_symbols = set(fail_symbols)
+        self.untradable_options = set(untradable_options)
+        self.tradability_lookups: list[str] = []
 
     @property
     def name(self): return "fake"
@@ -254,6 +256,10 @@ class _FakeBroker:
     def get_account(self): raise NotImplementedError
 
     def get_positions(self): return []
+
+    def option_contract_tradable(self, symbol):
+        self.tradability_lookups.append(symbol)
+        return symbol not in self.untradable_options
 
     def submit_order(self, req):
         from lib.broker import OrderResult
@@ -346,3 +352,127 @@ def test_submit_plan_renders_structured_alpaca_error():
     results = orders.submit_plan(plan, broker=_BrokerThatRejects())
     assert len(results) == 1
     assert results[0].status == "error[40010001]: qty must be an integer"
+
+
+# ---------- OSI symbol detector ----------
+
+
+@pytest.mark.parametrize("symbol", [
+    "SPY260619C00530000",   # SPY call
+    "TLT260619P00088000",   # TLT put (the May 12 2026 broken pick)
+    "QQQ260918P00400500",   # half-dollar strike
+    "A260619C00050000",     # 1-char underlying
+    "GOOGL260619C00150000", # 5-char underlying
+])
+def test_is_osi_symbol_recognizes_real_osis(symbol):
+    assert orders.is_osi_symbol(symbol)
+
+
+@pytest.mark.parametrize("symbol", [
+    "SPY",                 # plain ETF
+    "TQQQ",
+    "SPY26C00530000",      # missing date digits
+    "SPY260619X00530000",  # invalid C/P slot
+    "spy260619c00530000",  # lowercase
+    "",
+])
+def test_is_osi_symbol_rejects_non_osi(symbol):
+    assert not orders.is_osi_symbol(symbol)
+
+
+# ---------- submit_plan option-contract pre-validation ----------
+
+
+def _option_osi(**over):
+    """Build a valid option-leg dict for diff_portfolio whose OSI is known."""
+    base = dict(
+        underlying="TLT", type="put", strike=88.0, expiry="2026-06-19",
+        contracts=1,
+    )
+    base.update(over)
+    return _option(base.pop("underlying"), **base)
+
+
+def test_submit_plan_skips_untradable_option_open():
+    """Constructor invents OSI that isn't in the broker's chain — pre-validation
+    catches it, the order is never submitted, and the result carries a clear
+    'skipped' status (regression for May 12 2026 TLT260619P00088000 failure)."""
+    plan = orders.diff_portfolio(
+        {"positions": [_option_osi()]},   # TLT 2026-06-19 P88
+        [],
+    )
+    assert len(plan.requests) == 1
+    osi = plan.requests[0].symbol
+    assert osi == "TLT260619P00088000"
+
+    broker = _FakeBroker(untradable_options=(osi,))
+    results = orders.submit_plan(plan, broker=broker)
+
+    assert len(results) == 1
+    assert results[0].symbol == osi
+    assert results[0].status.startswith("skipped: option contract not tradable")
+    assert broker.tradability_lookups == [osi], "should query tradability exactly once"
+    assert broker.submitted == [], "no order should hit submit_order for an untradable contract"
+
+
+def test_submit_plan_submits_tradable_option_open():
+    """A tradable option contract flows through normally."""
+    plan = orders.diff_portfolio({"positions": [_option_osi()]}, [])
+    broker = _FakeBroker()  # nothing untradable
+    results = orders.submit_plan(plan, broker=broker)
+
+    assert len(results) == 1
+    assert results[0].status == "accepted"
+    assert len(broker.submitted) == 1
+    assert broker.tradability_lookups == [plan.requests[0].symbol]
+
+
+def test_submit_plan_does_not_gate_option_closes():
+    """Sells of options we already hold must NEVER be tradability-gated —
+    if the position is on our broker statement, the contract obviously
+    exists. Gating closes would strand untradable positions and prevent
+    kill-condition exits at expiry-near."""
+    from lib.broker import BrokerPosition
+    osi = "TLT260619P00088000"
+    held = BrokerPosition(
+        symbol=osi, qty=1, avg_cost=1.20, market_value=80.0,
+        unrealized_pl_usd=-40.0, asset_class="us_option",
+    )
+    # Target has no options → diff produces a close on the held OSI.
+    plan = orders.diff_portfolio({"positions": []}, [held])
+    assert len(plan.closes) == 1 and plan.closes[0].symbol == osi
+    assert plan.closes[0].side == "sell"
+
+    # Pretend the broker marks it untradable; the close must still go through.
+    broker = _FakeBroker(untradable_options=(osi,))
+    results = orders.submit_plan(plan, broker=broker)
+
+    assert len(results) == 1
+    assert results[0].status == "accepted"
+    assert broker.tradability_lookups == [], "closes must not invoke tradability check"
+    assert len(broker.submitted) == 1
+
+
+def test_submit_plan_does_not_gate_etf_orders():
+    """ETF symbols aren't OSI-shaped, so tradability is never queried."""
+    plan = orders.diff_portfolio({"positions": [_etf("TQQQ", 4)]}, [])
+    broker = _FakeBroker()
+    orders.submit_plan(plan, broker=broker)
+    assert broker.tradability_lookups == []
+
+
+def test_broker_default_option_tradable_returns_true():
+    """The base Broker class default must be permissive — stub brokers and
+    test fixtures that don't override the method should not block orders."""
+    from lib.broker import Broker
+    # Build a minimal concrete subclass that only implements the abstract bits.
+    class _Stub(Broker):
+        @property
+        def name(self): return "stub"
+        def get_account(self): raise NotImplementedError
+        def get_positions(self): return []
+        def submit_order(self, req): raise NotImplementedError
+        def cancel_all(self): return 0
+        def flatten(self, sym): return None
+
+    assert _Stub().option_contract_tradable("TLT260619P00088000") is True

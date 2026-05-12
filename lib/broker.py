@@ -82,3 +82,18 @@ class Broker(ABC):
 
     @abstractmethod
     def flatten(self, symbol: str) -> OrderResult | None: ...
+
+    def option_contract_tradable(self, symbol: str) -> bool:
+        """Return True iff the OSI option contract exists and is tradable.
+
+        Default implementation returns True — i.e. no validation. Concrete
+        brokers should override to actually query their contract catalog so
+        we can skip orders for non-existent / non-tradable contracts before
+        the request hits the API. Phase 10d guard: the constructor agent
+        sometimes invents OSI symbols whose expiry/strike combo isn't in
+        the broker's book (observed May 12 2026: TLT 2026-06-19 P88 returned
+        Alpaca error[42210000] 'asset not found'). Pre-validating gives the
+        operator a clearer skip reason than the raw broker error and avoids
+        burning an order attempt on a doomed contract.
+        """
+        return True
