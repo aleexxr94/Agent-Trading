@@ -504,19 +504,26 @@ def stage_execute(ctx: StageContext, portfolio: dict, scenarios_out: dict | None
 
         # Pull fills + fees back from Alpaca and append to trades.jsonl so
         # the dashboard's per-trade PnL + fees chart reflect actual broker
-        # activity from this cycle. Failures are soft — sync is best-effort
-        # and the next cycle's sync will pick up any missed fills.
-        if accepted_order_ids:
-            try:
-                from lib import trades_sync
-                trades_sync.sync_fills_from_alpaca(
-                    trading_client=getattr(ctx.broker, "_client", None),
-                    order_id_to_run_id=trades_sync.order_id_to_run_id_from_runs(),
-                )
-            except Exception as e:
-                next_run["trades_sync_error"] = (
-                    f"sync_fills_from_alpaca: {type(e).__name__}: {e}"
-                )
+        # activity. Run EVERY cycle that reaches stage_execute with a broker
+        # connection — not just cycles that submitted new orders. Codex P1
+        # caught the earlier `if accepted_order_ids` gate: it would miss
+        # fills from prior cycles' orders that filled late (partials, slow
+        # routing, out-of-hours fills) and leave trades.jsonl stale until
+        # another new order happened to fire. The sync is idempotent (PR
+        # #52: known_ids dedupe) so re-running every cycle is cheap.
+        try:
+            from lib import trades_sync
+            trades_sync.sync_fills_from_alpaca(
+                trading_client=getattr(ctx.broker, "_client", None),
+                order_id_to_run_id=trades_sync.order_id_to_run_id_from_runs(),
+            )
+        except Exception as e:
+            # Failures are soft — sync is best-effort and the next cycle's
+            # sync will pick up missed fills. Label lands on next_run.json
+            # so the dashboard Agent Logs tab can surface persistent errors.
+            next_run["trades_sync_error"] = (
+                f"sync_fills_from_alpaca: {type(e).__name__}: {e}"
+            )
     if not ctx.dry_run:
         state.write_json(state.NEXT_RUN, next_run)
         # NAV history: one row per run for the dashboard equity curve.

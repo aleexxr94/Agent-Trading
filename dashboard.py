@@ -871,6 +871,17 @@ with tabs[4]:
                 unsafe_allow_html=True,
             )
 
+    # Shared color formatter for Gross / Net columns on both the closed
+    # and open tables. Codex P1 caught a previous version that defined
+    # this inside the `if view["closed"]:` branch — when the closed list
+    # was empty but open lots existed, the open-table block raised
+    # UnboundLocalError. Hoisting to the outer scope keeps both branches
+    # independently renderable.
+    def _pnl_color(v):
+        if v is None or (isinstance(v, float) and v != v):
+            return "color: #94a3b8"
+        return "color: #059669; font-weight: 600" if v >= 0 else "color: #dc2626; font-weight: 600"
+
     st.markdown(
         '<div class="at-section-label" style="margin-top:1.2rem;">'
         'Closed trades</div>',
@@ -892,11 +903,6 @@ with tabs[4]:
             "net_pnl_usd": "Net",
             "buy_run_id": "Run",
         })
-
-        def _pnl_color(v):
-            if v is None or (isinstance(v, float) and v != v):
-                return "color: #94a3b8"
-            return "color: #059669; font-weight: 600" if v >= 0 else "color: #dc2626; font-weight: 600"
 
         sty = df_closed.style.format({
             "Entry": "${:,.4f}",
