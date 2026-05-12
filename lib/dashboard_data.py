@@ -175,6 +175,70 @@ def load_nav_history(limit: int | None = None) -> list[dict]:
     return state.read_nav_history(limit=limit)
 
 
+def load_trades() -> list[dict]:
+    """Read state/trades.jsonl. Each row is one Alpaca fill with real
+    fees_usd. Empty list when the log doesn't exist yet.
+
+    No reset-marker filtering — trading fees are real, paid money; we
+    don't want a display reset to make them disappear. The LLM-cost
+    reset only affects token-cost rows.
+    """
+    return state.read_trades()
+
+
+def total_trading_fees_usd() -> float:
+    """Sum fees_usd across every fill in trades.jsonl. Used by the stats
+    grid + the all-time totals on the Performance tab."""
+    return sum(float(r.get("fees_usd", 0.0) or 0.0) for r in load_trades())
+
+
+def fees_by_month() -> list[dict]:
+    """Return sorted list of {month: 'YYYY-MM', fees_usd, fills}.
+
+    Mirrors ``cost_by_month`` for trading fees: groups every fill in
+    trades.jsonl by its ``filled_at`` UTC month. Each entry is a single
+    bucket — both buy-side and sell-side fees count toward the same
+    month they were paid in.
+    """
+    rows = load_trades()
+    by_month: dict[str, dict] = {}
+    for r in rows:
+        at = r.get("filled_at") or ""
+        if len(at) < 7:
+            continue
+        key = at[:7]
+        bucket = by_month.setdefault(
+            key, {"month": key, "fees_usd": 0.0, "fills": 0}
+        )
+        bucket["fills"] += 1
+        bucket["fees_usd"] += float(r.get("fees_usd", 0.0) or 0.0)
+    return sorted(by_month.values(), key=lambda x: x["month"])
+
+
+def fees_running_total() -> list[dict]:
+    """Return ``[{at, fees_usd, cum_fees_usd}]`` ordered by fill time.
+
+    Powers the cumulative-fees line on the Performance tab. Cumulative
+    sum makes it easy to spot a fee spike on a busy day vs slow drift
+    from per-contract OCC fees. Returns [] when no fills.
+    """
+    rows = load_trades()
+    out: list[dict] = []
+    cum = 0.0
+    # Sort by filled_at to be safe — read_trades preserves file order but
+    # fills logged out of strict chronological order would distort the
+    # cumulative line.
+    for r in sorted(rows, key=lambda r: r.get("filled_at") or ""):
+        fee = float(r.get("fees_usd", 0.0) or 0.0)
+        cum += fee
+        out.append({
+            "at": r.get("filled_at") or "",
+            "fees_usd": fee,
+            "cum_fees_usd": cum,
+        })
+    return out
+
+
 def try_load_broker_marks() -> dict[str, float]:
     """Best-effort fetch of current marks from Alpaca paper.
 
