@@ -285,7 +285,16 @@ def structured_call(
             kwargs["output_config"] = call.output_config
         kwargs.update(call.extra)
 
-        resp = cli.messages.create(**kwargs)
+        # The Anthropic SDK refuses non-streaming requests once max_tokens
+        # is high enough that the worst-case latency could exceed 10 minutes
+        # (raises ValueError: "Streaming is required for operations that may
+        # take longer than 10 minutes"). The scenarios stage uses
+        # max_tokens=32768 + adaptive thinking, which trips that guard.
+        # Streaming sidesteps the timeout — we still wait for the final
+        # message, so the rest of the call site (cost recording, schema
+        # validation, retry) is unchanged.
+        with cli.messages.stream(**kwargs) as stream:
+            resp = stream.get_final_message()
         usage = CallUsage(
             input_tokens=getattr(resp.usage, "input_tokens", 0),
             output_tokens=getattr(resp.usage, "output_tokens", 0),
