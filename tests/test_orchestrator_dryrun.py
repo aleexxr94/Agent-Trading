@@ -91,7 +91,7 @@ def test_live_mode_writes_current_portfolio_with_mocked_llm(tmp_state, monkeypat
     orchestrator.run_pipeline(dry_run=False)
     assert state.CURRENT_PORTFOLIO.exists()
     p = json.loads(state.CURRENT_PORTFOLIO.read_text())
-    assert (3 <= len(p["positions"]) <= 12) or p["all_cash"]
+    assert (1 <= len(p["positions"]) <= 12) or p["all_cash"]
 
 
 def test_screener_strips_markdown_fences_from_haiku_output(tmp_state, monkeypatch):
@@ -140,7 +140,7 @@ def test_halt_flag_blocks_pipeline_start(tmp_state):
 def test_position_band_and_total_pct(tmp_state):
     result = orchestrator.run_pipeline(dry_run=True)
     p = result["portfolio"]
-    assert 3 <= len(p["positions"]) <= 12
+    assert 1 <= len(p["positions"]) <= 12
     assert sum(pos["position_pct"] for pos in p["positions"]) <= 100.0
 
 

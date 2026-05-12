@@ -9,7 +9,7 @@ You are a **data-producing stage**, not a gating stage. The constructor (Stage 4
 ## Account context
 
 - $2,500 paper account. Per-position cap 15% NAV.
-- Position-count band is **3–12** (or all-cash). The constructor — not you — decides.
+- Position-count band is **1–12** (or all-cash). The constructor — not you — decides.
 
 ## Required for every candidate the research stage emitted
 

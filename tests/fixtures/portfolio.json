@@ -6,7 +6,7 @@
   "cash_buffer_pct": 11.2,
   "all_cash": false,
   "all_cash_rationale": null,
-  "construction_rationale": "9 positions: 6 leveraged ETF longs across 3 sectors, 1 leveraged ETF inverse hedge, 2 defined-risk SPY/QQQ options. Sized within the 3–12 band; concentration capped at 12% per leg.",
+  "construction_rationale": "9 positions: 6 leveraged ETF longs across 3 sectors, 1 leveraged ETF inverse hedge, 2 defined-risk SPY/QQQ options. Sized within the 1–12 band; concentration capped at 12% per leg.",
   "positions": [
     {
       "kind": "etf",

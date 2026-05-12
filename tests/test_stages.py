@@ -27,11 +27,11 @@ def test_scenarios_max_tokens_above_8192_guard():
 
 
 def test_constructor_max_tokens_above_8192_guard():
-    """Constructor emits 3-12 positions each with entry_thesis,
+    """Constructor emits 1-12 positions each with entry_thesis,
     kill_conditions, sizing math, plus envelope rationales. Same defensive
     bump as scenarios so this stage doesn't become the next bottleneck."""
     cfg = stages.constructor()
     assert cfg.max_tokens >= 12_000, (
         f"constructor max_tokens={cfg.max_tokens} risks truncation on full "
-        "3-12 position portfolios with verbose theses"
+        "1-12 position portfolios with verbose theses"
     )
