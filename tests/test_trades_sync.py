@@ -458,3 +458,83 @@ def test_sync_stops_paginating_when_cursor_does_not_advance(tmp_state):
     assert tc.calls <= 3 + len(trades_sync._FEE_ACTIVITY_TYPES) * 2, (
         "loop must exit quickly on stuck cursor, not run _MAX_PAGES times"
     )
+
+
+# ---------- order_id_to_run_id_from_runs (PR 3 wiring) ----------
+
+
+def test_order_id_to_run_id_from_runs_empty_when_no_runs(tmp_state):
+    """No state/runs/ entries → empty map. Callers stamp run_id=None."""
+    assert trades_sync.order_id_to_run_id_from_runs() == {}
+
+
+def test_order_id_to_run_id_from_runs_aggregates_across_run_dirs(tmp_state):
+    """Each state/runs/{run_id}/orders.json contributes its order_ids to
+    the map. Union across all runs; collisions resolved by latest write
+    on disk (irrelevant in practice — Alpaca order_ids are globally unique)."""
+    import json as _json
+    for rid, oids in [
+        ("run-A", ["ord-1", "ord-2"]),
+        ("run-B", ["ord-3"]),
+    ]:
+        d = state.RUNS_DIR / rid
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "orders.json").write_text(_json.dumps({
+            "run_id": rid, "submitted_at": "2026-05-12T08:00:00Z",
+            "order_ids": oids,
+        }))
+    out = trades_sync.order_id_to_run_id_from_runs()
+    assert out == {"ord-1": "run-A", "ord-2": "run-A", "ord-3": "run-B"}
+
+
+def test_order_id_to_run_id_from_runs_skips_malformed_json(tmp_state):
+    """A broken orders.json file mustn't crash the helper — skip it and
+    continue to the next run dir."""
+    import json as _json
+    good_dir = state.RUNS_DIR / "run-A"
+    good_dir.mkdir(parents=True, exist_ok=True)
+    (good_dir / "orders.json").write_text(_json.dumps({
+        "run_id": "run-A", "submitted_at": "x", "order_ids": ["ord-1"],
+    }))
+    bad_dir = state.RUNS_DIR / "run-B"
+    bad_dir.mkdir(parents=True, exist_ok=True)
+    (bad_dir / "orders.json").write_text("{not valid json")
+    out = trades_sync.order_id_to_run_id_from_runs()
+    assert out == {"ord-1": "run-A"}
+
+
+def test_order_id_to_run_id_from_runs_skips_empty_order_id_entries(tmp_state):
+    import json as _json
+    d = state.RUNS_DIR / "run-A"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "orders.json").write_text(_json.dumps({
+        "run_id": "run-A", "submitted_at": "x",
+        "order_ids": ["ord-1", "", None, "ord-2"],
+    }))
+    out = trades_sync.order_id_to_run_id_from_runs()
+    assert out == {"ord-1": "run-A", "ord-2": "run-A"}
+
+
+def test_sync_uses_run_id_map_built_from_runs_dir(tmp_state):
+    """End-to-end wiring: orchestrator writes orders.json per cycle;
+    activities sync builds the map from those files and stamps the
+    run_id onto each new fill row."""
+    import json as _json
+    d = state.RUNS_DIR / "run-A"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "orders.json").write_text(_json.dumps({
+        "run_id": "run-A", "submitted_at": "x", "order_ids": ["ord-tracked"],
+    }))
+    tc = _FakeTrading(responses={
+        "/account/activities/FILL": [
+            _fill(activity_id="a1", order_id="ord-tracked"),
+            _fill(activity_id="a2", order_id="ord-manual", symbol="SOXL"),
+        ],
+    })
+    trades_sync.sync_fills_from_alpaca(
+        trading_client=tc,
+        order_id_to_run_id=trades_sync.order_id_to_run_id_from_runs(),
+    )
+    rows = {r["activity_id"]: r for r in state.read_trades()}
+    assert rows["a1"]["run_id"] == "run-A"
+    assert rows["a2"]["run_id"] is None  # manual fill, no run dir for ord-manual

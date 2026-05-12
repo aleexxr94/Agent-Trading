@@ -215,6 +215,83 @@ def fees_by_month() -> list[dict]:
     return sorted(by_month.values(), key=lambda x: x["month"])
 
 
+def trades_pnl_view(marks: dict[str, float] | None = None) -> dict:
+    """Return everything the Trades tab needs to render.
+
+    Output keys:
+      - ``closed``: list of closed-trade rows (symbol, qty, prices, gross,
+        fees_usd, llm_cost_usd, net, run_id, timestamps)
+      - ``open``: same shape with mark + None gross when unmarked
+      - ``totals``: realised aggregates + closed/open counts
+
+    Sources:
+      - ``state/trades.jsonl`` — one row per Alpaca fill (PR #52 + #55)
+      - ``state/costs.jsonl`` — LLM cost rows for equal-split attribution
+      - ``marks`` — optional {symbol: per-unit mark} for unrealised PnL
+        on open lots; the dashboard passes broker-live marks here.
+
+    Honours the all-time cost reset (PR #53): costs are filtered through
+    ``state.filter_costs_post_reset`` so a reset zeroes the LLM-cost
+    attribution column. Trading fees are NEVER filtered — they're real
+    paid money.
+    """
+    from . import trades as trades_lib
+
+    trade_rows = state.read_trades()
+    cost_rows = state.filter_costs_post_reset(
+        [json.loads(line) for line in (
+            state.COSTS_LOG.read_text(encoding="utf-8").splitlines()
+            if state.COSTS_LOG.exists() else []
+        ) if line.strip()]
+    )
+    pnl = trades_lib.compute_trades_pnl(
+        trade_rows, costs=cost_rows, marks=marks or {},
+    )
+    return {
+        "closed": [
+            {
+                "symbol": c.symbol,
+                "kind": c.kind,
+                "qty": c.qty,
+                "buy_price": c.buy_price,
+                "sell_price": c.sell_price,
+                "opened_at": c.opened_at,
+                "closed_at": c.closed_at,
+                "gross_pnl_usd": c.gross_pnl_usd,
+                "fees_usd": c.fees_usd,
+                "llm_cost_usd": c.attributed_llm_cost_usd,
+                "net_pnl_usd": c.net_pnl_usd,
+                "buy_run_id": c.buy_run_id,
+            }
+            for c in pnl.closed
+        ],
+        "open": [
+            {
+                "symbol": o.symbol,
+                "kind": o.kind,
+                "qty": o.qty,
+                "buy_price": o.buy_price,
+                "mark": o.mark,
+                "opened_at": o.opened_at,
+                "gross_pnl_usd": o.gross_pnl_usd,
+                "fees_usd": o.fees_usd,
+                "llm_cost_usd": o.attributed_llm_cost_usd,
+                "net_pnl_usd": o.net_pnl_usd,
+                "buy_run_id": o.buy_run_id,
+            }
+            for o in pnl.open
+        ],
+        "totals": {
+            "realised_gross_usd": pnl.total_realised_gross_usd,
+            "realised_fees_usd": pnl.total_realised_fees_usd,
+            "realised_llm_cost_usd": pnl.total_realised_llm_cost_usd,
+            "realised_net_usd": pnl.total_realised_net_usd,
+            "closed_count": len(pnl.closed),
+            "open_count": len(pnl.open),
+        },
+    }
+
+
 def fees_running_total() -> list[dict]:
     """Return ``[{at, fees_usd, cum_fees_usd}]`` ordered by fill time.
 

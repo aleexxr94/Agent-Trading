@@ -10,8 +10,10 @@ Layout:
   Stats grid — cost-today/cap meter, run count, positions, model-cost split
   Tabs:
     📊 Portfolio — positions table with P&L colouring, allocation, per-position bar
+    📒 Cycles — per-run summaries (rationale, candidate counts, cost)
     📜 Decisions — chronological stage decisions with full agent reasoning
-    📈 Performance — equity curve, cost-over-time, monthly cost breakdown
+    📈 Performance — equity curve, LLM-cost-over-time, trading-fees-over-time, monthly cost breakdown
+    💱 Trades — per-trade PnL (gross − fees − attributed LLM cost), closed + open lots, totals
     🤖 Agent Logs — latest artifacts (research/scenarios/portfolio), next-run plan
     ⚙️ Settings — halt flag toggle, cost totals, README link
 """
@@ -371,6 +373,7 @@ tabs = st.tabs([
     "📒 Cycles",
     "📜 Decisions",
     "📈 Performance",
+    "💱 Trades",
     "🤖 Agent Logs",
     "⚙️ Settings",
 ])
@@ -824,8 +827,136 @@ with tabs[3]:
         st.info("No monthly cost data yet.")
 
 
-# ===== Tab 4: Agent Logs =====
+# ===== Tab 4: Trades =====
 with tabs[4]:
+    st.markdown(
+        '<div class="at-section-label">Per-trade PnL — gross − fees − attributed LLM cost</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Each row pairs a buy fill with the sell that closed it (FIFO). "
+        "Fees are real, pulled per-fill from Alpaca activities. "
+        "LLM cost is the opening run's total split evenly across the positions "
+        "it opened (per the locked methodology). Net = gross − fees − LLM."
+    )
+    view = dd.trades_pnl_view(marks=broker_marks)
+    totals = view["totals"]
+
+    tcols = st.columns(4)
+    for col, label, value, fmt in [
+        (tcols[0], "Closed trades", totals["closed_count"], "{}"),
+        (tcols[1], "Open lots", totals["open_count"], "{}"),
+        (
+            tcols[2],
+            "Realised net",
+            totals["realised_net_usd"],
+            "${:,.2f}",
+        ),
+        (
+            tcols[3],
+            "Realised fees",
+            totals["realised_fees_usd"],
+            "${:,.2f}",
+        ),
+    ]:
+        with col:
+            cls = "pos" if (isinstance(value, (int, float)) and value > 0) else (
+                "neg" if (isinstance(value, (int, float)) and value < 0) else ""
+            )
+            st.markdown(
+                f'<div class="at-stat">'
+                f'<div class="at-stat-label">{label}</div>'
+                f'<div class="at-stat-value {cls}">{fmt.format(value)}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # Shared color formatter for Gross / Net columns on both the closed
+    # and open tables. Codex P1 caught a previous version that defined
+    # this inside the `if view["closed"]:` branch — when the closed list
+    # was empty but open lots existed, the open-table block raised
+    # UnboundLocalError. Hoisting to the outer scope keeps both branches
+    # independently renderable.
+    def _pnl_color(v):
+        if v is None or (isinstance(v, float) and v != v):
+            return "color: #94a3b8"
+        return "color: #059669; font-weight: 600" if v >= 0 else "color: #dc2626; font-weight: 600"
+
+    st.markdown(
+        '<div class="at-section-label" style="margin-top:1.2rem;">'
+        'Closed trades</div>',
+        unsafe_allow_html=True,
+    )
+    if view["closed"]:
+        df_closed = pd.DataFrame(view["closed"])
+        df_closed = df_closed.rename(columns={
+            "symbol": "Symbol",
+            "kind": "Kind",
+            "qty": "Qty",
+            "buy_price": "Entry",
+            "sell_price": "Exit",
+            "opened_at": "Opened",
+            "closed_at": "Closed",
+            "gross_pnl_usd": "Gross",
+            "fees_usd": "Fees",
+            "llm_cost_usd": "LLM",
+            "net_pnl_usd": "Net",
+            "buy_run_id": "Run",
+        })
+
+        sty = df_closed.style.format({
+            "Entry": "${:,.4f}",
+            "Exit": "${:,.4f}",
+            "Gross": "${:,.2f}",
+            "Fees": "${:,.2f}",
+            "LLM": "${:,.4f}",
+            "Net": "${:,.2f}",
+        }).map(_pnl_color, subset=["Gross", "Net"])
+        st.dataframe(sty, width="stretch", hide_index=True)
+    else:
+        st.info(
+            "No closed trades yet. Closed-trade rows appear once a position "
+            "is fully sold and the activities sync picks up the close."
+        )
+
+    st.markdown(
+        '<div class="at-section-label" style="margin-top:1.2rem;">'
+        'Open lots (unrealised)</div>',
+        unsafe_allow_html=True,
+    )
+    if view["open"]:
+        df_open = pd.DataFrame(view["open"])
+        df_open = df_open.rename(columns={
+            "symbol": "Symbol",
+            "kind": "Kind",
+            "qty": "Qty",
+            "buy_price": "Entry",
+            "mark": "Mark",
+            "opened_at": "Opened",
+            "gross_pnl_usd": "Gross",
+            "fees_usd": "Fees",
+            "llm_cost_usd": "LLM",
+            "net_pnl_usd": "Net",
+            "buy_run_id": "Run",
+        })
+        sty_o = df_open.style.format({
+            "Entry": "${:,.4f}",
+            "Mark": lambda v: "—" if v is None else f"${v:,.4f}",
+            "Gross": lambda v: "—" if v is None else f"${v:,.2f}",
+            "Fees": "${:,.2f}",
+            "LLM": "${:,.4f}",
+            "Net": lambda v: "—" if v is None else f"${v:,.2f}",
+        }).map(_pnl_color, subset=["Gross", "Net"])
+        st.dataframe(sty_o, width="stretch", hide_index=True)
+    else:
+        st.info(
+            "No open lots. Open lots populate once the activities sync writes "
+            "fills into state/trades.jsonl."
+        )
+
+
+# ===== Tab 5: Agent Logs =====
+with tabs[5]:
     if latest_rid is None:
         st.info("No runs yet.")
     else:
@@ -868,8 +999,8 @@ with tabs[4]:
         st.info("No next-run plan written yet.")
 
 
-# ===== Tab 5: Settings =====
-with tabs[5]:
+# ===== Tab 6: Settings =====
+with tabs[6]:
     st.markdown('<div class="at-section-label">Mode</div>', unsafe_allow_html=True)
     mode_pills = []
     mode_pills.append('<span class="at-pill paper">● PAPER</span>' if not live_trading

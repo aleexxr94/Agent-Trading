@@ -470,10 +470,60 @@ def stage_execute(ctx: StageContext, portfolio: dict, scenarios_out: dict | None
             "opens": len(plan.requests),
             "options_skipped": len(plan.skipped),
             "results": [
-                {"symbol": r.symbol, "qty": r.qty, "side": r.side, "status": r.status}
+                {
+                    "symbol": r.symbol,
+                    "qty": r.qty,
+                    "side": r.side,
+                    "status": r.status,
+                    # Phase 2 per-trade PnL: surface broker_order_id so the
+                    # activities sync (lib/trades_sync.sync_fills_from_alpaca)
+                    # can attribute each fill to this run via the
+                    # order_id_to_run_id map built by
+                    # lib/trades_sync.order_id_to_run_id_from_runs.
+                    "broker_order_id": r.broker_order_id,
+                }
                 for r in results
             ],
         }
+        # Per-run orders index — read by lib/trades_sync to build the
+        # order_id_to_run_id map without re-parsing the full decisions log.
+        # Atomic JSON write so concurrent dashboard reads always see a
+        # complete file (state.write_json uses a tmp+rename).
+        accepted_order_ids = [
+            r.broker_order_id for r in results
+            if r.broker_order_id and not r.status.startswith(("error", "skipped"))
+        ]
+        state.write_json(
+            state.run_dir(ctx.run_id) / "orders.json",
+            {
+                "run_id": ctx.run_id,
+                "submitted_at": state.utcnow_iso(),
+                "order_ids": accepted_order_ids,
+            },
+        )
+
+        # Pull fills + fees back from Alpaca and append to trades.jsonl so
+        # the dashboard's per-trade PnL + fees chart reflect actual broker
+        # activity. Run EVERY cycle that reaches stage_execute with a broker
+        # connection — not just cycles that submitted new orders. Codex P1
+        # caught the earlier `if accepted_order_ids` gate: it would miss
+        # fills from prior cycles' orders that filled late (partials, slow
+        # routing, out-of-hours fills) and leave trades.jsonl stale until
+        # another new order happened to fire. The sync is idempotent (PR
+        # #52: known_ids dedupe) so re-running every cycle is cheap.
+        try:
+            from lib import trades_sync
+            trades_sync.sync_fills_from_alpaca(
+                trading_client=getattr(ctx.broker, "_client", None),
+                order_id_to_run_id=trades_sync.order_id_to_run_id_from_runs(),
+            )
+        except Exception as e:
+            # Failures are soft — sync is best-effort and the next cycle's
+            # sync will pick up missed fills. Label lands on next_run.json
+            # so the dashboard Agent Logs tab can surface persistent errors.
+            next_run["trades_sync_error"] = (
+                f"sync_fills_from_alpaca: {type(e).__name__}: {e}"
+            )
     if not ctx.dry_run:
         state.write_json(state.NEXT_RUN, next_run)
         # NAV history: one row per run for the dashboard equity curve.

@@ -318,36 +318,41 @@ def sync_fills_from_alpaca(
     )
 
 
-def order_id_to_run_id_from_decisions() -> dict[str, str]:
-    """Best-effort map from Alpaca order_id → run_id, built from past
-    execute-stage decision log entries.
+def order_id_to_run_id_from_runs() -> dict[str, str]:
+    """Build the {broker_order_id: run_id} map from per-run orders.json files.
 
-    Today the execute stage doesn't record broker_order_id alongside the
-    submission (PR #46 wired the broker in but doesn't surface the order
-    id back into the decision log payload). Until that lands this map
-    will be empty for current/historical runs and new fills will
-    attribute as run_id=None.
+    The orchestrator writes ``state/runs/{run_id}/orders.json`` after every
+    execute stage that submits orders. Each file lists the order_ids
+    Alpaca accepted in that cycle. This helper walks every run dir,
+    reads each orders.json, and builds the union map.
 
-    PR after this should add ``broker_order_id`` to ``next_run["order_plan"]
-    ["results"]`` so this helper has data to work with.
+    Used by the activities sync to stamp each fill's ``run_id`` so
+    ``lib/trades.compute_trades_pnl`` can attribute LLM cost per the
+    locked methodology (per-position equal split of the opening run's
+    cost). Order_ids missing from the map land as ``run_id=None`` — those
+    are treated as manual operator trades with zero LLM attribution.
     """
-    out: dict[str, str] = {}
-    if not state.DECISIONS_LOG.exists():
-        return out
     import json as _json
-    for line in state.DECISIONS_LOG.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
+    out: dict[str, str] = {}
+    runs_dir = state.RUNS_DIR
+    if not runs_dir.exists():
+        return out
+    for run_dir in runs_dir.iterdir():
+        orders_path = run_dir / "orders.json"
+        if not orders_path.exists():
             continue
         try:
-            d = _json.loads(line)
-        except _json.JSONDecodeError:
+            data = _json.loads(orders_path.read_text(encoding="utf-8"))
+        except (_json.JSONDecodeError, OSError):
             continue
-        if d.get("stage") != "execute":
-            continue
-        rid = d.get("run_id")
-        # The decision log row points at output_ref="next_run.json"; we
-        # could load that file and read its order_plan but the file gets
-        # overwritten each run. The right home for this map is the per-run
-        # state/runs/{run_id}/orders.json — that lands in the follow-up PR.
-        _ = rid  # placeholder until follow-up PR
+        rid = data.get("run_id") or run_dir.name
+        for oid in data.get("order_ids") or []:
+            if oid:
+                out[oid] = rid
     return out
+
+
+# Backwards-compat alias so callers from PR #55 era still resolve. The
+# function it pointed at always returned {} (it was a stub flagged as
+# "lands in follow-up PR" — this PR is the follow-up).
+order_id_to_run_id_from_decisions = order_id_to_run_id_from_runs
