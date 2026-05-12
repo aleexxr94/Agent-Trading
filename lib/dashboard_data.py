@@ -229,20 +229,30 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
             "cost_usd": cost_by_run.get(rid, 0.0),
         }
 
-        # portfolio.json — the headline result + rationales
+        # portfolio.json — the headline result + rationales.
+        # Defensive: artifact may be malformed (LLM output, partial writes
+        # on a crashed run). Guard everything that calls len() / .startswith()
+        # / treats a value as a string.
         portfolio_path = run_dir / "portfolio.json"
         if portfolio_path.exists():
             try:
                 p = json.loads(portfolio_path.read_text())
-                s["generated_at"] = p.get("generated_at", "")
-                s["all_cash"] = p.get("all_cash")
-                s["positions_count"] = len(p.get("positions", []))
-                s["construction_rationale"] = p.get("construction_rationale", "")
-                s["all_cash_rationale"] = p.get("all_cash_rationale", "") or ""
-            except (json.JSONDecodeError, OSError):
+                if isinstance(p, dict):
+                    s["generated_at"] = p.get("generated_at", "") or ""
+                    s["all_cash"] = p.get("all_cash")
+                    positions = p.get("positions")
+                    s["positions_count"] = len(positions) if isinstance(positions, list) else 0
+                    s["construction_rationale"] = p.get("construction_rationale", "") or ""
+                    s["all_cash_rationale"] = p.get("all_cash_rationale", "") or ""
+            except (json.JSONDecodeError, OSError, TypeError):
                 pass
 
-        # Funnel widths from screen/research/scenarios
+        # Funnel widths from screen/research/scenarios.
+        # The artifacts are LLM output and only loosely validated — a
+        # crashed/interrupted stage can persist `{"passed": null}` or
+        # other off-schema shapes. Guard the len() call so one bad
+        # artifact doesn't kill the whole Cycles tab render (Codex P1
+        # on PR #35).
         for name, key in (
             ("screen.json", "screened_count"),
             ("research.json", "researched_count"),
@@ -253,21 +263,25 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
                 continue
             try:
                 data = json.loads(f.read_text())
-                if name == "screen.json":
-                    s[key] = len(data.get("passed", []))
-                else:
-                    s[key] = len(data.get("candidates", []))
-            except (json.JSONDecodeError, OSError):
+                field = "passed" if name == "screen.json" else "candidates"
+                val = data.get(field) if isinstance(data, dict) else None
+                s[key] = len(val) if isinstance(val, list) else 0
+            except (json.JSONDecodeError, OSError, TypeError):
+                # TypeError covers exotic deserialisation outcomes; leave
+                # the count at its 0 default rather than crashing the
+                # whole summary loop.
                 pass
 
-        # next_run.json — meta-scheduler's cadence call
+        # next_run.json — meta-scheduler's cadence call.
+        # Same defensive pattern as above: any field could be null.
         nr = run_dir / "next_run.json"
         if nr.exists():
             try:
                 d = json.loads(nr.read_text())
-                s["next_run_at"] = d.get("next_run_at", "")
-                s["next_run_rationale"] = d.get("rationale", "")
-            except (json.JSONDecodeError, OSError):
+                if isinstance(d, dict):
+                    s["next_run_at"] = d.get("next_run_at", "") or ""
+                    s["next_run_rationale"] = d.get("rationale", "") or ""
+            except (json.JSONDecodeError, OSError, TypeError):
                 pass
 
         summaries.append(s)
