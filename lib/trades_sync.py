@@ -11,11 +11,14 @@ every orchestrator cycle).
 
 Fee handling: Alpaca returns fees (OCC, REG, TAF, etc.) as SEPARATE
 activities from their parent fills. We pull both pools in one sync,
-match fees to fills by ``order_id``, sum into ``fees_usd``, and emit
-one trade row per fill. Fees that arrive in a later sync window — e.g.
-overnight clearing-house adjustments — get folded into a follow-up
-``reconcile_fees`` pass. For paper equity trading Alpaca currently
-reports $0 fees; option contracts pick up the OCC/SEC schedule.
+match fees to fills by ``order_id``, and SPLIT each order's total fee
+proportionally by qty across the (possibly multiple) FILL activities
+sharing that order_id — Alpaca emits one FILL per execution
+(``type=partial_fill`` for partials), so a single order can produce
+several FILL rows that must each carry their share of the fee. Codex
+P1 on PR #55 caught the pre-fix bug where every partial fill received
+the FULL order fee. For paper equity trading Alpaca currently reports
+$0 fees; option contracts pick up the OCC/SEC schedule.
 
 Run-id attribution: the optional ``order_id_to_run_id`` map lets the
 caller stamp the run_id of the orchestrator cycle that submitted each
@@ -36,6 +39,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import state
+
+
+# Alpaca's activities API paginates with a hard max of 100 rows per page.
+# We loop until a page returns fewer than this OR until we see no new IDs,
+# whichever comes first. The cap below is a safety rail against an upstream
+# pagination bug (or a stub test) returning the same page forever.
+_PAGE_SIZE = 100
+_MAX_PAGES = 200   # 20k rows; far above any plausible single-sync volume
 
 
 # Alpaca activity types that represent fees we want to fold into a fill's
@@ -92,6 +103,70 @@ def _normalize_side(side: Any) -> str:
     return "buy" if s == "buy" else "sell"
 
 
+def _is_unsupported_activity_404(exc: BaseException) -> bool:
+    """Return True iff ``exc`` represents an Alpaca 404 for an unsupported
+    activity type — the only fee-endpoint failure mode we want to silently
+    skip. Anything else (auth, 5xx, rate limit, parse error) must surface
+    so the operator notices instead of writing fills with silently-wrong
+    fees_usd=0.
+
+    Detection: alpaca-py wraps Alpaca's error responses in
+    ``alpaca.common.exceptions.APIError`` with a ``.status_code`` attribute.
+    A 404 here means the activity type isn't applicable to this account
+    (e.g. TAF on an account that never traded equities). httpx-level
+    HTTPStatusError can also surface; we honour the same status check.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        # httpx-level errors carry status via .response.status_code.
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None) if resp is not None else None
+    return status == 404
+
+
+def _paginate_activities(
+    trading_client: Any, *, activity_type: str, after: str | None,
+) -> list[dict]:
+    """Walk every page of ``/account/activities/{activity_type}``.
+
+    Codex P2 on PR #55: Alpaca's activities endpoint caps a single response
+    at 100 rows. Without pagination, syncs after a high-volume period (or
+    a long offline window) silently drop the older fills past row 100,
+    leaving permanent gaps in trades.jsonl.
+
+    Strategy: request ``page_size=100``; if the response is full (== 100),
+    use the LAST row's ``id`` as the next ``page_token`` and re-request.
+    Loop until a short page or empty response. Safety-capped at
+    ``_MAX_PAGES`` so a buggy upstream can't spin us.
+
+    Stub tests can either:
+      - return a single non-full list (one page → loop exits naturally), or
+      - implement ``page_token``-aware paging in their fake client.
+    """
+    all_rows: list[dict] = []
+    page_token: str | None = None
+    for _ in range(_MAX_PAGES):
+        params: dict[str, Any] = {"page_size": _PAGE_SIZE}
+        if after:
+            params["after"] = after
+        if page_token:
+            params["page_token"] = page_token
+        chunk = trading_client.get(f"/account/activities/{activity_type}", params)
+        if not isinstance(chunk, list) or not chunk:
+            break
+        all_rows.extend(chunk)
+        if len(chunk) < _PAGE_SIZE:
+            break  # short page = last page
+        # Alpaca's pagination uses the last row's id as the next token.
+        last_id = chunk[-1].get("id")
+        if not last_id or last_id == page_token:
+            # Defensive: if upstream is misbehaving and not advancing the
+            # cursor, exit rather than loop forever.
+            break
+        page_token = last_id
+    return all_rows
+
+
 def _build_fee_index(fee_rows: list[dict]) -> dict[str, float]:
     """Sum ``net_amount`` (absolute value) per ``order_id`` across fee activities.
 
@@ -141,64 +216,95 @@ def sync_fills_from_alpaca(
         broker = AlpacaBroker()
         trading_client = broker._client  # noqa: SLF001
 
-    # ---- Pull FILL activities ----
-    params: dict = {}
-    if after:
-        params["after"] = after
-    fill_rows = trading_client.get("/account/activities/FILL", params) or []
+    # ---- Pull FILL activities (paginated) ----
+    fill_rows = _paginate_activities(
+        trading_client, activity_type="FILL", after=after,
+    )
 
-    # ---- Pull fee activities (each type is a separate endpoint) ----
+    # ---- Pull fee activities (paginated per fee type) ----
+    # Codex P1 on PR #55: narrow exception handling. Catch only 404
+    # (== "this account doesn't have this activity type"); let
+    # auth / 5xx / rate-limit / parse errors propagate so the operator
+    # sees a real failure instead of fills being silently written with
+    # fees_usd=0.
     fee_rows: list[dict] = []
     for ftype in _FEE_ACTIVITY_TYPES:
         try:
-            chunk = trading_client.get(f"/account/activities/{ftype}", params) or []
-        except Exception:
-            # Some fee types may not exist on a given account — Alpaca
-            # returns 404 on unknown activity_type. Skip rather than fail
-            # the whole sync; missing fees just mean fees_usd=0 for now.
-            chunk = []
-        if isinstance(chunk, list):
-            fee_rows.extend(chunk)
+            fee_rows.extend(_paginate_activities(
+                trading_client, activity_type=ftype, after=after,
+            ))
+        except Exception as e:
+            if _is_unsupported_activity_404(e):
+                continue
+            raise
 
     fee_index = _build_fee_index(fee_rows)
 
-    # ---- Append new fills idempotently ----
+    # ---- Plan new fills and split fees pro-rata by qty (Codex P1) ----
+    # Group new (unseen) fills by order_id so we can compute each fill's
+    # share of the order-level fee. A single order can produce multiple
+    # FILL activities (partial_fill); assigning the full fee to each
+    # would double-count.
     known_ids = state.read_trade_activity_ids()
-    written = 0
-    fees_matched = 0
     order_id_to_run_id = order_id_to_run_id or {}
 
+    new_fills_by_order: dict[str, list[dict]] = defaultdict(list)
+    seen_this_call: set[str] = set()
     for row in fill_rows:
         aid = row.get("id")
         if not aid or aid in known_ids:
             continue
-        symbol = row.get("symbol") or ""
-        order_id = row.get("order_id") or ""
-        fee_for_order = fee_index.get(order_id, 0.0)
-        if fee_for_order > 0:
-            fees_matched += 1
-        state.append_trade({
-            "activity_id": aid,
-            "alpaca_order_id": order_id,
-            "symbol": symbol,
-            "kind": _normalize_kind(symbol),
-            "side": _normalize_side(row.get("side")),
-            "qty": _to_float(row.get("qty")),
-            "fill_price": _to_float(row.get("price")),
-            "fees_usd": fee_for_order,
-            "filled_at": row.get("transaction_time") or "",
-            "run_id": order_id_to_run_id.get(order_id),
-        })
-        written += 1
+        if aid in seen_this_call:
+            # Same activity_id appeared twice in fill_rows — happens when an
+            # upstream pagination bug returns the same page repeatedly. The
+            # _paginate_activities guard exits the loop quickly but the
+            # already-consumed duplicate page is still in fill_rows; skip it
+            # here so trades.jsonl gets one row per fill, not multiple.
+            continue
+        seen_this_call.add(aid)
+        oid = row.get("order_id") or ""
+        new_fills_by_order[oid].append(row)
 
-    # Fees that didn't match anything we wrote — could be from an older
-    # fill already in trades.jsonl. PR #58 will add a separate reconcile
-    # pass that updates existing rows with late-arriving fees. For now
-    # report the count so the operator can see whether reconciliation is
-    # worth wiring up immediately.
-    fills_written_orders = {
-        row.get("order_id") for row in fill_rows if row.get("id") not in known_ids
-    }
+    # ---- Append new fills with pro-rata fees ----
+    written = 0
+    fees_matched = 0
+    fills_written_orders: set[str] = set()
+    for oid, rows in new_fills_by_order.items():
+        order_fee_total = fee_index.get(oid, 0.0)
+        # Sum qty across the NEW fills for this order so the split
+        # denominator is consistent. Caveat: if part of this order
+        # already has fills on disk (from a prior sync window) and fees
+        # for that order are also arriving now, this sync's split will
+        # over-allocate fees to NEW fills. That partial-fill-across-sync
+        # case is rare in practice (orders fill in seconds) and is
+        # explicitly the territory of the reconcile-fees pass flagged
+        # for PR #58 / Phase 2.5.
+        total_qty = sum(_to_float(r.get("qty")) for r in rows) or 0.0
+        for row in rows:
+            aid = row.get("id")
+            symbol = row.get("symbol") or ""
+            qty = _to_float(row.get("qty"))
+            if total_qty > 0 and order_fee_total > 0:
+                fee_share = order_fee_total * (qty / total_qty)
+            else:
+                fee_share = 0.0
+            if fee_share > 0:
+                fees_matched += 1
+            state.append_trade({
+                "activity_id": aid,
+                "alpaca_order_id": oid,
+                "symbol": symbol,
+                "kind": _normalize_kind(symbol),
+                "side": _normalize_side(row.get("side")),
+                "qty": qty,
+                "fill_price": _to_float(row.get("price")),
+                "fees_usd": fee_share,
+                "filled_at": row.get("transaction_time") or "",
+                "run_id": order_id_to_run_id.get(oid),
+            })
+            written += 1
+            fills_written_orders.add(oid)
+
     fees_unmatched = sum(
         1 for oid in fee_index
         if oid not in fills_written_orders
