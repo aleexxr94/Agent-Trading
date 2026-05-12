@@ -151,22 +151,41 @@ def filter_chain(
     snaps: Iterable[ChainSnapshot],
     *,
     spot: float,
-    min_dte: int = 14,
-    max_dte: int = 75,
-    atm_band_pct: float = 25.0,
+    min_dte: int = 21,
+    max_dte: int = 45,
+    atm_band_pct: float = 10.0,
     max_spread_pct: float = 25.0,
+    max_per_direction_per_expiry: int | None = 6,
 ) -> list[ChainSnapshot]:
     """Reduce a raw chain to the agent-worthy subset.
 
-    Defaults match the strike/DTE guidance in prompts/scenarios.md:
-      - 14-75 DTE band (covers the 30-60 DTE long-put sweet spot plus
-        slack on either side for catalyst-driven shorter holds and slow
-        themes).
-      - ATM ±25% strike band (deep ITM/OTM rarely add information; the
-        long-put sweet spot of 0.30-0.40 delta usually sits within ±15%
-        but ±25% leaves room for the bear-case bull cases).
-      - max spread 25% of mid (filters dead-zone strikes whose marks
-        the agent shouldn't trust).
+    Defaults sized for the scenarios prompt's input budget. SPY/QQQ have
+    daily, weekly, and monthly expiries with 50+ strikes each — a loose
+    filter explodes the payload. 2026-05-12T22:07 live regression: with
+    the old ATM ±25% / DTE 14-75 / no per-expiry cap, chains.json hit
+    2.3MB and the embedded prompt blew Sonnet's input window, leaving
+    the scenarios stage hung indefinitely.
+
+    Filter chain (each is a hard reject):
+      - ``min_dte``-``max_dte`` (21–45 default): covers the 30 DTE
+        long-put sweet spot in PR #57's scenarios prompt with a small
+        margin on either side. Tighter than the old 14-75 because
+        sub-21 DTE is heavy theta and 45+ DTE rarely beats nearer
+        contracts on cost-per-day-of-exposure.
+      - ATM ``atm_band_pct`` (±10% default): the 0.30-0.40Δ long-put
+        zone sits inside ±10% on the underlying we trade. Old ±25%
+        included deep ITM/OTM strikes the agent never picks anyway.
+      - ``max_spread_pct`` (25% default): dead-zone strikes whose marks
+        the agent shouldn't trust get filtered.
+      - ``max_per_direction_per_expiry`` (6 default): hard cap on the
+        number of strikes kept per (expiry, type) bucket — strikes
+        closest to spot win. Bounds the worst case regardless of how
+        many strikes the broker lists. SET TO ``None`` TO DISABLE.
+
+    For SPY at $530:
+      - Old (±25% / 14-75 DTE / no cap): ~1100 calls × 1100 puts
+      - New (±10% / 21-45 DTE / 6/expiry): ~30 calls × 30 puts per
+        underlying → ~180 rows total across SPY/QQQ/TLT (vs ~2500).
     """
     band = spot * (atm_band_pct / 100.0)
     lo, hi = spot - band, spot + band
@@ -179,6 +198,16 @@ def filter_chain(
         if s.spread_pct > max_spread_pct:
             continue
         kept.append(s)
+    if max_per_direction_per_expiry is not None and max_per_direction_per_expiry > 0:
+        # Bucket by (expiry, type) and keep only the strikes closest to spot.
+        from collections import defaultdict as _dd
+        buckets: dict[tuple[str, str], list[ChainSnapshot]] = _dd(list)
+        for s in kept:
+            buckets[(s.expiry, s.type)].append(s)
+        kept = []
+        for rows in buckets.values():
+            rows.sort(key=lambda r: abs(r.strike - spot))
+            kept.extend(rows[:max_per_direction_per_expiry])
     return kept
 
 
@@ -255,10 +284,11 @@ class ChainFetcher:
         *,
         spot: float,
         today: date | None = None,
-        min_dte: int = 14,
-        max_dte: int = 75,
-        atm_band_pct: float = 25.0,
+        min_dte: int = 21,
+        max_dte: int = 45,
+        atm_band_pct: float = 10.0,
         max_spread_pct: float = 25.0,
+        max_per_direction_per_expiry: int | None = 6,
     ) -> dict:
         """Fetch + filter + summarise a real chain for ``underlying``.
 
@@ -300,6 +330,7 @@ class ChainFetcher:
             max_dte=max_dte,
             atm_band_pct=atm_band_pct,
             max_spread_pct=max_spread_pct,
+            max_per_direction_per_expiry=max_per_direction_per_expiry,
         )
         if not kept:
             raise ChainFetchError(

@@ -206,6 +206,69 @@ def test_filter_drops_wide_spread():
     assert [s.strike for s in kept] == [530]
 
 
+def test_filter_caps_strikes_per_direction_per_expiry():
+    """2026-05-12T22:07 live regression: SPY chain at ATM ±25% / 14-75 DTE
+    returned 1089 calls × 1160 puts = ~2.3MB JSON, blew Sonnet's input
+    window in the scenarios prompt. Per-expiry strike cap is the
+    backstop that keeps the payload bounded regardless of how many
+    strikes the broker lists. Cap to N nearest-to-spot per (expiry, type).
+    """
+    # 10 strikes one expiry one direction, cap to 4 → keep the 4 closest to spot.
+    snaps = [_cs(type="call", strike=spot, dte=30, bid=1, ask=1.1)
+             for spot in (510, 515, 520, 525, 530, 535, 540, 545, 550, 555)]
+    kept = oc.filter_chain(
+        snaps, spot=530, atm_band_pct=20, max_per_direction_per_expiry=4,
+    )
+    assert len(kept) == 4
+    # The 4 closest to spot=530 are 525, 530, 535, 520 (distance 5,0,5,10).
+    assert sorted(s.strike for s in kept) == [520, 525, 530, 535]
+
+
+def test_filter_per_expiry_cap_is_separate_per_call_vs_put_per_expiry():
+    """Cap applies per (expiry, type) bucket — calls and puts are
+    independent, and so are different expiries."""
+    snaps = (
+        # Expiry A, 6 calls, 6 puts
+        [_cs(type="call", strike=spot, dte=30) for spot in range(520, 542, 2)] +
+        [_cs(type="put",  strike=spot, dte=30) for spot in range(520, 542, 2)] +
+        # Expiry B, 6 calls
+        [_cs(type="call", strike=spot, dte=45) for spot in range(520, 542, 2)]
+    )
+    # Hack — _cs builds OSI using a fixed yymmdd; for the test we just need
+    # distinct (expiry, type) buckets. Since dte alone differs, the helper
+    # produces ChainSnapshots with the same expiry string. Override via the
+    # raw constructor for clarity:
+    snaps = [
+        oc.ChainSnapshot(
+            osi=f"SPY{i:08d}", underlying="SPY", type=s.type,
+            strike=s.strike, expiry=("2026-06-19" if s.dte == 30 else "2026-07-15"),
+            dte=s.dte, bid=s.bid, ask=s.ask, mid=s.mid,
+            spread_pct=s.spread_pct, iv=s.iv, delta=s.delta,
+            gamma=s.gamma, theta=s.theta, vega=s.vega,
+        )
+        for i, s in enumerate(snaps)
+    ]
+    kept = oc.filter_chain(
+        snaps, spot=530, atm_band_pct=20,
+        min_dte=21, max_dte=50,
+        max_per_direction_per_expiry=3,
+    )
+    # 3 per bucket × 3 buckets (calls@A, puts@A, calls@B) = 9
+    assert len(kept) == 9
+
+
+def test_filter_per_expiry_cap_none_disables_cap():
+    """Pass None to keep every row that passes the DTE/strike/spread
+    checks — useful for unit tests and rare cases where the caller wants
+    the full filtered chain."""
+    snaps = [_cs(type="call", strike=spot, dte=30, bid=1, ask=1.1)
+             for spot in (525, 530, 535)]
+    kept = oc.filter_chain(
+        snaps, spot=530, atm_band_pct=20, max_per_direction_per_expiry=None,
+    )
+    assert len(kept) == 3
+
+
 # ---------- summarise_chain ----------
 
 
