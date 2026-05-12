@@ -60,38 +60,53 @@ st.markdown(
     """
     <style>
       :root {
-        --bg-0: #0a0e17;
-        --bg-1: #111827;
-        --bg-2: #1f2937;
-        --border: #1f2937;
-        --text-0: #e5e7eb;
-        --text-1: #9ca3af;
-        --text-2: #6b7280;
-        --green: #10b981;
-        --green-soft: #064e3b;
-        --red: #ef4444;
-        --red-soft: #7f1d1d;
-        --amber: #f59e0b;
-        --amber-soft: #78350f;
-        --blue: #3b82f6;
-        --purple: #a855f7;
+        /* Light theme palette */
+        --bg-0:   #ffffff;
+        --bg-1:   #f8fafc;   /* slate-50  — card background */
+        --bg-2:   #f1f5f9;   /* slate-100 — meter track    */
+        --border: #e2e8f0;   /* slate-200 — card borders   */
+        --text-0: #0f172a;   /* slate-900 — primary text   */
+        --text-1: #475569;   /* slate-600 — secondary text */
+        --text-2: #94a3b8;   /* slate-400 — muted text     */
+        --green:       #059669;  /* emerald-600 */
+        --green-soft:  #d1fae5;  /* emerald-100 */
+        --green-text:  #065f46;  /* emerald-800 */
+        --red:         #dc2626;  /* red-600     */
+        --red-soft:    #fee2e2;  /* red-100     */
+        --red-text:    #991b1b;  /* red-800     */
+        --amber:       #d97706;  /* amber-600   */
+        --amber-soft:  #fef3c7;  /* amber-100   */
+        --amber-text:  #92400e;  /* amber-800   */
+        --blue:        #2563eb;  /* blue-600    */
+        --blue-soft:   #dbeafe;  /* blue-100    */
+        --blue-text:   #1e40af;  /* blue-800    */
+        --purple:      #7c3aed;  /* violet-600  */
+        --plot-grid:   #e2e8f0;  /* slate-200   */
       }
 
-      /* tighten the main container */
-      .block-container { padding-top: 1.2rem !important; padding-bottom: 4rem !important; max-width: 1400px; }
+      /* widen the main container — was bottle-necked at 1400px; use the full
+         viewport so a wide monitor doesn't leave empty bands on either side */
+      .block-container {
+        padding-top: 1.4rem !important;
+        padding-bottom: 4rem !important;
+        padding-left: 2rem !important;
+        padding-right: 2rem !important;
+        max-width: none !important;
+      }
 
       /* hero card */
       .at-hero {
-        background: linear-gradient(135deg, #111827 0%, #0a0e17 100%);
+        background: linear-gradient(135deg, var(--bg-1) 0%, var(--bg-0) 100%);
         border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 1.25rem 1.5rem;
-        margin-bottom: 0.75rem;
+        border-radius: 14px;
+        padding: 1.4rem 1.75rem;
+        margin-bottom: 0.9rem;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
       }
       .at-hero-row { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
-      .at-hero-label { color: var(--text-1); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; }
-      .at-hero-nav { font-size: 2.4rem; font-weight: 600; color: var(--text-0); letter-spacing: -0.02em; line-height: 1.1; margin-top: 0.1rem; }
-      .at-hero-sub { color: var(--text-1); font-size: 0.85rem; margin-top: 0.25rem; }
+      .at-hero-label { color: var(--text-1); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; }
+      .at-hero-nav { font-size: 3.1rem; font-weight: 800; color: var(--text-0); letter-spacing: -0.02em; line-height: 1.05; margin-top: 0.25rem; }
+      .at-hero-sub { color: var(--text-1); font-size: 0.95rem; margin-top: 0.4rem; font-weight: 500; }
 
       /* status pills */
       .at-pills { display: flex; gap: 0.5rem; flex-wrap: wrap; }
@@ -99,40 +114,41 @@ st.markdown(
         display: inline-flex;
         align-items: center;
         gap: 0.4rem;
-        padding: 0.25rem 0.7rem;
+        padding: 0.3rem 0.8rem;
         border-radius: 999px;
-        font-size: 0.78rem;
-        font-weight: 600;
+        font-size: 0.85rem;
+        font-weight: 700;
         letter-spacing: 0.02em;
         border: 1px solid transparent;
       }
-      .at-pill.paper      { background: #064e3b; color: #6ee7b7; border-color: #065f46; }
-      .at-pill.live       { background: #7f1d1d; color: #fecaca; border-color: #991b1b; }
-      .at-pill.orders-on  { background: #1e3a8a; color: #bfdbfe; border-color: #1e40af; }
-      .at-pill.orders-off { background: var(--bg-2); color: var(--text-1); border-color: var(--border); }
-      .at-pill.halted     { background: #b91c1c; color: #fff5f5; border-color: #dc2626;
+      .at-pill.paper      { background: var(--green-soft); color: var(--green-text); border-color: #a7f3d0; }
+      .at-pill.live       { background: var(--red-soft);   color: var(--red-text);   border-color: #fecaca; }
+      .at-pill.orders-on  { background: var(--blue-soft);  color: var(--blue-text);  border-color: #bfdbfe; }
+      .at-pill.orders-off { background: var(--bg-2);       color: var(--text-1);     border-color: var(--border); }
+      .at-pill.halted     { background: #fef2f2; color: var(--red-text); border-color: var(--red);
                             animation: at-pulse 1.5s ease-in-out infinite; }
-      .at-pill.allcash    { background: #78350f; color: #fde68a; border-color: #92400e; }
-      .at-pill.active     { background: #064e3b; color: #6ee7b7; border-color: #065f46; }
+      .at-pill.allcash    { background: var(--amber-soft); color: var(--amber-text); border-color: #fde68a; }
+      .at-pill.active     { background: var(--green-soft); color: var(--green-text); border-color: #a7f3d0; }
 
-      @keyframes at-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+      @keyframes at-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 
       /* slim risk strip — replaces the chunky old banner */
       .at-risk-strip {
-        background: #7f1d1d; color: #fecaca;
-        padding: 0.35rem 0.85rem; border-radius: 6px;
-        font-size: 0.78rem; text-align: center;
-        margin: 0 0 0.75rem 0;
-        border: 1px solid #991b1b;
+        background: var(--red); color: #fff5f5;
+        padding: 0.45rem 0.95rem; border-radius: 8px;
+        font-size: 0.9rem; font-weight: 600; text-align: center;
+        margin: 0 0 0.9rem 0;
+        border: 1px solid var(--red-text);
+        box-shadow: 0 1px 3px rgba(220, 38, 38, 0.18);
       }
 
       /* halted banner — sticks to top, pulses */
       .at-halt-banner {
         position: sticky; top: 0; z-index: 999;
-        background: #b91c1c; color: #fff5f5;
-        padding: 0.6rem 1rem; border-radius: 6px; margin-bottom: 0.75rem;
-        font-weight: 700; text-align: center;
-        box-shadow: 0 4px 12px rgba(185, 28, 28, 0.4);
+        background: var(--red); color: #ffffff;
+        padding: 0.7rem 1rem; border-radius: 8px; margin-bottom: 0.85rem;
+        font-weight: 800; font-size: 1rem; text-align: center;
+        box-shadow: 0 6px 18px rgba(220, 38, 38, 0.35);
         animation: at-pulse 1.5s ease-in-out infinite;
       }
 
@@ -140,35 +156,43 @@ st.markdown(
       .at-stat {
         background: var(--bg-1);
         border: 1px solid var(--border);
-        border-radius: 10px;
-        padding: 0.85rem 1rem;
+        border-radius: 12px;
+        padding: 1rem 1.15rem;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
       }
-      .at-stat-label { color: var(--text-1); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; }
-      .at-stat-value { color: var(--text-0); font-size: 1.35rem; font-weight: 600; margin-top: 0.15rem; }
-      .at-stat-sub { color: var(--text-2); font-size: 0.72rem; margin-top: 0.15rem; }
+      .at-stat-label { color: var(--text-1); font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; }
+      .at-stat-value { color: var(--text-0); font-size: 1.7rem; font-weight: 700; margin-top: 0.2rem; letter-spacing: -0.01em; }
+      .at-stat-sub { color: var(--text-1); font-size: 0.85rem; margin-top: 0.25rem; font-weight: 500; }
       .at-stat-value.pos { color: var(--green); }
       .at-stat-value.neg { color: var(--red); }
       .at-stat-value.warn { color: var(--amber); }
 
       /* cost meter bar */
-      .at-meter { height: 6px; background: var(--bg-2); border-radius: 999px; overflow: hidden; margin-top: 0.4rem; }
+      .at-meter { height: 7px; background: var(--bg-2); border-radius: 999px; overflow: hidden; margin-top: 0.5rem; }
       .at-meter-fill { height: 100%; background: var(--green); border-radius: 999px; transition: width 0.4s; }
       .at-meter-fill.warn { background: var(--amber); }
       .at-meter-fill.danger { background: var(--red); }
 
-      /* tighter tab look */
-      .stTabs [data-baseweb="tab-list"] { gap: 0.25rem; border-bottom: 1px solid var(--border); }
-      .stTabs [data-baseweb="tab"] { padding: 0.5rem 1rem; }
+      /* tabs */
+      .stTabs [data-baseweb="tab-list"] { gap: 0.3rem; border-bottom: 1px solid var(--border); }
+      .stTabs [data-baseweb="tab"] { padding: 0.65rem 1.2rem; font-size: 0.95rem; font-weight: 600; }
 
-      /* dataframe row hover */
-      [data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 8px; }
+      /* dataframe */
+      [data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
 
       /* subtle subheaders */
-      h2, h3 { color: var(--text-0); font-weight: 600; letter-spacing: -0.01em; }
-      .at-section-label { color: var(--text-1); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; margin: 0.5rem 0 0.4rem 0; }
+      h1, h2, h3 { color: var(--text-0); font-weight: 700; letter-spacing: -0.01em; }
+      .at-section-label {
+        color: var(--text-1); font-size: 0.88rem; text-transform: uppercase;
+        letter-spacing: 0.08em; font-weight: 700;
+        margin: 1rem 0 0.5rem 0;
+      }
 
       /* small-muted text */
-      .small-muted { color: var(--text-2); font-size: 0.78rem; }
+      .small-muted { color: var(--text-2); font-size: 0.85rem; }
+
+      /* slightly larger body type for readability */
+      .stMarkdown, .stCaption, p { font-size: 0.95rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -370,11 +394,13 @@ with tabs[0]:
 
         # Color-code Gross/Net P&L: green positive, red negative, neutral when blank.
         def _color_pnl(v):
+            # On a light background the brighter Tailwind-emerald-500 / red-500
+            # are washed-out; the -600 variants below carry better contrast.
             if v is None or (isinstance(v, float) and v != v):  # NaN check
-                return "color: var(--text-2)"
+                return "color: #94a3b8"
             if isinstance(v, (int, float)):
-                if v > 0: return "color: #10b981; font-weight: 600"
-                if v < 0: return "color: #ef4444; font-weight: 600"
+                if v > 0: return "color: #059669; font-weight: 700"
+                if v < 0: return "color: #dc2626; font-weight: 700"
             return ""
 
         styled = df_pos.style.map(_color_pnl, subset=["Gross P&L", "Net P&L"])
@@ -404,16 +430,16 @@ with tabs[0]:
                 labels=[r["label"] for r in pie_data],
                 values=[r["value"] for r in pie_data],
                 hole=0.55,
-                marker=dict(line=dict(color="#0a0e17", width=2)),
+                marker=dict(line=dict(color="#ffffff", width=2)),
             ))
             fig.update_layout(
-                template="plotly_dark",
+                template="plotly_white",
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
                 height=360,
                 margin=dict(l=10, r=10, t=40, b=10),
-                title=dict(text="Allocation — % NAV", font=dict(size=14, color="#e5e7eb")),
-                legend=dict(font=dict(color="#e5e7eb", size=11)),
+                title=dict(text="Allocation — % NAV", font=dict(size=15, color="#0f172a")),
+                legend=dict(font=dict(color="#0f172a", size=12)),
             )
             st.plotly_chart(fig, width="stretch")
 
@@ -425,19 +451,19 @@ with tabs[0]:
                     x=[r["Symbol"] for r in bar_rows],
                     y=[r["Net P&L"] for r in bar_rows],
                     marker_color=[
-                        "#10b981" if r["Net P&L"] >= 0 else "#ef4444" for r in bar_rows
+                        "#059669" if r["Net P&L"] >= 0 else "#dc2626" for r in bar_rows
                     ],
                 ))
                 fig_bar.update_layout(
-                    template="plotly_dark",
+                    template="plotly_white",
                     paper_bgcolor="rgba(0,0,0,0)",
                     plot_bgcolor="rgba(0,0,0,0)",
                     height=360,
                     margin=dict(l=10, r=10, t=40, b=10),
                     title=dict(text="Net P&L per position (USD)",
-                               font=dict(size=14, color="#e5e7eb")),
-                    yaxis=dict(title="USD", gridcolor="#1f2937"),
-                    xaxis=dict(tickfont=dict(size=10)),
+                               font=dict(size=15, color="#0f172a")),
+                    yaxis=dict(title="USD", gridcolor="#e2e8f0"),
+                    xaxis=dict(tickfont=dict(size=11)),
                 )
                 st.plotly_chart(fig_bar, width="stretch")
             else:
@@ -536,28 +562,28 @@ with tabs[2]:
         fig_nav.add_trace(go.Scatter(
             x=nav_df["at"], y=nav_df["nav_usd"], mode="lines+markers",
             name="NAV (USD)",
-            line=dict(width=2, color="#10b981"),
-            marker=dict(size=4, color="#10b981"),
+            line=dict(width=2.5, color="#059669"),
+            marker=dict(size=5, color="#059669"),
         ))
         if "net_pnl_usd" in nav_df.columns:
             fig_nav.add_trace(go.Scatter(
                 x=nav_df["at"], y=nav_df["net_pnl_usd"], mode="lines",
                 name="Cumulative Net P&L (USD)",
-                yaxis="y2", line=dict(dash="dot", color="#a855f7"),
+                yaxis="y2", line=dict(dash="dot", color="#7c3aed", width=2),
             ))
             fig_nav.update_layout(
                 yaxis2=dict(title="Net P&L (USD)", overlaying="y", side="right",
-                            showgrid=False, color="#a855f7"),
+                            showgrid=False, color="#7c3aed"),
             )
         fig_nav.update_layout(
-            template="plotly_dark",
+            template="plotly_white",
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            height=340, yaxis_title="NAV (USD)",
-            yaxis=dict(gridcolor="#1f2937", color="#10b981"),
-            xaxis=dict(gridcolor="#1f2937"),
+            height=360, yaxis_title="NAV (USD)",
+            yaxis=dict(gridcolor="#e2e8f0", color="#059669"),
+            xaxis=dict(gridcolor="#e2e8f0"),
             margin=dict(l=10, r=10, t=20, b=10),
-            legend=dict(orientation="h", y=1.1),
+            legend=dict(orientation="h", y=1.1, font=dict(size=12)),
         )
         st.plotly_chart(fig_nav, width="stretch")
     else:
@@ -573,17 +599,17 @@ with tabs[2]:
         fig.add_trace(go.Scatter(
             x=df["at"], y=df["cum_cost"], mode="lines",
             name="Cumulative LLM cost",
-            line=dict(color="#3b82f6", width=2),
+            line=dict(color="#2563eb", width=2.5),
             fill="tozeroy",
-            fillcolor="rgba(59, 130, 246, 0.1)",
+            fillcolor="rgba(37, 99, 235, 0.12)",
         ))
         fig.update_layout(
-            template="plotly_dark",
+            template="plotly_white",
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            height=300, yaxis_title="USD",
-            yaxis=dict(gridcolor="#1f2937"),
-            xaxis=dict(gridcolor="#1f2937"),
+            height=320, yaxis_title="USD",
+            yaxis=dict(gridcolor="#e2e8f0"),
+            xaxis=dict(gridcolor="#e2e8f0"),
             margin=dict(l=10, r=10, t=10, b=10),
             showlegend=False,
         )
