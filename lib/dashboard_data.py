@@ -6,6 +6,7 @@ installed. Keep this file streamlit-free.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -183,6 +184,11 @@ def try_load_broker_marks_and_costs() -> tuple[dict[str, float], dict[str, float
     Use cost-basis to compute P&L that matches Alpaca's reported numbers
     — the agent's `premium_paid` in portfolio.json is an estimate that's
     often 5-10× off real option premiums.
+
+    Kept for backwards-compatibility. New callers should prefer
+    ``try_load_broker_view()`` because this 2-tuple cannot distinguish
+    "broker unreachable" from "broker says zero positions" — both return
+    ({}, {}). The dashboard's stale-position filter needs that distinction.
     """
     try:
         from .alpaca_client import AlpacaBroker
@@ -193,6 +199,96 @@ def try_load_broker_marks_and_costs() -> tuple[dict[str, float], dict[str, float
         return marks_from_broker(broker), cost_basis_from_broker(broker)
     except Exception:
         return {}, {}
+
+
+@dataclass(frozen=True)
+class BrokerView:
+    """Snapshot of what the broker currently reports — distinguishes
+    "broker unreachable" (``available=False``) from "broker says zero
+    positions" (``available=True, held_keys=set()``).
+
+    ``marks`` and ``costs`` are keyed by the same shape used throughout
+    the codebase (ETF symbol or ``UNDERLYING|STRIKE|EXPIRY|TYPE``).
+    ``held_keys`` is exactly ``set(costs)`` precomputed; ``cost_basis_from_broker``
+    already filters qty == 0 so it's the truth about what's still open
+    on the broker.
+    """
+    marks: dict[str, float]
+    costs: dict[str, float]
+    held_keys: frozenset[str]
+    available: bool
+
+
+def try_load_broker_view() -> BrokerView:
+    """Best-effort fetch returning a BrokerView. On any failure path
+    ``available=False`` and all dicts/sets are empty, signalling to the
+    dashboard that it should NOT filter positions (since we can't tell
+    if a position is stale or just temporarily unreachable).
+
+    On success ``available=True`` and ``held_keys`` reflects what's
+    currently open at the broker. Dashboards should hide portfolio.json
+    rows that aren't in ``held_keys`` to avoid showing stale positions
+    after a manual close / kill-condition exit / expiry.
+
+    Codex P1 (PR #51): we must call ``broker.get_positions()`` directly
+    here, NOT through ``marks_from_broker`` / ``cost_basis_from_broker``
+    — those helpers swallow get_positions() exceptions and return ``{}``,
+    which is indistinguishable from "broker says zero positions". If we
+    routed through them, a transient broker failure would set
+    ``available=True, held_keys=set()`` and the dashboard filter would
+    blank the entire table. Calling get_positions() ourselves lets the
+    exception bubble to the outer ``except`` and flips ``available=False``,
+    so we degrade to "render everything from portfolio.json" instead.
+    """
+    try:
+        from .alpaca_client import AlpacaBroker
+        from .marks import marks_from_positions, cost_basis_from_positions
+        broker = AlpacaBroker()
+        positions = broker.get_positions()
+    except Exception:
+        return BrokerView(
+            marks={}, costs={}, held_keys=frozenset(), available=False,
+        )
+    marks = marks_from_positions(positions)
+    costs = cost_basis_from_positions(positions)
+    return BrokerView(
+        marks=marks,
+        costs=costs,
+        held_keys=frozenset(costs),
+        available=True,
+    )
+
+
+def mark_key_for_position(pos: dict) -> str:
+    """Return the key the broker would use for this portfolio position.
+
+    Must match lib.marks._key_for_broker_position so that membership tests
+    against ``BrokerView.held_keys`` work both ways round.
+    """
+    if pos["kind"] == "etf":
+        return pos["symbol"]
+    return f"{pos['underlying']}|{pos['strike']}|{pos['expiry']}|{pos['type']}"
+
+
+def split_positions_by_broker_holdings(
+    portfolio: dict, *, held_keys: frozenset[str] | set[str] | None,
+) -> tuple[list[dict], list[dict]]:
+    """Partition portfolio positions into (open_at_broker, closed_at_broker).
+
+    When ``held_keys`` is None the broker is unreachable — everything
+    stays in the open list (we can't tell what's actually held). When
+    ``held_keys`` is empty the broker reachably says zero positions, so
+    every portfolio entry is treated as closed.
+    """
+    if held_keys is None:
+        return list(portfolio.get("positions", [])), []
+    open_, closed = [], []
+    for p in portfolio.get("positions", []):
+        if mark_key_for_position(p) in held_keys:
+            open_.append(p)
+        else:
+            closed.append(p)
+    return open_, closed
 
 
 def latest_run_id() -> str | None:
@@ -315,6 +411,7 @@ def position_table_rows(
     portfolio: dict,
     marks: dict[str, float] | None = None,
     costs: dict[str, float] | None = None,
+    held_keys: frozenset[str] | set[str] | None = None,
 ) -> list[dict]:
     """Flatten ETF + option rows into uniform columns for st.dataframe.
 
@@ -339,6 +436,13 @@ def position_table_rows(
     costs = costs or {}
     out: list[dict] = []
     for p in portfolio.get("positions", []):
+        # Stale-position filter: when the broker is reachable and reports
+        # which keys it still holds, hide portfolio.json rows the broker
+        # no longer carries (manual close, kill-condition exit, expiry).
+        # held_keys=None means "broker unreachable, don't filter" — we
+        # render everything in that case rather than blank the dashboard.
+        if held_keys is not None and mark_key_for_position(p) not in held_keys:
+            continue
         if p["kind"] == "etf":
             key = p["symbol"]
             mark = marks.get(key)

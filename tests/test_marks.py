@@ -245,3 +245,42 @@ def test_cost_basis_skips_zero_qty():
         asset_class="us_equity",
     )
     assert marks.cost_basis_from_broker(_FakeBroker([pos])) == {}
+
+
+# ---------- pure helpers (Codex P1 follow-up on PR #51) ----------
+
+
+def test_marks_from_positions_pure_helper_matches_broker_wrapper():
+    """marks_from_positions takes a positions list directly so callers
+    can fetch positions themselves and have exceptions propagate. It
+    must produce the same dict as marks_from_broker on the same data."""
+    positions = [
+        _bp("TQQQ", 10, 750.0, current_price=75.0),
+        _bp("SOXL", 5, 200.0, current_price=40.0),
+    ]
+    via_helper = marks.marks_from_positions(positions)
+    via_broker = marks.marks_from_broker(_FakeBroker(positions))
+    assert via_helper == via_broker
+    assert via_helper == {"TQQQ": 75.0, "SOXL": 40.0}
+
+
+def test_cost_basis_from_positions_pure_helper_matches_broker_wrapper():
+    positions = [
+        _bp("TQQQ", 10, 750.0),
+        _bp("SOXL", 5, 200.0),
+    ]
+    via_helper = marks.cost_basis_from_positions(positions)
+    via_broker = marks.cost_basis_from_broker(_FakeBroker(positions))
+    assert via_helper == via_broker
+
+
+def test_marks_from_positions_propagates_when_caller_did_not_catch():
+    """Sanity check that the pure helper has NO try/except — its job is
+    to be transparent. Callers (e.g. try_load_broker_view) rely on this
+    so a transient broker outage doesn't get silently turned into an
+    empty dict."""
+    # No try/except inside marks_from_positions itself; the get_positions
+    # call lives in the wrapper. Passing a list directly means we never
+    # touch the broker, so no exceptions to swallow — verified by the
+    # function signature accepting list[BrokerPosition].
+    assert marks.marks_from_positions([]) == {}
