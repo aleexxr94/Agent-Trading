@@ -83,13 +83,16 @@ def scenarios() -> StageConfig:
         model=_model("MODEL_SCENARIOS", "claude-sonnet-4-6"),
         system_prompt=_load("scenarios.md"),
         schema_filename="scenarios.schema.json",
-        # 16384 (was 8192): each candidate emits 600-800 tokens of base/bull/bear
-        # scenarios with narratives. With 8 research-pair candidates feeding in,
-        # the first paper run hit exactly 8192 output tokens mid-JSON and the
-        # retry-with-error-feedback shrank itself to 2 candidates to fit.
-        # Result: portfolio constructor saw only 2 correlated 3x bull ETFs and
-        # correctly abstained to all-cash — but for the wrong reason.
-        max_tokens=16384,
+        # 32768 (was 16384, originally 8192): the relaxed scenarios.md from
+        # PR #26 made the stage emit a row for every researched candidate
+        # (instead of dropping low-EV ones). Combined with `thinking: adaptive`
+        # — which charges thinking tokens against the output budget — 16384
+        # wasn't enough: the first paper run after PR #26 truncated mid-string
+        # at ~7843 chars (~2000 output tokens after thinking consumed the rest)
+        # and both retry attempts failed the same way, crashing the orchestrator
+        # before construct could even run. 32k gives thinking ample room while
+        # still leaving 4-8k output tokens for 8 candidates of scenarios JSON.
+        max_tokens=32768,
         thinking={"type": "adaptive"},
         output_config_extras={"effort": "high"},
     )
