@@ -269,6 +269,18 @@ def test_filter_per_expiry_cap_none_disables_cap():
     assert len(kept) == 3
 
 
+def test_filter_per_expiry_cap_zero_keeps_zero_rows():
+    """Codex P2 (PR #60): only None disables the cap; 0 must drop every
+    row (legitimate "keep none" sentinel for callers building chain-data-
+    free runs). The previous `> 0` guard silently re-expanded the payload."""
+    snaps = [_cs(type="call", strike=spot, dte=30, bid=1, ask=1.1)
+             for spot in (525, 530, 535)]
+    kept = oc.filter_chain(
+        snaps, spot=530, atm_band_pct=20, max_per_direction_per_expiry=0,
+    )
+    assert kept == []
+
+
 # ---------- summarise_chain ----------
 
 

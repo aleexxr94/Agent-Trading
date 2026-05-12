@@ -198,8 +198,13 @@ def filter_chain(
         if s.spread_pct > max_spread_pct:
             continue
         kept.append(s)
-    if max_per_direction_per_expiry is not None and max_per_direction_per_expiry > 0:
+    if max_per_direction_per_expiry is not None:
         # Bucket by (expiry, type) and keep only the strikes closest to spot.
+        # Codex P2 (PR #60): only ``None`` disables the cap; ``0`` is a
+        # legitimate "keep zero rows per bucket" value (e.g. a caller
+        # building a chain-data-free run for testing). The earlier
+        # ``> 0`` guard silently re-expanded the payload when ``0`` was
+        # passed — exactly the regression this knob was added to prevent.
         from collections import defaultdict as _dd
         buckets: dict[tuple[str, str], list[ChainSnapshot]] = _dd(list)
         for s in kept:
