@@ -4,7 +4,7 @@ Stages:
   1. screen      → state/runs/{run_id}/screen.json   (Haiku)
   2. research    → state/runs/{run_id}/research.json (Sonnet — bull+bear in parallel per candidate)
   3. scenarios   → state/runs/{run_id}/scenarios.json (Sonnet)
-  4. construct   → state/runs/{run_id}/portfolio.json (Sonnet, 8–12 or all-cash)
+  4. construct   → state/runs/{run_id}/portfolio.json (Opus, 3–12 or all-cash)
   5. execute     → submit paper orders, write state/next_run.json
 
 `--dry-run` reads from tests/fixtures/* (no LLM, no orders). Live mode calls
@@ -554,7 +554,7 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
         model=cons_model,
     )
     if not risk.position_band_ok(len(portfolio["positions"]), portfolio["all_cash"]):
-        raise RuntimeError("portfolio violates 8–12 band / all-cash invariant")
+        raise RuntimeError("portfolio violates 3–12 band / all-cash invariant")
 
     next_run = _run_stage(
         ctx=ctx, stage_id="execute", schema="", output_filename="next_run.json",
