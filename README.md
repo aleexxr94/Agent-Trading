@@ -43,9 +43,108 @@ Per-stage model assignment matches the cost/quality demand of each decision. All
 | **research** (bull + bear, parallel) | `claude-sonnet-4-6` | Fans out 2× per candidate (~16 calls/run). Sonnet is the right cost/quality sweet spot at this fan-out. |
 | **scenarios** | `claude-sonnet-4-6` | Probability-weighted base/bull/bear case modelling. Well-defined output shape. |
 | **construct** | `claude-opus-4-6` | **The actual trade decision** — picks positions, sizing, kill conditions. Highest-stakes call on a $2,500 account where each trade matters disproportionately; gets the Opus tier. |
-| **orchestrator-meta** *(timing only, not yet wired)* | `claude-opus-4-6` | Decides next-run window from regime + portfolio state. Wires in Phase 9.1. |
+| **orchestrator-meta** *(timing only)* | `claude-opus-4-6` | Decides next-run window from regime + portfolio state. Bounded 1–24h, falls back to a 4h/6h heuristic if the LLM output is unusable. |
 
 Typical cost per orchestrator run on a real universe: **~$0.10–$0.50** (most of it in `construct`). Per-run cap defaults to $2; daily cap defaults to $10.
+
+---
+
+## What we scan & trade
+
+**Universe: 33 instruments** across 13 factor groups. Curated, not exhaustive — entries that fail runtime liquidity filters (ADV, spread, options OI) are rejected at screen time even though they're listed here.
+
+### Leveraged ETFs (28)
+
+Direct positions in 2x / 3x daily-rebalancing ETFs. Subject to per-position **15% NAV cap** and **25% loss kill condition**.
+
+| Factor | Bull | Bear |
+|---|---|---|
+| Nasdaq-100 (3x) | TQQQ | SQQQ |
+| S&P 500 (3x) | UPRO | SPXU |
+| Russell 2000 (3x) | TNA, URTY | TZA, SRTY |
+| Semiconductors (3x) | SOXL | SOXS |
+| Financials, broad (3x) | FAS | FAZ |
+| Financials, regional banks (3x) | DPST | — |
+| Biotech (3x) | LABU | LABD |
+| Healthcare (3x) | CURE | — |
+| China large-cap (3x) | YINN | YANG |
+| Energy (2x) | ERX | ERY |
+| Gold miners (2x) | NUGT | DUST |
+| VIX front-month (1.5x) | UVXY | — |
+| Natural Gas (2x) | BOIL | — |
+| Bitcoin futures (2x) | BITX, BITU | SBIT |
+| Ether futures (2x) | ETHU | — |
+
+### Option underlyings (5)
+
+The agent doesn't hold these as positions — only **listed calls / puts on them**. Long options only (no writes, no spreads). Subject to **100% premium kill condition**.
+
+| Symbol | Why |
+|---|---|
+| SPY | Most liquid options chain in the world; broad-market exposure |
+| QQQ | Tech-heavy options chain, very liquid |
+| IWM | Small-cap options chain |
+| DIA | Dow Jones — large-cap value tilt, different factor from SPY/QQQ |
+| TLT | 20+ Year Treasury — rates exposure, anti-correlated to equity-long |
+
+### What we explicitly don't trade
+
+- **Spot single-name equities** (no AAPL, NVDA, etc.) — too much idiosyncratic risk on a $2,500 account
+- **Unleveraged broad-market ETFs as positions** — SPY/QQQ/IWM/DIA/TLT are only entered via their options
+- **Direct spot crypto** (BTC/USD on Alpaca) — exposure is via the leveraged-ETF wrappers above instead, fits the existing schema
+- **Multi-leg option combos** — single-leg only for now (no spreads, condors, straddles)
+- **Live trading** — gate hard-disabled until §"Promotion to live" in [CLAUDE.md](./CLAUDE.md) is met
+
+---
+
+## How the agents work
+
+Each cycle, five agents run in sequence with **schema-validated JSON outputs**. Each agent has a role-specific system prompt under [`prompts/`](./prompts/). Anthropic prompt caching keeps the static system block + universe block cheap across calls.
+
+### 1. Screener — Haiku 4.5
+Receives the full 33-symbol universe with live **ADV**, **30-day historical volatility**, **last close** (fetched via `yfinance`). Applies liquidity filters and emits a `passed` candidate list. Cheap and fast — Haiku is right-sized for structured filtering. Output: `screen.json`.
+
+### 2. Adversarial research — Sonnet 4.6, parallel bull + bear
+For each of the **top 8 screened candidates**, two parallel LLM calls — one bull, one bear. **Bear must steel-man the bull case** before disagreeing (and vice versa); both sides are required by schema to list counterarguments. Each side returns a thesis, key drivers, counterarguments, and a confidence ∈ [0, 1]. Output: `research.json` with one row per candidate carrying `confidence_delta = bull.confidence − bear.confidence` and an `abstain` flag for genuinely-unclear cases.
+
+### 3. Scenario modelling — Sonnet 4.6
+For **every** researched candidate (including likely-negative-EV ones — *the constructor decides what to trade*), produces probability-weighted **base / bull / bear** cases:
+- 3 probabilities summing to 1.0 (±0.01)
+- Expected return per case (signed; bear typically negative)
+- Horizon in days (agent's choice — no hard-coded calendar rules)
+- `expected_value_pct` = probability-weighted return across cases
+- For options: explicit DTE rationale + strike rationale
+
+This is a **data-producing** stage, not a gating one. Output: `scenarios.json`.
+
+### 4. Portfolio construction — Opus 4.6 (the actual trade decision)
+Reads all scenarios, filters by:
+- Positive `expected_value_pct` (drops negative-EV candidates here)
+- Correlation across surviving positions (bull/bear pairs of the same factor count as one)
+- Stomach for the bear case
+
+Builds a **1–12 position portfolio** with sizing math:
+- ETFs: integer shares from `position_pct × NAV / share_price`, floored
+- Options: integer contracts at `position_pct × NAV / (premium × 100)`, floored
+- Hard 15% per-position NAV cap, sum of `position_pct` ≤ 100 (residual = cash buffer)
+- Explicit kill conditions per leg
+
+If every candidate is negative-EV, outputs **all-cash** with rationale. **A single strong positive-EV thesis is acceptable** — no artificial minimum-diversification rule; the 15% per-position cap is the concentration guard. Output: `portfolio.json`.
+
+### 5. Execution + meta-scheduling
+- **execute**: diffs target portfolio vs current Alpaca positions, emits **close orders first** (free cash) then **open orders**. Single-leg market orders for ETFs and options (option symbols built via OSI: `SPY260619C00530000` etc.). Gated behind `ORDERS_ENABLED=true` — default off so dry-runs are safe.
+- **meta** — Opus 4.6: given the freshly-built portfolio + recent NAV trend + time of day, decides when the **next cycle fires** (bounded 1–24h, falls back to a 4h/6h heuristic if the LLM output is unusable). Writes `state/next_run.json` for the systemd timer to pick up.
+
+### Risk controls (always-on)
+
+- **8% daily-drawdown circuit breaker**: NAV down ≥8% in a UTC day → next orchestrator run halts new orders; `monitor.py` still flattens. Resets at 00:00 UTC.
+- **`monitor.py`** (every 15 min during US market hours): re-evaluates kill conditions on every open position. Flattens via the broker. **Cannot open new positions** — it's a stop-loss daemon, not a trader.
+- **Halt flag (`state/halt.flag`)**: presence stops both orchestrator and monitor *before any API call*. Toggled from the dashboard, or `sudo -u agent touch /opt/agent-trading/state/halt.flag`.
+- **Cost caps**: per-run **$2**, daily **$10**. Cleanly aborts between stages if hit.
+
+### Strategy in one paragraph
+
+On a $2,500 paper account in a leveraged-ETF + listed-options universe, **the edge isn't sector picking — it's discipline**: positive-EV only, hard 15% per-position NAV cap, 25% kill for ETFs / 100% premium kill for long options, single-leg trades only, no multi-leg combos. Every idea passes through adversarial bull/bear research before scenarios; every position is sized by an Opus model that's been told *capital preservation matters, but so does deploying capital when the edge is real*. The agent picks cadence dynamically (1–24h between runs), tightening near catalysts and loosening when all-cash. **Losses are expected** — the experiment is whether the agent's prompt + schema discipline produces an honest Sharpe across many cycles, not whether it picks individual winners.
 
 ---
 
