@@ -7,7 +7,7 @@
   "properties": {
     "run_id": {"type": "string", "minLength": 1},
     "stage": {
-      "enum": ["screen", "research", "scenarios", "construct", "execute", "monitor"]
+      "enum": ["screen", "research", "chains", "scenarios", "construct", "execute", "monitor"]
     },
     "model": {"type": "string", "minLength": 1},
     "inputs_hash": {"type": "string", "pattern": "^[a-f0-9]{16,64}$"},

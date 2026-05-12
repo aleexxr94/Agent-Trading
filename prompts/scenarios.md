@@ -38,6 +38,16 @@ old 1:1 mapping.
 4. **expected_value_pct**: probability-weighted return across cases. Report it honestly — including negative values. The constructor needs the full distribution.
 5. **For options candidates**: `option_rationale` is required with `type`, `strike`, `expiry`, `dte`, `dte_rationale`, `strike_rationale`. Justify the DTE choice (event timing? theta tolerance?) and strike (delta exposure? defined risk?).
 
+## Live option chains — use these, not training-data priors
+
+The user message may include a "Live option chains" block keyed by underlying with arrays of `calls` and `puts`. Each row carries the REAL `bid`, `ask`, `mid`, `iv`, `delta`, `gamma`, `theta`, `vega`, `dte`, `strike`, and `osi` symbol fetched from Alpaca seconds ago.
+
+**Rules when this block is present for an underlying:**
+- **Pick `strike` + `expiry` from this chain.** Do NOT invent strikes or expiries that aren't listed; the broker rejects non-existent OSIs (PR #49 catches it but the trade gets skipped, wasting the cycle).
+- **Use the real `mid` (or `ask` for a market buy estimate) as `premium_paid`** — the agent's training-data priors on premiums run 5–10× off real market on a small paper account (May 11 2026 SPY-565P incident: priced $3.50, fill was $0.61).
+- **Use the real `delta`/`iv`** when computing EV and writing greeks into `option_rationale`. Cross-check IV against `iv_percentile` only as a sanity ratio — never as a substitute for the live IV.
+- **If the chain block is absent or shows an `error` for the underlying**, you may fall back to training priors with explicit acknowledgement in `strike_rationale` ("no live chain available — premium estimate is a 0.30Δ approximation, may differ materially from fill"). Prefer to abstain on that candidate over a high-conviction trade priced from priors.
+
 ## Why both directions on option underlyings matter
 
 The constructor needs to compare both call and put for the same underlying. In a high-vol regime at 52-week highs, a long put is often the highest-EV trade in the entire candidate set — but only if you actually model it. Don't quietly skip the put leg because the underlying is in an uptrend; that's the *exact* setup where puts have positive EV.

@@ -3,9 +3,10 @@
 Stages:
   1. screen      → state/runs/{run_id}/screen.json   (Haiku)
   2. research    → state/runs/{run_id}/research.json (Sonnet — bull+bear in parallel per candidate)
-  3. scenarios   → state/runs/{run_id}/scenarios.json (Sonnet)
-  4. construct   → state/runs/{run_id}/portfolio.json (Opus, 1–12 or all-cash)
-  5. execute     → submit paper orders, write state/next_run.json
+  3. chains      → state/runs/{run_id}/chains.json   (Alpaca data — real bid/ask/IV/delta per option underlying)
+  4. scenarios   → state/runs/{run_id}/scenarios.json (Sonnet)
+  5. construct   → state/runs/{run_id}/portfolio.json (Opus, 1–12 or all-cash)
+  6. execute     → submit paper orders, write state/next_run.json
 
 `--dry-run` reads from tests/fixtures/* (no LLM, no orders). Live mode calls
 lib.llm.structured_call per stage with prompt-cached system blocks.
@@ -259,12 +260,130 @@ def stage_research(ctx: StageContext, screen: dict) -> dict:
     }
 
 
-def stage_scenarios(ctx: StageContext, research: dict) -> dict:
+def _option_underlyings_from_research(research: dict) -> list[str]:
+    """Pick the candidates marked as option plays. The research stage emits
+    ``instrument_kind: "option"`` for option underlyings (mirroring the
+    screener's ``kind: "option_underlying"`` flag); ETFs use
+    ``instrument_kind: "etf"``."""
+    out: list[str] = []
+    for c in research.get("candidates") or []:
+        if c.get("abstain"):
+            continue
+        if c.get("instrument_kind") == "option":
+            sym = c.get("symbol") or c.get("underlying")
+            if sym:
+                out.append(sym)
+    return out
+
+
+def _spot_lookup_from_screen(screen: dict) -> dict[str, float]:
+    """Build {symbol: last_close} from screen output so the chain stage can
+    set its ATM band without re-hitting yfinance. Falls back to None for
+    symbols with missing/error rows; the chain stage skips those."""
+    out: dict[str, float] = {}
+    for c in (screen.get("passed") or []) + (screen.get("failed") or []):
+        sym = c.get("symbol")
+        lc = c.get("last_close")
+        if sym and isinstance(lc, (int, float)) and lc > 0:
+            out[sym] = float(lc)
+    return out
+
+
+def stage_chains(
+    ctx: StageContext, research: dict, screen: dict | None = None,
+) -> dict:
+    """Fetch live Alpaca option chains for every option-underlying candidate.
+
+    Phase 9b fix for the May 11 2026 SPY-565P incident: the scenarios
+    agent was pricing premiums and IVs from training-data priors, which
+    on a small paper account ran 5-10x off real market (agent said
+    $3.50; fill was $0.61). This stage runs BEFORE scenarios so the
+    next prompt can include real bid/ask/IV/greeks per strike.
+
+    Per-underlying failures are isolated — we record the error in the
+    artifact and continue. If every underlying fails we still emit a
+    chains.json with empty ``underlyings`` so the scenarios stage knows
+    no live chain context is available and can fall back gracefully.
+
+    Dry-run: load tests/fixtures/chains.json if present; otherwise emit
+    an empty stub. The fixture is regenerated when the chain shape
+    changes — keep tests/fixtures/chains.json in sync with PR #50's
+    ``summarise_chain`` shape.
+    """
+    if ctx.dry_run:
+        # Fixture is optional — older fixtures predate this stage. Fall back
+        # to an empty stub rather than crashing dry-runs that don't include it.
+        try:
+            out = _load_fixture("chains.json")
+            out["run_id"] = ctx.run_id
+            return out
+        except FileNotFoundError:
+            return {
+                "run_id": ctx.run_id,
+                "generated_at": state.utcnow_iso(),
+                "underlyings": {},
+            }
+
+    from datetime import date as _date
+    from lib import options_chain
+
+    underlyings = _option_underlyings_from_research(research)
+    spots = _spot_lookup_from_screen(screen or {})
+    today = _date.today()
+
+    out: dict = {
+        "run_id": ctx.run_id,
+        "generated_at": state.utcnow_iso(),
+        "underlyings": {},
+    }
+    if not underlyings:
+        return out
+
+    # Lazy fetcher construction so an all-spots-missing run doesn't burn an
+    # AlpacaBroker init (which requires API keys + a successful SDK import).
+    fetcher: options_chain.ChainFetcher | None = None
+
+    for sym in underlyings:
+        spot = spots.get(sym)
+        if spot is None:
+            out["underlyings"][sym] = {
+                "error": "no spot price available from screen — chain skip",
+            }
+            continue
+        if fetcher is None:
+            fetcher = options_chain.ChainFetcher()
+        try:
+            summary = fetcher.fetch(sym, spot=spot, today=today)
+            out["underlyings"][sym] = summary
+        except options_chain.ChainFetchError as e:
+            out["underlyings"][sym] = {"error": str(e)}
+        except Exception as e:
+            # Defensive — fetcher already wraps known failure modes as
+            # ChainFetchError. Unexpected exceptions get the same soft-fail
+            # treatment so a misbehaving SDK can't take down the whole cycle.
+            out["underlyings"][sym] = {
+                "error": f"unexpected {type(e).__name__}: {e}"
+            }
+    return out
+
+
+def stage_scenarios(ctx: StageContext, research: dict, chains: dict | None = None) -> dict:
     if ctx.dry_run:
         out = _load_fixture("scenarios.json")
         out["run_id"] = ctx.run_id
         return out
     cfg = stages.scenarios()
+    chains_block = ""
+    if chains and chains.get("underlyings"):
+        chains_block = (
+            "\n\nLive option chains (Alpaca, ATM band ±25%, DTE 14–75, "
+            "spread ≤25%). Use THESE bid/ask/iv/delta/dte values as the "
+            "ground truth for option picks — NOT training-data priors:\n"
+            f"{json.dumps(chains.get('underlyings'), sort_keys=True)}\n"
+            "When picking strike + expiry for an option_rationale, pick "
+            "from this chain. premium_paid should equal the mid (or ask "
+            "for a market buy) of the selected OSI row."
+        )
     res = llm.structured_call(llm.StageCall(
         run_id=ctx.run_id,
         stage=cfg.stage,
@@ -274,7 +393,8 @@ def stage_scenarios(ctx: StageContext, research: dict) -> dict:
             "role": "user",
             "content": (
                 f"Research summary: {json.dumps(research, sort_keys=True)}\n"
-                f"Run id: {ctx.run_id}\n"
+                f"Run id: {ctx.run_id}"
+                f"{chains_block}\n"
                 "Return JSON conforming to scenarios.schema.json."
             ),
         }],
@@ -609,11 +729,37 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
         inputs_hash_parts=(rid, json.dumps(screen, sort_keys=True)),
         model=research_model,
     )
+    # Phase 9b: real option chains fetched from Alpaca BEFORE scenarios so
+    # the scenarios agent prices off ground-truth bid/ask/IV/delta, not
+    # training-data priors that ran 5-10× off real market (May 11 2026
+    # SPY-565P regression). Per-underlying failures don't abort; scenarios
+    # degrades to "no chain context for X" and falls back to priors only
+    # where chain data is missing.
+    chains = _run_stage(
+        ctx=ctx, stage_id="chains", schema="",
+        output_filename="chains.json",
+        runner=lambda: stage_chains(ctx, research, screen=screen),
+        # Codex P2 on PR #57: chains stage consumes spot prices from screen
+        # (via _spot_lookup_from_screen). Without screen in the hash, two
+        # runs with identical research but different last_close would log
+        # the same inputs_hash even though the fetched chain set and
+        # downstream scenarios can differ — breaking the audit trail.
+        inputs_hash_parts=(
+            rid,
+            json.dumps(research, sort_keys=True),
+            json.dumps(screen, sort_keys=True),
+        ),
+        model="alpaca-data",
+    )
     scenarios_out = _run_stage(
         ctx=ctx, stage_id="scenarios", schema="scenarios.schema.json",
         output_filename="scenarios.json",
-        runner=lambda: stage_scenarios(ctx, research),
-        inputs_hash_parts=(rid, json.dumps(research, sort_keys=True)),
+        runner=lambda: stage_scenarios(ctx, research, chains=chains),
+        inputs_hash_parts=(
+            rid,
+            json.dumps(research, sort_keys=True),
+            json.dumps(chains, sort_keys=True),
+        ),
         model=scen_model,
     )
     portfolio = _run_stage(
@@ -640,6 +786,7 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
         "run_id": rid,
         "screen": screen,
         "research": research,
+        "chains": chains,
         "scenarios": scenarios_out,
         "portfolio": portfolio,
         "next_run": next_run,
