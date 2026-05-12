@@ -201,6 +201,54 @@ def test_structured_call_gives_up_after_max_retries(tmp_state, monkeypatch):
         llm.structured_call(_call(), client_factory=lambda: _fake_client(fm))
 
 
+def test_structured_call_retries_on_anthropic_overloaded(tmp_state, monkeypatch):
+    """Regression: live observation May 12 2026 had a scenarios call die on
+    anthropic.APIStatusError with type='overloaded_error' (HTTP 529). The
+    typed subclass is anthropic.InternalServerError. Previously this wasn't
+    in the retry tuple — one 529 ate the whole cycle. After this PR it's
+    retryable and one transient overload should not crash the orchestrator."""
+    anthropic = pytest.importorskip("anthropic")
+
+    monkeypatch.setattr(llm, "STREAM_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+    monkeypatch.setattr(llm, "STREAM_RETRY_ATTEMPTS", 5)
+
+    attempts = {"n": 0}
+
+    class _OverloadedThenOkCtx:
+        def __init__(self, payload: str):
+            self._payload = payload
+
+        def __enter__(self):
+            attempts["n"] += 1
+            if attempts["n"] <= 2:
+                # Simulate anthropic.InternalServerError without a real
+                # 5xx response by raising the class directly. The retry
+                # loop catches it regardless of how it's instantiated.
+                raise anthropic.InternalServerError(
+                    message="Overloaded",
+                    response=None,
+                    body={"type": "overloaded_error"},
+                )
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def get_final_message(self):
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text=self._payload)],
+                usage=FakeUsage(),
+            )
+
+    class _OverloadedMessages:
+        def stream(self, **kwargs):
+            return _OverloadedThenOkCtx(json.dumps(_DECISION_PAYLOAD))
+
+    res = llm.structured_call(_call(), client_factory=lambda: _fake_client(_OverloadedMessages()))
+    assert attempts["n"] == 3, "should retry past 2 overloaded errors and succeed on the 3rd"
+    assert res.payload["stage"] == "screen"
+
+
 def test_thinking_and_output_config_passthrough(tmp_state):
     fm = FakeMessages([json.dumps(_DECISION_PAYLOAD)])
     llm.structured_call(

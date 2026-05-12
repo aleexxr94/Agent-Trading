@@ -37,10 +37,19 @@ from . import state
 
 
 # Transient HTTP/SDK errors that warrant a retry rather than a hard crash.
-# Anthropic's streaming edge occasionally drops connections mid-response,
-# especially on long-running Opus calls with adaptive thinking + 30k+
-# max_tokens. The orchestrator runs these at 60s cadence — one blip
-# shouldn't take down the whole cycle.
+# Anthropic's streaming edge drops connections mid-response on long-running
+# Opus calls (httpx.RemoteProtocolError), times out on slow networks
+# (httpx.ReadTimeout / anthropic.APITimeoutError), AND occasionally returns
+# 5xx / 529 Overloaded when traffic is heavy (anthropic.InternalServerError
+# raised with type='overloaded_error'). Rate-limit (429) is also worth
+# retrying — Anthropic recommends exponential backoff for those.
+#
+# 4xx errors like 400/401/403/404/422 should NOT be retried — they signal a
+# request bug (auth, schema, malformed contract), not a transient outage.
+# anthropic's typed exceptions split them out cleanly: BadRequestError /
+# AuthenticationError / PermissionDeniedError / NotFoundError /
+# UnprocessableEntityError are all separate subclasses of APIStatusError
+# and stay outside our retry tuple.
 #
 # Imported lazily inside _retryable_stream_errors() so a missing optional
 # dependency (httpx is a transitive dep of the anthropic SDK) can't break
@@ -62,17 +71,22 @@ def _retryable_stream_errors() -> tuple[type[BaseException], ...]:
         errs.extend([
             anthropic.APIConnectionError,
             anthropic.APITimeoutError,
+            anthropic.InternalServerError,  # 5xx incl. 529 Overloaded
+            anthropic.RateLimitError,       # 429 — backoff handles it
         ])
     except ImportError:
         pass
     return tuple(errs) or (ConnectionError,)
 
 
-# Retry tuning. Three attempts total (first try + 2 retries). Exponential
-# backoff 1s, 4s. Total worst-case wait is ~5s before giving up — short
-# enough not to hide a real outage, long enough to ride out one blip.
-STREAM_RETRY_ATTEMPTS = 3
-STREAM_RETRY_BACKOFF_SECONDS = (1.0, 4.0)
+# Retry tuning. Five attempts total (first try + 4 retries). Exponential
+# backoff 2s, 5s, 10s, 20s — total worst-case wait ~37s. Heavier than the
+# original 1s/4s because Anthropic's "overloaded_error" responses often
+# need 10-30s to clear on the server side. Short enough not to hide a
+# sustained outage; long enough to ride out the brief 529 bursts we saw
+# on May 12 2026 during a live scenarios call.
+STREAM_RETRY_ATTEMPTS = 5
+STREAM_RETRY_BACKOFF_SECONDS = (2.0, 5.0, 10.0, 20.0)
 
 # USD per million tokens — Claude 4.X published list prices.
 # Cache writes at 1.25x base input (5min TTL); cache reads at ~0.1x base input.
