@@ -191,6 +191,59 @@ def test_load_run_summaries_newest_first(tmp_state):
     ]
 
 
+def test_load_run_summaries_tolerates_null_list_fields(tmp_state):
+    """Regression for Codex P1 on PR #35: a malformed artifact like
+    {"passed": null} previously raised TypeError on len(None), killing
+    the entire Cycles tab render. One bad run must not take down
+    visibility for all others."""
+    bad_rid = "20260512T120000Z-corrupt"
+    good_rid = "20260512T130000Z-clean"
+
+    bad_dir = state.RUNS_DIR / bad_rid
+    bad_dir.mkdir(parents=True)
+    state.write_json(bad_dir / "screen.json", {"passed": None, "rejected": None})
+    state.write_json(bad_dir / "research.json", {"candidates": None})
+    state.write_json(bad_dir / "portfolio.json", {"positions": None, "all_cash": None})
+    state.write_json(bad_dir / "next_run.json", {"next_run_at": None, "rationale": None})
+
+    good_dir = state.RUNS_DIR / good_rid
+    good_dir.mkdir(parents=True)
+    state.write_json(good_dir / "screen.json", {"passed": [{"symbol": "TQQQ"}]})
+
+    # Must not raise. Both summaries should come back.
+    out = dd.load_run_summaries()
+    assert len(out) == 2
+
+    # Corrupt run shows zeros for the null fields, not garbage / crash
+    corrupt = next(s for s in out if s["run_id"] == bad_rid)
+    assert corrupt["screened_count"] == 0
+    assert corrupt["researched_count"] == 0
+    assert corrupt["scenarios_count"] == 0
+    assert corrupt["positions_count"] == 0
+    assert corrupt["next_run_rationale"] == ""
+
+    # Clean run still parsed correctly alongside the corrupt one
+    clean = next(s for s in out if s["run_id"] == good_rid)
+    assert clean["screened_count"] == 1
+
+
+def test_load_run_summaries_tolerates_top_level_non_dict(tmp_state):
+    """Even more degenerate: the artifact is a JSON list/string at the
+    top level. Still mustn't crash."""
+    rid = "20260512T140000Z-weird"
+    run_dir = state.RUNS_DIR / rid
+    run_dir.mkdir(parents=True)
+    state.write_json(run_dir / "portfolio.json", ["not", "a", "dict"])
+    state.write_json(run_dir / "next_run.json", "just a string")
+    state.write_json(run_dir / "screen.json", 42)
+
+    out = dd.load_run_summaries()
+    assert len(out) == 1
+    assert out[0]["run_id"] == rid
+    assert out[0]["positions_count"] == 0
+    assert out[0]["screened_count"] == 0
+
+
 def test_load_run_summaries_tolerates_missing_artifacts(tmp_state):
     """A run dir that crashed mid-stage may be missing some artifacts. The
     summary should still come back populated for whatever was written."""
