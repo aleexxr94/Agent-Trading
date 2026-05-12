@@ -129,6 +129,78 @@ def test_structured_call_uses_streaming_api(tmp_state):
     assert create_calls["n"] == 0, "non-streaming create() must not be used"
 
 
+def test_structured_call_retries_on_transient_stream_error(tmp_state, monkeypatch):
+    """Regression for an observed live failure: Anthropic's streaming edge
+    dropped a connection mid-response on a long construct call, raising
+    httpx.RemoteProtocolError. lib.llm previously crashed the whole
+    orchestrator on the first such blip. Now we retry with backoff and
+    only escalate after exhausting STREAM_RETRY_ATTEMPTS.
+    """
+    httpx = pytest.importorskip("httpx")  # only installed alongside anthropic
+
+    monkeypatch.setattr(llm, "STREAM_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+
+    attempts = {"n": 0}
+
+    class _FlakyStreamCtx:
+        def __init__(self, fail_count: int, then_payload: str):
+            self._fail_count = fail_count
+            self._payload = then_payload
+
+        def __enter__(self):
+            attempts["n"] += 1
+            if attempts["n"] <= self._fail_count:
+                raise httpx.RemoteProtocolError(
+                    "peer closed connection without sending complete message body"
+                )
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def get_final_message(self):
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text=self._payload)],
+                usage=FakeUsage(),
+            )
+
+    class _FlakyMessages:
+        def __init__(self, fail_count: int, payload: str):
+            self._fail_count = fail_count
+            self._payload = payload
+
+        def stream(self, **kwargs):
+            return _FlakyStreamCtx(self._fail_count, self._payload)
+
+    # 2 failures, then succeed → expect 3 attempts total
+    fm = _FlakyMessages(fail_count=2, payload=json.dumps(_DECISION_PAYLOAD))
+    res = llm.structured_call(_call(), client_factory=lambda: _fake_client(fm))
+    assert attempts["n"] == 3
+    assert res.payload["stage"] == "screen"
+
+
+def test_structured_call_gives_up_after_max_retries(tmp_state, monkeypatch):
+    """If every attempt fails with a transient error, eventually re-raise
+    the underlying exception rather than retrying forever."""
+    httpx = pytest.importorskip("httpx")
+
+    monkeypatch.setattr(llm, "STREAM_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+    monkeypatch.setattr(llm, "STREAM_RETRY_ATTEMPTS", 3)
+
+    class _AlwaysFailMessages:
+        def stream(self, **kwargs):
+            class _Ctx:
+                def __enter__(self_):
+                    raise httpx.RemoteProtocolError("perma-broken")
+                def __exit__(self_, *_a):
+                    return False
+            return _Ctx()
+
+    fm = _AlwaysFailMessages()
+    with pytest.raises(httpx.RemoteProtocolError):
+        llm.structured_call(_call(), client_factory=lambda: _fake_client(fm))
+
+
 def test_thinking_and_output_config_passthrough(tmp_state):
     fm = FakeMessages([json.dumps(_DECISION_PAYLOAD)])
     llm.structured_call(
