@@ -3,10 +3,13 @@ Description=Agent-Trading dynamic scheduler — honours state/next_run.json
 Documentation=https://github.com/aleexxr94/agent-trading
 After=network-online.target
 Wants=network-online.target
-# Don't try to schedule when halted. The script also checks this flag on
-# each tick, but skipping start when the flag is already there saves a
-# minute of polling.
-ConditionPathExists=!{{REPO_DIR}}/state/halt.flag
+# Note: we deliberately do NOT use `ConditionPathExists=!.../halt.flag`
+# here. ConditionPathExists is checked only at unit start — a
+# condition-skipped unit stays inactive even after the flag is removed,
+# so `RESUME` (rm halt.flag) would not bring the scheduler back without
+# a manual `systemctl start`. The bash loop in run_scheduler.sh re-checks
+# halt.flag on every tick, which is the correct level for a daemon
+# that needs to react to flag changes without a service bounce.
 
 [Service]
 # Runs as root so `systemctl start agent-orchestrator.service` actually

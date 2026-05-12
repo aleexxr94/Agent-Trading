@@ -171,6 +171,26 @@ def test_agent_scheduler_unit_runs_as_root():
     assert "run_scheduler.sh" in raw
 
 
+def test_agent_scheduler_does_not_use_condition_path_for_halt():
+    """Regression for Codex P1 on PR #38: ConditionPathExists=!halt.flag
+    silently disables the scheduler permanently if the host boots while
+    halted — removing halt.flag wouldn't auto-restart it. The bash loop
+    in run_scheduler.sh re-checks halt.flag every tick, which is the
+    correct level for live response to flag changes."""
+    raw = (DEPLOY / "systemd" / "agent-scheduler.service").read_text(encoding="utf-8")
+    # Strip comment lines so the explanatory note about WHY we don't use
+    # it doesn't trigger the assertion.
+    code_lines = [
+        line for line in raw.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    code = "\n".join(code_lines)
+    assert "ConditionPathExists" not in code, (
+        "ConditionPathExists for halt.flag is a one-shot start gate, not a "
+        "live check — use the bash loop's halt.flag check in run_scheduler.sh"
+    )
+
+
 def test_install_sh_installs_scheduler_unit():
     """install.sh must drop agent-scheduler.service into /etc/systemd/system
     alongside the other units."""
