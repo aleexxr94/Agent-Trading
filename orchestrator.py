@@ -739,7 +739,16 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
         ctx=ctx, stage_id="chains", schema="",
         output_filename="chains.json",
         runner=lambda: stage_chains(ctx, research, screen=screen),
-        inputs_hash_parts=(rid, json.dumps(research, sort_keys=True)),
+        # Codex P2 on PR #57: chains stage consumes spot prices from screen
+        # (via _spot_lookup_from_screen). Without screen in the hash, two
+        # runs with identical research but different last_close would log
+        # the same inputs_hash even though the fetched chain set and
+        # downstream scenarios can differ — breaking the audit trail.
+        inputs_hash_parts=(
+            rid,
+            json.dumps(research, sort_keys=True),
+            json.dumps(screen, sort_keys=True),
+        ),
         model="alpaca-data",
     )
     scenarios_out = _run_stage(
