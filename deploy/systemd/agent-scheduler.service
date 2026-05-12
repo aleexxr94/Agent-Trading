@@ -1,0 +1,43 @@
+[Unit]
+Description=Agent-Trading dynamic scheduler — honours state/next_run.json
+Documentation=https://github.com/aleexxr94/agent-trading
+After=network-online.target
+Wants=network-online.target
+# Don't try to schedule when halted. The script also checks this flag on
+# each tick, but skipping start when the flag is already there saves a
+# minute of polling.
+ConditionPathExists=!{{REPO_DIR}}/state/halt.flag
+
+[Service]
+# Runs as root so `systemctl start agent-orchestrator.service` actually
+# works. The orchestrator wrapper still runs as the agent user; this
+# service only needs root to bridge the privilege gap that the
+# orchestrator wrapper hit with `systemd-run`.
+Type=simple
+User=root
+WorkingDirectory={{REPO_DIR}}
+ExecStart=/bin/bash {{REPO_DIR}}/deploy/run_scheduler.sh
+Restart=always
+RestartSec=10s
+# Don't hold up shutdown if the script is mid-sleep.
+TimeoutStopSec=15s
+
+# Hardening — minimal surface area for a tiny shell-loop daemon.
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths={{REPO_DIR}}/state
+ReadOnlyPaths={{REPO_DIR}}
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# Note: ProtectHome=true is OK — the script doesn't need $HOME.
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

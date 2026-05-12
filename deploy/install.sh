@@ -79,7 +79,8 @@ install -d -m 750 -o "$AGENT_USER" -g "$AGENT_USER" "$REPO_DIR/state/runs"
 log "Installing systemd units..."
 for unit in agent-orchestrator.service agent-orchestrator.timer \
             agent-monitor.service      agent-monitor.timer \
-            agent-dashboard.service; do
+            agent-dashboard.service \
+            agent-scheduler.service; do
     src="$REPO_DIR/deploy/systemd/$unit"
     [ -f "$src" ] || fail "Missing unit file: $src"
     # Substitute placeholders so the units track REPO_DIR / AGENT_USER.
@@ -88,6 +89,19 @@ for unit in agent-orchestrator.service agent-orchestrator.timer \
         "$src" > "/etc/systemd/system/$unit"
 done
 systemctl daemon-reload
+
+# Auto-enable the scheduler if the orchestrator timer is enabled — once an
+# operator has flipped timers on, they want dynamic cadence by default.
+# (Re-running install.sh on an existing deployment keeps everything in sync.)
+if systemctl is-enabled agent-orchestrator.timer >/dev/null 2>&1; then
+    if ! systemctl is-enabled agent-scheduler.service >/dev/null 2>&1; then
+        log "Enabling agent-scheduler.service (dynamic cadence from next_run.json)..."
+        systemctl enable --now agent-scheduler.service
+    else
+        # Already enabled — make sure new run_scheduler.sh is picked up.
+        systemctl restart agent-scheduler.service
+    fi
+fi
 
 # ---------- 8. log rotation ----------
 cat >/etc/logrotate.d/agent-trading <<'EOF'
@@ -126,13 +140,20 @@ NEXT STEPS (in order):
   3. Start the dashboard (binds to 127.0.0.1:8501 — reach via Tailscale or SSH tunnel):
        systemctl enable --now agent-dashboard.service
 
-  4. When the smoke looks clean, enable the timers:
+  4. When the smoke looks clean, enable the timers + the dynamic scheduler:
        systemctl enable --now agent-orchestrator.timer agent-monitor.timer
+       systemctl enable --now agent-scheduler.service
+
+     The OnCalendar in agent-orchestrator.timer is just a daily-13:30-UTC
+     safety net. The real cadence is agent-scheduler.service — a tiny
+     root-level daemon that polls state/next_run.json and starts the
+     orchestrator when the meta-scheduler-chosen time arrives.
 
   5. Inspect everything:
-       systemctl status   agent-orchestrator.timer agent-monitor.timer agent-dashboard.service
+       systemctl status   agent-orchestrator.timer agent-monitor.timer agent-dashboard.service agent-scheduler.service
        systemctl list-timers
        journalctl -u agent-orchestrator.service -f
+       journalctl -u agent-scheduler.service   -f
 
 HALT (stops all timers within one cycle):
        sudo -u $AGENT_USER touch $REPO_DIR/state/halt.flag
