@@ -796,6 +796,38 @@ def test_strip_fences_returns_input_when_only_opening_fence():
     assert out == '{"x": 1}'
 
 
+def test_strip_fences_does_not_truncate_triple_backticks_inside_json_string():
+    """Codex P2 (PR #58): a previous version of the helper truncated at
+    the first occurrence of ``` anywhere in the body. That breaks valid
+    JSON whose string values legitimately contain triple backticks
+    (markdown content embedded in a field). The closing fence must be
+    anchored to a line start (\\n```) so backticks inside a JSON value
+    can't trigger a false cut.
+
+    Unescaped real newlines are illegal inside JSON string literals (they
+    must be `\\n` two-char escapes), so anchoring on \\n is robust.
+    """
+    payload = {"rationale": "render code with ``` like this"}
+    text = '```json\n' + json.dumps(payload) + '\n```'
+    out = llm.strip_markdown_fences(text)
+    # Round-trip cleanly — no truncation at the in-string backticks.
+    parsed = json.loads(out)
+    assert parsed == payload
+
+
+def test_strip_fences_keeps_in_string_backticks_with_trailing_prose():
+    """Combined case: in-string backticks AND prose after the real
+    closing fence. We must keep all of the JSON and drop only the prose."""
+    payload = {
+        "thesis": "see ```python\\nprint('x')\\n``` block",
+        "confidence": 0.8,
+    }
+    text = '```json\n' + json.dumps(payload) + '\n```\n\nProse epilogue'
+    out = llm.strip_markdown_fences(text)
+    parsed = json.loads(out)
+    assert parsed == payload
+
+
 def test_structured_call_parses_fenced_response(tmp_state):
     """Even if the model wraps JSON in markdown fences, structured_call should
     parse it cleanly instead of triggering the schema-retry path."""

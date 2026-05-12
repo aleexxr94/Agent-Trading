@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -243,6 +244,9 @@ def sanitize_schema_for_structured_output(
     return _walk(inlined)
 
 
+_CLOSING_FENCE_RE = re.compile(r"\n```")
+
+
 def strip_markdown_fences(text: str) -> str:
     """Strip a leading ```json … ``` fence and any prose that may follow.
 
@@ -261,6 +265,15 @@ def strip_markdown_fences(text: str) -> str:
     Both shapes resolve to "extract the FIRST fenced block, drop the
     fence and anything after it". For unfenced JSON (the happy path) we
     return the input unchanged after stripping whitespace.
+
+    Codex P2 (PR #58): the closing fence is matched as ``\\n```'' — a
+    triple-backtick sequence at the START of a line. A naive
+    ``body.find('```')`` would falsely truncate when a JSON string value
+    legitimately contains triple backticks (e.g. markdown content
+    embedded in a field). Unescaped real newlines are illegal inside
+    JSON string literals (they must be `\\n` two-char escapes), so the
+    `\\n` prefix on the terminator guarantees we only cut at an actual
+    fence line, never inside a JSON value.
     """
     t = text.strip()
     if not t.startswith("```"):
@@ -270,13 +283,9 @@ def strip_markdown_fences(text: str) -> str:
     if nl == -1:
         return t
     body = t[nl + 1:]
-    # Find the FIRST closing fence and take only what came before it. This
-    # handles the trailing-prose case — anything past the closing fence is
-    # commentary the model wasn't supposed to emit, but we accept it
-    # gracefully rather than letting json.loads fail.
-    end = body.find("```")
-    if end != -1:
-        body = body[:end]
+    m = _CLOSING_FENCE_RE.search(body)
+    if m is not None:
+        body = body[:m.start()]
     return body.strip()
 
 
