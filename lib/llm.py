@@ -79,6 +79,40 @@ def _retryable_stream_errors() -> tuple[type[BaseException], ...]:
     return tuple(errs) or (ConnectionError,)
 
 
+# Some Anthropic in-stream SSE error events surface as the BASE
+# `anthropic.APIStatusError`, not its typed `InternalServerError` /
+# `RateLimitError` subclasses (observed May 12 2026: an overloaded_error
+# raised as base APIStatusError mid-stream, bypassing PR #47's typed retry
+# tuple). We can't put the base class in `_retryable_stream_errors()` —
+# that would also retry 4xx auth / bad-request / schema errors, which are
+# bugs not outages. Instead, inspect the exception body + status code at
+# catch time and retry only when it represents a transient condition.
+def _is_transient_anthropic_error(exc: BaseException) -> bool:
+    try:
+        import anthropic
+    except ImportError:
+        return False
+    if not isinstance(exc, anthropic.APIStatusError):
+        return False
+    # Body-based check: in-stream SSE error events carry a dict body with
+    # the upstream error type. `overloaded_error` is the 529 we keep
+    # seeing on heavy Sonnet/Opus traffic and is always worth a retry.
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error", body)
+        if isinstance(err, dict):
+            etype = err.get("type")
+            if etype in ("overloaded_error", "api_error", "timeout_error"):
+                return True
+    # Status-code fallback for cases where body isn't a dict (e.g. raw
+    # response surfaced through the base class). 5xx and 429 are
+    # transient; 4xx (except 429) is a request bug — don't retry.
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and (status >= 500 or status == 429):
+        return True
+    return False
+
+
 # Retry tuning. Five attempts total (first try + 4 retries). Exponential
 # backoff 2s, 5s, 10s, 20s — total worst-case wait ~37s. Heavier than the
 # original 1s/4s because Anthropic's "overloaded_error" responses often
@@ -362,7 +396,15 @@ def structured_call(
                 with cli.messages.stream(**kwargs) as stream:
                     resp = stream.get_final_message()
                 break  # success
-            except retryable as exc:
+            except BaseException as exc:
+                # Retry only if the error matches one of the typed transient
+                # classes OR the predicate detects a transient overloaded /
+                # 5xx / 429 condition surfaced through base APIStatusError.
+                if not (
+                    isinstance(exc, retryable)
+                    or _is_transient_anthropic_error(exc)
+                ):
+                    raise
                 last_exc = exc
                 if attempt == STREAM_RETRY_ATTEMPTS - 1:
                     raise

@@ -69,6 +69,18 @@ def _fake_client(messages: FakeMessages):
     return SimpleNamespace(messages=messages)
 
 
+def _make_apistatus_error(anthropic_mod, *, status_code: int, body: dict, message: str = "err"):
+    """Build a real anthropic.APIStatusError with a working response object.
+
+    The SDK's constructor reads ``response.request`` so we can't pass None.
+    Construct a minimal httpx.Response + Request pair.
+    """
+    import httpx
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    resp = httpx.Response(status_code=status_code, request=req, json=body)
+    return anthropic_mod.APIStatusError(message=message, response=resp, body=body)
+
+
 _DECISION_PAYLOAD = {
     "run_id": "rid",
     "stage": "screen",
@@ -221,12 +233,13 @@ def test_structured_call_retries_on_anthropic_overloaded(tmp_state, monkeypatch)
         def __enter__(self):
             attempts["n"] += 1
             if attempts["n"] <= 2:
-                # Simulate anthropic.InternalServerError without a real
-                # 5xx response by raising the class directly. The retry
-                # loop catches it regardless of how it's instantiated.
+                # Simulate the typed 529 InternalServerError subclass.
+                import httpx
+                req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+                resp = httpx.Response(status_code=529, request=req, json={"type": "overloaded_error"})
                 raise anthropic.InternalServerError(
                     message="Overloaded",
-                    response=None,
+                    response=resp,
                     body={"type": "overloaded_error"},
                 )
             return self
@@ -247,6 +260,133 @@ def test_structured_call_retries_on_anthropic_overloaded(tmp_state, monkeypatch)
     res = llm.structured_call(_call(), client_factory=lambda: _fake_client(_OverloadedMessages()))
     assert attempts["n"] == 3, "should retry past 2 overloaded errors and succeed on the 3rd"
     assert res.payload["stage"] == "screen"
+
+
+def test_structured_call_retries_on_base_apistatuserror_overloaded(tmp_state, monkeypatch):
+    """Regression for PR #48: the Anthropic SDK raises the BASE
+    ``anthropic.APIStatusError`` class (not the typed ``InternalServerError``
+    subclass) when an in-stream SSE error event carries
+    ``error.type == 'overloaded_error'``. PR #47 only retried the typed
+    subclass, so a single overload mid-stream still crashed the cycle.
+    The predicate-based check must catch the base class when the body
+    indicates a transient condition."""
+    anthropic = pytest.importorskip("anthropic")
+
+    monkeypatch.setattr(llm, "STREAM_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+    monkeypatch.setattr(llm, "STREAM_RETRY_ATTEMPTS", 5)
+
+    attempts = {"n": 0}
+
+    class _BaseAPIStatusErrorCtx:
+        def __init__(self, payload: str):
+            self._payload = payload
+
+        def __enter__(self):
+            attempts["n"] += 1
+            if attempts["n"] <= 2:
+                # Raise the BASE class directly — this is what the SDK does
+                # for in-stream SSE error events that don't map to a typed
+                # subclass.
+                raise _make_apistatus_error(
+                    anthropic,
+                    status_code=529,
+                    body={
+                        "type": "error",
+                        "error": {"type": "overloaded_error", "message": "Overloaded"},
+                    },
+                    message="Overloaded",
+                )
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def get_final_message(self):
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text=self._payload)],
+                usage=FakeUsage(),
+            )
+
+    class _OverloadedMessages:
+        def stream(self, **kwargs):
+            return _BaseAPIStatusErrorCtx(json.dumps(_DECISION_PAYLOAD))
+
+    res = llm.structured_call(_call(), client_factory=lambda: _fake_client(_OverloadedMessages()))
+    assert attempts["n"] == 3, "should retry past 2 base-APIStatusError overloads and succeed on the 3rd"
+    assert res.payload["stage"] == "screen"
+
+
+def test_structured_call_does_not_retry_base_apistatuserror_4xx(tmp_state, monkeypatch):
+    """Sister regression: a base APIStatusError without a transient body
+    (e.g. 400 bad-request surfaced via the base class) must NOT trigger
+    retries — those are request bugs, not outages."""
+    anthropic = pytest.importorskip("anthropic")
+
+    monkeypatch.setattr(llm, "STREAM_RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+    monkeypatch.setattr(llm, "STREAM_RETRY_ATTEMPTS", 5)
+
+    attempts = {"n": 0}
+
+    class _BadRequestCtx:
+        def __enter__(self):
+            attempts["n"] += 1
+            raise _make_apistatus_error(
+                anthropic,
+                status_code=400,
+                body={
+                    "type": "error",
+                    "error": {"type": "invalid_request_error", "message": "bad schema"},
+                },
+                message="invalid_request",
+            )
+
+        def __exit__(self, *_a):
+            return False
+
+    class _BadMessages:
+        def stream(self, **kwargs):
+            return _BadRequestCtx()
+
+    with pytest.raises(anthropic.APIStatusError):
+        llm.structured_call(_call(), client_factory=lambda: _fake_client(_BadMessages()))
+    assert attempts["n"] == 1, "4xx-style request bugs must not be retried"
+
+
+def test_is_transient_anthropic_error_predicate():
+    """Direct unit test for the predicate to lock down the exact body
+    shapes and status codes that count as transient."""
+    anthropic = pytest.importorskip("anthropic")
+
+    # In-stream overloaded SSE event (the May 12 2026 production case).
+    overloaded = _make_apistatus_error(
+        anthropic,
+        status_code=529,
+        body={"type": "error", "error": {"type": "overloaded_error"}},
+        message="Overloaded",
+    )
+    assert llm._is_transient_anthropic_error(overloaded)
+
+    # Bad-request body — must NOT be transient.
+    bad = _make_apistatus_error(
+        anthropic,
+        status_code=400,
+        body={"type": "error", "error": {"type": "invalid_request_error"}},
+        message="bad",
+    )
+    assert not llm._is_transient_anthropic_error(bad)
+
+    # 500-class status with an unfamiliar body still counts as transient
+    # via the status-code fallback.
+    server_500 = _make_apistatus_error(
+        anthropic,
+        status_code=503,
+        body={"some": "other shape"},
+        message="service unavailable",
+    )
+    assert llm._is_transient_anthropic_error(server_500)
+
+    # Non-anthropic exception — must be False (not True).
+    assert not llm._is_transient_anthropic_error(ValueError("nope"))
 
 
 def test_thinking_and_output_config_passthrough(tmp_state):
