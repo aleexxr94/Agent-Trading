@@ -840,22 +840,28 @@ with tabs[4]:
         "it opened (per the locked methodology). Net = gross − fees − LLM."
     )
     view = dd.trades_pnl_view(marks=broker_marks)
-    totals = view["totals"]
+    # Local name MUST NOT shadow the module-level `totals` which the
+    # Settings tab below reads as a dd.total_token_cost() dict (keys
+    # `cost_usd`, `calls`, `total_tokens`, …). Streamlit re-runs every
+    # `with tabs[N]:` block on each render, so a name collision here
+    # leaks into the Settings tab and triggers
+    # `KeyError: 'cost_usd'` on the lifetime-cost stat card.
+    trade_totals = view["totals"]
 
     tcols = st.columns(4)
     for col, label, value, fmt in [
-        (tcols[0], "Closed trades", totals["closed_count"], "{}"),
-        (tcols[1], "Open lots", totals["open_count"], "{}"),
+        (tcols[0], "Closed trades", trade_totals["closed_count"], "{}"),
+        (tcols[1], "Open lots", trade_totals["open_count"], "{}"),
         (
             tcols[2],
             "Realised net",
-            totals["realised_net_usd"],
+            trade_totals["realised_net_usd"],
             "${:,.2f}",
         ),
         (
             tcols[3],
             "Realised fees",
-            totals["realised_fees_usd"],
+            trade_totals["realised_fees_usd"],
             "${:,.2f}",
         ),
     ]:
