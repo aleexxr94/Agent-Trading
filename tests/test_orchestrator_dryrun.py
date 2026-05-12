@@ -23,7 +23,10 @@ def test_dry_run_writes_all_artifacts(tmp_state):
     rid = result["run_id"]
     rdir = state.RUNS_DIR / rid
 
-    expected = {"screen.json", "research.json", "scenarios.json", "portfolio.json", "next_run.json"}
+    expected = {
+        "screen.json", "research.json", "chains.json",
+        "scenarios.json", "portfolio.json", "next_run.json",
+    }
     assert {p.name for p in rdir.iterdir()} == expected
 
     # Schemas were validated on write — re-validate to be explicit
@@ -35,9 +38,11 @@ def test_dry_run_writes_all_artifacts(tmp_state):
 def test_dry_run_emits_decision_log(tmp_state):
     orchestrator.run_pipeline(dry_run=True)
     lines = state.DECISIONS_LOG.read_text().strip().splitlines()
-    assert len(lines) == 5
+    assert len(lines) == 6
     stages = [json.loads(line)["stage"] for line in lines]
-    assert stages == ["screen", "research", "scenarios", "construct", "execute"]
+    # Phase 9b: chains stage runs between research and scenarios so the
+    # scenarios prompt gets real bid/ask/IV/delta instead of priors.
+    assert stages == ["screen", "research", "chains", "scenarios", "construct", "execute"]
     for line in lines:
         row = json.loads(line)
         assert row["status"] == "ok"
@@ -87,6 +92,11 @@ def test_live_mode_writes_current_portfolio_with_mocked_llm(tmp_state, monkeypat
             {"symbol": s, "kind": "etf", "last_close": 50.0, "adv_30d": 5_000_000,
              "hv_30d_annualised": 0.4} for s in symbols
         ],
+    )
+    # Phase 9b: chains stage runs before scenarios on live. Force it to
+    # the no-data branch so the test doesn't try to hit Alpaca.
+    monkeypatch.setattr(
+        orchestrator, "_option_underlyings_from_research", lambda research: [],
     )
     orchestrator.run_pipeline(dry_run=False)
     assert state.CURRENT_PORTFOLIO.exists()
@@ -249,6 +259,10 @@ def test_run_pipeline_writes_future_next_run_at(tmp_state):
                  "hv_30d_annualised": 0.4} for s in symbols
             ],
         )
+        # Skip chain-fetch live network call — empty underlyings list.
+        monkeypatch.setattr(
+            orchestrator, "_option_underlyings_from_research", lambda research: [],
+        )
         orchestrator.run_pipeline(dry_run=False)
     finally:
         monkeypatch.undo()
@@ -258,6 +272,116 @@ def test_run_pipeline_writes_future_next_run_at(tmp_state):
     from datetime import datetime, timezone
     parsed = datetime.strptime(nr["next_run_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     assert parsed > datetime.now(timezone.utc), "next_run_at must be future"
+
+
+# ---------- Phase 9b: chain-fetch stage ----------
+
+
+def test_option_underlyings_from_research_filters_correctly():
+    research = {
+        "candidates": [
+            {"symbol": "TQQQ", "instrument_kind": "etf", "abstain": False},
+            {"symbol": "SPY", "instrument_kind": "option", "abstain": False},
+            {"symbol": "QQQ", "instrument_kind": "option", "abstain": True},  # skip
+            {"underlying": "TLT", "instrument_kind": "option", "abstain": False},
+        ],
+    }
+    out = orchestrator._option_underlyings_from_research(research)
+    assert out == ["SPY", "TLT"]  # abstained QQQ skipped; ETF skipped
+
+
+def test_option_underlyings_from_research_empty_input():
+    assert orchestrator._option_underlyings_from_research({}) == []
+    assert orchestrator._option_underlyings_from_research({"candidates": []}) == []
+
+
+def test_spot_lookup_from_screen_pulls_last_close():
+    screen = {
+        "passed": [
+            {"symbol": "SPY", "last_close": 530.42},
+            {"symbol": "QQQ", "last_close": 0},   # invalid spot — skipped
+            {"symbol": "IWM", "last_close": None},
+        ],
+        "failed": [{"symbol": "TLT", "last_close": 88.5}],
+    }
+    out = orchestrator._spot_lookup_from_screen(screen)
+    assert out == {"SPY": 530.42, "TLT": 88.5}
+
+
+def test_stage_chains_dry_run_loads_fixture(tmp_state):
+    """Dry-run reads tests/fixtures/chains.json if present."""
+    ctx = orchestrator.StageContext(run_id="rid-x", dry_run=True, broker=None)
+    out = orchestrator.stage_chains(ctx, research={}, screen={})
+    assert out["run_id"] == "rid-x"
+    assert "underlyings" in out
+
+
+def test_stage_chains_skips_underlyings_with_no_spot(tmp_state, monkeypatch):
+    """Live path: underlyings with no spot price get an explanatory error
+    row rather than crashing the whole stage."""
+    research = {"candidates": [
+        {"symbol": "SPY", "instrument_kind": "option", "abstain": False},
+    ]}
+    screen = {"passed": [{"symbol": "SPY", "last_close": None}]}
+
+    # Block ChainFetcher construction — we shouldn't reach it.
+    class _Boom:
+        def __init__(self, *a, **kw): raise AssertionError("should not construct")
+    from lib import options_chain as oc
+    monkeypatch.setattr(oc, "ChainFetcher", _Boom)
+
+    ctx = orchestrator.StageContext(run_id="r", dry_run=False, broker=None)
+    out = orchestrator.stage_chains(ctx, research=research, screen=screen)
+    assert "error" in out["underlyings"]["SPY"]
+    assert "no spot" in out["underlyings"]["SPY"]["error"]
+
+
+def test_stage_chains_isolates_per_underlying_failures(tmp_state, monkeypatch):
+    """One underlying's ChainFetchError must not block the other's success."""
+    from lib import options_chain as oc
+
+    research = {"candidates": [
+        {"symbol": "SPY", "instrument_kind": "option", "abstain": False},
+        {"symbol": "QQQ", "instrument_kind": "option", "abstain": False},
+    ]}
+    screen = {"passed": [
+        {"symbol": "SPY", "last_close": 530.0},
+        {"symbol": "QQQ", "last_close": 440.0},
+    ]}
+
+    class _MixedFetcher:
+        def fetch(self, underlying, **kw):
+            if underlying == "SPY":
+                return {"underlying": "SPY", "spot": 530.0, "calls": [], "puts": []}
+            raise oc.ChainFetchError("alpaca 503")
+
+    monkeypatch.setattr(oc, "ChainFetcher", lambda *a, **kw: _MixedFetcher())
+
+    ctx = orchestrator.StageContext(run_id="r", dry_run=False, broker=None)
+    out = orchestrator.stage_chains(ctx, research=research, screen=screen)
+    assert out["underlyings"]["SPY"]["underlying"] == "SPY"
+    assert "alpaca 503" in out["underlyings"]["QQQ"]["error"]
+
+
+def test_stage_chains_returns_empty_when_no_option_underlyings(tmp_state, monkeypatch):
+    """No option candidates → empty underlyings map, no fetcher constructed."""
+    research = {"candidates": [{"symbol": "TQQQ", "instrument_kind": "etf"}]}
+
+    class _Boom:
+        def __init__(self, *a, **kw): raise AssertionError("should not construct")
+    from lib import options_chain as oc
+    monkeypatch.setattr(oc, "ChainFetcher", _Boom)
+
+    ctx = orchestrator.StageContext(run_id="r", dry_run=False, broker=None)
+    out = orchestrator.stage_chains(ctx, research=research, screen={})
+    assert out["underlyings"] == {}
+
+
+def test_dry_run_pipeline_passes_chains_through_to_scenarios(tmp_state):
+    """End-to-end: run_pipeline returns chains as a top-level key."""
+    result = orchestrator.run_pipeline(dry_run=True)
+    assert "chains" in result
+    assert "underlyings" in result["chains"]
 
 
 def test_main_passes_broker_to_run_pipeline(tmp_state, monkeypatch):
