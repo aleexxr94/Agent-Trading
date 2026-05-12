@@ -596,6 +596,25 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
     }
 
 
+def _try_load_broker() -> Broker | None:
+    """Best-effort AlpacaBroker construction. Returns None if creds are
+    missing or the SDK isn't installed — orchestrator still runs (writes
+    portfolio.json, decision_log, next_run.json) but stage_execute can't
+    submit orders without a broker. Same shape as monitor.py's helper —
+    deliberately duplicated so the two entrypoints can fail independently.
+    """
+    try:
+        from lib.alpaca_client import AlpacaBroker
+        return AlpacaBroker()
+    except Exception as e:
+        print(
+            f"broker unavailable ({type(e).__name__}: {e}); "
+            f"stage_execute will skip order submission",
+            file=sys.stderr,
+        )
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Multi-agent paper-trading orchestrator")
     parser.add_argument("--dry-run", action="store_true", help="No orders, no LLM calls — fixture mode")
@@ -609,8 +628,16 @@ def main(argv: list[str] | None = None) -> int:
         print("LIVE_TRADING_ENABLED=true but LIVE_VERSION=0 — refusing to run.", file=sys.stderr)
         return 2
 
+    # Load the broker for live (non-dry-run) cycles so stage_execute can
+    # actually submit orders. Dry runs skip broker entirely — they use
+    # fixtures end-to-end and shouldn't open a network connection.
+    # Previously this was never instantiated in main(); stage_execute saw
+    # ctx.broker=None on every cycle, silently skipped submission, and the
+    # operator had to run orders.submit_plan by hand to produce trades.
+    broker = None if args.dry_run else _try_load_broker()
+
     t0 = time.time()
-    result = run_pipeline(dry_run=args.dry_run, run_id=args.run_id)
+    result = run_pipeline(dry_run=args.dry_run, run_id=args.run_id, broker=broker)
     dt = time.time() - t0
     print(f"run_id={result['run_id']} stages=5 elapsed={dt:.2f}s dry_run={args.dry_run}")
     return 0

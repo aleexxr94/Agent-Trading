@@ -258,3 +258,38 @@ def test_run_pipeline_writes_future_next_run_at(tmp_state):
     from datetime import datetime, timezone
     parsed = datetime.strptime(nr["next_run_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     assert parsed > datetime.now(timezone.utc), "next_run_at must be future"
+
+
+def test_main_passes_broker_to_run_pipeline(tmp_state, monkeypatch):
+    """Regression for the live-run bug observed May 12 2026: the agent
+    constructed real positive-EV portfolios but Alpaca showed zero
+    positions because main() called run_pipeline WITHOUT broker=. With
+    broker defaulting to None, stage_execute's `if ctx.broker is not None`
+    guard always skipped submission, no matter how many trades the
+    constructor produced. This test pins that main() now constructs a
+    broker (via _try_load_broker) on live runs and forwards it through."""
+    captured = {}
+
+    def fake_run_pipeline(*, dry_run, run_id=None, broker=None):
+        captured["broker_arg"] = broker
+        return {"run_id": "stub", "screen": {}, "research": {}, "scenarios": {}, "portfolio": {}}
+
+    # Stub the broker loader so we don't open a real connection in the test
+    class _FakeBroker: pass
+    monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(orchestrator, "_try_load_broker", lambda: _FakeBroker())
+
+    # Live run: broker must be passed
+    orchestrator.main([])
+    assert isinstance(captured["broker_arg"], _FakeBroker), (
+        "main() did not pass a broker to run_pipeline on a non-dry-run cycle; "
+        "stage_execute will silently skip order submission"
+    )
+
+    # Dry run: broker should NOT be loaded (no network connection on dry-runs)
+    captured["broker_arg"] = "untouched"
+    orchestrator.main(["--dry-run"])
+    assert captured["broker_arg"] is None, (
+        "main() must skip broker init on --dry-run; got "
+        f"{captured['broker_arg']!r} — dry-runs are fixture-only"
+    )
