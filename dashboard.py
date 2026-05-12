@@ -357,6 +357,7 @@ sg[3].markdown(
 
 tabs = st.tabs([
     "📊 Portfolio",
+    "📒 Cycles",
     "📜 Decisions",
     "📈 Performance",
     "🤖 Agent Logs",
@@ -472,8 +473,77 @@ with tabs[0]:
         st.write("No open positions.")
 
 
-# ===== Tab 2: Decisions =====
+# ===== Tab 2: Cycles =====
 with tabs[1]:
+    summaries = dd.load_run_summaries(limit=20)
+    if not summaries:
+        st.info("No runs yet — fire the orchestrator (manually or via the timer) to populate this view.")
+    else:
+        st.markdown(
+            f'<div class="at-section-label">Last {len(summaries)} cycles — newest first, all expanded</div>',
+            unsafe_allow_html=True,
+        )
+        for s in summaries:
+            # Status pill (matches the hero-row pills): orange for all-cash,
+            # green for positions, neutral for in-flight runs missing data.
+            if s["all_cash"] is True:
+                status_html = '<span class="at-pill allcash">💰 all-cash</span>'
+            elif s["all_cash"] is False and s["positions_count"] > 0:
+                status_html = f'<span class="at-pill active">▶ {s["positions_count"]} positions</span>'
+            else:
+                status_html = '<span class="at-pill orders-off">○ no portfolio</span>'
+
+            # Funnel: screened → researched → scenarios → final
+            funnel = (
+                f'{s["screened_count"]} screened → '
+                f'{s["researched_count"]} researched → '
+                f'{s["scenarios_count"]} scenarios → '
+                f'{s["positions_count"]} {"positions" if s["positions_count"] != 1 else "position"}'
+            )
+
+            # Escape the rationales since they're model-generated text and we're
+            # injecting them into an unsafe_allow_html block.
+            construction = html.escape(s["construction_rationale"] or "—")
+            all_cash_rat = html.escape(s["all_cash_rationale"] or "")
+            next_rat     = html.escape(s["next_run_rationale"] or "")
+            run_id_safe  = html.escape(s["run_id"])
+
+            # Pick the most informative rationale to lead with: all-cash takes
+            # priority because it answers "why no trade" — exactly what an
+            # operator wants to see at a glance.
+            primary_rationale = all_cash_rat if (s["all_cash"] and all_cash_rat) else construction
+
+            st.markdown(
+                f'''
+                <div class="at-stat" style="margin-bottom: 0.85rem;">
+                  <div style="display:flex; align-items:baseline; justify-content:space-between; gap:1rem; flex-wrap:wrap; margin-bottom: 0.6rem;">
+                    <div>
+                      <div class="at-stat-label" style="margin-bottom: 0.15rem;">
+                        {_fmt_ts(s["generated_at"]) if s["generated_at"] else "in flight"}
+                      </div>
+                      <div style="font-family: ui-monospace, monospace; font-size: 0.85rem; color: var(--text-2);">
+                        {run_id_safe}
+                      </div>
+                    </div>
+                    <div style="text-align:right;">
+                      {status_html}
+                      <div style="color: var(--text-1); font-size: 0.85rem; margin-top: 0.3rem;">
+                        ${s["cost_usd"]:.4f} spent · {funnel}
+                      </div>
+                    </div>
+                  </div>
+                  <div style="color: var(--text-0); font-size: 0.95rem; line-height: 1.6;">
+                    {primary_rationale}
+                  </div>
+                  {f'<div style="margin-top: 0.7rem; padding-top: 0.7rem; border-top: 1px solid var(--border);"><div class="at-stat-label" style="font-size: 0.75rem;">Meta-scheduler — next at {_fmt_ts(s["next_run_at"])}</div><div style="color: var(--text-1); font-size: 0.9rem; line-height: 1.5; margin-top: 0.3rem;">{next_rat}</div></div>' if next_rat else ""}
+                </div>
+                ''',
+                unsafe_allow_html=True,
+            )
+
+
+# ===== Tab 3: Decisions =====
+with tabs[2]:
     if not decisions:
         st.info("No decisions logged yet.")
     else:
@@ -511,7 +581,7 @@ with tabs[1]:
 
 
 # ===== Tab 3: Performance =====
-with tabs[2]:
+with tabs[3]:
     pnl_break = pnl_lib.compute_portfolio_pnl(
         portfolio=portfolio, marks=broker_marks or None,
     )
@@ -639,7 +709,7 @@ with tabs[2]:
 
 
 # ===== Tab 4: Agent Logs =====
-with tabs[3]:
+with tabs[4]:
     if latest_rid is None:
         st.info("No runs yet.")
     else:
@@ -683,7 +753,7 @@ with tabs[3]:
 
 
 # ===== Tab 5: Settings =====
-with tabs[4]:
+with tabs[5]:
     st.markdown('<div class="at-section-label">Mode</div>', unsafe_allow_html=True)
     mode_pills = []
     mode_pills.append('<span class="at-pill paper">● PAPER</span>' if not live_trading

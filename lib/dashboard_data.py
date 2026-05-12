@@ -180,6 +180,101 @@ def latest_run_id() -> str | None:
     return rows[-1]["run_id"] if rows else None
 
 
+def load_run_summaries(limit: int = 20) -> list[dict]:
+    """Return one human-readable summary per recent orchestrator run, newest first.
+
+    Each summary is built from the run-dir artifacts (screen.json, research.json,
+    scenarios.json, portfolio.json, next_run.json) + the cost log. Use this on
+    the dashboard's Cycles tab — it pre-expands what would otherwise live
+    behind expanders in the Decisions / Agent Logs tabs.
+
+    Returns:
+        List of dicts with keys:
+          run_id, generated_at, all_cash, positions_count,
+          screened_count, researched_count, scenarios_count,
+          construction_rationale, all_cash_rationale,
+          next_run_at, next_run_rationale,
+          cost_usd
+    """
+    if not state.RUNS_DIR.exists():
+        return []
+    # Run dirs are named with a sortable timestamp prefix (YYYYMMDDTHHMMSSZ-xxxxxx).
+    run_dirs = sorted(
+        [p for p in state.RUNS_DIR.iterdir() if p.is_dir()],
+        key=lambda p: p.name,
+        reverse=True,
+    )[:limit]
+
+    cost_by_run: dict[str, float] = {}
+    for r in load_costs(limit=10**9):
+        rid = r.get("run_id")
+        if rid:
+            cost_by_run[rid] = cost_by_run.get(rid, 0.0) + (r.get("cost_usd") or 0.0)
+
+    summaries: list[dict] = []
+    for run_dir in run_dirs:
+        rid = run_dir.name
+        s: dict = {
+            "run_id": rid,
+            "generated_at": "",
+            "all_cash": None,
+            "positions_count": 0,
+            "screened_count": 0,
+            "researched_count": 0,
+            "scenarios_count": 0,
+            "construction_rationale": "",
+            "all_cash_rationale": "",
+            "next_run_at": "",
+            "next_run_rationale": "",
+            "cost_usd": cost_by_run.get(rid, 0.0),
+        }
+
+        # portfolio.json — the headline result + rationales
+        portfolio_path = run_dir / "portfolio.json"
+        if portfolio_path.exists():
+            try:
+                p = json.loads(portfolio_path.read_text())
+                s["generated_at"] = p.get("generated_at", "")
+                s["all_cash"] = p.get("all_cash")
+                s["positions_count"] = len(p.get("positions", []))
+                s["construction_rationale"] = p.get("construction_rationale", "")
+                s["all_cash_rationale"] = p.get("all_cash_rationale", "") or ""
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Funnel widths from screen/research/scenarios
+        for name, key in (
+            ("screen.json", "screened_count"),
+            ("research.json", "researched_count"),
+            ("scenarios.json", "scenarios_count"),
+        ):
+            f = run_dir / name
+            if not f.exists():
+                continue
+            try:
+                data = json.loads(f.read_text())
+                if name == "screen.json":
+                    s[key] = len(data.get("passed", []))
+                else:
+                    s[key] = len(data.get("candidates", []))
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # next_run.json — meta-scheduler's cadence call
+        nr = run_dir / "next_run.json"
+        if nr.exists():
+            try:
+                d = json.loads(nr.read_text())
+                s["next_run_at"] = d.get("next_run_at", "")
+                s["next_run_rationale"] = d.get("rationale", "")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        summaries.append(s)
+
+    return summaries
+
+
 def position_table_rows(
     portfolio: dict, marks: dict[str, float] | None = None,
 ) -> list[dict]:
