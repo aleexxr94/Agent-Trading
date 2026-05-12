@@ -41,12 +41,25 @@ def test_scenarios_max_tokens_within_provider_caps():
     )
 
 
-def test_constructor_max_tokens_above_8192_guard():
+def test_constructor_max_tokens_within_provider_caps():
     """Constructor emits 1-12 positions each with entry_thesis,
-    kill_conditions, sizing math, plus envelope rationales. Same defensive
-    bump as scenarios so this stage doesn't become the next bottleneck."""
+    kill_conditions, sizing math, plus envelope rationales. After PRs
+    #39-41 the constructor consumes 14-row scenarios inputs (8 ETFs + up
+    to 6 option-direction rows per scenarios.md's cardinality rule); the
+    older 16k cap left the model with ~340 output tokens after adaptive
+    thinking consumed the budget, observed truncating at chars 1341 and
+    2296 on a real paper run.
+
+    Two-sided guard:
+      - Floor 24k so future "trim tokens" edits can't regress us below
+        the level where Opus 4.6's adaptive thinking + the verbose
+        portfolio payload reliably fits.
+      - Ceiling 32k because that's Opus 4.6's default max_tokens cap
+        (without the interleaved-thinking beta header).
+    """
     cfg = stages.constructor()
-    assert cfg.max_tokens >= 12_000, (
-        f"constructor max_tokens={cfg.max_tokens} risks truncation on full "
-        "1-12 position portfolios with verbose theses"
+    assert 24_000 <= cfg.max_tokens <= 32_000, (
+        f"constructor max_tokens={cfg.max_tokens} is outside the safe range "
+        f"[24000, 32000]. Below 24k risks truncation; above 32k exceeds "
+        f"Opus 4.6's default max_tokens cap."
     )

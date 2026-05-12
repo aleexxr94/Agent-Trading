@@ -108,12 +108,18 @@ def constructor() -> StageConfig:
         model=_model("MODEL_CONSTRUCTOR", "claude-opus-4-6"),
         system_prompt=_load("constructor.md"),
         schema_filename="portfolio.schema.json",
-        # 16384 (was 8192): same headroom rationale as scenarios — constructor
-        # outputs 1-12 positions each with entry_thesis, kill_conditions,
-        # sizing math, plus a portfolio-level construction_rationale and
-        # all_cash_rationale envelope. Defensive bump to match scenarios so the
-        # construct stage doesn't become the next bottleneck.
-        max_tokens=16384,
+        # 32000 (was 16384, originally 8192): the same growth that pushed
+        # scenarios to 64k (PR #42) also widened constructor's input — it
+        # now reads 14-row scenarios payloads (8 ETFs + up to 6 option-
+        # direction rows per PRs #39-41). Combined with `thinking: adaptive`
+        # on Opus 4.6 (deep thinking, expensive per token), the original
+        # 16k cap left the model emitting only ~340 output tokens before
+        # truncation in the regime-aware run — constructor crashed before
+        # writing portfolio.json, taking the whole cycle with it.
+        # 32k is Opus 4.6's default max_tokens cap without the
+        # interleaved-thinking beta. Going higher than 32k would need
+        # extra headers; this is the safe ceiling.
+        max_tokens=32_000,
         thinking={"type": "adaptive"},
         output_config_extras={"effort": "high"},
     )
