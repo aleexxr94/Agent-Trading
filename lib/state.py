@@ -32,6 +32,12 @@ HALT_FLAG = STATE_DIR / "halt.flag"
 COST_RESET_FLAG = STATE_DIR / "cost_reset.json"
 DECISIONS_LOG = STATE_DIR / "decisions.jsonl"
 COSTS_LOG = STATE_DIR / "costs.jsonl"
+# Per-fill audit log for per-trade PnL accounting. One row per Alpaca
+# activity (fill or partial fill). Idempotent by activity_id so repeated
+# syncs from /v2/account/activities don't duplicate rows. See lib/trades.py
+# for the writer and the FIFO matcher that turns this log into closed-trade
+# realised PnL with real fees and equal-split attributed LLM cost.
+TRADES_LOG = STATE_DIR / "trades.jsonl"
 CURRENT_PORTFOLIO = STATE_DIR / "current_portfolio.json"
 NEXT_RUN = STATE_DIR / "next_run.json"
 NAV_HISTORY_LOG = STATE_DIR / "nav_history.jsonl"
@@ -217,6 +223,65 @@ def read_costs_for_run(run_id: str) -> list[dict]:
         if row.get("run_id") == run_id:
             out.append(row)
     return out
+
+
+def append_trade(entry: dict) -> None:
+    """Append one row to state/trades.jsonl.
+
+    Required keys (raises ValueError if missing):
+      - activity_id (str) — Alpaca activities-API ID; the idempotency key.
+        Callers must check existing rows before calling this; the function
+        does NOT dedupe internally to keep the writer fast.
+      - alpaca_order_id (str)
+      - symbol (str) — ETF symbol or OSI option symbol
+      - kind ("etf" | "option")
+      - side ("buy" | "sell")
+      - qty (number)
+      - fill_price (number) — per-share for ETFs, per-share-premium for options
+      - fees_usd (number) — sum of OCC + SEC + any other fees from the fill
+      - filled_at (ISO UTC)
+      - run_id (str | None) — the orchestrator run that triggered this fill,
+        when known. None is allowed for manual / out-of-band trades that the
+        operator placed without the agent's involvement.
+    """
+    required = {
+        "activity_id", "alpaca_order_id", "symbol", "kind", "side",
+        "qty", "fill_price", "fees_usd", "filled_at",
+    }
+    missing = required - entry.keys()
+    if missing:
+        raise ValueError(f"trade entry missing keys: {sorted(missing)}")
+    if "run_id" not in entry:
+        entry["run_id"] = None
+    TRADES_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with TRADES_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, sort_keys=False) + "\n")
+
+
+def read_trades() -> list[dict]:
+    """Return all rows from state/trades.jsonl, in append order.
+
+    Returns [] when the file doesn't exist yet — same convention as the
+    other JSONL readers in this module.
+    """
+    if not TRADES_LOG.exists():
+        return []
+    out = []
+    for line in TRADES_LOG.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def read_trade_activity_ids() -> set[str]:
+    """Return the set of activity_ids already in trades.jsonl. Use this
+    for idempotent sync against /v2/account/activities — only insert rows
+    whose activity_id isn't already in the set."""
+    return {r.get("activity_id") for r in read_trades() if r.get("activity_id")}
 
 
 def append_nav(entry: dict) -> None:
