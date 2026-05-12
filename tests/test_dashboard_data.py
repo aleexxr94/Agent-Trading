@@ -579,3 +579,92 @@ def test_load_nav_history_round_trip(tmp_state):
     hist = dd.load_nav_history()
     assert len(hist) == 2
     assert hist[1]["nav_usd"] == 2520.0
+
+
+# ---------- trading fees over time ----------
+
+
+def _fill(**over):
+    base = dict(
+        activity_id="a1",
+        alpaca_order_id="o1",
+        symbol="TQQQ",
+        kind="etf",
+        side="buy",
+        qty=10,
+        fill_price=70.0,
+        fees_usd=0.10,
+        filled_at="2026-05-12T14:30:00Z",
+        run_id="run-A",
+    )
+    base.update(over)
+    return base
+
+
+def test_total_trading_fees_empty(tmp_state):
+    assert dd.total_trading_fees_usd() == 0.0
+
+
+def test_total_trading_fees_sums_all_fills(tmp_state):
+    state.append_trade(_fill(activity_id="a1", fees_usd=0.10))
+    state.append_trade(_fill(activity_id="a2", side="sell", fees_usd=0.20))
+    state.append_trade(_fill(activity_id="a3", fees_usd=0.65, kind="option"))
+    assert dd.total_trading_fees_usd() == pytest.approx(0.95)
+
+
+def test_fees_by_month_buckets_by_filled_at(tmp_state):
+    state.append_trade(_fill(activity_id="a1", fees_usd=0.10,
+                              filled_at="2026-04-15T09:30:00Z"))
+    state.append_trade(_fill(activity_id="a2", fees_usd=0.20,
+                              filled_at="2026-05-12T14:30:00Z"))
+    state.append_trade(_fill(activity_id="a3", fees_usd=0.30,
+                              filled_at="2026-05-29T23:00:00Z"))
+    by_month = dd.fees_by_month()
+    assert [b["month"] for b in by_month] == ["2026-04", "2026-05"]
+    may = next(b for b in by_month if b["month"] == "2026-05")
+    assert may["fills"] == 2
+    assert may["fees_usd"] == pytest.approx(0.50)
+
+
+def test_fees_by_month_empty(tmp_state):
+    assert dd.fees_by_month() == []
+
+
+def test_fees_running_total_sorts_and_accumulates(tmp_state):
+    """Powers the cumulative-fees chart. Output must be in chronological
+    order regardless of append order, with monotonically increasing
+    cum_fees_usd."""
+    # Append OUT of chronological order to verify the sort.
+    state.append_trade(_fill(activity_id="a3", fees_usd=0.30,
+                              filled_at="2026-05-12T14:30:00Z"))
+    state.append_trade(_fill(activity_id="a1", fees_usd=0.10,
+                              filled_at="2026-05-10T09:30:00Z"))
+    state.append_trade(_fill(activity_id="a2", fees_usd=0.20,
+                              filled_at="2026-05-11T12:00:00Z"))
+    out = dd.fees_running_total()
+    assert [r["at"] for r in out] == [
+        "2026-05-10T09:30:00Z",
+        "2026-05-11T12:00:00Z",
+        "2026-05-12T14:30:00Z",
+    ]
+    assert [r["cum_fees_usd"] for r in out] == pytest.approx([0.10, 0.30, 0.60])
+    assert [r["fees_usd"] for r in out] == pytest.approx([0.10, 0.20, 0.30])
+
+
+def test_fees_running_total_empty(tmp_state):
+    assert dd.fees_running_total() == []
+
+
+def test_fees_helpers_read_trades_not_costs(tmp_state):
+    """Trading-fee helpers must source from trades.jsonl, not costs.jsonl.
+    Sanity check: appending a cost row must NOT show up as a trading fee.
+    (PR #53's all-time-cost reset filter applies to costs only; this is
+    the architectural reason it cannot affect fees.)"""
+    state.append_cost({
+        "run_id": "r1", "stage": "screen", "model": "m",
+        "cost_usd": 0.50, "at": "2026-05-12T08:00:00Z",
+    })
+    assert dd.total_trading_fees_usd() == 0.0  # no trades.jsonl entries
+    state.append_trade(_fill(activity_id="a1", fees_usd=0.10))
+    assert dd.total_trading_fees_usd() == pytest.approx(0.10)
+    # The $0.50 cost row never crosses over.

@@ -747,6 +747,62 @@ with tabs[3]:
     else:
         st.info("No LLM cost history yet — run the orchestrator (live mode) to populate.")
 
+    st.markdown(
+        '<div class="at-section-label">Trading fees over time (real, from Alpaca fills)</div>',
+        unsafe_allow_html=True,
+    )
+    fees_cum = dd.fees_running_total()
+    if fees_cum:
+        df_fees = pd.DataFrame(fees_cum)
+        fig_fees = go.Figure()
+        fig_fees.add_trace(go.Scatter(
+            x=df_fees["at"], y=df_fees["cum_fees_usd"], mode="lines",
+            name="Cumulative trading fees",
+            line=dict(color="#d97706", width=2.5),  # amber to distinguish from blue LLM line
+            fill="tozeroy",
+            fillcolor="rgba(217, 119, 6, 0.12)",
+        ))
+        fig_fees.update_layout(
+            template="plotly_white",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            height=320, yaxis_title="USD (fees)",
+            yaxis=dict(gridcolor="#e2e8f0"),
+            xaxis=dict(gridcolor="#e2e8f0"),
+            margin=dict(l=10, r=10, t=10, b=10),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_fees, width="stretch")
+        total_fees = dd.total_trading_fees_usd()
+        st.caption(
+            f"All-time trading fees: **${total_fees:,.2f}** across "
+            f"**{len(fees_cum)}** fills. Pulled per-fill from Alpaca activities — "
+            f"unaffected by the LLM-cost reset (these are real paid fees)."
+        )
+    else:
+        st.info(
+            "No trading fees yet. trades.jsonl is empty — fills are populated "
+            "once the orchestrator starts submitting paper orders and the "
+            "Alpaca activities sync runs."
+        )
+
+    st.markdown('<div class="at-section-label">Trading fees by month</div>', unsafe_allow_html=True)
+    fees_m = dd.fees_by_month()
+    if fees_m:
+        df_fm = pd.DataFrame(fees_m)
+        df_fm["fees_usd"] = df_fm["fees_usd"].map(lambda v: f"${v:,.2f}")
+        st.dataframe(
+            df_fm.rename(columns={
+                "month": "Month",
+                "fills": "Fills",
+                "fees_usd": "Fees (USD)",
+            }),
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.info("No monthly trading-fee data yet.")
+
     st.markdown('<div class="at-section-label">Cost & tokens by month (this project only)</div>',
                 unsafe_allow_html=True)
     by_month = dd.cost_by_month()
