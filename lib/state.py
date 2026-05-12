@@ -23,6 +23,13 @@ RUNS_DIR = STATE_DIR / "runs"
 SCHEMA_DIR = ROOT / "schemas"
 
 HALT_FLAG = STATE_DIR / "halt.flag"
+# Cost-reset marker: when an operator manually resets the daily-cost meter
+# from the dashboard, this file is written with the UTC timestamp. Cost
+# helpers (read_costs_today / cost_today_usd) only sum rows whose `at` is
+# AFTER this timestamp (when present and same-day). The underlying
+# costs.jsonl audit log is never mutated — the reset is purely a display
+# offset.
+COST_RESET_FLAG = STATE_DIR / "cost_reset.json"
 DECISIONS_LOG = STATE_DIR / "decisions.jsonl"
 COSTS_LOG = STATE_DIR / "costs.jsonl"
 CURRENT_PORTFOLIO = STATE_DIR / "current_portfolio.json"
@@ -139,18 +146,63 @@ def append_cost(entry: dict) -> None:
         f.write(json.dumps(entry, sort_keys=False) + "\n")
 
 
+def read_cost_reset_at() -> str | None:
+    """Return the ISO UTC timestamp when the dashboard last reset the
+    daily cost meter (or None if no reset on file). Helpers compare each
+    log row's `at` against this to decide whether to count it toward
+    the displayed "today's cost"."""
+    if not COST_RESET_FLAG.exists():
+        return None
+    try:
+        return json.loads(COST_RESET_FLAG.read_text(encoding="utf-8")).get("at")
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def set_cost_reset(reason: str = "dashboard") -> str:
+    """Mark NOW as the cost-meter reset point. Returns the ISO timestamp written.
+    Subsequent calls to read_costs_today only return rows with `at` > this."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    at = utcnow_iso()
+    COST_RESET_FLAG.write_text(
+        json.dumps({"at": at, "reason": reason}, sort_keys=True),
+        encoding="utf-8",
+    )
+    return at
+
+
+def clear_cost_reset() -> None:
+    """Discard any reset marker — the daily meter reverts to summing the
+    full UTC day. Useful when the operator wants to see the unfiltered
+    daily total again."""
+    if COST_RESET_FLAG.exists():
+        COST_RESET_FLAG.unlink()
+
+
 def read_costs_today() -> list[dict]:
-    """Return cost rows from the current UTC day. Used by daily-cap enforcement."""
+    """Return cost rows from the current UTC day. Used by daily-cap enforcement.
+
+    Honours `cost_reset.json` if present and same-UTC-day: rows are filtered
+    to those AFTER the reset marker. This lets an operator zero the meter
+    from the dashboard without losing audit-log entries.
+    """
     if not COSTS_LOG.exists():
         return []
     today = utcnow().date().isoformat()
+    reset_at = read_cost_reset_at()
+    # Only apply the reset filter when it's from today — yesterday's reset
+    # shouldn't affect today's accounting.
+    reset_today = reset_at if (reset_at and reset_at.startswith(today)) else None
     out = []
     for line in COSTS_LOG.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         row = json.loads(line)
-        if row.get("at", "").startswith(today):
-            out.append(row)
+        if not row.get("at", "").startswith(today):
+            continue
+        if reset_today and row.get("at", "") <= reset_today:
+            continue
+        out.append(row)
     return out
 
 

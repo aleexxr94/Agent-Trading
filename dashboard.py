@@ -330,7 +330,10 @@ def _meter_card(label: str, current: float, cap: float, *, fmt: str = "${:.2f}")
 
 
 sg = st.columns(4)
-sg[0].markdown(_meter_card("Cost today", cost_today, DAILY_CAP_USD), unsafe_allow_html=True)
+cost_today_label = "Cost today"
+if state.read_cost_reset_at():
+    cost_today_label = "Cost today · since reset"
+sg[0].markdown(_meter_card(cost_today_label, cost_today, DAILY_CAP_USD), unsafe_allow_html=True)
 sg[1].markdown(_meter_card("Cost this run", cost_this_run, PER_RUN_CAP_USD), unsafe_allow_html=True)
 runs_total = dd.runs_count()
 sg[2].markdown(
@@ -513,29 +516,47 @@ with tabs[1]:
             # operator wants to see at a glance.
             primary_rationale = all_cash_rat if (s["all_cash"] and all_cash_rat) else construction
 
+            # Pre-compute the meta-scheduler footer so the outer f-string
+            # stays clean (Python 3.11 doesn't allow nested f-strings with
+            # quote-mismatched expressions; pre-computing avoids the trap
+            # entirely AND makes the markup easier to read).
+            meta_footer = ""
+            if next_rat:
+                meta_footer = (
+                    '<div style="margin-top: 0.9rem; padding-top: 0.9rem; '
+                    'border-top: 1px solid var(--border);">'
+                    '<div class="at-stat-label" style="font-size: 0.85rem;">'
+                    f'Meta-scheduler — next at {_fmt_ts(s["next_run_at"])}'
+                    '</div>'
+                    '<div style="color: var(--text-0); font-size: 1.0rem; '
+                    'line-height: 1.55; margin-top: 0.4rem; font-weight: 500;">'
+                    f'{next_rat}'
+                    '</div></div>'
+                )
+
             st.markdown(
                 f'''
-                <div class="at-stat" style="margin-bottom: 0.85rem;">
-                  <div style="display:flex; align-items:baseline; justify-content:space-between; gap:1rem; flex-wrap:wrap; margin-bottom: 0.6rem;">
+                <div class="at-stat" style="margin-bottom: 1rem; padding: 1.2rem 1.4rem;">
+                  <div style="display:flex; align-items:baseline; justify-content:space-between; gap:1rem; flex-wrap:wrap; margin-bottom: 0.85rem;">
                     <div>
-                      <div class="at-stat-label" style="margin-bottom: 0.15rem;">
+                      <div class="at-stat-label" style="margin-bottom: 0.2rem; font-size: 0.95rem;">
                         {_fmt_ts(s["generated_at"]) if s["generated_at"] else "in flight"}
                       </div>
-                      <div style="font-family: ui-monospace, monospace; font-size: 0.85rem; color: var(--text-2);">
+                      <div style="font-family: ui-monospace, monospace; font-size: 0.9rem; color: var(--text-2); font-weight: 500;">
                         {run_id_safe}
                       </div>
                     </div>
                     <div style="text-align:right;">
                       {status_html}
-                      <div style="color: var(--text-1); font-size: 0.85rem; margin-top: 0.3rem;">
+                      <div style="color: var(--text-1); font-size: 0.95rem; margin-top: 0.4rem; font-weight: 600;">
                         ${s["cost_usd"]:.4f} spent · {funnel}
                       </div>
                     </div>
                   </div>
-                  <div style="color: var(--text-0); font-size: 0.95rem; line-height: 1.6;">
+                  <div style="color: var(--text-0); font-size: 1.15rem; line-height: 1.65; font-weight: 500;">
                     {primary_rationale}
                   </div>
-                  {f'<div style="margin-top: 0.7rem; padding-top: 0.7rem; border-top: 1px solid var(--border);"><div class="at-stat-label" style="font-size: 0.75rem;">Meta-scheduler — next at {_fmt_ts(s["next_run_at"])}</div><div style="color: var(--text-1); font-size: 0.9rem; line-height: 1.5; margin-top: 0.3rem;">{next_rat}</div></div>' if next_rat else ""}
+                  {meta_footer}
                 </div>
                 ''',
                 unsafe_allow_html=True,
@@ -793,6 +814,34 @@ with tabs[5]:
     st.caption(
         "All-time totals scoped to **this project** — aggregates `state/costs.jsonl` only."
     )
+
+    st.markdown('<div class="at-section-label">Cost meter</div>', unsafe_allow_html=True)
+    reset_at = state.read_cost_reset_at()
+    if reset_at:
+        st.info(
+            f"Daily cost meter is currently filtered — only counting LLM spend "
+            f"after **{_fmt_ts(reset_at)}**. Underlying `state/costs.jsonl` is "
+            f"untouched (audit log is complete)."
+        )
+        cm = st.columns(2)
+        with cm[0]:
+            if st.button("🔄 Reset meter to now (zero it again)", help="Records a new reset marker at the current time."):
+                state.set_cost_reset("dashboard")
+                st.rerun()
+        with cm[1]:
+            if st.button("↩ Clear the reset (show full UTC-day total)"):
+                state.clear_cost_reset()
+                st.rerun()
+    else:
+        st.caption(
+            "The daily-cost meter reads spend since 00:00 UTC by default. "
+            "Press the button below to zero the meter at the current moment "
+            "(e.g. discount today's testing churn). The `state/costs.jsonl` "
+            "audit log is never mutated."
+        )
+        if st.button("🔄 Reset daily cost meter to $0", help="Records a reset marker. Audit log remains intact."):
+            state.set_cost_reset("dashboard")
+            st.rerun()
 
     st.markdown('<div class="at-section-label">Halt flag</div>', unsafe_allow_html=True)
     if halted:

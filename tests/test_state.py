@@ -22,6 +22,66 @@ def test_halt_flag_round_trip(tmp_state):
     assert not state.is_halted()
 
 
+def test_cost_reset_round_trip(tmp_state):
+    """Operator marks a reset → read_cost_reset_at returns the timestamp;
+    clear removes it. Underlying behaviour for the dashboard's '🔄 Reset
+    daily cost meter' button."""
+    assert state.read_cost_reset_at() is None
+    at = state.set_cost_reset("test")
+    assert state.read_cost_reset_at() == at
+    state.clear_cost_reset()
+    assert state.read_cost_reset_at() is None
+
+
+def test_read_costs_today_filters_by_reset_marker(tmp_state, monkeypatch):
+    """When the reset marker is set, read_costs_today only returns rows
+    timestamped AFTER it. Same-UTC-day check: a yesterday-reset shouldn't
+    affect today's accounting."""
+    today = state.utcnow().date().isoformat()
+    # Rows: two before the reset, one after.
+    state.append_cost({
+        "run_id": "r1", "stage": "screen", "model": "x", "cost_usd": 0.10,
+        "at": f"{today}T05:00:00Z",
+    })
+    state.append_cost({
+        "run_id": "r2", "stage": "screen", "model": "x", "cost_usd": 0.20,
+        "at": f"{today}T09:00:00Z",
+    })
+    # Plant a reset marker at 10:00 today
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.COST_RESET_FLAG.write_text(
+        f'{{"at": "{today}T10:00:00Z", "reason": "test"}}',
+        encoding="utf-8",
+    )
+    state.append_cost({
+        "run_id": "r3", "stage": "screen", "model": "x", "cost_usd": 0.40,
+        "at": f"{today}T11:00:00Z",
+    })
+
+    rows = state.read_costs_today()
+    # Only the post-reset row should survive
+    assert [r["run_id"] for r in rows] == ["r3"]
+    assert sum(r["cost_usd"] for r in rows) == 0.40
+
+
+def test_read_costs_today_ignores_yesterday_reset(tmp_state):
+    """A reset marker from yesterday's UTC day must not filter today's rows."""
+    today = state.utcnow().date().isoformat()
+    state.append_cost({
+        "run_id": "r1", "stage": "screen", "model": "x", "cost_usd": 0.10,
+        "at": f"{today}T05:00:00Z",
+    })
+    # Plant a yesterday-dated reset marker
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.COST_RESET_FLAG.write_text(
+        '{"at": "2026-05-11T23:59:59Z", "reason": "old"}',
+        encoding="utf-8",
+    )
+    rows = state.read_costs_today()
+    assert len(rows) == 1
+    assert rows[0]["run_id"] == "r1"
+
+
 def test_atomic_write_json(tmp_state):
     p = tmp_state / "out.json"
     state.write_json(p, {"a": 1})
