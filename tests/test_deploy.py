@@ -110,20 +110,92 @@ def test_monitor_timer_market_hours_only():
     assert "13..21" in raw and "/15" in raw
 
 
-def test_run_orchestrator_uses_state_next_run_for_rescheduling():
+def test_run_orchestrator_does_not_self_reschedule():
+    """The orchestrator wrapper used to try `systemd-run --on-calendar=...`
+    after each run to schedule the next one. That broke because the wrapper
+    runs as the unprivileged agent user (NoNewPrivileges=true) — systemd-run
+    silently failed and the daily-fallback OnCalendar was the only thing
+    actually firing.
+
+    Dynamic scheduling now lives in agent-scheduler.service /
+    deploy/run_scheduler.sh (root-level poller). The wrapper's executable
+    lines must not call systemd-run or read next_run.json. (Comment lines
+    that explain WHY this responsibility moved are fine.)
+    """
     raw = (DEPLOY / "run_orchestrator.sh").read_text(encoding="utf-8")
+    # Strip comment lines + blank lines so we only check the active code.
+    code_lines = [
+        line for line in raw.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    code = "\n".join(code_lines)
+    assert "systemd-run" not in code, (
+        "run_orchestrator.sh must not call systemd-run — scheduling lives "
+        "in run_scheduler.sh / agent-scheduler.service now"
+    )
+    assert "next_run.json" not in code, (
+        "run_orchestrator.sh no longer reads next_run.json — that's the "
+        "scheduler service's job"
+    )
+
+
+def test_run_scheduler_exists_and_polls_next_run():
+    """agent-scheduler.service runs as root and polls state/next_run.json
+    on a fixed cadence, firing `systemctl start agent-orchestrator.service`
+    when the meta-scheduler's chosen time arrives. This is the privilege
+    boundary that the old in-orchestrator systemd-run approach could not
+    cross."""
+    script = DEPLOY / "run_scheduler.sh"
+    assert script.exists(), "deploy/run_scheduler.sh missing"
+    raw = script.read_text(encoding="utf-8")
     assert "state/next_run.json" in raw
-    assert "systemd-run" in raw
+    assert "agent-orchestrator.service" in raw
+    assert "systemctl start" in raw
+    # Idempotency safeguard: don't refire while orchestrator is mid-run,
+    # don't refire for a target we already fired.
+    assert "scheduler_last_fired.txt" in raw
+    assert "is-active" in raw
+    # Halt flag honoured (matches orchestrator wrapper convention)
+    assert "halt.flag" in raw
 
 
-def test_run_orchestrator_refuses_past_next_run_time():
-    """systemd-run errors if --on-calendar is in the past. The wrapper now
-    short-circuits and logs a clear reason instead of letting systemd-run
-    emit a confusing error."""
-    raw = (DEPLOY / "run_orchestrator.sh").read_text(encoding="utf-8")
-    # Comparison of NEXT_EPOCH ≤ NOW_EPOCH means "skip if not strictly future"
-    assert "NEXT_EPOCH" in raw and "NOW_EPOCH" in raw
-    assert "in the future" in raw
+def test_agent_scheduler_unit_runs_as_root():
+    """The scheduler service must run as root because it calls
+    `systemctl start agent-orchestrator.service` (starting a system service
+    requires PolicyKit-elevated permission). The orchestrator itself still
+    runs as the unprivileged agent user."""
+    raw = (DEPLOY / "systemd" / "agent-scheduler.service").read_text(encoding="utf-8")
+    assert "User=root" in raw
+    assert "Type=simple" in raw         # long-running daemon
+    assert "Restart=always" in raw      # survives transient failures
+    assert "run_scheduler.sh" in raw
+
+
+def test_agent_scheduler_does_not_use_condition_path_for_halt():
+    """Regression for Codex P1 on PR #38: ConditionPathExists=!halt.flag
+    silently disables the scheduler permanently if the host boots while
+    halted — removing halt.flag wouldn't auto-restart it. The bash loop
+    in run_scheduler.sh re-checks halt.flag every tick, which is the
+    correct level for live response to flag changes."""
+    raw = (DEPLOY / "systemd" / "agent-scheduler.service").read_text(encoding="utf-8")
+    # Strip comment lines so the explanatory note about WHY we don't use
+    # it doesn't trigger the assertion.
+    code_lines = [
+        line for line in raw.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    code = "\n".join(code_lines)
+    assert "ConditionPathExists" not in code, (
+        "ConditionPathExists for halt.flag is a one-shot start gate, not a "
+        "live check — use the bash loop's halt.flag check in run_scheduler.sh"
+    )
+
+
+def test_install_sh_installs_scheduler_unit():
+    """install.sh must drop agent-scheduler.service into /etc/systemd/system
+    alongside the other units."""
+    raw = (DEPLOY / "install.sh").read_text(encoding="utf-8")
+    assert "agent-scheduler.service" in raw
 
 
 @pytest.mark.parametrize("name", [

@@ -1,0 +1,46 @@
+[Unit]
+Description=Agent-Trading dynamic scheduler — honours state/next_run.json
+Documentation=https://github.com/aleexxr94/agent-trading
+After=network-online.target
+Wants=network-online.target
+# Note: we deliberately do NOT use `ConditionPathExists=!.../halt.flag`
+# here. ConditionPathExists is checked only at unit start — a
+# condition-skipped unit stays inactive even after the flag is removed,
+# so `RESUME` (rm halt.flag) would not bring the scheduler back without
+# a manual `systemctl start`. The bash loop in run_scheduler.sh re-checks
+# halt.flag on every tick, which is the correct level for a daemon
+# that needs to react to flag changes without a service bounce.
+
+[Service]
+# Runs as root so `systemctl start agent-orchestrator.service` actually
+# works. The orchestrator wrapper still runs as the agent user; this
+# service only needs root to bridge the privilege gap that the
+# orchestrator wrapper hit with `systemd-run`.
+Type=simple
+User=root
+WorkingDirectory={{REPO_DIR}}
+ExecStart=/bin/bash {{REPO_DIR}}/deploy/run_scheduler.sh
+Restart=always
+RestartSec=10s
+# Don't hold up shutdown if the script is mid-sleep.
+TimeoutStopSec=15s
+
+# Hardening — minimal surface area for a tiny shell-loop daemon.
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths={{REPO_DIR}}/state
+ReadOnlyPaths={{REPO_DIR}}
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# Note: ProtectHome=true is OK — the script doesn't need $HOME.
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
