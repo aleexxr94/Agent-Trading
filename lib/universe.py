@@ -57,16 +57,51 @@ _LEVERAGED_ETFS: tuple[UniverseEntry, ...] = (
                   "Direxion Daily Semiconductor Bull 3x — 3x daily long PHLX Semi"),
     UniverseEntry("SOXS", "etf", -3.0, "Semis 3x short",
                   "Direxion Daily Semiconductor Bear 3x — 3x daily inverse PHLX Semi"),
-    # ---- Financials ----
+    # ---- Financials (broad) ----
     UniverseEntry("FAS",  "etf",  3.0, "Financials 3x long",
                   "Direxion Daily Financial Bull 3x — 3x daily long Russell 1000 Financials"),
     UniverseEntry("FAZ",  "etf", -3.0, "Financials 3x short",
                   "Direxion Daily Financial Bear 3x — 3x daily inverse Russell 1000 Financials"),
+    # ---- Regional banks (different factor from broad financials) ----
+    UniverseEntry("DPST", "etf",  3.0, "Regional Banks 3x long",
+                  "Direxion Daily Regional Banks Bull 3x — 3x daily long S&P Regional Banks"),
+    # ---- Biotech ----
+    UniverseEntry("LABU", "etf",  3.0, "Biotech 3x long",
+                  "Direxion Daily S&P Biotech Bull 3x — 3x daily long S&P Biotech"),
+    UniverseEntry("LABD", "etf", -3.0, "Biotech 3x short",
+                  "Direxion Daily S&P Biotech Bear 3x — 3x daily inverse S&P Biotech"),
+    # ---- Healthcare ----
+    UniverseEntry("CURE", "etf",  3.0, "Healthcare 3x long",
+                  "Direxion Daily Healthcare Bull 3x — 3x daily long Russell 1000 Healthcare"),
+    # ---- China ----
+    UniverseEntry("YINN", "etf",  3.0, "China 3x long",
+                  "Direxion Daily FTSE China Bull 3x — 3x daily long FTSE China 50"),
+    UniverseEntry("YANG", "etf", -3.0, "China 3x short",
+                  "Direxion Daily FTSE China Bear 3x — 3x daily inverse FTSE China 50"),
+    # ---- Energy ----
+    UniverseEntry("ERX",  "etf",  2.0, "Energy 2x long",
+                  "Direxion Daily Energy Bull 2x — 2x daily long S&P Energy Select"),
+    UniverseEntry("ERY",  "etf", -2.0, "Energy 2x short",
+                  "Direxion Daily Energy Bear 2x — 2x daily inverse S&P Energy Select"),
+    # ---- Gold miners ----
+    UniverseEntry("NUGT", "etf",  2.0, "Gold Miners 2x long",
+                  "Direxion Daily Gold Miners Bull 2x — 2x daily long NYSE Arca Gold Miners"),
+    UniverseEntry("DUST", "etf", -2.0, "Gold Miners 2x short",
+                  "Direxion Daily Gold Miners Bear 2x — 2x daily inverse NYSE Arca Gold Miners"),
     # ---- Volatility / commodity ----
     UniverseEntry("UVXY", "etf",  1.5, "VIX 1.5x long",
                   "ProShares Ultra VIX Short-Term Futures — 1.5x daily long VIX front-month"),
     UniverseEntry("BOIL", "etf",  2.0, "Natural Gas 2x long",
                   "ProShares Ultra Bloomberg Natural Gas — 2x daily long NatGas futures"),
+    # ---- Crypto (leveraged-ETF exposure, in-spirit with spec) ----
+    UniverseEntry("BITX", "etf",  2.0, "Bitcoin 2x long (Volatility Shares)",
+                  "Volatility Shares 2x Bitcoin Strategy ETF — 2x daily long BTC futures"),
+    UniverseEntry("BITU", "etf",  2.0, "Bitcoin 2x long (ProShares)",
+                  "ProShares Ultra Bitcoin Strategy ETF — 2x daily long BTC futures"),
+    UniverseEntry("SBIT", "etf", -2.0, "Bitcoin 2x short",
+                  "ProShares UltraShort Bitcoin Strategy ETF — 2x daily inverse BTC futures"),
+    UniverseEntry("ETHU", "etf",  2.0, "Ether 2x long",
+                  "Volatility Shares 2x Ether ETF — 2x daily long ETH futures"),
 )
 
 
@@ -77,6 +112,10 @@ _OPTION_UNDERLYINGS: tuple[UniverseEntry, ...] = (
                   "Tech-heavy options chain, very liquid"),
     UniverseEntry("IWM",  "option_underlying", 1.0, "Russell 2000 ETF",
                   "Small-cap options chain"),
+    UniverseEntry("DIA",  "option_underlying", 1.0, "Dow Jones Industrial ETF",
+                  "Large-cap value tilt — different factor than SPY/QQQ"),
+    UniverseEntry("TLT",  "option_underlying", 1.0, "20+ Year Treasury Bond ETF",
+                  "Bond/rates exposure — anti-correlated to equity-long positions"),
 )
 
 
