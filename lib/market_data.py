@@ -88,13 +88,21 @@ def passes_liquidity_filter(
 
 def _snapshot_one(symbol: str, *, run_id: str | None) -> dict:
     """Per-symbol live data block. Tolerant — partial failures leave the
-    affected field as None rather than crashing the whole universe fetch."""
+    affected field as None rather than crashing the whole universe fetch.
+
+    The static metadata (kind/leverage_factor/family/factor) comes from
+    lib.universe; live fields (closes, ADV, HV) come from yfinance below.
+    Codex P1 on PR #31: `factor` must be included here, not just in
+    universe.metadata_block(), because stage_screen serializes THIS output
+    (not metadata_block) when building the screener payload.
+    """
     meta = by_symbol(symbol)
     entry: dict = {
         "symbol": symbol,
         "kind": meta.kind if meta else "unknown",
         "leverage_factor": meta.leverage_factor if meta else 1.0,
         "family": meta.family if meta else "",
+        "factor": meta.factor if meta else "unknown",
     }
     try:
         df = history(

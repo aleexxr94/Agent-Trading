@@ -52,11 +52,25 @@ def test_universe_snapshot_returns_one_row_per_symbol(fake_yf, tmp_state):
 
 
 def test_snapshot_includes_metadata_from_universe(fake_yf, tmp_state):
+    """Static metadata fields must flow through to the per-symbol snapshot.
+    Codex P1 on PR #31: `factor` must be present here (not just in
+    universe.metadata_block) because stage_screen serializes the snapshot
+    output as the screener LLM's input."""
     snap = market_data.universe_snapshot(["TQQQ"], run_id="test-run")
     row = snap[0]
     assert row["kind"] == "etf"
     assert row["leverage_factor"] == 3.0
     assert "Nasdaq" in row["family"]
+    assert row["factor"] == "nasdaq"
+
+
+def test_snapshot_factor_shared_across_bull_bear_pair(fake_yf, tmp_state):
+    """Bull/bear pairs share a factor in the snapshot too — same invariant
+    as the static universe, but verified through the live data pipeline."""
+    snap = market_data.universe_snapshot(["TQQQ", "SQQQ"], run_id="test-run")
+    assert {r["symbol"]: r["factor"] for r in snap} == {
+        "TQQQ": "nasdaq", "SQQQ": "nasdaq",
+    }
 
 
 def test_snapshot_computes_price_volume_volatility(fake_yf, tmp_state):
