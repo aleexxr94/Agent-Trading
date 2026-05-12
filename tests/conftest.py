@@ -24,4 +24,5 @@ def tmp_state(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setattr(state_mod, "NEXT_RUN", sd / "next_run.json")
     monkeypatch.setattr(state_mod, "NAV_HISTORY_LOG", sd / "nav_history.jsonl")
     monkeypatch.setattr(state_mod, "COST_RESET_FLAG", sd / "cost_reset.json")
+    monkeypatch.setattr(state_mod, "ALL_TIME_COST_RESET_FLAG", sd / "cost_all_time_reset.json")
     return sd

@@ -564,6 +564,101 @@ def test_cost_by_month_empty(tmp_state):
     assert dd.cost_by_month() == []
 
 
+# ---------- all-time cost reset display filter ----------
+
+
+def test_total_token_cost_filters_post_all_time_reset(tmp_state):
+    """After state.set_all_time_cost_reset, total_token_cost only counts rows
+    AFTER the reset timestamp. Underlying costs.jsonl is unchanged."""
+    state.append_cost({
+        "run_id": "old", "stage": "x", "model": "m",
+        "cost_usd": 0.50, "input_tokens": 100, "output_tokens": 0,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+        "at": "2026-05-10T12:00:00Z",
+    })
+    # Plant a reset marker AFTER the old row
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.ALL_TIME_COST_RESET_FLAG.write_text(
+        '{"at": "2026-05-11T00:00:00Z", "reason": "test"}',
+        encoding="utf-8",
+    )
+    state.append_cost({
+        "run_id": "new", "stage": "y", "model": "m",
+        "cost_usd": 0.10, "input_tokens": 50, "output_tokens": 0,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+        "at": "2026-05-12T08:00:00Z",
+    })
+    t = dd.total_token_cost()
+    assert t["calls"] == 1, "should only count post-reset call"
+    assert t["cost_usd"] == pytest.approx(0.10)
+    assert t["input_tokens"] == 50
+    # Audit log preserved
+    assert state.COSTS_LOG.exists()
+    raw_lines = state.COSTS_LOG.read_text(encoding="utf-8").strip().splitlines()
+    assert len(raw_lines) == 2
+
+
+def test_runs_count_filters_post_all_time_reset(tmp_state):
+    """A reset wipes pre-reset run_ids from the displayed cycle count."""
+    for at, rid in [
+        ("2026-05-10T12:00:00Z", "old-1"),
+        ("2026-05-10T14:00:00Z", "old-2"),
+        ("2026-05-12T08:00:00Z", "new-1"),
+    ]:
+        state.append_cost({
+            "run_id": rid, "stage": "s", "model": "m",
+            "cost_usd": 0.10, "at": at,
+        })
+    assert dd.runs_count() == 3  # before reset
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.ALL_TIME_COST_RESET_FLAG.write_text(
+        '{"at": "2026-05-11T00:00:00Z", "reason": "test"}',
+        encoding="utf-8",
+    )
+    assert dd.runs_count() == 1  # only new-1 survives
+
+
+def test_cost_by_month_filters_post_all_time_reset(tmp_state):
+    """Monthly breakdown also honours the all-time reset."""
+    state.append_cost({
+        "run_id": "x", "stage": "s", "model": "m",
+        "cost_usd": 0.30, "at": "2026-04-15T09:30:00Z",
+    })
+    state.append_cost({
+        "run_id": "y", "stage": "s", "model": "m",
+        "cost_usd": 0.10, "at": "2026-05-12T08:00:00Z",
+    })
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.ALL_TIME_COST_RESET_FLAG.write_text(
+        '{"at": "2026-05-11T00:00:00Z", "reason": "test"}',
+        encoding="utf-8",
+    )
+    by_month = dd.cost_by_month()
+    assert [b["month"] for b in by_month] == ["2026-05"]
+    assert by_month[0]["cost_usd"] == pytest.approx(0.10)
+
+
+def test_cost_for_run_usd_filters_post_all_time_reset(tmp_state):
+    """A reset zeros an in-flight run's displayed cost so the "this run"
+    meter on the dashboard matches user expectation, but the raw log
+    used by cap enforcement (state.read_costs_for_run) is preserved."""
+    state.append_cost({
+        "run_id": "in-flight", "stage": "screen", "model": "m",
+        "cost_usd": 0.40, "at": "2026-05-12T08:00:00Z",
+    })
+    assert dd.cost_for_run_usd("in-flight") == pytest.approx(0.40)
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.ALL_TIME_COST_RESET_FLAG.write_text(
+        '{"at": "2026-05-12T09:00:00Z", "reason": "test"}',
+        encoding="utf-8",
+    )
+    # Display: zero
+    assert dd.cost_for_run_usd("in-flight") == pytest.approx(0.0)
+    # Raw log (cap enforcement path): preserved
+    rows = state.read_costs_for_run("in-flight")
+    assert sum(r["cost_usd"] for r in rows) == pytest.approx(0.40)
+
+
 def test_try_load_broker_marks_no_keys_returns_empty(tmp_state, monkeypatch):
     """Without ALPACA_API_KEY / SECRET in env, AlpacaBroker init raises and
     the dashboard helper must absorb the failure so the page still renders."""
