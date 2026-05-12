@@ -27,12 +27,52 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from jsonschema import ValidationError
 
 from . import state
+
+
+# Transient HTTP/SDK errors that warrant a retry rather than a hard crash.
+# Anthropic's streaming edge occasionally drops connections mid-response,
+# especially on long-running Opus calls with adaptive thinking + 30k+
+# max_tokens. The orchestrator runs these at 60s cadence — one blip
+# shouldn't take down the whole cycle.
+#
+# Imported lazily inside _retryable_stream_errors() so a missing optional
+# dependency (httpx is a transitive dep of the anthropic SDK) can't break
+# import of this module.
+def _retryable_stream_errors() -> tuple[type[BaseException], ...]:
+    errs: list[type[BaseException]] = []
+    try:
+        import httpx
+        errs.extend([
+            httpx.RemoteProtocolError,
+            httpx.ConnectError,
+            httpx.ReadTimeout,
+            httpx.ReadError,
+        ])
+    except ImportError:
+        pass
+    try:
+        import anthropic
+        errs.extend([
+            anthropic.APIConnectionError,
+            anthropic.APITimeoutError,
+        ])
+    except ImportError:
+        pass
+    return tuple(errs) or (ConnectionError,)
+
+
+# Retry tuning. Three attempts total (first try + 2 retries). Exponential
+# backoff 1s, 4s. Total worst-case wait is ~5s before giving up — short
+# enough not to hide a real outage, long enough to ride out one blip.
+STREAM_RETRY_ATTEMPTS = 3
+STREAM_RETRY_BACKOFF_SECONDS = (1.0, 4.0)
 
 # USD per million tokens — Claude 4.X published list prices.
 # Cache writes at 1.25x base input (5min TTL); cache reads at ~0.1x base input.
@@ -293,8 +333,38 @@ def structured_call(
         # Streaming sidesteps the timeout — we still wait for the final
         # message, so the rest of the call site (cost recording, schema
         # validation, retry) is unchanged.
-        with cli.messages.stream(**kwargs) as stream:
-            resp = stream.get_final_message()
+        #
+        # Transient HTTP-level retry: Anthropic's edge occasionally closes
+        # the streaming connection mid-response on long Opus calls
+        # (observed RemoteProtocolError on a construct call with 32k
+        # max_tokens + adaptive thinking). One blip used to take down the
+        # whole orchestrator cycle — now we retry with backoff. The
+        # downstream schema-retry path is separate; this loop only
+        # handles network/protocol failures.
+        retryable = _retryable_stream_errors()
+        last_exc: BaseException | None = None
+        for attempt in range(STREAM_RETRY_ATTEMPTS):
+            try:
+                with cli.messages.stream(**kwargs) as stream:
+                    resp = stream.get_final_message()
+                break  # success
+            except retryable as exc:
+                last_exc = exc
+                if attempt == STREAM_RETRY_ATTEMPTS - 1:
+                    raise
+                backoff = STREAM_RETRY_BACKOFF_SECONDS[
+                    min(attempt, len(STREAM_RETRY_BACKOFF_SECONDS) - 1)
+                ]
+                print(
+                    f"llm: stream attempt {attempt + 1}/{STREAM_RETRY_ATTEMPTS} "
+                    f"failed ({type(exc).__name__}: {exc}); retrying in {backoff}s",
+                    flush=True,
+                )
+                time.sleep(backoff)
+        else:
+            # Loop exhausted without break — re-raise the last exception.
+            assert last_exc is not None
+            raise last_exc
         usage = CallUsage(
             input_tokens=getattr(resp.usage, "input_tokens", 0),
             output_tokens=getattr(resp.usage, "output_tokens", 0),
