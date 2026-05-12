@@ -303,6 +303,25 @@ def test_chain_fetcher_raises_chainfetcherror_on_empty_chain():
         f.fetch("SPY", spot=530)
 
 
+def test_chain_fetcher_raises_chainfetcherror_when_alpaca_sdk_missing(monkeypatch):
+    """Codex P1 (PR #50): the SDK import for OptionChainRequest must live
+    inside the try block so a missing alpaca-py / alpaca submodule raises
+    ChainFetchError (the documented soft-failure contract) instead of
+    leaking ModuleNotFoundError up the call stack and aborting the run."""
+    import sys
+    client = _FakeOptionDataClient(raw={})  # never reached
+    f = oc.ChainFetcher(client=client)
+
+    # Force the import inside fetch() to fail. Setting the module entry
+    # to None makes Python raise ModuleNotFoundError on the next import
+    # of that name (PEP 328 behaviour). monkeypatch restores on teardown.
+    monkeypatch.setitem(sys.modules, "alpaca.data.requests", None)
+
+    with pytest.raises(oc.ChainFetchError) as ei:
+        f.fetch("SPY", spot=530)
+    assert "alpaca get_option_chain failed" in str(ei.value)
+
+
 def test_chain_fetcher_raises_when_filter_drops_everything():
     """Liquid strikes but all outside DTE band → ChainFetchError so the
     caller can degrade rather than send the agent an empty chain."""

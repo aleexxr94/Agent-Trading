@@ -264,9 +264,12 @@ class ChainFetcher:
 
         Returns the dict shape produced by ``summarise_chain``. On any
         Alpaca-side failure raises ChainFetchError — callers should
-        catch and degrade gracefully rather than abort the run.
+        catch and degrade gracefully rather than abort the run. This
+        includes the case where ``alpaca-py`` isn't installed: the SDK
+        import lives inside the try block so a ModuleNotFoundError
+        surfaces through the same soft-failure path rather than
+        crashing the pipeline.
         """
-        from alpaca.data.requests import OptionChainRequest
         today = today or date.today()
         # Pre-filter on Alpaca's side using strike/expiry bounds so the
         # response is small even on huge chains (SPX, SPY); we still
@@ -274,6 +277,7 @@ class ChainFetcher:
         # outside the bounds (adjusted-strike contracts, etc).
         band = spot * (atm_band_pct / 100.0)
         try:
+            from alpaca.data.requests import OptionChainRequest  # noqa: WPS433
             req = OptionChainRequest(
                 underlying_symbol=underlying,
                 strike_price_gte=max(0.0, spot - band),
