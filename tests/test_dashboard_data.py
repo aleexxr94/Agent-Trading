@@ -16,7 +16,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "portfolio.json"
 def test_load_portfolio_falls_back_to_fixture(tmp_state):
     p, src = dd.load_portfolio()
     assert src == "fixture"
-    assert 8 <= len(p["positions"]) <= 12
+    assert 3 <= len(p["positions"]) <= 12
 
 
 def test_load_portfolio_prefers_live(tmp_state):

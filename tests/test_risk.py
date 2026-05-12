@@ -66,8 +66,9 @@ def test_circuit_breaker_8pct_drop():
 
 
 @pytest.mark.parametrize("count,all_cash,ok", [
-    (8, False, True), (10, False, True), (12, False, True),
-    (7, False, False), (13, False, False),
+    (3, False, True), (5, False, True), (8, False, True),
+    (10, False, True), (12, False, True),
+    (2, False, False), (13, False, False),
     (0, True, True), (1, True, False),
 ])
 def test_position_band(count, all_cash, ok):

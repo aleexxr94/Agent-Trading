@@ -102,7 +102,7 @@ def constructor() -> StageConfig:
         system_prompt=_load("constructor.md"),
         schema_filename="portfolio.schema.json",
         # 16384 (was 8192): same headroom rationale as scenarios — constructor
-        # outputs 8-12 positions each with entry_thesis, kill_conditions,
+        # outputs 3-12 positions each with entry_thesis, kill_conditions,
         # sizing math, plus a portfolio-level construction_rationale and
         # all_cash_rationale envelope. Defensive bump to match scenarios so the
         # construct stage doesn't become the next bottleneck.

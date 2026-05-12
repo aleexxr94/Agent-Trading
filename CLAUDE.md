@@ -16,7 +16,7 @@ You are a senior quant systems engineer. Build a complete, **paper-trading-only*
 ## System scope
 - Universe: leveraged ETFs (2x/3x equity, sector, vol) + listed options on liquid underlyings (SPY, QQQ, IWM, and high-volume leveraged ETFs).
 - **No spot single-name equities. No unleveraged broad-market ETFs as core positions.**
-- Portfolio target: **exactly 10 open positions** at the end of each rebalance cycle. 8–11 is acceptable transiently during execution; must converge to 10 within one cycle.
+- Portfolio target: **3–12 open positions** at the end of each rebalance cycle (or all-cash if conviction is genuinely absent). The original "exactly 10" target was infeasible on a $2,500 leveraged-ETF + listed-options universe — every cycle abstained to all-cash, paying LLM cost for zero trades. 3 is the new floor for meaningful diversification on this account size; 12 remains the upper cap.
 - Per-position cap at entry: **≤15% of portfolio NAV**.
 - Per-position kill condition: **≤25% loss of position NAV** (or 100% premium for long options).
 - Daily portfolio drawdown circuit breaker: **≥8% in a single UTC day** halts new orders and triggers monitor-only mode until next manual review.
@@ -57,7 +57,7 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
 1. **Universe Screening** — yfinance + Alpaca options chain. Apply liquidity filters (min average daily volume, options OI ≥ threshold, bid-ask spread cap). Output: `screen.json`.
 2. **Adversarial Research** — for each top candidate, run a bull and bear sub-agent **in parallel**. Bear must steel-man the bull case before disagreeing. Includes Greeks, IV percentile, IV vs HV. Output: `research.json` with confidence delta per candidate.
 3. **Scenario Modeling** — probability-weighted base/bull/bear cases with explicit horizon chosen by the agent. For options candidates, include expiry rationale (DTE choice) and strike rationale. Output: `scenarios.json`.
-4. **Portfolio Construction** — converge on 10 positions (or all-cash if conviction is insufficient). Each position carries: rationale, "why this instrument vs alternatives", "why now", explicit kill conditions, sizing math. Output: `portfolio.json`.
+4. **Portfolio Construction** — converge on 3–12 positions (or all-cash if conviction is genuinely absent). Each position carries: rationale, "why this instrument vs alternatives", "why now", explicit kill conditions, sizing math. Output: `portfolio.json`.
 5. **Execution + Monitoring** — submit paper orders via Alpaca; on success, orchestrator decides next-run window in minutes or hours and writes `next_run.json`. A lightweight `monitor.py` runs more frequently and only checks kill conditions; it can flatten a position but cannot open new ones.
 
 ## Repo structure

@@ -5,7 +5,7 @@ Phone access:   streamlit run dashboard.py --server.address 0.0.0.0
                 (no auth — only on a trusted home network; see README)
 
 Tabs:
-  1. Portfolio — NAV, cash, the 8–12 positions, allocation pie, P&L stub.
+  1. Portfolio — NAV, cash, the 3–12 positions, allocation pie, P&L stub.
   2. Trades & Rationales — chronological decisions with full agent reasoning.
   3. Performance — equity curve + drawdown + SPY benchmark (Plotly).
   4. Agent Logs — bull/bear debates, scenarios, last 20 decision-log rows,
