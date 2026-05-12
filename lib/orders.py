@@ -18,10 +18,21 @@ OSI symbol convention used (matches Alpaca paper):
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from .broker import Broker, BrokerPosition, OrderRequest, OrderResult
+
+# OCC OSI option-symbol shape: 1-6 char underlying + YYMMDD + C/P + strike*1000
+# zero-padded to 8 digits. Used to detect option legs in submit_plan without
+# threading kind="option" through OrderRequest (which would muddle the ETF path).
+_OSI_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+
+
+def is_osi_symbol(symbol: str) -> bool:
+    """True iff ``symbol`` matches the OCC OSI option-symbol shape."""
+    return bool(_OSI_RE.match(symbol))
 
 
 def is_enabled() -> bool:
@@ -190,9 +201,28 @@ def _alpaca_error_label(e: Exception) -> str:
 def submit_plan(plan: OrderPlan, *, broker: Broker) -> list[OrderResult]:
     """Submit every OrderRequest in the plan via the broker, in close → open
     order (frees cash before sizing new positions). Returns the result list
-    so the orchestrator can log broker order IDs into the decision log."""
+    so the orchestrator can log broker order IDs into the decision log.
+
+    Option-open guard: before submitting a BUY for an OSI-shaped symbol,
+    ask the broker whether the contract exists and is tradable. If not,
+    skip with a clear status string instead of submitting an order that
+    will fail with Alpaca's generic error[42210000] 'asset not found'.
+    Closes (sells) are never gated — if we hold the position the contract
+    obviously exists at the broker.
+    """
     results: list[OrderResult] = []
     for req in plan.closes + plan.requests:
+        if req.side == "buy" and is_osi_symbol(req.symbol):
+            if not broker.option_contract_tradable(req.symbol):
+                results.append(OrderResult(
+                    broker_order_id="",
+                    symbol=req.symbol,
+                    qty=req.qty,
+                    side=req.side,
+                    submitted_at="",
+                    status="skipped: option contract not tradable at broker",
+                ))
+                continue
         try:
             results.append(broker.submit_order(req))
         except Exception as e:
