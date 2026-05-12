@@ -2,7 +2,7 @@
 
 > **PAPER TRADING — Experimental autonomous AI agent. Leveraged ETFs and listed options on a small account are high-risk. Not financial advice.**
 
-Autonomous multi-agent trading system that screens leveraged ETFs and listed options, runs adversarial bull/bear research, builds scenario-weighted views, constructs a **3–12 position portfolio (or all-cash)**, and executes via **Alpaca paper**. Runs unattended on a Linux VPS (or on Windows under Task Scheduler) with a Streamlit dashboard.
+Autonomous multi-agent trading system that screens leveraged ETFs and listed options, runs adversarial bull/bear research, builds scenario-weighted views, constructs a **1–12 position portfolio (or all-cash)**, and executes via **Alpaca paper**. Runs unattended on a Linux VPS (or on Windows under Task Scheduler) with a Streamlit dashboard.
 
 The canonical build spec is [CLAUDE.md](./CLAUDE.md). This README is the operator's manual.
 
@@ -21,7 +21,7 @@ systemd timer (Linux) / Task Scheduler (Windows) ──▶ orchestrator.py
                                                       ├─ Stage 1: screen      (Haiku 4.5)
                                                       ├─ Stage 2: research    (Sonnet 4.6, bull+bear in parallel)
                                                       ├─ Stage 3: scenarios   (Sonnet 4.6)
-                                                      ├─ Stage 4: construct   (Opus 4.6, 3–12 or all-cash)
+                                                      ├─ Stage 4: construct   (Opus 4.6, 1–12 or all-cash)
                                                       └─ Stage 5: execute     (Alpaca paper) + write next_run.json
                                                             │
                                                             ▼

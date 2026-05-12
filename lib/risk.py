@@ -7,7 +7,7 @@ Spec invariants:
   - Per-position cap at entry: ≤15% of portfolio NAV.
   - Per-position kill: ≤25% loss of position NAV (or 100% premium for long options).
   - Daily portfolio drawdown circuit breaker: ≥8% in a single UTC day halts new orders.
-  - Target band 3–12 positions (or all-cash) — judgement call by the agent.
+  - Target band 1–12 positions (or all-cash) — judgement call by the agent.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ MAX_POSITION_PCT = 15.0
 MAX_POSITION_LOSS_PCT = 25.0
 MAX_OPTION_LOSS_PCT = 100.0
 DAILY_DD_HALT_PCT = 8.0
-TARGET_POSITION_BAND = (3, 12)
+TARGET_POSITION_BAND = (1, 12)
 
 
 class RiskViolation(ValueError):

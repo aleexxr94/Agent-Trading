@@ -1,6 +1,6 @@
 """Schema tests — validate fixtures against schemas/*.schema.json.
 
-Covers the 3–12 position band, all-cash empty case, the 15% per-position cap,
+Covers the 1–12 position band, all-cash empty case, the 15% per-position cap,
 the option/ETF discriminator, scenario probability shape, and the decision-log
 required fields.
 """
@@ -148,19 +148,20 @@ def test_option_requires_greeks(registry):
 # ---------- portfolio.schema ----------
 
 
-@pytest.mark.parametrize("count", [3, 5, 8, 10, 12])
+@pytest.mark.parametrize("count", [1, 2, 3, 5, 8, 10, 12])
 def test_portfolio_position_band_valid(registry, count):
-    """Position band relaxed from 8-12 → 3-12 — the old floor of 8 was
-    infeasible on a $2,500 leveraged-ETF + options universe; every cycle
-    abstained, burning LLM cost for zero trades."""
+    """Position band relaxed from 3-12 → 1-12 — the 3-position floor was
+    suppressing single strong positive-EV trades (e.g. a +26%-EV option) when
+    the rest of the surviving candidate set was too correlated or negative-EV
+    to clear the count rule. Concentration risk is bounded by the per-position
+    15% NAV cap, not by a minimum count."""
     positions = [_etf_position(symbol=f"AAA{i}", position_pct=5.0) for i in range(count)]
     _validator("portfolio.schema.json", registry).validate(_portfolio(positions))
 
 
-@pytest.mark.parametrize("count", [0, 1, 2, 13])
+@pytest.mark.parametrize("count", [0, 13])
 def test_portfolio_position_band_rejects_out_of_range(registry, count):
-    """1 or 2 positions = no meaningful diversification (use all-cash instead).
-    13+ = beyond the cap."""
+    """0 positions = use all_cash:true instead. 13+ = beyond the cap."""
     positions = [_etf_position(symbol=f"AAA{i}", position_pct=2.0) for i in range(count)]
     with pytest.raises(Exception):
         _validator("portfolio.schema.json", registry).validate(_portfolio(positions))

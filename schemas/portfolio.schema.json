@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://agent-trading.local/schemas/portfolio.schema.json",
   "title": "Portfolio",
-  "description": "Output of Stage 4 (Portfolio Construction). The agent may converge to 3–12 positions OR output an all-cash portfolio (empty positions) with rationale. Sum of position_pct must be ≤ 100.",
+  "description": "Output of Stage 4 (Portfolio Construction). The agent may converge to 1–12 positions OR output an all-cash portfolio (empty positions) with rationale. Sum of position_pct must be ≤ 100.",
   "type": "object",
   "properties": {
     "run_id": {"type": "string", "minLength": 1},
@@ -21,7 +21,7 @@
       "items": {"$ref": "https://agent-trading.local/schemas/position.schema.json"}
     },
     "construction_rationale": {"type": "string", "minLength": 1,
-                                 "description": "Why this set of positions, why this count within 3–12, why now."}
+                                 "description": "Why this set of positions, why this count within 1–12, why now."}
   },
   "required": ["run_id", "generated_at", "nav_usd", "cash_usd",
                 "cash_buffer_pct", "all_cash", "positions",
@@ -39,7 +39,7 @@
       },
       "else": {
         "properties": {
-          "positions": {"type": "array", "minItems": 3, "maxItems": 12}
+          "positions": {"type": "array", "minItems": 1, "maxItems": 12}
         }
       }
     }
