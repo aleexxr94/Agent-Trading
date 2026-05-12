@@ -308,6 +308,88 @@ def test_spot_lookup_from_screen_pulls_last_close():
     assert out == {"SPY": 530.42, "TLT": 88.5}
 
 
+def test_spot_lookup_prefers_spot_prices_side_table_over_passed_rows():
+    """Regression 2026-05-12T21:40 paper run: Haiku's screener output
+    omitted `last_close` per passed row, so the chain stage skipped every
+    fetch. Fix: stage_screen now attaches a `spot_prices` side-table
+    built from the universe snapshot, and the lookup prefers it."""
+    screen = {
+        "spot_prices": {"SPY": 530.42, "QQQ": 440.0, "IWM": 220.0, "TLT": 88.5},
+        "passed": [
+            {"symbol": "SPY", "kind": "option_underlying"},  # no last_close
+            {"symbol": "QQQ", "kind": "option_underlying"},
+        ],
+    }
+    out = orchestrator._spot_lookup_from_screen(screen)
+    assert out == {"SPY": 530.42, "QQQ": 440.0, "IWM": 220.0, "TLT": 88.5}
+
+
+def test_spot_lookup_side_table_takes_priority_over_legacy_field():
+    """When both spot_prices and per-row last_close exist, the side-table
+    wins."""
+    screen = {
+        "spot_prices": {"SPY": 530.42},
+        "passed": [{"symbol": "SPY", "last_close": 999.99}],
+    }
+    out = orchestrator._spot_lookup_from_screen(screen)
+    assert out == {"SPY": 530.42}
+
+
+def test_spot_lookup_falls_back_to_passed_rows_when_no_side_table():
+    """Legacy / fixture path: an older screen artifact without the
+    spot_prices side-table must still resolve spots from per-row
+    last_close so back-compat doesn't break."""
+    screen = {"passed": [{"symbol": "SPY", "last_close": 530.42}]}
+    out = orchestrator._spot_lookup_from_screen(screen)
+    assert out == {"SPY": 530.42}
+
+
+def test_spot_lookup_skips_zero_and_none_in_side_table():
+    screen = {
+        "spot_prices": {"SPY": 530.42, "QQQ": 0, "IWM": None, "TLT": -1.0},
+    }
+    out = orchestrator._spot_lookup_from_screen(screen)
+    assert out == {"SPY": 530.42}
+
+
+def test_stage_screen_attaches_spot_prices_from_universe_snapshot(tmp_state, monkeypatch):
+    """End-to-end: stage_screen builds the spot_prices side-table from the
+    universe snapshot's last_close values, regardless of whether Haiku
+    echoes them in its JSON output."""
+    snapshot = [
+        {"symbol": "SPY", "kind": "option_underlying", "last_close": 530.42, "adv_30d": 57_667_948, "hv_30d_annualised": 0.13},
+        {"symbol": "QQQ", "kind": "option_underlying", "last_close": 440.0, "adv_30d": 44_385_545, "hv_30d_annualised": 0.17},
+        {"symbol": "BROKEN", "kind": "etf", "error": "no history"},  # no last_close
+    ]
+    monkeypatch.setattr(
+        orchestrator.market_data, "universe_snapshot",
+        lambda symbols, run_id=None, **kw: snapshot,
+    )
+    haiku_response = json.dumps({
+        "generated_at": "2026-05-12T21:40:00Z",
+        "passed": [
+            {"symbol": "SPY", "kind": "option_underlying", "adv": 57_667_948, "hv_annualised": 0.13},
+            {"symbol": "QQQ", "kind": "option_underlying", "adv": 44_385_545, "hv_annualised": 0.17},
+        ],
+        "rejected": [],
+    })
+
+    def fake_call(call, **kwargs):
+        from lib.llm import CallUsage, StructuredCallResult
+        return StructuredCallResult(
+            payload={}, usage=CallUsage(0, 0, 0, 0), cost_usd=0.0,
+            cache_hit_pct=0.0, raw_text=haiku_response,
+        )
+
+    monkeypatch.setattr(orchestrator.llm, "structured_call", fake_call)
+    ctx = orchestrator.StageContext(run_id="t", dry_run=False, broker=None)
+    out = orchestrator.stage_screen(ctx)
+
+    assert out["spot_prices"] == {"SPY": 530.42, "QQQ": 440.0}
+    spots = orchestrator._spot_lookup_from_screen(out)
+    assert spots == {"SPY": 530.42, "QQQ": 440.0}
+
+
 def test_stage_chains_dry_run_loads_fixture(tmp_state):
     """Dry-run reads tests/fixtures/chains.json if present."""
     ctx = orchestrator.StageContext(run_id="rid-x", dry_run=True, broker=None)

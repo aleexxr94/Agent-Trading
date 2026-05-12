@@ -161,9 +161,27 @@ def stage_screen(ctx: StageContext) -> dict:
     # silent `raw` envelope — downstream stages see {"passed": []} and the
     # agent abstains to all-cash even though the screener found candidates.
     try:
-        return json.loads(llm.strip_markdown_fences(res.raw_text))
+        parsed = json.loads(llm.strip_markdown_fences(res.raw_text))
     except json.JSONDecodeError:
-        return {"generated_at": state.utcnow_iso(), "raw": res.raw_text, "passed": [], "rejected": []}
+        parsed = {
+            "generated_at": state.utcnow_iso(),
+            "raw": res.raw_text,
+            "passed": [],
+            "rejected": [],
+        }
+    # Attach a side-table of spot prices keyed by symbol. The chain stage
+    # downstream uses this to set its ATM band without re-fetching yfinance
+    # AND without relying on Haiku to echo `last_close` per passed row.
+    # Observed regression 2026-05-12T21:40 paper run: Haiku omitted the
+    # `last_close` field on each passed entry, so stage_chains' lookup
+    # found None for every option underlying and skipped every chain fetch.
+    parsed["spot_prices"] = {
+        row["symbol"]: row["last_close"]
+        for row in snapshot
+        if row.get("symbol") and isinstance(row.get("last_close"), (int, float))
+        and row["last_close"] > 0
+    }
+    return parsed
 
 
 async def _research_one(ctx: StageContext, candidate: dict) -> dict:
@@ -278,13 +296,32 @@ def _option_underlyings_from_research(research: dict) -> list[str]:
 
 def _spot_lookup_from_screen(screen: dict) -> dict[str, float]:
     """Build {symbol: last_close} from screen output so the chain stage can
-    set its ATM band without re-hitting yfinance. Falls back to None for
-    symbols with missing/error rows; the chain stage skips those."""
+    set its ATM band without re-hitting yfinance.
+
+    Priority:
+      1. ``screen["spot_prices"]`` — explicit side-table populated by
+         stage_screen from the universe snapshot. This is the canonical
+         source: independent of whether Haiku chose to echo `last_close`
+         per row in its JSON output. Added after a 2026-05-12 paper run
+         where Haiku omitted the field on every passed row and the chain
+         stage skipped every fetch with "no spot price available".
+      2. ``passed[i].last_close`` / ``failed[i].last_close`` — legacy
+         path for older screen artifacts that don't carry spot_prices.
+
+    Falls back to None for symbols with no usable spot; the chain stage
+    skips those underlyings.
+    """
     out: dict[str, float] = {}
+    # Preferred: explicit side-table.
+    spot_prices = screen.get("spot_prices") or {}
+    for sym, lc in spot_prices.items():
+        if isinstance(lc, (int, float)) and lc > 0:
+            out[sym] = float(lc)
+    # Fallback: per-row last_close (legacy / fixture path).
     for c in (screen.get("passed") or []) + (screen.get("failed") or []):
         sym = c.get("symbol")
         lc = c.get("last_close")
-        if sym and isinstance(lc, (int, float)) and lc > 0:
+        if sym and sym not in out and isinstance(lc, (int, float)) and lc > 0:
             out[sym] = float(lc)
     return out
 
