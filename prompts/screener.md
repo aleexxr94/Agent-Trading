@@ -70,8 +70,8 @@ Return JSON only — no prose, no markdown fences. Shape:
   "generated_at": "<ISO 8601 UTC>",
   "universe_size": <int — count of input rows>,
   "passed": [
-    {"symbol": "TQQQ", "kind": "etf", "leverage_factor": 3.0, "adv": 50000000, "hv_annualised": 0.45},
-    {"symbol": "SPY",  "kind": "option_underlying", "adv": 90000000, "hv_annualised": 0.13}
+    {"symbol": "TQQQ", "kind": "etf", "factor": "nasdaq", "leverage_factor": 3.0, "adv": 50000000, "hv_annualised": 0.45},
+    {"symbol": "SPY",  "kind": "option_underlying", "factor": "sp500", "adv": 90000000, "hv_annualised": 0.13}
   ],
   "rejected": [
     {"symbol": "BOIL", "reason": "ADV < 1M"},
@@ -79,5 +79,7 @@ Return JSON only — no prose, no markdown fences. Shape:
   ]
 }
 ```
+
+**Always echo the `factor` field on each `passed` row** — downstream stages (research, constructor) rely on it for diversification + correlation reasoning. Drop it and they fall back to inferring from `family`/`symbol`, which is brittle.
 
 Keep `passed` to **≤ 12 candidates**. Prefer breadth across **`factor`** values rather than loading up on one factor — the universe spans Nasdaq, S&P 500, small caps, semis, broad financials, regional banks, biotech, healthcare, China, energy, gold miners, vol, natgas, crypto (BTC/ETH), plus the Dow and rates via option underlyings. Don't include both a 3x-long and its 3x-inverse pair unless both make the cut on standalone merit — typically the screener should pick one direction per `factor`.

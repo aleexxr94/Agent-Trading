@@ -221,12 +221,32 @@ async def _research_one(ctx: StageContext, candidate: dict) -> dict:
     }
 
 
+RESEARCH_CANDIDATE_CAP = 10            # total candidates that fan into bull+bear research
+RESEARCH_OPTION_UNDERLYING_CAP = 5     # max option underlyings (full SPY/QQQ/IWM/DIA/TLT set)
+
+
+def _select_research_candidates(passed: list[dict]) -> list[dict]:
+    """Pick which of the screener's `passed` rows go into bull+bear research.
+
+    Prioritises option underlyings (SPY/QQQ/IWM/DIA/TLT) so they never get
+    cut by a "first 8" slice that the screener happened to fill with ETFs.
+    In high-vol / extended-market regimes, defined-risk long puts on those
+    underlyings are frequently the only positive-EV plays — the constructor
+    can only consider candidates that survive this stage's cap.
+    """
+    options = [c for c in passed if c.get("kind") == "option_underlying"]
+    etfs    = [c for c in passed if c.get("kind") != "option_underlying"]
+    options = options[:RESEARCH_OPTION_UNDERLYING_CAP]
+    etfs    = etfs[: max(0, RESEARCH_CANDIDATE_CAP - len(options))]
+    return options + etfs
+
+
 def stage_research(ctx: StageContext, screen: dict) -> dict:
     if ctx.dry_run:
         out = _load_fixture("research.json")
         out["run_id"] = ctx.run_id
         return out
-    candidates = screen.get("passed", [])[:8]  # cap fan-out for cost discipline
+    candidates = _select_research_candidates(screen.get("passed", []))
 
     async def _gather():
         return await asyncio.gather(*[_research_one(ctx, c) for c in candidates])

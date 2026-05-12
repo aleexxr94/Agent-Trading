@@ -94,6 +94,61 @@ def test_live_mode_writes_current_portfolio_with_mocked_llm(tmp_state, monkeypat
     assert (1 <= len(p["positions"]) <= 12) or p["all_cash"]
 
 
+def _row(symbol: str, kind: str) -> dict:
+    return {"symbol": symbol, "kind": kind, "factor": "x", "adv": 0, "hv_annualised": 0.4}
+
+
+def test_select_research_candidates_prioritises_options_over_etfs():
+    """Regression for the bug observed after PR #39 landed: screener passed
+    SPY/QQQ/TLT plus 9 ETFs (12 total), but `[:8]` slice took the 9 ETFs
+    first and dropped the option underlyings before research, so the
+    constructor never saw them. Long puts couldn't fire because nothing
+    asked the LLM to model them. Option underlyings must always survive
+    the cap."""
+    passed = [
+        _row("TQQQ", "etf"), _row("UPRO", "etf"), _row("TNA", "etf"),
+        _row("TZA",  "etf"), _row("SOXL", "etf"), _row("SOXS", "etf"),
+        _row("LABD", "etf"), _row("BOIL", "etf"), _row("BITX", "etf"),
+        _row("SPY",  "option_underlying"),
+        _row("QQQ",  "option_underlying"),
+        _row("TLT",  "option_underlying"),
+    ]
+    selected = orchestrator._select_research_candidates(passed)
+    symbols = [c["symbol"] for c in selected]
+    # All 3 option underlyings must be present
+    assert {"SPY", "QQQ", "TLT"}.issubset(symbols), (
+        f"option underlyings dropped from research input: {symbols}"
+    )
+    # Total cap respected
+    assert len(selected) == orchestrator.RESEARCH_CANDIDATE_CAP
+
+
+def test_select_research_candidates_caps_options_at_5():
+    """If the screener somehow passes more than 5 option underlyings, cap
+    at 5 so ETFs still get represented."""
+    passed = (
+        [_row(f"OPT{i}", "option_underlying") for i in range(7)]
+        + [_row("TQQQ", "etf"), _row("UPRO", "etf")]
+    )
+    selected = orchestrator._select_research_candidates(passed)
+    n_options = sum(1 for c in selected if c["kind"] == "option_underlying")
+    assert n_options == 5
+    assert len(selected) == 7  # 5 options + 2 etfs
+
+
+def test_select_research_candidates_empty_input():
+    assert orchestrator._select_research_candidates([]) == []
+
+
+def test_select_research_candidates_etfs_only_uses_full_cap():
+    """No option underlyings in input → fall back to top-N ETFs filling the
+    full RESEARCH_CANDIDATE_CAP — don't artificially shrink the slice."""
+    passed = [_row(f"ETF{i}", "etf") for i in range(15)]
+    selected = orchestrator._select_research_candidates(passed)
+    assert len(selected) == orchestrator.RESEARCH_CANDIDATE_CAP
+    assert all(c["kind"] == "etf" for c in selected)
+
+
 def test_screener_strips_markdown_fences_from_haiku_output(tmp_state, monkeypatch):
     """Regression: Haiku occasionally wraps its JSON in ```json fences despite
     the 'no markdown fences' prompt directive. Bare json.loads chokes and the
