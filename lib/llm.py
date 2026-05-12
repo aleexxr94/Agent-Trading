@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -243,19 +244,49 @@ def sanitize_schema_for_structured_output(
     return _walk(inlined)
 
 
+_CLOSING_FENCE_RE = re.compile(r"\n```")
+
+
 def strip_markdown_fences(text: str) -> str:
-    """Sonnet sometimes wraps JSON in ```json … ``` fences despite explicit
-    instructions to the contrary. Strip them defensively before json.loads."""
+    """Strip a leading ```json … ``` fence and any prose that may follow.
+
+    The screener / scenarios prompts forbid markdown fences, but Haiku in
+    particular occasionally:
+      (a) wraps the JSON in ```json … ``` and stops there (the original
+          observation that motivated this helper), or
+      (b) wraps the JSON in ```json … ``` AND THEN appends a "Regime
+          flags & rationale:" prose epilogue OUTSIDE the closing fence
+          (observed in the live paper run at 2026-05-12T21:23 UTC — the
+          screener produced 12 well-formed candidates inside the fenced
+          block but json.loads choked on the trailing prose, fell back to
+          a `raw` envelope, and zeroed `passed`/`rejected` for the rest
+          of the cycle).
+
+    Both shapes resolve to "extract the FIRST fenced block, drop the
+    fence and anything after it". For unfenced JSON (the happy path) we
+    return the input unchanged after stripping whitespace.
+
+    Codex P2 (PR #58): the closing fence is matched as ``\\n```'' — a
+    triple-backtick sequence at the START of a line. A naive
+    ``body.find('```')`` would falsely truncate when a JSON string value
+    legitimately contains triple backticks (e.g. markdown content
+    embedded in a field). Unescaped real newlines are illegal inside
+    JSON string literals (they must be `\\n` two-char escapes), so the
+    `\\n` prefix on the terminator guarantees we only cut at an actual
+    fence line, never inside a JSON value.
+    """
     t = text.strip()
-    if t.startswith("```"):
-        # Drop the opening fence (with optional language tag) and the closing fence.
-        nl = t.find("\n")
-        if nl != -1:
-            t = t[nl + 1:]
-        if t.endswith("```"):
-            t = t[: -3]
-        t = t.strip()
-    return t
+    if not t.startswith("```"):
+        return t
+    # Drop the opening fence line (with optional language tag, e.g. ```json).
+    nl = t.find("\n")
+    if nl == -1:
+        return t
+    body = t[nl + 1:]
+    m = _CLOSING_FENCE_RE.search(body)
+    if m is not None:
+        body = body[:m.start()]
+    return body.strip()
 
 
 class CostCapExceeded(RuntimeError):
