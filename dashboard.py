@@ -882,6 +882,46 @@ with tabs[5]:
             state.set_cost_reset("dashboard")
             st.rerun()
 
+    st.markdown(
+        '<div class="at-section-label">All-time LLM cost</div>',
+        unsafe_allow_html=True,
+    )
+    all_time_reset_at = state.read_all_time_cost_reset_at()
+    if all_time_reset_at:
+        st.info(
+            f"All dashboard cost totals are currently filtered — only counting "
+            f"LLM spend after **{_fmt_ts(all_time_reset_at)}**. Underlying "
+            f"`state/costs.jsonl` is intact; cap enforcement still uses the raw "
+            f"log so per-run / per-day safety rails remain in force."
+        )
+        at_cols = st.columns(2)
+        with at_cols[0]:
+            if st.button(
+                "🔄 Re-reset all costs to now",
+                help="Records a new all-time reset marker at the current time.",
+            ):
+                state.set_all_time_cost_reset("dashboard")
+                st.rerun()
+        with at_cols[1]:
+            if st.button("↩ Clear all-time reset (show full history)"):
+                state.clear_all_time_cost_reset()
+                st.rerun()
+    else:
+        st.caption(
+            "Dashboard totals (today, this run, monthly, all-time) read from the "
+            "full `state/costs.jsonl` by default. Pressing the button below zeroes "
+            "ALL displayed totals at the current moment — useful after a testing "
+            "burn or model-config change you want to draw a line under. Audit log "
+            "and cap enforcement are unaffected."
+        )
+        if st.button(
+            "🧹 Reset ALL LLM costs to $0 (display only)",
+            help="Records an all-time reset marker. costs.jsonl audit log is preserved; "
+                 "per-run and per-day caps continue to use the raw log.",
+        ):
+            state.set_all_time_cost_reset("dashboard")
+            st.rerun()
+
     st.markdown('<div class="at-section-label">Halt flag</div>', unsafe_allow_html=True)
     if halted:
         st.error(f"Orchestrator is HALTED. Flag file: `{state.HALT_FLAG}`")

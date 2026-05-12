@@ -30,6 +30,14 @@ HALT_FLAG = STATE_DIR / "halt.flag"
 # costs.jsonl audit log is never mutated — the reset is purely a display
 # offset.
 COST_RESET_FLAG = STATE_DIR / "cost_reset.json"
+# All-time cost reset marker. Set from the dashboard when the operator
+# wants to zero ALL displayed LLM-cost totals (today, month, all-time),
+# not just the daily meter. Helpers in lib.dashboard_data filter every
+# costs.jsonl row whose `at` is ≤ this timestamp out of the displayed
+# totals — the underlying audit log is never mutated. Cap enforcement
+# in lib.llm.check_caps_or_raise stays unfiltered: it's a per-run /
+# per-day safety rail and isn't subject to the operator's display preference.
+ALL_TIME_COST_RESET_FLAG = STATE_DIR / "cost_all_time_reset.json"
 DECISIONS_LOG = STATE_DIR / "decisions.jsonl"
 COSTS_LOG = STATE_DIR / "costs.jsonl"
 # Per-fill audit log for per-trade PnL accounting. One row per Alpaca
@@ -183,6 +191,74 @@ def clear_cost_reset() -> None:
     daily total again."""
     if COST_RESET_FLAG.exists():
         COST_RESET_FLAG.unlink()
+
+
+def read_all_time_cost_reset_at() -> str | None:
+    """Return the ISO UTC timestamp of the all-time cost-reset marker,
+    or None if no reset on file. Display helpers filter every cost row
+    whose `at` is ≤ this timestamp out of dashboard totals."""
+    if not ALL_TIME_COST_RESET_FLAG.exists():
+        return None
+    try:
+        return json.loads(
+            ALL_TIME_COST_RESET_FLAG.read_text(encoding="utf-8")
+        ).get("at")
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def set_all_time_cost_reset(reason: str = "dashboard") -> str:
+    """Mark NOW as the all-time display-reset point for LLM cost totals.
+    Returns the ISO timestamp written.
+
+    The underlying costs.jsonl audit log is preserved untouched — only
+    the dashboard's displayed totals (today, this run, monthly, all-time)
+    will skip rows at or before this marker. Cap enforcement in
+    lib.llm.check_caps_or_raise is NOT affected; per-run and per-day
+    caps remain in force based on the raw log.
+
+    Also stamps the same timestamp into the daily reset marker so that
+    "today's cost" meter zeros at the same moment — the operator asked
+    for "reset all costs up to date", which includes the current UTC day.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    at = utcnow_iso()
+    ALL_TIME_COST_RESET_FLAG.write_text(
+        json.dumps({"at": at, "reason": reason}, sort_keys=True),
+        encoding="utf-8",
+    )
+    # Stamp the same timestamp into the daily-reset marker so today's
+    # display clears synchronously. The two markers serve different
+    # display surfaces but the "reset all" action should affect both.
+    COST_RESET_FLAG.write_text(
+        json.dumps({"at": at, "reason": reason}, sort_keys=True),
+        encoding="utf-8",
+    )
+    return at
+
+
+def clear_all_time_cost_reset() -> None:
+    """Discard the all-time reset marker; dashboard totals revert to the
+    full audit log."""
+    if ALL_TIME_COST_RESET_FLAG.exists():
+        ALL_TIME_COST_RESET_FLAG.unlink()
+
+
+def filter_costs_post_reset(rows: list[dict]) -> list[dict]:
+    """Drop cost rows whose `at` is ≤ the all-time reset marker.
+
+    Used by every dashboard helper that surfaces an LLM-cost total
+    (lib.dashboard_data.total_token_cost / cost_by_month / load_costs /
+    runs_count). When no reset marker exists, returns ``rows`` unchanged.
+
+    Per-day display (cost_today / read_costs_today) already filters on
+    the same-day reset marker; this is a stricter superset that also
+    blanks history.
+    """
+    reset_at = read_all_time_cost_reset_at()
+    if not reset_at:
+        return rows
+    return [r for r in rows if (r.get("at") or "") > reset_at]
 
 
 def read_costs_today() -> list[dict]:

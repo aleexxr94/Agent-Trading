@@ -166,3 +166,65 @@ def test_read_nav_history_limit(tmp_state):
 def test_append_nav_rejects_missing_keys(tmp_state):
     with pytest.raises(ValueError):
         state.append_nav({"run_id": "r1", "at": state.utcnow_iso()})  # missing nav_usd
+
+
+# ---------- all-time cost reset ----------
+
+
+def test_all_time_cost_reset_round_trip(tmp_state):
+    """Set / read / clear cycle for the all-time reset marker."""
+    assert state.read_all_time_cost_reset_at() is None
+    at = state.set_all_time_cost_reset("test")
+    assert state.read_all_time_cost_reset_at() == at
+    state.clear_all_time_cost_reset()
+    assert state.read_all_time_cost_reset_at() is None
+
+
+def test_set_all_time_cost_reset_also_stamps_daily_marker(tmp_state):
+    """`Reset ALL costs` should zero today's meter too — the operator asked
+    for 'reset all costs up to date', not just historical totals.
+    set_all_time_cost_reset writes BOTH markers to the same timestamp."""
+    assert state.read_cost_reset_at() is None
+    at = state.set_all_time_cost_reset("test")
+    assert state.read_all_time_cost_reset_at() == at
+    assert state.read_cost_reset_at() == at  # daily marker also stamped
+
+
+def test_filter_costs_post_reset_passthrough_when_no_marker(tmp_state):
+    """No reset marker → filter is identity."""
+    rows = [
+        {"run_id": "r1", "at": "2026-05-10T05:00:00Z", "cost_usd": 0.1},
+        {"run_id": "r2", "at": "2026-05-11T08:00:00Z", "cost_usd": 0.2},
+    ]
+    assert state.filter_costs_post_reset(rows) == rows
+
+
+def test_filter_costs_post_reset_drops_at_or_before_marker(tmp_state):
+    """Reset planted at 2026-05-12T10:00:00Z → rows ≤ that drop, rows after stay."""
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.ALL_TIME_COST_RESET_FLAG.write_text(
+        '{"at": "2026-05-12T10:00:00Z", "reason": "test"}',
+        encoding="utf-8",
+    )
+    rows = [
+        {"run_id": "old1", "at": "2026-05-10T05:00:00Z", "cost_usd": 0.10},
+        {"run_id": "old2", "at": "2026-05-12T09:59:59Z", "cost_usd": 0.20},
+        {"run_id": "boundary", "at": "2026-05-12T10:00:00Z", "cost_usd": 0.30},  # ≤ marker
+        {"run_id": "new", "at": "2026-05-12T10:00:01Z", "cost_usd": 0.40},
+    ]
+    out = state.filter_costs_post_reset(rows)
+    assert [r["run_id"] for r in out] == ["new"]
+
+
+def test_filter_costs_post_reset_does_not_mutate_input(tmp_state):
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.ALL_TIME_COST_RESET_FLAG.write_text(
+        '{"at": "2026-05-12T10:00:00Z", "reason": "test"}',
+        encoding="utf-8",
+    )
+    rows = [
+        {"run_id": "old", "at": "2026-05-10T05:00:00Z", "cost_usd": 0.10},
+        {"run_id": "new", "at": "2026-05-12T10:00:01Z", "cost_usd": 0.40},
+    ]
+    state.filter_costs_post_reset(rows)
+    assert len(rows) == 2  # not mutated

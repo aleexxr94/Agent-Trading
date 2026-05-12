@@ -64,6 +64,18 @@ def load_decisions(limit: int = 100) -> list[dict]:
 
 
 def load_costs(limit: int = 1000) -> list[dict]:
+    """Read state/costs.jsonl, honouring the all-time reset marker.
+
+    When the operator hits "Reset all LLM costs" on the dashboard,
+    state.set_all_time_cost_reset stamps a UTC timestamp; every row
+    whose `at` is ≤ that timestamp is excluded from the returned list.
+    The underlying audit log on disk is never mutated.
+
+    Cap enforcement in lib.llm.check_caps_or_raise does NOT go through
+    this function — it reads state.read_costs_today / read_costs_for_run
+    directly so per-run and per-day caps stay on the raw log even after
+    a display reset.
+    """
     if not state.COSTS_LOG.exists():
         return []
     rows = []
@@ -74,15 +86,23 @@ def load_costs(limit: int = 1000) -> list[dict]:
             rows.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+    rows = state.filter_costs_post_reset(rows)
     return rows[-limit:]
 
 
 def cost_today_usd() -> float:
+    # read_costs_today already honours the daily reset marker (which is
+    # stamped to the same timestamp by set_all_time_cost_reset), so an
+    # all-time reset clears today's display automatically.
     return sum(r.get("cost_usd", 0.0) for r in state.read_costs_today())
 
 
 def cost_for_run_usd(run_id: str) -> float:
-    return sum(r.get("cost_usd", 0.0) for r in state.read_costs_for_run(run_id))
+    """Per-run display cost. Applies the all-time reset filter so a fresh
+    "reset all" zeroes the in-flight run's meter too. Cap enforcement in
+    lib.llm.check_caps_or_raise stays on the raw log via state.read_costs_for_run."""
+    rows = state.filter_costs_post_reset(state.read_costs_for_run(run_id))
+    return sum(r.get("cost_usd", 0.0) for r in rows)
 
 
 def runs_count() -> int:
