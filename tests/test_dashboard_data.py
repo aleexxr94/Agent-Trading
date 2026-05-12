@@ -129,6 +129,54 @@ def test_broker_view_dataclass_shape():
     assert view.available is True
 
 
+def test_try_load_broker_view_sets_available_false_when_get_positions_raises(
+    tmp_state, monkeypatch
+):
+    """Codex P1 (PR #51 review): marks_from_broker and
+    cost_basis_from_broker both swallow get_positions() exceptions and
+    return {}, which is indistinguishable from a broker that legitimately
+    holds zero positions. try_load_broker_view must call get_positions()
+    itself so transient broker failures flip available=False — otherwise
+    a flaky network blanks the entire dashboard table by treating every
+    portfolio.json entry as 'closed at broker'."""
+
+    class _FailingBroker:
+        def get_positions(self):
+            raise RuntimeError("simulated alpaca 500")
+
+    import lib.alpaca_client as ac_mod
+    monkeypatch.setattr(ac_mod, "AlpacaBroker", lambda *a, **kw: _FailingBroker())
+
+    view = dd.try_load_broker_view()
+    assert view.available is False, (
+        "broker call failed transiently — must report unavailable, not "
+        "available with empty held_keys (which would blank the dashboard)"
+    )
+    assert view.marks == {}
+    assert view.costs == {}
+    assert view.held_keys == frozenset()
+
+
+def test_try_load_broker_view_distinguishes_unreachable_from_empty(
+    tmp_state, monkeypatch
+):
+    """Sister regression: when the broker is reachable and reports an
+    empty position list (a genuine all-cash account), available=True and
+    held_keys=set() so the dashboard correctly hides stale portfolio.json
+    rows."""
+
+    class _EmptyBroker:
+        def get_positions(self):
+            return []
+
+    import lib.alpaca_client as ac_mod
+    monkeypatch.setattr(ac_mod, "AlpacaBroker", lambda *a, **kw: _EmptyBroker())
+
+    view = dd.try_load_broker_view()
+    assert view.available is True
+    assert view.held_keys == frozenset()
+
+
 def test_position_table_rows_etf_and_option_columns(tmp_state):
     portfolio = json.loads(FIXTURE.read_text())
     rows = dd.position_table_rows(portfolio)

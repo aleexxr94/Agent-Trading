@@ -59,19 +59,14 @@ def _key_for_broker_position(p: BrokerPosition) -> str:
     return p.symbol
 
 
-def marks_from_broker(broker: Broker) -> dict[str, float]:
-    """Build a {key: per_unit_price} dict from broker.get_positions().
+def marks_from_positions(positions: list[BrokerPosition]) -> dict[str, float]:
+    """Pure helper: turn a list of broker positions into a marks dict.
 
-    Safe to call when broker is None or get_positions fails — returns {} in
-    both cases so callers don't have to special-case missing-broker paths.
+    Same key convention as marks_from_broker (ETF symbol or synthetic
+    UNDERLYING|STRIKE|EXPIRY|TYPE). Use this when the caller has already
+    fetched positions (e.g. to share a single get_positions round-trip
+    between marks + cost basis) and wants exceptions to propagate.
     """
-    if broker is None:
-        return {}
-    try:
-        positions = broker.get_positions()
-    except Exception:
-        return {}
-
     out: dict[str, float] = {}
     for p in positions:
         if p.qty == 0:
@@ -97,6 +92,42 @@ def marks_from_broker(broker: Broker) -> dict[str, float]:
     return out
 
 
+def cost_basis_from_positions(positions: list[BrokerPosition]) -> dict[str, float]:
+    """Pure helper: turn broker positions into a cost-basis dict.
+
+    Same key convention + same qty/cost filters as cost_basis_from_broker.
+    Use this when the caller wants exceptions to propagate (e.g. so the
+    dashboard can flag broker-unreachable rather than silently treating
+    every position as closed).
+    """
+    out: dict[str, float] = {}
+    for p in positions:
+        if p.qty == 0:
+            continue
+        if p.avg_cost is None:
+            continue
+        out[_key_for_broker_position(p)] = p.avg_cost
+    return out
+
+
+def marks_from_broker(broker: Broker) -> dict[str, float]:
+    """Build a {key: per_unit_price} dict from broker.get_positions().
+
+    Safe to call when broker is None or get_positions fails — returns {} in
+    both cases so callers don't have to special-case missing-broker paths.
+    Callers that NEED to distinguish "broker says zero positions" from
+    "broker call failed" should use marks_from_positions on a positions
+    list they fetched themselves, so exceptions propagate.
+    """
+    if broker is None:
+        return {}
+    try:
+        positions = broker.get_positions()
+    except Exception:
+        return {}
+    return marks_from_positions(positions)
+
+
 def cost_basis_from_broker(broker: Broker) -> dict[str, float]:
     """Build a {key: per_unit_cost_basis} dict from broker.get_positions().
 
@@ -118,19 +149,7 @@ def cost_basis_from_broker(broker: Broker) -> dict[str, float]:
         positions = broker.get_positions()
     except Exception:
         return {}
-
-    out: dict[str, float] = {}
-    for p in positions:
-        if p.qty == 0:
-            continue
-        if p.avg_cost is None:
-            continue
-        # avg_cost is per-share for ETFs and per-share for options too
-        # (Alpaca reports option avg_cost as price-per-contract / 100, same
-        # units as the option's current_price). Same downstream convention
-        # as marks_from_broker so the two dicts pair cleanly.
-        out[_key_for_broker_position(p)] = p.avg_cost
-    return out
+    return cost_basis_from_positions(positions)
 
 
 def portfolio_to_mark_keys(portfolio: dict) -> dict[str, str]:

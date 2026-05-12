@@ -229,17 +229,28 @@ def try_load_broker_view() -> BrokerView:
     currently open at the broker. Dashboards should hide portfolio.json
     rows that aren't in ``held_keys`` to avoid showing stale positions
     after a manual close / kill-condition exit / expiry.
+
+    Codex P1 (PR #51): we must call ``broker.get_positions()`` directly
+    here, NOT through ``marks_from_broker`` / ``cost_basis_from_broker``
+    — those helpers swallow get_positions() exceptions and return ``{}``,
+    which is indistinguishable from "broker says zero positions". If we
+    routed through them, a transient broker failure would set
+    ``available=True, held_keys=set()`` and the dashboard filter would
+    blank the entire table. Calling get_positions() ourselves lets the
+    exception bubble to the outer ``except`` and flips ``available=False``,
+    so we degrade to "render everything from portfolio.json" instead.
     """
     try:
         from .alpaca_client import AlpacaBroker
-        from .marks import marks_from_broker, cost_basis_from_broker
+        from .marks import marks_from_positions, cost_basis_from_positions
         broker = AlpacaBroker()
-        marks = marks_from_broker(broker)
-        costs = cost_basis_from_broker(broker)
+        positions = broker.get_positions()
     except Exception:
         return BrokerView(
             marks={}, costs={}, held_keys=frozenset(), available=False,
         )
+    marks = marks_from_positions(positions)
+    costs = cost_basis_from_positions(positions)
     return BrokerView(
         marks=marks,
         costs=costs,
