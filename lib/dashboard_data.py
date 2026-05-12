@@ -84,9 +84,26 @@ def cost_for_run_usd(run_id: str) -> float:
     return sum(r.get("cost_usd", 0.0) for r in state.read_costs_for_run(run_id))
 
 
+def runs_count() -> int:
+    """Number of orchestrator runs to date.
+
+    Counted as distinct `run_id`s observed in `state/costs.jsonl`. Each
+    orchestrator cycle invokes the LLM multiple times (one per stage, plus
+    retries), so `len(load_costs())` over-counts runs by ~6-8×. Use this
+    helper when you want an operator-meaningful "how many cycles has the
+    system done" number.
+    """
+    rows = load_costs(limit=10**9)
+    return len({r.get("run_id") for r in rows if r.get("run_id")})
+
+
 def total_token_cost() -> dict:
     """All-time totals across this project's state/costs.jsonl. Project-scoped
-    (the SDK only writes to this file from this codebase)."""
+    (the SDK only writes to this file from this codebase).
+
+    NOTE: `calls` here is the number of LLM invocations (cost-log rows), NOT
+    the number of orchestrator runs. Use `runs_count()` for that.
+    """
     rows = load_costs(limit=10**9)
     sums = {
         "calls": len(rows),

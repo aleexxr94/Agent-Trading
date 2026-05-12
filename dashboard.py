@@ -17,6 +17,7 @@ Layout:
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 from pathlib import Path
@@ -307,11 +308,12 @@ def _meter_card(label: str, current: float, cap: float, *, fmt: str = "${:.2f}")
 sg = st.columns(4)
 sg[0].markdown(_meter_card("Cost today", cost_today, DAILY_CAP_USD), unsafe_allow_html=True)
 sg[1].markdown(_meter_card("Cost this run", cost_this_run, PER_RUN_CAP_USD), unsafe_allow_html=True)
+runs_total = dd.runs_count()
 sg[2].markdown(
     _stat_card(
         "Runs all time",
-        f"{totals['calls']:,}",
-        sub=f"${totals['cost_usd']:.2f} total LLM cost",
+        f"{runs_total:,}",
+        sub=f"{totals['calls']:,} LLM calls · ${totals['cost_usd']:.2f} total",
     ),
     unsafe_allow_html=True,
 )
@@ -349,7 +351,10 @@ with tabs[0]:
     rows = dd.position_table_rows(portfolio, marks=broker_marks or None)
 
     if is_all_cash:
-        rationale = portfolio.get("all_cash_rationale") or "—"
+        # Escape the rationale — it's model-generated text and may contain
+        # angle brackets or other HTML-looking content that would otherwise
+        # render as markup inside this unsafe_allow_html block.
+        rationale = html.escape(portfolio.get("all_cash_rationale") or "—")
         st.markdown(
             f'<div class="at-stat" style="border-color: var(--amber-soft);">'
             f'<div class="at-stat-label" style="color:var(--amber);">💰 ALL-CASH PORTFOLIO</div>'

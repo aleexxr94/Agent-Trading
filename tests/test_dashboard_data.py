@@ -125,6 +125,28 @@ def test_cost_today_zero_no_log(tmp_state):
     assert dd.cost_today_usd() == 0.0
 
 
+def test_runs_count_distinct_run_ids(tmp_state):
+    """`runs_count()` must count distinct run_ids, not cost-log rows. Codex
+    P2 on PR #33: total_token_cost()['calls'] was being mislabelled as
+    'Runs all time' on the dashboard. One orchestrator run produces ~6-8
+    cost-log rows (one per LLM stage + retries) so 'calls' over-counts
+    runs by that factor."""
+    # Three runs, 7 stages each → calls=21 but runs=3.
+    for run_id in ("r-A", "r-B", "r-C"):
+        for stage in ("screen", "research_bull", "research_bear",
+                      "scenarios", "construct", "meta", "execute"):
+            state.append_cost({
+                "run_id": run_id, "stage": stage, "model": "claude-x",
+                "cost_usd": 0.01, "at": state.utcnow_iso(),
+            })
+    assert dd.runs_count() == 3
+    assert dd.total_token_cost()["calls"] == 21
+
+
+def test_runs_count_empty(tmp_state):
+    assert dd.runs_count() == 0
+
+
 def test_cost_today_aggregates(tmp_state):
     state.append_cost({"run_id": "r1", "stage": "screen", "model": "m", "cost_usd": 0.10, "at": state.utcnow_iso()})
     state.append_cost({"run_id": "r2", "stage": "screen", "model": "m", "cost_usd": 0.20, "at": state.utcnow_iso()})
