@@ -760,6 +760,42 @@ def test_strip_fences_no_op_when_no_fence():
     assert llm.strip_markdown_fences('  {"a": 1}  ') == '{"a": 1}'
 
 
+def test_strip_fences_tolerates_prose_after_closing_fence():
+    """Regression for 2026-05-12T21:23 live paper run: Haiku wrapped the
+    screener's JSON in ```json … ``` and then appended a "Regime flags
+    & rationale:" prose epilogue OUTSIDE the closing fence. Before this
+    fix the helper returned the prose-tail intact and json.loads failed,
+    zeroing the entire cycle's screener output. We extract the FIRST
+    fenced block and discard the trailing prose silently.
+    """
+    text = (
+        '```json\n'
+        '{"passed": [{"symbol": "SPY", "kind": "option_underlying"}]}\n'
+        '```\n\n'
+        '**Regime flags & rationale:**\n'
+        '- High-vol trigger satisfied: HV 0.5997 > 0.40 threshold.\n'
+        '- Both regime signals active: SPY/QQQ/IWM within 2% of 52w highs.\n'
+    )
+    out = llm.strip_markdown_fences(text)
+    assert out == '{"passed": [{"symbol": "SPY", "kind": "option_underlying"}]}'
+    # And the cleaned output must parse cleanly.
+    assert json.loads(out)["passed"][0]["symbol"] == "SPY"
+
+
+def test_strip_fences_handles_prose_inline_with_closing_fence():
+    """Edge case: prose immediately after the closing fence, no newline."""
+    text = '```json\n{"x": 1}\n```Some prose'
+    assert llm.strip_markdown_fences(text) == '{"x": 1}'
+
+
+def test_strip_fences_returns_input_when_only_opening_fence():
+    """Pathological: an opening fence with no closing fence at all. Take
+    everything after the opening line and return it — better than crashing.
+    """
+    out = llm.strip_markdown_fences('```json\n{"x": 1}')
+    assert out == '{"x": 1}'
+
+
 def test_structured_call_parses_fenced_response(tmp_state):
     """Even if the model wraps JSON in markdown fences, structured_call should
     parse it cleanly instead of triggering the schema-retry path."""

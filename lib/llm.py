@@ -244,18 +244,40 @@ def sanitize_schema_for_structured_output(
 
 
 def strip_markdown_fences(text: str) -> str:
-    """Sonnet sometimes wraps JSON in ```json … ``` fences despite explicit
-    instructions to the contrary. Strip them defensively before json.loads."""
+    """Strip a leading ```json … ``` fence and any prose that may follow.
+
+    The screener / scenarios prompts forbid markdown fences, but Haiku in
+    particular occasionally:
+      (a) wraps the JSON in ```json … ``` and stops there (the original
+          observation that motivated this helper), or
+      (b) wraps the JSON in ```json … ``` AND THEN appends a "Regime
+          flags & rationale:" prose epilogue OUTSIDE the closing fence
+          (observed in the live paper run at 2026-05-12T21:23 UTC — the
+          screener produced 12 well-formed candidates inside the fenced
+          block but json.loads choked on the trailing prose, fell back to
+          a `raw` envelope, and zeroed `passed`/`rejected` for the rest
+          of the cycle).
+
+    Both shapes resolve to "extract the FIRST fenced block, drop the
+    fence and anything after it". For unfenced JSON (the happy path) we
+    return the input unchanged after stripping whitespace.
+    """
     t = text.strip()
-    if t.startswith("```"):
-        # Drop the opening fence (with optional language tag) and the closing fence.
-        nl = t.find("\n")
-        if nl != -1:
-            t = t[nl + 1:]
-        if t.endswith("```"):
-            t = t[: -3]
-        t = t.strip()
-    return t
+    if not t.startswith("```"):
+        return t
+    # Drop the opening fence line (with optional language tag, e.g. ```json).
+    nl = t.find("\n")
+    if nl == -1:
+        return t
+    body = t[nl + 1:]
+    # Find the FIRST closing fence and take only what came before it. This
+    # handles the trailing-prose case — anything past the closing fence is
+    # commentary the model wasn't supposed to emit, but we accept it
+    # gracefully rather than letting json.loads fail.
+    end = body.find("```")
+    if end != -1:
+        body = body[:end]
+    return body.strip()
 
 
 class CostCapExceeded(RuntimeError):
