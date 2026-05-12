@@ -29,7 +29,7 @@ class FakeMessages:
         self.calls = 0
         self.last_kwargs: dict | None = None
 
-    def create(self, **kwargs):
+    def _next_message(self, kwargs):
         i = self.calls
         self.calls += 1
         self.last_kwargs = kwargs
@@ -38,6 +38,31 @@ class FakeMessages:
             content=[SimpleNamespace(type="text", text=text)],
             usage=self._usages[i],
         )
+
+    def create(self, **kwargs):
+        # Retained for backwards compat with callers that may still use the
+        # non-streaming path. Production code (lib.llm._one_call) now uses
+        # stream() to sidestep the SDK's 10-minute non-streaming timeout.
+        return self._next_message(kwargs)
+
+    def stream(self, **kwargs):
+        return _FakeStreamCtx(self._next_message(kwargs))
+
+
+class _FakeStreamCtx:
+    """Mimics the context-manager returned by anthropic SDK's messages.stream()."""
+
+    def __init__(self, final_message):
+        self._final = final_message
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+    def get_final_message(self):
+        return self._final
 
 
 def _fake_client(messages: FakeMessages):
@@ -79,6 +104,29 @@ def test_structured_call_happy_path(tmp_state):
     assert res.payload["stage"] == "screen"
     assert res.cost_usd > 0
     assert state.read_costs_for_run("rid")
+
+
+def test_structured_call_uses_streaming_api(tmp_state):
+    """Regression: lib.llm must call messages.stream(), not messages.create().
+    The Anthropic SDK refuses non-streaming requests when max_tokens is high
+    enough to risk a >10-minute response — observed crash on the first paper
+    run after scenarios was bumped to max_tokens=32768."""
+    create_calls = {"n": 0}
+    stream_calls = {"n": 0}
+
+    class _SpyMessages(FakeMessages):
+        def create(self, **kw):
+            create_calls["n"] += 1
+            return super().create(**kw)
+
+        def stream(self, **kw):
+            stream_calls["n"] += 1
+            return super().stream(**kw)
+
+    fm = _SpyMessages([json.dumps(_DECISION_PAYLOAD)])
+    llm.structured_call(_call(), client_factory=lambda: _fake_client(fm))
+    assert stream_calls["n"] == 1, "expected exactly one stream() call"
+    assert create_calls["n"] == 0, "non-streaming create() must not be used"
 
 
 def test_thinking_and_output_config_passthrough(tmp_state):
