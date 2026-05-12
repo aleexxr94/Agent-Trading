@@ -13,12 +13,70 @@ def test_universe_non_empty():
 def test_universe_covers_multiple_uncorrelated_factors():
     """Earlier-cycle bug: every research candidate was a 3x broad-equity ETF,
     so the constructor abstained because nothing was uncorrelated. Universe
-    must span at least 6 distinct factors (broad-eq long+short, sector,
+    must span at least 10 distinct factors (broad indices long+short, sector,
     commodity, vol, crypto, rates) so the agent has real diversification
-    options to choose from."""
-    families = {e.family.split()[0] for e in universe.UNIVERSE}
-    # Spot-check: at least 6 distinct family roots present
-    assert len(families) >= 6, f"universe is too narrow — only {len(families)} factor roots: {families}"
+    options to choose from.
+
+    Uses the explicit `factor` field on UniverseEntry — bull/bear pairs of
+    the same index share a factor, so `TQQQ` and `SQQQ` both count as
+    `"nasdaq"` (a single factor), not two. Replaces the brittle earlier
+    heuristic of splitting `family` on whitespace (Codex P2 on PR #30).
+    """
+    factors = {e.factor for e in universe.UNIVERSE}
+    assert len(factors) >= 10, (
+        f"universe spans only {len(factors)} factors: {sorted(factors)}. "
+        "Diversification floor for this experiment is 10 — add more uncorrelated "
+        "factor families before pruning below this threshold."
+    )
+
+
+def test_every_entry_has_non_empty_factor():
+    """The `factor` field is mandatory — used by screener for diversification
+    ranking and by the factor-coverage invariant above. Empty factor = silent
+    classification gap."""
+    for e in universe.UNIVERSE:
+        assert e.factor and e.factor == e.factor.lower().strip(), (
+            f"{e.symbol}: factor must be a non-empty lowercase identifier, got {e.factor!r}"
+        )
+
+
+def test_bull_bear_pairs_share_factor():
+    """Bull/bear pairs of the same index must share a factor so the
+    constructor's correlation check doesn't double-count them as
+    'diversified across two factors'."""
+    pairs = [
+        ("TQQQ", "SQQQ"),
+        ("UPRO", "SPXU"),
+        ("TNA", "TZA"),
+        ("URTY", "SRTY"),
+        ("SOXL", "SOXS"),
+        ("FAS", "FAZ"),
+        ("LABU", "LABD"),
+        ("YINN", "YANG"),
+        ("ERX", "ERY"),
+        ("NUGT", "DUST"),
+    ]
+    for bull_sym, bear_sym in pairs:
+        bull = universe.by_symbol(bull_sym)
+        bear = universe.by_symbol(bear_sym)
+        assert bull is not None and bear is not None, f"{bull_sym}/{bear_sym} missing"
+        assert bull.factor == bear.factor, (
+            f"{bull_sym} factor={bull.factor!r} differs from {bear_sym} factor={bear.factor!r} "
+            "— same-index bull/bear pairs must share a factor"
+        )
+
+
+def test_option_underlyings_share_factor_with_their_leveraged_counterparts():
+    """An option on SPY hits the same underlying factor as UPRO/SPXU — the
+    constructor needs this to be visible so it can avoid loading the same
+    factor twice (once via the leveraged ETF, once via its option underlying)."""
+    pairs = [("SPY", "UPRO"), ("QQQ", "TQQQ"), ("IWM", "TNA")]
+    for opt_sym, etf_sym in pairs:
+        opt = universe.by_symbol(opt_sym)
+        etf = universe.by_symbol(etf_sym)
+        assert opt.factor == etf.factor, (
+            f"{opt_sym} factor={opt.factor!r} differs from {etf_sym} factor={etf.factor!r}"
+        )
 
 
 def test_all_symbols_unique():
@@ -70,7 +128,7 @@ def test_metadata_block_shape():
     block = universe.metadata_block()
     assert len(block) == len(universe.UNIVERSE)
     for row in block:
-        assert set(row.keys()) == {"symbol", "kind", "leverage_factor", "family", "description"}
+        assert set(row.keys()) == {"symbol", "kind", "leverage_factor", "family", "factor", "description"}
 
 
 @pytest.mark.parametrize("expected", [
