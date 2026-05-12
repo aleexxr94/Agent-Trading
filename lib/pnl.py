@@ -136,6 +136,7 @@ def compute_position_pnl(
     *,
     position: dict,
     current_mark_usd: float | None,
+    actual_cost_per_unit: float | None = None,
 ) -> PnLBreakdown:
     """Unrealised P&L for an open position. Returns gross, modelled cost, and net.
 
@@ -144,6 +145,16 @@ def compute_position_pnl(
       - For options: per-contract premium (USD), the same units as `premium_paid`.
       - Pass None when no mark is available — gross is 0 and modelled cost is
         still computed (entry leg already paid).
+
+    actual_cost_per_unit (optional override):
+      - When provided, overrides the cost basis pulled from the position dict.
+      - For ETFs: per-share fill price (replaces position["avg_cost"]).
+      - For options: per-share premium actually paid (replaces position
+        ["premium_paid"]). Use Alpaca's reported `avg_cost` here — the
+        agent's training-data option-premium estimates are routinely 5-10×
+        off real market quotes, so trusting position["premium_paid"]
+        produces fictitious P&L (e.g. -$290 displayed on a position that
+        Alpaca reports as -$2). Pass None to keep the historical behaviour.
     """
     cost = model_position_cost(position)
     if current_mark_usd is None:
@@ -151,9 +162,15 @@ def compute_position_pnl(
         entry_leg_cost = cost.half_spread_usd + cost.commission_usd
         return PnLBreakdown(gross_pnl_usd=0.0, modelled_costs_usd=entry_leg_cost)
     if position["kind"] == "etf":
-        gross = (current_mark_usd - position["avg_cost"]) * position["shares"]
+        basis = actual_cost_per_unit if actual_cost_per_unit is not None else position["avg_cost"]
+        gross = (current_mark_usd - basis) * position["shares"]
     else:
-        gross = (current_mark_usd - position["premium_paid"]) * position["contracts"] * 100
+        basis = (
+            actual_cost_per_unit
+            if actual_cost_per_unit is not None
+            else position["premium_paid"]
+        )
+        gross = (current_mark_usd - basis) * position["contracts"] * 100
     return PnLBreakdown(gross_pnl_usd=gross, modelled_costs_usd=cost.round_trip_usd)
 
 
@@ -161,22 +178,32 @@ def compute_portfolio_pnl(
     *,
     portfolio: dict,
     marks: dict[str, float] | None = None,
+    costs: dict[str, float] | None = None,
 ) -> PnLBreakdown:
     """Aggregate gross / modelled-cost / net across all open positions.
 
     `marks` keys: ETF symbol for ETFs; for options use
     f"{underlying}|{strike}|{expiry}|{type}" — same convention as monitor.py.
+    `costs` (optional): same keying as marks, holds the actual per-unit
+    fill prices from the broker. When provided, P&L uses the broker's
+    cost basis rather than the agent's `premium_paid` / `avg_cost`
+    estimates — important for options where the agent's premium
+    predictions can be 5-10× off real market quotes.
     """
     marks = marks or {}
+    costs = costs or {}
     gross = 0.0
     cost_total = 0.0
     for p in portfolio.get("positions", []):
         if p["kind"] == "etf":
-            mark = marks.get(p["symbol"])
+            key = p["symbol"]
         else:
             key = f"{p['underlying']}|{p['strike']}|{p['expiry']}|{p['type']}"
-            mark = marks.get(key)
-        b = compute_position_pnl(position=p, current_mark_usd=mark)
+        b = compute_position_pnl(
+            position=p,
+            current_mark_usd=marks.get(key),
+            actual_cost_per_unit=costs.get(key),
+        )
         gross += b.gross_pnl_usd
         cost_total += b.modelled_costs_usd
     return PnLBreakdown(gross_pnl_usd=gross, modelled_costs_usd=cost_total)

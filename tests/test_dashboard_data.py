@@ -117,6 +117,65 @@ def test_allocation_pie_includes_cash(tmp_state):
     assert sum(r["value"] for r in pie) == pytest.approx(100.0, abs=0.5)
 
 
+def test_position_pnl_uses_broker_cost_basis_when_provided(tmp_state):
+    """Regression for the live observation on May 12 2026:
+       Agent's portfolio.json said premium_paid=3.50 (its training-data prior)
+       Alpaca actually filled at avg_cost=0.61
+       Dashboard used to show -$290 fictional loss when truth was -$2.
+    The `costs` dict passed into position_table_rows must override
+    portfolio.json's premium_paid when computing Cost / Notional / P&L."""
+    rows = dd.position_table_rows(
+        {"positions": [_option_pos()]},  # premium_paid=6.50 in fixture
+        marks={"SPY|530.0|2026-06-19|call": 0.59},
+        costs={"SPY|530.0|2026-06-19|call": 0.61},
+    )
+    r = rows[0]
+    # Cost column shows broker's actual fill, not the agent's premium_paid
+    assert r["Cost"] == pytest.approx(0.61)
+    # Notional reflects truth: 1 contract × 100 × $0.61 = $61
+    assert r["Notional"] == pytest.approx(61.0)
+    # Gross P&L: ($0.59 - $0.61) × 1 × 100 = -$2  (NOT the -$590 we'd see
+    # if we used the fixture's premium_paid=6.50 as basis)
+    assert r["Gross P&L"] == pytest.approx(-2.0)
+
+
+def test_position_pnl_falls_back_to_portfolio_premium_when_no_broker_costs(tmp_state):
+    """When the broker is unreachable (no costs dict), keep the old
+    behaviour and use portfolio.json's premium_paid. Otherwise we'd
+    silently lose P&L for offline / no-keys configurations."""
+    rows = dd.position_table_rows(
+        {"positions": [_option_pos()]},  # premium_paid=6.50
+        marks={"SPY|530.0|2026-06-19|call": 8.00},
+        costs=None,  # broker unavailable
+    )
+    r = rows[0]
+    assert r["Cost"] == pytest.approx(6.50)
+    # ($8.00 - $6.50) × 1 × 100 = $150
+    assert r["Gross P&L"] == pytest.approx(150.0)
+
+
+def test_position_pnl_etf_uses_broker_cost_basis_when_provided(tmp_state):
+    """Same broker-truth principle for ETFs: prefer the broker's filled
+    avg_cost over the portfolio's intended avg_cost."""
+    portfolio = {
+        "positions": [{
+            "kind": "etf", "symbol": "TQQQ", "shares": 4, "avg_cost": 70.0,
+            "leverage_factor": 3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+        }],
+    }
+    rows = dd.position_table_rows(
+        portfolio,
+        marks={"TQQQ": 80.0},
+        costs={"TQQQ": 75.0},  # agent thought $70, actually filled at $75
+    )
+    r = rows[0]
+    assert r["Cost"] == pytest.approx(75.0)
+    assert r["Notional"] == pytest.approx(300.0)  # 4 × $75
+    # ($80 - $75) × 4 = $20 (not $40 against the agent's $70 intent)
+    assert r["Gross P&L"] == pytest.approx(20.0)
+
+
 def test_load_decisions_empty_log(tmp_state):
     assert dd.load_decisions() == []
 

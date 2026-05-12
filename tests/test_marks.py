@@ -194,3 +194,54 @@ def test_marks_key_falls_back_to_osi_when_parse_fails():
     ]))
     # No synthetic-key match possible; raw symbol preserved
     assert "BAD_OPTION_SYMBOL" in out
+
+
+# ---------------- cost_basis_from_broker ----------------
+
+
+def test_cost_basis_etf():
+    """ETF: per-share avg_cost flows straight through with bare-symbol key."""
+    pos = BrokerPosition(
+        symbol="TQQQ", qty=10, avg_cost=68.40,
+        market_value=750.0, unrealized_pl_usd=0.0,
+        asset_class="us_equity",
+    )
+    out = marks.cost_basis_from_broker(_FakeBroker([pos]))
+    assert out == {"TQQQ": 68.40}
+
+
+def test_cost_basis_option_uses_synthetic_key():
+    """Option: synthetic UNDERLYING|STRIKE|EXPIRY|TYPE key (same as marks)
+    and per-share avg_cost (matching schema's premium_paid units)."""
+    pos = BrokerPosition(
+        symbol="SPY260626P00565000", qty=1, avg_cost=0.61,
+        market_value=59.0, unrealized_pl_usd=-2.0,
+        asset_class="us_option",
+    )
+    out = marks.cost_basis_from_broker(_FakeBroker([pos]))
+    # OSI 260626 = 2026-06-26, strike 565000 / 1000 = 565.0
+    assert out == {"SPY|565.0|2026-06-26|put": 0.61}
+
+
+def test_cost_basis_none_broker_returns_empty():
+    assert marks.cost_basis_from_broker(None) == {}
+
+
+def test_cost_basis_broker_error_returns_empty():
+    """get_positions raising shouldn't crash the dashboard — return {} so
+    the table falls back to portfolio.json values."""
+    class _BrokenBroker(_FakeBroker):
+        def get_positions(self):
+            raise RuntimeError("network down")
+
+    assert marks.cost_basis_from_broker(_BrokenBroker([])) == {}
+
+
+def test_cost_basis_skips_zero_qty():
+    """Closed positions still have qty=0 transiently; don't emit a row."""
+    pos = BrokerPosition(
+        symbol="TQQQ", qty=0, avg_cost=70.0,
+        market_value=0.0, unrealized_pl_usd=0.0,
+        asset_class="us_equity",
+    )
+    assert marks.cost_basis_from_broker(_FakeBroker([pos])) == {}
