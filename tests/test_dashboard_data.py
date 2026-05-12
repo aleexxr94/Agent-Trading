@@ -125,6 +125,91 @@ def test_cost_today_zero_no_log(tmp_state):
     assert dd.cost_today_usd() == 0.0
 
 
+def test_load_run_summaries_returns_empty_when_no_runs(tmp_state):
+    assert dd.load_run_summaries() == []
+
+
+def test_load_run_summaries_pulls_rationales_and_funnel(tmp_state):
+    """Each summary aggregates portfolio.json (rationales + position count),
+    screen/research/scenarios candidate counts, next_run.json, and the run's
+    total cost from the cost log. Powers the Cycles tab."""
+    # Build a fake run dir with all five artifacts
+    rid = "20260512T123456Z-deadbeef"
+    run_dir = state.RUNS_DIR / rid
+    run_dir.mkdir(parents=True)
+    state.write_json(run_dir / "screen.json", {
+        "passed": [{"symbol": "TQQQ"}, {"symbol": "UPRO"}, {"symbol": "SOXL"}],
+    })
+    state.write_json(run_dir / "research.json", {
+        "candidates": [{"symbol": "TQQQ"}, {"symbol": "UPRO"}],
+    })
+    state.write_json(run_dir / "scenarios.json", {
+        "candidates": [{"symbol": "TQQQ"}],
+    })
+    state.write_json(run_dir / "portfolio.json", {
+        "run_id": rid, "generated_at": "2026-05-12T12:34:56Z",
+        "all_cash": True, "positions": [],
+        "all_cash_rationale": "Single positive-EV candidate below threshold.",
+        "construction_rationale": "Zero positions taken.",
+    })
+    state.write_json(run_dir / "next_run.json", {
+        "next_run_at": "2026-05-12T14:00:00Z",
+        "rationale": "Wait for market open.",
+    })
+    state.append_cost({
+        "run_id": rid, "stage": "screen", "model": "haiku",
+        "cost_usd": 0.05, "at": "2026-05-12T12:30:00Z",
+    })
+    state.append_cost({
+        "run_id": rid, "stage": "construct", "model": "opus",
+        "cost_usd": 0.20, "at": "2026-05-12T12:34:00Z",
+    })
+
+    out = dd.load_run_summaries(limit=10)
+    assert len(out) == 1
+    s = out[0]
+    assert s["run_id"] == rid
+    assert s["all_cash"] is True
+    assert s["positions_count"] == 0
+    assert s["screened_count"] == 3
+    assert s["researched_count"] == 2
+    assert s["scenarios_count"] == 1
+    assert s["all_cash_rationale"].startswith("Single positive-EV candidate")
+    assert s["next_run_rationale"] == "Wait for market open."
+    assert s["cost_usd"] == pytest.approx(0.25)
+
+
+def test_load_run_summaries_newest_first(tmp_state):
+    """Run dirs are timestamp-prefixed; summary order must be newest first."""
+    for rid in ("20260510T100000Z-old", "20260512T100000Z-new", "20260511T100000Z-mid"):
+        (state.RUNS_DIR / rid).mkdir(parents=True)
+    out = dd.load_run_summaries()
+    assert [s["run_id"] for s in out] == [
+        "20260512T100000Z-new",
+        "20260511T100000Z-mid",
+        "20260510T100000Z-old",
+    ]
+
+
+def test_load_run_summaries_tolerates_missing_artifacts(tmp_state):
+    """A run dir that crashed mid-stage may be missing some artifacts. The
+    summary should still come back populated for whatever was written."""
+    rid = "20260512T120000Z-partial"
+    run_dir = state.RUNS_DIR / rid
+    run_dir.mkdir(parents=True)
+    # Only screen.json — no portfolio.json or next_run.json
+    state.write_json(run_dir / "screen.json", {"passed": [{"symbol": "TQQQ"}]})
+
+    out = dd.load_run_summaries()
+    assert len(out) == 1
+    s = out[0]
+    assert s["run_id"] == rid
+    assert s["screened_count"] == 1
+    assert s["all_cash"] is None  # never written
+    assert s["construction_rationale"] == ""
+    assert s["next_run_rationale"] == ""
+
+
 def test_runs_count_distinct_run_ids(tmp_state):
     """`runs_count()` must count distinct run_ids, not cost-log rows. Codex
     P2 on PR #33: total_token_cost()['calls'] was being mislabelled as
