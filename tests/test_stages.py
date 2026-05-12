@@ -13,22 +13,31 @@ from __future__ import annotations
 from lib import stages
 
 
-def test_scenarios_max_tokens_above_48k_guard():
-    """The scenarios stage uses `thinking: adaptive`, and thinking tokens
-    are charged against the output budget. Each iteration of the cardinality
-    rule has pushed scenarios output bigger:
+def test_scenarios_max_tokens_within_provider_caps():
+    """The scenarios stage uses `thinking: adaptive`, which charges thinking
+    tokens against the output budget. Each iteration of the cardinality rule
+    has pushed scenarios output bigger:
       - PR #26 made it emit one row per candidate (was: drop low-EV)
       - PR #27 bumped 16k → 32k after observing truncation at ~7843 chars
       - PR #39-41 made option underlyings emit BOTH call+put rows + full
         option_rationale per direction, pushing output past 32k again
         (observed truncation at ~8697 chars on the regime-aware run)
-    Floor is now 48k so any future "trim tokens" edit can't take us back
-    below the level where Sonnet 4.6's adaptive thinking + the full
-    cardinality output reliably fits. Sonnet 4.6's max output is 64k."""
+
+    Two-sided guard now:
+      - Floor 48k so future "trim tokens" edits can't regress us into the
+        same truncation crash.
+      - Ceiling 64k because that's Sonnet 4.6's hard provider cap (Codex
+        P1 on PR #42: an earlier 65536 value would 400-fail the API call
+        at request validation BEFORE retry logic could run — turning the
+        stage into a hard-failure path instead of fixing truncation).
+
+    If MODEL_SCENARIOS is changed to a model with a different cap, this
+    guard should be made model-aware rather than relaxed."""
     cfg = stages.scenarios()
-    assert cfg.max_tokens >= 48_000, (
-        f"scenarios max_tokens={cfg.max_tokens} risks truncation when "
-        "adaptive thinking eats the output budget on full-cardinality runs"
+    assert 48_000 <= cfg.max_tokens <= 64_000, (
+        f"scenarios max_tokens={cfg.max_tokens} is outside the safe range "
+        f"[48000, 64000]. Below 48k risks truncation; above 64k fails "
+        f"Sonnet 4.6's provider cap with a 400 before retry logic runs."
     )
 
 

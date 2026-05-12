@@ -83,17 +83,20 @@ def scenarios() -> StageConfig:
         model=_model("MODEL_SCENARIOS", "claude-sonnet-4-6"),
         system_prompt=_load("scenarios.md"),
         schema_filename="scenarios.schema.json",
-        # 65536 (was 32768): PRs #39-41 expanded scenarios output (option
-        # underlyings now emit BOTH call and put rows + full option_rationale
-        # with strike, expiry, dte, dte_rationale, strike_rationale per side).
-        # With 8 ETF rows + up to 6 option-direction rows × ~1000 tokens each,
-        # combined with `thinking: adaptive` consuming most of the budget,
-        # 32k truncated at char 8697 on a real paper run (Sonnet got nothing
-        # back on the first attempt — all tokens went to thinking — and the
-        # retry got ~2200 output tokens of JSON before running out). 64k is
-        # Sonnet 4.6's max output cap and leaves enough room for both deep
-        # thinking AND the full scenarios payload.
-        max_tokens=65536,
+        # 64000 (was 32768, originally 8192): PRs #39-41 expanded scenarios
+        # output (option underlyings now emit BOTH call and put rows + full
+        # option_rationale with strike, expiry, dte, dte_rationale,
+        # strike_rationale per side). With 8 ETF rows + up to 6 option-direction
+        # rows × ~1000 tokens each, combined with `thinking: adaptive` consuming
+        # most of the budget, 32k truncated at char 8697 on a real paper run
+        # (Sonnet returned nothing on the first attempt — all tokens went to
+        # thinking — and the retry got ~2200 output tokens of JSON before
+        # running out).
+        # 64000 is Sonnet 4.6's actual max_tokens cap. Setting 65536 (a power
+        # of two) trips a 400 at request validation BEFORE the retry/schema
+        # logic can run — Codex P1 on PR #42. Sonnet's hard ceiling is 64k,
+        # so this is now the highest legal value.
+        max_tokens=64_000,
         thinking={"type": "adaptive"},
         output_config_extras={"effort": "high"},
     )
