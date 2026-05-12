@@ -190,6 +190,22 @@ def test_set_all_time_cost_reset_also_stamps_daily_marker(tmp_state):
     assert state.read_cost_reset_at() == at  # daily marker also stamped
 
 
+def test_clear_all_time_cost_reset_also_clears_daily_marker(tmp_state):
+    """Codex P2 (PR #53): clear must be symmetric with set. After
+    set_all_time_cost_reset stamps BOTH markers, clear_all_time_cost_reset
+    must drop BOTH — otherwise today's meter stays filtered and the
+    dashboard ends up in a partially-reset state."""
+    state.set_all_time_cost_reset("test")
+    assert state.read_all_time_cost_reset_at() is not None
+    assert state.read_cost_reset_at() is not None
+    state.clear_all_time_cost_reset()
+    assert state.read_all_time_cost_reset_at() is None
+    assert state.read_cost_reset_at() is None, (
+        "daily marker must also be cleared so 'show full history' "
+        "actually shows full history including today"
+    )
+
+
 def test_filter_costs_post_reset_passthrough_when_no_marker(tmp_state):
     """No reset marker → filter is identity."""
     rows = [

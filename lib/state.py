@@ -239,9 +239,21 @@ def set_all_time_cost_reset(reason: str = "dashboard") -> str:
 
 def clear_all_time_cost_reset() -> None:
     """Discard the all-time reset marker; dashboard totals revert to the
-    full audit log."""
+    full audit log.
+
+    Codex P2 (PR #53): set_all_time_cost_reset writes BOTH markers
+    (all-time + daily) to the same timestamp so today's meter zeros
+    synchronously. The clear path must do the symmetric thing — drop
+    both — otherwise today's meter stays filtered after the operator
+    clicks "Clear all-time reset (show full history)" and the dashboard
+    is left in a partially-reset state. If the operator wants a daily-
+    only reset they can re-apply it via the dedicated daily-reset button.
+    """
     if ALL_TIME_COST_RESET_FLAG.exists():
         ALL_TIME_COST_RESET_FLAG.unlink()
+    # Symmetric to set_all_time_cost_reset which writes both markers.
+    if COST_RESET_FLAG.exists():
+        COST_RESET_FLAG.unlink()
 
 
 def filter_costs_post_reset(rows: list[dict]) -> list[dict]:
