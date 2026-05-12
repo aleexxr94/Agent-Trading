@@ -763,3 +763,89 @@ def test_fees_helpers_read_trades_not_costs(tmp_state):
     state.append_trade(_fill(activity_id="a1", fees_usd=0.10))
     assert dd.total_trading_fees_usd() == pytest.approx(0.10)
     # The $0.50 cost row never crosses over.
+
+
+# ---------- trades_pnl_view (PR 3 dashboard data) ----------
+
+
+def test_trades_pnl_view_empty(tmp_state):
+    """No trades on disk → empty closed/open lists, zero totals."""
+    v = dd.trades_pnl_view()
+    assert v["closed"] == []
+    assert v["open"] == []
+    assert v["totals"]["closed_count"] == 0
+    assert v["totals"]["open_count"] == 0
+    assert v["totals"]["realised_net_usd"] == 0.0
+
+
+def test_trades_pnl_view_closed_round_trip_etf(tmp_state):
+    """Buy 10 TQQQ @ $70 (fees $0.10), sell @ $75 (fees $0.10), run cost
+    $0.40 on a run that opened 1 position → per-trade LLM cost $0.40.
+    Gross = $50, fees = $0.20, LLM = $0.40, net = $49.40."""
+    state.append_cost({
+        "run_id": "r1", "stage": "screen", "model": "m",
+        "cost_usd": 0.40, "at": "2026-05-12T08:00:00Z",
+    })
+    state.append_trade(_fill(activity_id="b", symbol="TQQQ", side="buy",
+                              qty=10, fill_price=70.0, fees_usd=0.10,
+                              run_id="r1"))
+    state.append_trade(_fill(activity_id="s", symbol="TQQQ", side="sell",
+                              qty=10, fill_price=75.0, fees_usd=0.10,
+                              run_id="r2", filled_at="2026-05-13T14:00:00Z"))
+    v = dd.trades_pnl_view()
+    assert len(v["closed"]) == 1
+    c = v["closed"][0]
+    assert c["symbol"] == "TQQQ"
+    assert c["gross_pnl_usd"] == pytest.approx(50.0)
+    assert c["fees_usd"] == pytest.approx(0.20)
+    assert c["llm_cost_usd"] == pytest.approx(0.40)
+    assert c["net_pnl_usd"] == pytest.approx(49.40)
+    assert c["buy_run_id"] == "r1"
+
+    t = v["totals"]
+    assert t["closed_count"] == 1
+    assert t["open_count"] == 0
+    assert t["realised_net_usd"] == pytest.approx(49.40)
+    assert t["realised_fees_usd"] == pytest.approx(0.20)
+
+
+def test_trades_pnl_view_open_lot_uses_marks(tmp_state):
+    """Open lot with no sell yet: gross/net computed against passed marks dict."""
+    state.append_trade(_fill(activity_id="b", symbol="TQQQ", side="buy",
+                              qty=10, fill_price=70.0, fees_usd=0.10,
+                              run_id="r1"))
+    v = dd.trades_pnl_view(marks={"TQQQ": 80.0})
+    assert v["closed"] == []
+    assert len(v["open"]) == 1
+    o = v["open"][0]
+    assert o["mark"] == 80.0
+    # ($80 - $70) * 10 = $100
+    assert o["gross_pnl_usd"] == pytest.approx(100.0)
+
+
+def test_trades_pnl_view_honours_all_time_cost_reset(tmp_state):
+    """All-time cost reset (PR #53) → LLM column zeros even though cost
+    rows still exist on disk. Fees stay as paid."""
+    state.append_cost({
+        "run_id": "r1", "stage": "x", "model": "m",
+        "cost_usd": 0.40, "at": "2026-05-10T08:00:00Z",
+    })
+    state.append_trade(_fill(activity_id="b", symbol="TQQQ", side="buy",
+                              qty=10, fill_price=70.0, fees_usd=0.10,
+                              run_id="r1"))
+    state.append_trade(_fill(activity_id="s", symbol="TQQQ", side="sell",
+                              qty=10, fill_price=75.0, fees_usd=0.10,
+                              run_id="r2", filled_at="2026-05-13T14:00:00Z"))
+    # Plant a reset AFTER the cost row's timestamp.
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.ALL_TIME_COST_RESET_FLAG.write_text(
+        '{"at": "2026-05-11T00:00:00Z", "reason": "test"}',
+        encoding="utf-8",
+    )
+    v = dd.trades_pnl_view()
+    c = v["closed"][0]
+    # LLM column zeroed by the reset; fees unaffected.
+    assert c["llm_cost_usd"] == 0.0
+    assert c["fees_usd"] == pytest.approx(0.20)
+    # Net should now equal gross - fees (no LLM cost).
+    assert c["net_pnl_usd"] == pytest.approx(50.0 - 0.20)
