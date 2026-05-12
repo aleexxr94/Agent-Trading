@@ -30,6 +30,22 @@ The scenarios stage emits a row for **every** researched candidate, including ne
 
 If the highest-EV candidate is +20% and the next-best is -3%, take the +20% solo. **Don't force-fill weaker positions for the sake of position count.**
 
+## Long puts vs leveraged-ETF trap
+
+In high-realised-volatility regimes (median HV >40% across leveraged ETFs), or when several underlyings are within 5% of their 52-week high, leveraged ETFs face a structural EV problem on both sides:
+
+- **3x longs**: rebalancing decay + crowded entry near highs → expected returns often negative.
+- **3x inverses**: same decay + rallying against the daily reset → typically worse.
+
+In those regimes, **defined-risk long puts on the unleveraged option underlyings (SPY, QQQ, IWM, DIA, TLT) are frequently the only positive-EV plays the agent can build.** Don't anchor on "every leveraged ETF is negative-EV, therefore all-cash" — that's the wrong conclusion if the scenarios input shows a positive-EV long put on SPY (or similar). Long puts have:
+
+- **Capped downside** at premium paid (the 100% kill condition makes this safer than 3x leveraged ETFs on a per-position basis)
+- **Convex payoff** when the underlying drops materially (a 5% SPY drawdown on a 30-delta SPY put can produce 50%+ on the option position)
+- **No daily-rebalancing decay** (the structural headwind that breaks leveraged ETFs)
+- **Theta is the real cost**, but is bounded and predictable, unlike leverage drag
+
+So: before deciding all-cash, scan the scenarios input for any option row with `expected_value_pct > 0`. If one exists and it's a put on an extended underlying, it's likely the right trade for the cycle — even if it's the only position.
+
 ## Sizing math
 
 For each position, derive:

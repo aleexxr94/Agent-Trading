@@ -41,9 +41,25 @@ Each user message contains a JSON array — one row per instrument — with thes
 - Where HV is unusually high or low vs the typical band, note it (signals regime).
 - For option underlyings, the screener doesn't see IV — but flag underlyings whose HV is well above their historical norm (often coincides with rich IV).
 
+## Regime-aware tilt — options are first-class, not an afterthought
+
+Leveraged ETFs are punished in **two distinct regimes**:
+
+1. **High realised volatility + sideways tape** — 3x daily-rebalancing decay dominates returns regardless of direction. Both 3x longs and 3x inverses bleed.
+2. **Strong directional uptrend at 52-week highs** — 3x longs face crowded-entry / gap risk; 3x inverses get crushed by compounding against the daily reset.
+
+When you see either signal in the live data block, **you must promote at least 3 of the option underlyings (SPY/QQQ/IWM/DIA/TLT) into `passed`**, not just the leveraged ETFs. Long puts on extended underlyings and long calls on TLT (rates hedge) are often the only positive-EV plays the downstream constructor can build in these regimes — and the constructor can only see candidates you pass.
+
+Concrete trigger heuristic (apply at least one):
+  - Median `hv_30d_annualised` across leveraged-ETF candidates > 0.40 → high-vol regime, promote ≥3 option underlyings
+  - ≥4 leveraged ETFs sitting within 5% of their 52w high (`pct_off_52w_high > -0.05`) → extended-uptrend regime, promote ≥3 option underlyings
+  - Either trigger satisfied → include at minimum SPY + QQQ + TLT in `passed` (SPY/QQQ for index put exposure, TLT for rates hedge)
+
+In calm trending regimes (low HV, well off 52w highs), default leveraged-ETF picks are fine and you can drop the option-underlying promotion.
+
 ## "If uncertain, abstain"
 
-If the data is missing, inconsistent, or the regime suggests nothing in the universe meets the bar, return an **empty `passed` list**. An all-cash downstream portfolio is the spec-correct response when the universe has nothing worth trading.
+If the data is missing, inconsistent, or the regime suggests nothing in the universe meets the bar — **including the option underlyings above** — return an empty `passed` list. The downstream all-cash portfolio is the spec-correct response when the universe genuinely has nothing worth trading. But "leveraged ETFs all look bad in this regime" is NOT a valid abstain reason if you haven't passed the option underlyings for the constructor to consider.
 
 ## Output
 
