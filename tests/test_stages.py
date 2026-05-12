@@ -14,13 +14,15 @@ from lib import stages
 
 
 def test_scenarios_max_tokens_above_8192_guard():
-    """Each candidate's base/bull/bear narrative is ~700 tokens. 8 candidates
-    × ~700 = ~5,600 plus JSON overhead, headroom for verbose narratives.
-    16384 was chosen as the safe doubling; anything <12k is unsafe."""
+    """The scenarios stage uses `thinking: adaptive`, and thinking tokens
+    are charged against the output budget. Combined with the PR #26 prompt
+    that emits a row for every researched candidate (including negative-EV
+    ones), 16384 was insufficient — observed truncation at ~7843 chars on
+    the first paper run after the prompt relaxation. 24k is the safe floor."""
     cfg = stages.scenarios()
-    assert cfg.max_tokens >= 12_000, (
-        f"scenarios max_tokens={cfg.max_tokens} risks the regression where "
-        "the LLM truncates mid-JSON on 8-candidate runs"
+    assert cfg.max_tokens >= 24_000, (
+        f"scenarios max_tokens={cfg.max_tokens} risks truncation when "
+        "adaptive thinking eats the output budget on 8-candidate runs"
     )
 
 
