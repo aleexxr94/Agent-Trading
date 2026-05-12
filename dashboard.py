@@ -207,7 +207,7 @@ decisions = dd.load_decisions(limit=200)
 costs = dd.load_costs(limit=2000)
 latest_rid = dd.latest_run_id()
 halted = state.is_halted()
-broker_marks = dd.try_load_broker_marks()
+broker_marks, broker_costs = dd.try_load_broker_marks_and_costs()
 
 # Useful pre-computed values
 cost_today = dd.cost_today_usd()
@@ -376,7 +376,11 @@ with tabs[0]:
             "Run `python orchestrator.py` to populate."
         )
 
-    rows = dd.position_table_rows(portfolio, marks=broker_marks or None)
+    rows = dd.position_table_rows(
+        portfolio,
+        marks=broker_marks or None,
+        costs=broker_costs or None,
+    )
 
     if is_all_cash:
         # Escape the rationale — it's model-generated text and may contain
@@ -604,7 +608,9 @@ with tabs[2]:
 # ===== Tab 3: Performance =====
 with tabs[3]:
     pnl_break = pnl_lib.compute_portfolio_pnl(
-        portfolio=portfolio, marks=broker_marks or None,
+        portfolio=portfolio,
+        marks=broker_marks or None,
+        costs=broker_costs or None,
     )
     has_gross = broker_marks and pnl_break.gross_pnl_usd != 0
 

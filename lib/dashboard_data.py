@@ -173,6 +173,28 @@ def try_load_broker_marks() -> dict[str, float]:
         return {}
 
 
+def try_load_broker_marks_and_costs() -> tuple[dict[str, float], dict[str, float]]:
+    """Best-effort fetch of marks AND actual cost-basis dicts from the broker.
+
+    Returns ({}, {}) on any failure path. The two dicts share the same
+    key shape (ETF symbol or synthetic `UNDERLYING|STRIKE|EXPIRY|TYPE`),
+    so consumers can look up both with a single key per position.
+
+    Use cost-basis to compute P&L that matches Alpaca's reported numbers
+    — the agent's `premium_paid` in portfolio.json is an estimate that's
+    often 5-10× off real option premiums.
+    """
+    try:
+        from .alpaca_client import AlpacaBroker
+        from .marks import marks_from_broker, cost_basis_from_broker
+        broker = AlpacaBroker()
+        # Two get_positions() round-trips today; could be merged into one
+        # broker call later. For a once-per-dashboard-render this is fine.
+        return marks_from_broker(broker), cost_basis_from_broker(broker)
+    except Exception:
+        return {}, {}
+
+
 def latest_run_id() -> str | None:
     if not state.DECISIONS_LOG.exists():
         return None
@@ -290,58 +312,78 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
 
 
 def position_table_rows(
-    portfolio: dict, marks: dict[str, float] | None = None,
+    portfolio: dict,
+    marks: dict[str, float] | None = None,
+    costs: dict[str, float] | None = None,
 ) -> list[dict]:
     """Flatten ETF + option rows into uniform columns for st.dataframe.
 
-    When `marks` is provided (keys: ETF symbol, or
-    f"{underlying}|{strike}|{expiry}|{type}" for options — same convention as
-    monitor.py / compute_portfolio_pnl), each row gets Mark / Gross P&L /
-    Net P&L columns. Without marks those columns stay '—'.
+    `marks` and `costs` are both keyed by the same convention (ETF symbol,
+    or `f"{underlying}|{strike}|{expiry}|{type}"` for options — same shape
+    used by monitor.py / compute_portfolio_pnl / marks_from_broker /
+    cost_basis_from_broker).
+
+    Per-row precedence:
+      - **Cost / Notional**: prefer broker's actual `avg_cost` (`costs`)
+        when present, otherwise fall back to the agent's `avg_cost` /
+        `premium_paid` from portfolio.json. This matters for options
+        because the agent's premium estimates are often 5-10× off real
+        market premiums — the broker fill is the truth.
+      - **Mark / P&L**: same — prefer live broker mark, fall back to
+        portfolio.json values.
+      - When `costs` provides a real fill price, P&L is computed against
+        THAT, not the agent's intended premium. Otherwise we'd show a
+        fictional -$290 loss on a position that's actually -$2.
     """
     marks = marks or {}
+    costs = costs or {}
     out: list[dict] = []
     for p in portfolio.get("positions", []):
         if p["kind"] == "etf":
+            key = p["symbol"]
+            mark = marks.get(key)
+            broker_cost = costs.get(key)
+            cost_per_unit = broker_cost if broker_cost is not None else p["avg_cost"]
             shares = p["shares"]
-            mark = marks.get(p["symbol"])
             row = {
                 "Symbol": p["symbol"],
                 "Kind": "ETF",
                 "Leverage": f"{p.get('leverage_factor', 1):g}x",
                 "Qty": shares,
-                "Cost": p["avg_cost"],
-                "Notional": shares * p["avg_cost"],
+                "Cost": cost_per_unit,
+                "Notional": shares * cost_per_unit,
                 "% NAV": p["position_pct"],
                 "Greeks": "—",
                 "Kill": f"≤{p['kill_conditions']['max_loss_pct']}%",
             }
         else:
             contracts = p["contracts"]
-            premium_usd = p["premium_paid"] * 100 * contracts
             g = p["greeks"]
-            # marks_from_broker currently keys options by OSI symbol; the
-            # rest of the codebase uses the synthetic underlying|strike|expiry|type
-            # key. Try the synthetic key first (forward-compatible with the
-            # PR-#20 alignment fix), then fall back to the OSI key so live
-            # marks match today on main.
+            # Look up via synthetic key (the convention the rest of the
+            # codebase uses); fall back to OSI for backwards compat.
             synth_key = f"{p['underlying']}|{p['strike']}|{p['expiry']}|{p['type']}"
             mark = marks.get(synth_key)
-            if mark is None:
+            broker_cost = costs.get(synth_key)
+            if mark is None or broker_cost is None:
                 try:
                     osi = osi_symbol(
                         underlying=p["underlying"], expiry=p["expiry"],
                         type=p["type"], strike=p["strike"],
                     )
-                    mark = marks.get(osi)
+                    if mark is None:
+                        mark = marks.get(osi)
+                    if broker_cost is None:
+                        broker_cost = costs.get(osi)
                 except (ValueError, KeyError):
                     pass
+            cost_per_unit = broker_cost if broker_cost is not None else p["premium_paid"]
+            premium_usd = cost_per_unit * 100 * contracts
             row = {
                 "Symbol": f"{p['underlying']} {p['type'].upper()} {p['strike']} {p['expiry']}",
                 "Kind": "OPT",
                 "Leverage": "—",
                 "Qty": contracts,
-                "Cost": p["premium_paid"],
+                "Cost": cost_per_unit,
                 "Notional": premium_usd,
                 "% NAV": p["position_pct"],
                 "Greeks": (
@@ -350,7 +392,13 @@ def position_table_rows(
                 ),
                 "Kill": f"≤{p['kill_conditions']['max_loss_pct']}%",
             }
-        breakdown = pnl_lib.compute_position_pnl(position=p, current_mark_usd=mark)
+        # Pass the broker-truth cost basis into the P&L helper so option
+        # P&L reflects actual fill, not the agent's premium estimate.
+        breakdown = pnl_lib.compute_position_pnl(
+            position=p,
+            current_mark_usd=mark,
+            actual_cost_per_unit=cost_per_unit,
+        )
         row["Mark"] = mark if mark is not None else None
         row["Gross P&L"] = breakdown.gross_pnl_usd if mark is not None else None
         row["Net P&L"] = breakdown.net_pnl_usd if mark is not None else None

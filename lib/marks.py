@@ -97,6 +97,42 @@ def marks_from_broker(broker: Broker) -> dict[str, float]:
     return out
 
 
+def cost_basis_from_broker(broker: Broker) -> dict[str, float]:
+    """Build a {key: per_unit_cost_basis} dict from broker.get_positions().
+
+    Same key convention as marks_from_broker (ETF: symbol; option:
+    synthetic UNDERLYING|STRIKE|EXPIRY|TYPE). Per-share / per-share-premium
+    cost basis comes from Alpaca's `avg_cost` — the actual fill price the
+    broker recorded, NOT the agent's estimate in portfolio.json's
+    `premium_paid`. The two can diverge widely on options because the
+    agent's training-data priors are often 5-10× off real market premiums;
+    dashboards / P&L code should prefer this when computing realised vs
+    intended-vs-actual P&L.
+
+    Safe to call when broker is None or get_positions fails — returns {}
+    in both cases.
+    """
+    if broker is None:
+        return {}
+    try:
+        positions = broker.get_positions()
+    except Exception:
+        return {}
+
+    out: dict[str, float] = {}
+    for p in positions:
+        if p.qty == 0:
+            continue
+        if p.avg_cost is None:
+            continue
+        # avg_cost is per-share for ETFs and per-share for options too
+        # (Alpaca reports option avg_cost as price-per-contract / 100, same
+        # units as the option's current_price). Same downstream convention
+        # as marks_from_broker so the two dicts pair cleanly.
+        out[_key_for_broker_position(p)] = p.avg_cost
+    return out
+
+
 def portfolio_to_mark_keys(portfolio: dict) -> dict[str, str]:
     """Map each portfolio position to the mark key it should look up.
 
