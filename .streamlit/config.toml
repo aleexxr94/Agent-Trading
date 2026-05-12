@@ -1,9 +1,13 @@
 [theme]
 base = "dark"
-primaryColor = "#ef4444"
-backgroundColor = "#0b0f1a"
+# Accent: emerald-500. Used for primary buttons, links, focus rings.
+# Paper-trading risk red is reserved for the risk banner + halt state so
+# accents don't constantly compete with the warning.
+primaryColor = "#10b981"
+backgroundColor = "#0a0e17"
 secondaryBackgroundColor = "#111827"
 textColor = "#e5e7eb"
+font = "sans serif"
 
 [server]
 headless = true
