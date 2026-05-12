@@ -207,14 +207,22 @@ decisions = dd.load_decisions(limit=200)
 costs = dd.load_costs(limit=2000)
 latest_rid = dd.latest_run_id()
 halted = state.is_halted()
-broker_marks, broker_costs = dd.try_load_broker_marks_and_costs()
+broker_view = dd.try_load_broker_view()
+broker_marks, broker_costs = broker_view.marks, broker_view.costs
 
 # Useful pre-computed values
 cost_today = dd.cost_today_usd()
 cost_today_pct = min(100.0, 100.0 * cost_today / max(DAILY_CAP_USD, 0.0001))
 cost_this_run = dd.cost_for_run_usd(latest_rid) if latest_rid else 0.0
 totals = dd.total_token_cost()
-n_positions = len(portfolio.get("positions", []))
+_open_for_count, _closed_for_count = dd.split_positions_by_broker_holdings(
+    portfolio,
+    held_keys=broker_view.held_keys if broker_view.available else None,
+)
+# n_positions reflects what's actually open at the broker (or everything in
+# portfolio.json when the broker is unreachable). Avoids the hero/status
+# pills disagreeing with the table after a position closes.
+n_positions = len(_open_for_count)
 is_all_cash = portfolio.get("all_cash", False)
 orders_enabled = os.environ.get("ORDERS_ENABLED", "false").lower() == "true"
 live_trading = os.environ.get("LIVE_TRADING_ENABLED", "false").lower() == "true"
@@ -376,11 +384,36 @@ with tabs[0]:
             "Run `python orchestrator.py` to populate."
         )
 
+    # When the broker is reachable, hide portfolio.json positions the broker
+    # no longer carries (closed manually / expired / killed). When the broker
+    # is unreachable we render everything — better than blanking the dashboard.
+    filter_keys = broker_view.held_keys if broker_view.available else None
     rows = dd.position_table_rows(
         portfolio,
         marks=broker_marks or None,
         costs=broker_costs or None,
+        held_keys=filter_keys,
     )
+
+    open_positions, closed_positions = dd.split_positions_by_broker_holdings(
+        portfolio, held_keys=filter_keys,
+    )
+    if closed_positions:
+        closed_labels = []
+        for p in closed_positions:
+            if p["kind"] == "etf":
+                closed_labels.append(p["symbol"])
+            else:
+                closed_labels.append(
+                    f"{p['underlying']} {p['type'].upper()} {p['strike']:g} {p['expiry']}"
+                )
+        st.warning(
+            "Closed since last orchestrator run — "
+            "broker no longer reports: **"
+            + ", ".join(closed_labels)
+            + "**. These were in the agent's last portfolio.json but are no "
+            "longer open at Alpaca."
+        )
 
     if is_all_cash:
         # Escape the rationale — it's model-generated text and may contain

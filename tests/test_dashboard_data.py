@@ -32,6 +32,103 @@ def test_load_portfolio_seed_overrides_fixture(tmp_state):
     assert src == "seed"
 
 
+# ---------- mark_key_for_position ----------
+
+
+def test_mark_key_for_position_etf():
+    assert dd.mark_key_for_position({"kind": "etf", "symbol": "TQQQ"}) == "TQQQ"
+
+
+def test_mark_key_for_position_option():
+    pos = {
+        "kind": "option", "underlying": "SPY", "strike": 530.0,
+        "expiry": "2026-06-19", "type": "call",
+    }
+    assert dd.mark_key_for_position(pos) == "SPY|530.0|2026-06-19|call"
+
+
+# ---------- split_positions_by_broker_holdings ----------
+
+
+def test_split_returns_all_open_when_held_keys_none():
+    """held_keys=None signals broker unreachable; don't filter anything."""
+    portfolio = json.loads(FIXTURE.read_text())
+    open_, closed = dd.split_positions_by_broker_holdings(
+        portfolio, held_keys=None,
+    )
+    assert len(open_) == len(portfolio["positions"])
+    assert closed == []
+
+
+def test_split_treats_empty_held_keys_as_all_closed():
+    """held_keys=set() = broker reachable, says zero positions → every
+    portfolio entry is treated as closed."""
+    portfolio = json.loads(FIXTURE.read_text())
+    open_, closed = dd.split_positions_by_broker_holdings(
+        portfolio, held_keys=frozenset(),
+    )
+    assert open_ == []
+    assert len(closed) == len(portfolio["positions"])
+
+
+def test_split_partitions_etf_and_option_correctly():
+    """Mixed portfolio: TQQQ + SPY 530C still open at broker; rest closed."""
+    portfolio = json.loads(FIXTURE.read_text())
+    held = frozenset({"TQQQ", "SPY|530.0|2026-06-19|call"})
+    open_, closed = dd.split_positions_by_broker_holdings(
+        portfolio, held_keys=held,
+    )
+    assert len(open_) == 2
+    assert {dd.mark_key_for_position(p) for p in open_} == set(held)
+    # Everything else closed.
+    assert len(closed) == len(portfolio["positions"]) - 2
+
+
+# ---------- position_table_rows held_keys filter ----------
+
+
+def test_position_table_rows_filters_stale_positions_when_broker_reachable(tmp_state):
+    """Regression for May 12 2026: dashboard kept rendering a position
+    after it closed on Alpaca because portfolio.json still listed it.
+    Now: when held_keys is supplied, only those keys render."""
+    portfolio = json.loads(FIXTURE.read_text())
+    # Broker holds only TQQQ; everything else got manually closed.
+    held = frozenset({"TQQQ"})
+    rows = dd.position_table_rows(portfolio, held_keys=held)
+    assert len(rows) == 1
+    assert rows[0]["Symbol"] == "TQQQ"
+
+
+def test_position_table_rows_renders_everything_when_held_keys_none(tmp_state):
+    """held_keys=None = broker unreachable; don't blank the dashboard."""
+    portfolio = json.loads(FIXTURE.read_text())
+    rows = dd.position_table_rows(portfolio, held_keys=None)
+    assert len(rows) == len(portfolio["positions"])
+
+
+def test_position_table_rows_empty_when_held_keys_empty(tmp_state):
+    """held_keys=set() = broker reachable, zero positions → table empty."""
+    portfolio = json.loads(FIXTURE.read_text())
+    rows = dd.position_table_rows(portfolio, held_keys=frozenset())
+    assert rows == []
+
+
+# ---------- BrokerView ----------
+
+
+def test_broker_view_dataclass_shape():
+    """BrokerView's held_keys must equal set(costs) so the dashboard's
+    filter is consistent with the cost dict used for P&L."""
+    view = dd.BrokerView(
+        marks={"TQQQ": 80.0},
+        costs={"TQQQ": 75.0, "SPY|530.0|2026-06-19|call": 8.10},
+        held_keys=frozenset({"TQQQ", "SPY|530.0|2026-06-19|call"}),
+        available=True,
+    )
+    assert set(view.costs) == set(view.held_keys)
+    assert view.available is True
+
+
 def test_position_table_rows_etf_and_option_columns(tmp_state):
     portfolio = json.loads(FIXTURE.read_text())
     rows = dd.position_table_rows(portfolio)
