@@ -45,7 +45,7 @@ Per-stage model assignment matches the cost/quality demand of each decision. All
 | **construct** | `claude-opus-4-6` | **The actual trade decision** — picks positions, sizing, kill conditions. Highest-stakes call on a $2,500 account where each trade matters disproportionately; gets the Opus tier. |
 | **orchestrator-meta** *(timing only)* | `claude-opus-4-6` | Decides next-run window from regime + portfolio state. Bounded 1–24h, falls back to a 4h/6h heuristic if the LLM output is unusable. |
 
-Typical cost per orchestrator run on a real universe: **~$0.10–$0.50** (most of it in `construct`). Per-run cap defaults to $2; daily cap defaults to $10.
+Typical cost per orchestrator run on a real universe: **~$0.10–$0.50** (most of it in `construct`). Per-run cap defaults to $3; daily cap defaults to $12.
 
 ---
 
@@ -209,8 +209,8 @@ Fill in:
 | `ALPACA_API_KEY` / `_SECRET` | **Paper** keys from [alpaca.markets](https://alpaca.markets) — never live. |
 | `ALPACA_BASE_URL`            | `https://paper-api.alpaca.markets` (default).                         |
 | `MODEL_*`                    | Override the per-stage model IDs if needed (defaults are Claude 4.X). |
-| `PER_RUN_COST_CAP_USD`       | Default `2.00`. Per-run hard cap.                                     |
-| `DAILY_COST_CAP_USD`         | Default `10.00`. Daily hard cap (resets at 00:00 UTC).                |
+| `PER_RUN_COST_CAP_USD`       | Default `3.00`. Per-run hard cap.                                     |
+| `DAILY_COST_CAP_USD`         | Default `12.00`. Daily hard cap (resets at 00:00 UTC).                |
 | `LIVE_TRADING_ENABLED`       | **Leave `false`.** See [Promotion to live](./CLAUDE.md#promotion-to-live-documented-only--do-not-enable-in-code). |
 
 ### 4. Manual smoke (do this BEFORE enabling timers)

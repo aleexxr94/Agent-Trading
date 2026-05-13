@@ -120,8 +120,8 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
 
 ## Cost controls (mandatory)
 - Anthropic prompt caching on every static system prompt and on the screening universe block.
-- **Per-run hard cap: $2.00 USD.** If exceeded mid-run, finish current stage, abort the rest, log.
-- **Daily hard cap: $10.00 USD.** Beyond this, orchestrator refuses to run until next UTC day.
+- **Per-run hard cap: $3.00 USD.** If exceeded mid-run, finish current stage, abort the rest, log. Raised from $2.00 on 2026-05-13 after a paper run overshot to $2.22 mid-stage; the new headroom lets cycles complete through `stage_execute` even when the construct stage runs on the Opus tier.
+- **Daily hard cap: $12.00 USD.** Beyond this, orchestrator refuses to run until next UTC day.
 - Append cost per run to `state/costs.jsonl`. Surface in dashboard.
 
 ## Dashboard (Streamlit, dark mode, mobile-friendly)

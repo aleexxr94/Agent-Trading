@@ -443,6 +443,16 @@ def test_daily_cap_aborts_across_runs(tmp_state, monkeypatch):
     assert "daily" in str(ei.value)
 
 
+def test_default_cost_caps_are_three_and_twelve(monkeypatch):
+    # Lock the bumped defaults so a future "tidy-up" doesn't silently
+    # revert them. Spec moved from $2/$10 to $3/$12 on 2026-05-13 after
+    # the cost-cap-overrun observation on the live paper run.
+    monkeypatch.delenv("PER_RUN_COST_CAP_USD", raising=False)
+    monkeypatch.delenv("DAILY_COST_CAP_USD", raising=False)
+    assert llm._per_run_cap() == 3.00
+    assert llm._daily_cap() == 12.00
+
+
 def test_halt_flag_blocks_call(tmp_state):
     state.set_halt("test")
     fm = FakeMessages([json.dumps(_DECISION_PAYLOAD)])
