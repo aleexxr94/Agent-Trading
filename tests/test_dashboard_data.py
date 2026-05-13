@@ -334,21 +334,23 @@ def test_load_run_summaries_returns_empty_when_no_runs(tmp_state):
 
 
 def test_load_run_summaries_pulls_rationales_and_funnel(tmp_state):
-    """Each summary aggregates portfolio.json (rationales + position count),
-    screen/research/scenarios candidate counts, next_run.json, and the run's
-    total cost from the cost log. Powers the Cycles tab."""
-    # Build a fake run dir with all five artifacts
+    """Each summary aggregates portfolio.json (rationales + position
+    count), the v2 funnel widths from signals.json + view.json,
+    sanity.json status, critique.json accept flag, next_run.json,
+    and the run's total cost from the cost log. Powers the Cycles
+    tab."""
     rid = "20260512T123456Z-deadbeef"
     run_dir = state.RUNS_DIR / rid
     run_dir.mkdir(parents=True)
-    state.write_json(run_dir / "screen.json", {
-        "passed": [{"symbol": "TQQQ"}, {"symbol": "UPRO"}, {"symbol": "SOXL"}],
+    state.write_json(run_dir / "signals.json", {
+        "tickers": [{"symbol": f"S{i}"} for i in range(15)],
     })
-    state.write_json(run_dir / "research.json", {
-        "candidates": [{"symbol": "TQQQ"}, {"symbol": "UPRO"}],
-    })
-    state.write_json(run_dir / "scenarios.json", {
-        "candidates": [{"symbol": "TQQQ"}],
+    state.write_json(run_dir / "view.json", {
+        "regime": "trending_up",
+        "candidates": [
+            {"symbol": "TQQQ", "instrument_kind": "etf"},
+            {"symbol": "SOXL", "instrument_kind": "etf"},
+        ],
     })
     state.write_json(run_dir / "portfolio.json", {
         "run_id": rid, "generated_at": "2026-05-12T12:34:56Z",
@@ -356,12 +358,19 @@ def test_load_run_summaries_pulls_rationales_and_funnel(tmp_state):
         "all_cash_rationale": "Single positive-EV candidate below threshold.",
         "construction_rationale": "Zero positions taken.",
     })
+    state.write_json(run_dir / "sanity.json", {
+        "status": "pass", "summary": {"pass": 6, "warn": 0, "fail": 0, "skip": 4},
+        "rules": [],
+    })
+    state.write_json(run_dir / "critique.json", {
+        "accept": True, "critique": "ok", "suggested_changes": [],
+    })
     state.write_json(run_dir / "next_run.json", {
         "next_run_at": "2026-05-12T14:00:00Z",
         "rationale": "Wait for market open.",
     })
     state.append_cost({
-        "run_id": rid, "stage": "screen", "model": "haiku",
+        "run_id": rid, "stage": "strategist", "model": "sonnet",
         "cost_usd": 0.05, "at": "2026-05-12T12:30:00Z",
     })
     state.append_cost({
@@ -375,9 +384,11 @@ def test_load_run_summaries_pulls_rationales_and_funnel(tmp_state):
     assert s["run_id"] == rid
     assert s["all_cash"] is True
     assert s["positions_count"] == 0
-    assert s["screened_count"] == 3
-    assert s["researched_count"] == 2
-    assert s["scenarios_count"] == 1
+    assert s["signals_count"] == 15
+    assert s["candidates_count"] == 2
+    assert s["regime"] == "trending_up"
+    assert s["sanity_status"] == "pass"
+    assert s["critic_accept"] is True
     assert s["all_cash_rationale"].startswith("Single positive-EV candidate")
     assert s["next_run_rationale"] == "Wait for market open."
     assert s["cost_usd"] == pytest.approx(0.25)
@@ -397,22 +408,22 @@ def test_load_run_summaries_newest_first(tmp_state):
 
 def test_load_run_summaries_tolerates_null_list_fields(tmp_state):
     """Regression for Codex P1 on PR #35: a malformed artifact like
-    {"passed": null} previously raised TypeError on len(None), killing
-    the entire Cycles tab render. One bad run must not take down
-    visibility for all others."""
+    {"tickers": null} previously raised TypeError on len(None),
+    killing the entire Cycles tab render. One bad run must not take
+    down visibility for all others."""
     bad_rid = "20260512T120000Z-corrupt"
     good_rid = "20260512T130000Z-clean"
 
     bad_dir = state.RUNS_DIR / bad_rid
     bad_dir.mkdir(parents=True)
-    state.write_json(bad_dir / "screen.json", {"passed": None, "rejected": None})
-    state.write_json(bad_dir / "research.json", {"candidates": None})
+    state.write_json(bad_dir / "signals.json", {"tickers": None})
+    state.write_json(bad_dir / "view.json", {"candidates": None})
     state.write_json(bad_dir / "portfolio.json", {"positions": None, "all_cash": None})
     state.write_json(bad_dir / "next_run.json", {"next_run_at": None, "rationale": None})
 
     good_dir = state.RUNS_DIR / good_rid
     good_dir.mkdir(parents=True)
-    state.write_json(good_dir / "screen.json", {"passed": [{"symbol": "TQQQ"}]})
+    state.write_json(good_dir / "signals.json", {"tickers": [{"symbol": "TQQQ"}]})
 
     # Must not raise. Both summaries should come back.
     out = dd.load_run_summaries()
@@ -420,15 +431,14 @@ def test_load_run_summaries_tolerates_null_list_fields(tmp_state):
 
     # Corrupt run shows zeros for the null fields, not garbage / crash
     corrupt = next(s for s in out if s["run_id"] == bad_rid)
-    assert corrupt["screened_count"] == 0
-    assert corrupt["researched_count"] == 0
-    assert corrupt["scenarios_count"] == 0
+    assert corrupt["signals_count"] == 0
+    assert corrupt["candidates_count"] == 0
     assert corrupt["positions_count"] == 0
     assert corrupt["next_run_rationale"] == ""
 
     # Clean run still parsed correctly alongside the corrupt one
     clean = next(s for s in out if s["run_id"] == good_rid)
-    assert clean["screened_count"] == 1
+    assert clean["signals_count"] == 1
 
 
 def test_load_run_summaries_tolerates_top_level_non_dict(tmp_state):
@@ -439,13 +449,13 @@ def test_load_run_summaries_tolerates_top_level_non_dict(tmp_state):
     run_dir.mkdir(parents=True)
     state.write_json(run_dir / "portfolio.json", ["not", "a", "dict"])
     state.write_json(run_dir / "next_run.json", "just a string")
-    state.write_json(run_dir / "screen.json", 42)
+    state.write_json(run_dir / "signals.json", 42)
 
     out = dd.load_run_summaries()
     assert len(out) == 1
     assert out[0]["run_id"] == rid
     assert out[0]["positions_count"] == 0
-    assert out[0]["screened_count"] == 0
+    assert out[0]["signals_count"] == 0
 
 
 def test_load_run_summaries_tolerates_missing_artifacts(tmp_state):
@@ -454,14 +464,14 @@ def test_load_run_summaries_tolerates_missing_artifacts(tmp_state):
     rid = "20260512T120000Z-partial"
     run_dir = state.RUNS_DIR / rid
     run_dir.mkdir(parents=True)
-    # Only screen.json — no portfolio.json or next_run.json
-    state.write_json(run_dir / "screen.json", {"passed": [{"symbol": "TQQQ"}]})
+    # Only signals.json — no portfolio.json or next_run.json
+    state.write_json(run_dir / "signals.json", {"tickers": [{"symbol": "TQQQ"}]})
 
     out = dd.load_run_summaries()
     assert len(out) == 1
     s = out[0]
     assert s["run_id"] == rid
-    assert s["screened_count"] == 1
+    assert s["signals_count"] == 1
     assert s["all_cash"] is None  # never written
     assert s["construction_rationale"] == ""
     assert s["next_run_rationale"] == ""

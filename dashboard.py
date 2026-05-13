@@ -539,11 +539,10 @@ with tabs[1]:
             else:
                 status_html = '<span class="at-pill orders-off">○ no portfolio</span>'
 
-            # Funnel: screened → researched → scenarios → final
+            # Funnel: universe signals → strategist candidates → portfolio positions.
             funnel = (
-                f'{s["screened_count"]} screened → '
-                f'{s["researched_count"]} researched → '
-                f'{s["scenarios_count"]} scenarios → '
+                f'{s["signals_count"]} signals → '
+                f'{s["candidates_count"]} candidates → '
                 f'{s["positions_count"]} {"positions" if s["positions_count"] != 1 else "position"}'
             )
 
@@ -618,14 +617,15 @@ with tabs[2]:
         for row in reversed(decisions):
             stage = row['stage']
             stage_icon = {
-                "screen": "🔎",
-                "research": "⚖️",
-                "research_bull": "📈",
-                "research_bear": "📉",
-                "scenarios": "🎲",
+                "market_gate": "🕰️",
+                "signals": "📊",
+                "strategist": "🧠",
+                "chain_lookup": "🔗",
                 "construct": "🧩",
+                "critic": "⚖️",
                 "execute": "📤",
                 "meta": "🕒",
+                "monitor": "🛡️",
             }.get(stage, "•")
             with st.expander(
                 f"{stage_icon}  {stage:<14} • {row['model']:<28} • "
