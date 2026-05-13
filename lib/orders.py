@@ -131,11 +131,25 @@ def _plan_for_symbol(
         side = "sell" if current_qty > 0 else "buy"
         return [OrderRequest(symbol=symbol, qty=abs(current_qty), side=side, order_type="market")], []
     if (current_qty > 0) == (target_qty > 0):
-        # Same sign: single delta order. abs(delta) is correct size and
-        # the side depends on whether we're growing or shrinking the
-        # position.
+        # Same sign (both long, or both short — current schema is long-only
+        # but the helper stays defensive). Single delta order.
+        #
+        # Broker semantics: a `buy` always adds to position (grows a long
+        # or covers a short toward zero); a `sell` always reduces a long
+        # toward zero OR builds a short. So with current and target on
+        # the same side of zero, the order side is determined purely by
+        # the sign of (target - current):
+        #
+        #   long  4 → long  6: delta=+2 → buy  (grow long)
+        #   long  6 → long  4: delta=-2 → sell (reduce long)
+        #   short-5 → short-2: delta=+3 → buy  (cover toward zero)
+        #   short-2 → short-5: delta=-3 → sell (grow short)
+        #
+        # Codex P1 on the v2 PR: an earlier version inverted this for
+        # negative current_qty (buy⇄sell flipped on short adjustments).
+        # The simple rule above is the correct one.
         delta = target_qty - current_qty
-        side = "buy" if (delta > 0 and current_qty > 0) or (delta < 0 and current_qty < 0) else "sell"
+        side = "buy" if delta > 0 else "sell"
         return [], [OrderRequest(symbol=symbol, qty=abs(delta), side=side, order_type="market")]
 
     # Opposite signs — the dangerous case. Split into close + open.

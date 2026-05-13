@@ -514,6 +514,29 @@ def test_plan_for_symbol_long_to_smaller_long_is_single_sell():
     assert opens[0].side == "sell" and opens[0].qty == 3
 
 
+def test_plan_for_symbol_short_to_more_short_is_single_sell():
+    """Codex P1 regression: short -2 → short -5 should sell 3 (grow
+    the short). An earlier same-sign branch inverted this and emitted
+    a buy, moving AWAY from the target. The fix collapsed the side
+    logic to the simple rule `buy if delta > 0 else sell`.
+    """
+    closes, opens = orders._plan_for_symbol(symbol="TQQQ", current_qty=-2, target_qty=-5)
+    assert closes == []
+    assert len(opens) == 1
+    assert opens[0].side == "sell" and opens[0].qty == 3
+
+
+def test_plan_for_symbol_short_to_less_short_is_single_buy():
+    """Codex P1 regression: short -5 → short -2 should buy 3 (cover
+    toward zero). An earlier same-sign branch inverted this and
+    emitted a sell.
+    """
+    closes, opens = orders._plan_for_symbol(symbol="TQQQ", current_qty=-5, target_qty=-2)
+    assert closes == []
+    assert len(opens) == 1
+    assert opens[0].side == "buy" and opens[0].qty == 3
+
+
 def test_plan_for_symbol_no_change_emits_no_orders():
     """current == target: zero orders."""
     closes, opens = orders._plan_for_symbol(symbol="TQQQ", current_qty=3, target_qty=3)

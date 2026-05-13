@@ -108,7 +108,17 @@ class AlpacaBroker(Broker):
         cycles when markets are closed. Returns None on any error so the
         market_gate stage falls back to its "conservative closed" branch
         rather than crashing the pipeline on a transient API hiccup.
+
+        Codex P2 on the v2 PR: the broker's datetimes are normalised to
+        UTC BEFORE we render them as ISO strings. An earlier version
+        only rewrote ``+00:00`` → ``Z``, which silently broke when
+        alpaca-py returned a datetime with a non-UTC offset (e.g.
+        ``-04:00``): the resulting string was unparsable by the
+        downstream ``datetime.strptime(..., '%Y-%m-%dT%H:%M:%SZ')`` in
+        the scheduler / orchestrator, causing the immediate-reopen
+        timestamp on closed-market cycles to be silently dropped.
         """
+        from datetime import datetime, timezone
         try:
             c = self._client.get_clock()
         except Exception:
@@ -117,9 +127,18 @@ class AlpacaBroker(Broker):
         def _iso(v) -> str:
             if v is None:
                 return ""
-            # alpaca-py returns datetime objects; convert to ISO-8601 UTC.
+            # If v is a datetime, normalise to UTC FIRST. Naive datetimes
+            # are assumed to already be UTC (alpaca-py returns aware
+            # datetimes in practice, but be defensive).
+            if isinstance(v, datetime):
+                v = (
+                    v.replace(tzinfo=timezone.utc)
+                    if v.tzinfo is None
+                    else v.astimezone(timezone.utc)
+                )
             iso = getattr(v, "isoformat", lambda: str(v))()
-            # Normalise to ...Z form for consistency with rest of codebase.
+            # After UTC normalisation the offset is always +00:00; render
+            # as the canonical ...Z form used by the rest of the codebase.
             if iso.endswith("+00:00"):
                 iso = iso[:-6] + "Z"
             return iso
