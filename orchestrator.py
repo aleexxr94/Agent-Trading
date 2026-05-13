@@ -497,12 +497,46 @@ def _update_cycle_dedup_hash(signals_out: dict, current_positions: list[dict]) -
 
 
 def _peak_nav_30d() -> float:
-    """Highest NAV observed in the last 30 days from state.read_nav_history.
-    Used by risk.adaptive_position_cap_pct to dial size down in drawdown."""
-    rows = state.read_nav_history(limit=180)  # ~30d at 6 cycles/day
+    """Highest NAV observed in the last 30 calendar days from
+    state.read_nav_history. Used by risk.adaptive_position_cap_pct
+    to dial size down in drawdown.
+
+    Codex P2 on PR #69: an earlier version used ``limit=180`` (≈30d
+    at 6 cycles/day) as a proxy for "last 30 days." But the orchestrator
+    cadence floor is 1h (META_MIN_HOURS), so in faster regimes 180
+    rows could cover only ~7.5 days. The drawdown-adaptive cap would
+    then "forget" earlier peaks and lift size limits too soon — the
+    opposite of what the protection was meant to do.
+
+    Fix: filter rows by the ``at`` timestamp against a 30-day-ago cutoff
+    rather than relying on row count. Pull a generous slab (1000 rows)
+    to absorb sub-1h cadence experiments; the math still operates on
+    a clean 30-day window.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    rows = state.read_nav_history(limit=1000)
     if not rows:
         return 0.0
-    return max((r.get("nav_usd") or 0.0) for r in rows)
+    cutoff = utcnow_aware = state.utcnow()
+    cutoff = cutoff - timedelta(days=30)
+
+    peak = 0.0
+    for r in rows:
+        nav = r.get("nav_usd") or 0.0
+        if nav <= 0:
+            continue
+        at_str = r.get("at") or ""
+        try:
+            at = datetime.strptime(at_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            # Malformed timestamp — include the row defensively so a
+            # bad write doesn't accidentally lift the cap.
+            peak = max(peak, nav)
+            continue
+        if at >= cutoff:
+            peak = max(peak, nav)
+    return peak
 
 
 def _default_next_run_at(portfolio: dict) -> str:
