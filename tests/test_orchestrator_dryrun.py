@@ -411,3 +411,60 @@ def test_peak_nav_30d_returns_max_observed(tmp_state):
                           "nav_usd": nav, "positions_count": 0, "all_cash": True,
                           "gross_pnl_usd": 0.0, "modelled_costs_usd": 0.0, "net_pnl_usd": 0.0})
     assert orchestrator._peak_nav_30d() == 2700.0
+
+
+def test_peak_nav_30d_ignores_rows_older_than_30_days(tmp_state, monkeypatch):
+    """Codex P2 regression: a peak from 60 days ago must NOT be returned
+    as the 30-day peak, regardless of how few rows are in the log.
+
+    Earlier version used limit=180 as a proxy for 30 days, which broke
+    when cadence ran faster than 6/day. Now the filter is timestamp-
+    based against utcnow() - 30 days.
+    """
+    from datetime import datetime, timedelta, timezone
+    now = datetime(2026, 5, 13, 14, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(state, "utcnow", lambda: now)
+
+    # 60 days old — outside the window. Big NAV that should NOT be
+    # returned as the peak.
+    state.append_nav({"run_id": "old", "at": "2026-03-14T14:00:00Z",
+                      "nav_usd": 5000.0, "positions_count": 0, "all_cash": True,
+                      "gross_pnl_usd": 0.0, "modelled_costs_usd": 0.0, "net_pnl_usd": 0.0})
+    # 10 days old — inside the window.
+    state.append_nav({"run_id": "recent", "at": "2026-05-03T14:00:00Z",
+                      "nav_usd": 2700.0, "positions_count": 0, "all_cash": True,
+                      "gross_pnl_usd": 0.0, "modelled_costs_usd": 0.0, "net_pnl_usd": 0.0})
+    # 1 day old — inside the window.
+    state.append_nav({"run_id": "today", "at": "2026-05-12T14:00:00Z",
+                      "nav_usd": 2400.0, "positions_count": 0, "all_cash": True,
+                      "gross_pnl_usd": 0.0, "modelled_costs_usd": 0.0, "net_pnl_usd": 0.0})
+
+    # Peak should be 2700 (the 10-day-old row), NOT 5000 (the 60-day-old).
+    assert orchestrator._peak_nav_30d() == 2700.0
+
+
+def test_peak_nav_30d_handles_hourly_cadence(tmp_state, monkeypatch):
+    """Codex P2 scenario: hourly cadence means the cap-bump 30d window
+    could contain ~720 rows. With the old limit=180, only the most
+    recent 7.5 days would be considered. Confirm the timestamp-based
+    filter handles a high-density NAV log correctly.
+    """
+    from datetime import datetime, timedelta, timezone
+    now = datetime(2026, 5, 13, 14, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(state, "utcnow", lambda: now)
+
+    # 25 days of hourly NAV rows. Peak at hour 1 (oldest in-window).
+    base = now - timedelta(days=25)
+    for h in range(25 * 24):
+        ts = base + timedelta(hours=h)
+        # 3000 is the peak; everything else is 2500.
+        nav = 3000.0 if h == 1 else 2500.0
+        state.append_nav({
+            "run_id": f"r{h}",
+            "at": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "nav_usd": nav,
+            "positions_count": 0, "all_cash": True,
+            "gross_pnl_usd": 0.0, "modelled_costs_usd": 0.0, "net_pnl_usd": 0.0,
+        })
+    # All 600 rows are within the 30-day window, including the 3000 peak.
+    assert orchestrator._peak_nav_30d() == 3000.0

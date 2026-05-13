@@ -107,21 +107,51 @@ def lookup_nearest_otm(
         return None
 
     lo, hi = _target_expiry_window(target_dte=target_dte)
-    try:
-        req = GetOptionContractsRequest(
-            underlying_symbols=[underlying],
-            status=AssetStatus.ACTIVE,
-            type=ContractType.CALL if side == "call" else ContractType.PUT,
-            expiration_date_gte=lo,
-            expiration_date_lte=hi,
-            limit=500,
-        )
-        resp = broker._client.get_option_contracts(req)
-    except Exception:
-        return None
 
-    # alpaca-py returns OptionContractsResponse with .option_contracts
-    contracts = getattr(resp, "option_contracts", None) or []
+    # Codex P1 on PR #69: SPY/QQQ's 23–51 DTE window can exceed 500
+    # contracts (multiple weeklies + monthlies × hundreds of strikes).
+    # The original single-page fetch silently truncated the chain,
+    # which meant the "nearest OTM" pick could come from an incomplete
+    # universe (or return None when the true nearest strike sits past
+    # the cutoff). Paginate via page_token until exhausted.
+    #
+    # Hard ceiling on pages (50) to bound worst-case latency; one full
+    # SPY chain at 500/page is typically ~2-4 pages, so 50 is well above
+    # the real working set but stops a pathological mis-config from
+    # spinning forever.
+    contracts: list = []
+    page_token: str | None = None
+    pages_fetched = 0
+    MAX_PAGES = 50
+    while pages_fetched < MAX_PAGES:
+        try:
+            req = GetOptionContractsRequest(
+                underlying_symbols=[underlying],
+                status=AssetStatus.ACTIVE,
+                type=ContractType.CALL if side == "call" else ContractType.PUT,
+                expiration_date_gte=lo,
+                expiration_date_lte=hi,
+                limit=500,
+                page_token=page_token,
+            )
+            resp = broker._client.get_option_contracts(req)
+        except Exception:
+            # Partial pagination is still better than no chain at all —
+            # only return None if we never got any contracts. Otherwise
+            # rank what we have and proceed.
+            if not contracts:
+                return None
+            break
+        page = getattr(resp, "option_contracts", None) or []
+        contracts.extend(page)
+        pages_fetched += 1
+        # alpaca-py returns the next-page cursor on .next_page_token
+        # (or None when exhausted). Some SDK versions may also drop the
+        # attribute entirely once done; getattr handles both shapes.
+        page_token = getattr(resp, "next_page_token", None)
+        if not page_token:
+            break
+
     if not contracts:
         return None
 
