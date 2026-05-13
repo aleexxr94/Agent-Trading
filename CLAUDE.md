@@ -141,7 +141,7 @@ Tabs:
 1. **Portfolio** — NAV, cash, 10 positions. ETF rows show leverage factor + shares. Option rows show strike, expiry, DTE, Greeks, IV, premium paid, current mark. Allocation pie. Day P&L, total P&L.
 2. **Trades & Rationales** — chronological decisions: full agent reasoning, "why this instrument", "why now", kill conditions, horizon chosen.
 3. **Performance** — equity curve, drawdown, vs SPY benchmark (Plotly).
-4. **Agent Logs** — latest bull/bear debates, scenario tables, current orchestrator-set next-run time, last 20 decision-log entries.
+4. **Agent Logs** — sanity-report panel + latest stage artifacts (market_gate, signals, view, portfolio, sanity, orders, next_run), current orchestrator-set next-run time, last 20 decision-log entries.
 5. **Settings** — emergency stop button (writes `state/halt.flag`; orchestrator checks this **before any API call**), paper/live indicator (live disabled), API cost today and this run, manual refresh, link to README.
 
 Phone access on local Wi-Fi: `streamlit run dashboard.py --server.address 0.0.0.0`. Do not enable ngrok or any tunnel by default. Leave a commented `tunnel.sh.example` with a warning that I have not added auth.

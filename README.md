@@ -2,7 +2,7 @@
 
 > **PAPER TRADING — Experimental autonomous AI agent. Leveraged ETFs and listed options on a small account are high-risk. Not financial advice.**
 
-Autonomous multi-agent trading system that screens leveraged ETFs and listed options, runs adversarial bull/bear research, builds scenario-weighted views, constructs a **1–12 position portfolio (or all-cash)**, and executes via **Alpaca paper**. Runs unattended on a Linux VPS (or on Windows under Task Scheduler) with a Streamlit dashboard.
+Autonomous multi-agent trading system that runs a deterministic-signals scan over 15 leveraged ETFs + option underlyings, asks a strategist agent for a regime call + ranked candidate ideas, and asks a constructor agent to build a **1–12 position portfolio (or all-cash)** that's then executed via **Alpaca paper**. Runs unattended on a Linux VPS (or on Windows under Task Scheduler) with a Streamlit dashboard.
 
 The canonical build spec is [CLAUDE.md](./CLAUDE.md). This README is the operator's manual.
 
