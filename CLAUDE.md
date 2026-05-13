@@ -14,7 +14,7 @@ You are a senior quant systems engineer. Build a complete, **paper-trading-only*
 6. If anything below is ambiguous, bundle all clarifying questions into one message before starting. Do not guess on capital allocation, position counts, kill switches, or broker behaviour.
 
 ## System scope
-- Universe (v2, 15 tickers): bull/bear leveraged-ETF pairs (TQQQ/SQQQ, UPRO/SPXU, SOXL/SOXS, TNA/TZA, FAS/FAZ), solo leveraged ETFs (UVXY, BITX), and option underlyings (SPY, QQQ, TLT). Trimmed from v1's 33 tickers.
+- Universe (v2 + gold expansion 2026-05-13, 18 tickers): bull/bear leveraged-ETF pairs (TQQQ/SQQQ, UPRO/SPXU, SOXL/SOXS, TNA/TZA, FAS/FAZ, NUGT/DUST), solo leveraged ETFs (UVXY, BITX), and option underlyings (SPY, QQQ, TLT, GLD). Trimmed from v1's 33 tickers, then NUGT/DUST/GLD added back for gold-factor diversification.
 - **No spot single-name equities. No unleveraged broad-market ETFs as core positions** (SPY/QQQ/TLT only via options).
 - **No broker shorts.** Bear theses are expressed as long bear ETFs (SQQQ, SPXU, etc.) or long puts. Cash account only.
 - Portfolio target: **1–12 open positions** at the end of each cycle (or all-cash if conviction is genuinely absent). The 1-position floor lets a single strong-conviction thesis fire even when broader diversification isn't available. Concentration risk is bounded by the per-position 15% NAV cap and kill conditions.
@@ -59,7 +59,7 @@ Sub-agents are separate Anthropic API calls with role-specific system prompts an
 Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-failed LLM outputs are retried once with the validation error fed back; second failure aborts the run and logs.
 
 0. **Market Gate** (Python, $0) — Alpaca `/v2/clock` query. If markets are closed → write `market_gate.json` + closed-market `next_run.json` and exit. No LLM calls billed on closed-market cycles.
-1. **Signals** (Python, $0) — For each of the 15 universe tickers, compute deterministic features from yfinance daily history: momentum (30/60d), HV (30/90d), distance from 50/200d MAs, ADV, last close, is_optionable. Includes per-ticker `upcoming_macro_events_7d` (FOMC/CPI/NFP/PCE within 7 days). Output: `signals.json`. Replaces the v1 screener + bull/bear research + scenarios chain entirely.
+1. **Signals** (Python, $0) — For each of the 18 universe tickers, compute deterministic features from yfinance daily history: momentum (30/60d), HV (30/90d), distance from 50/200d MAs, ADV, last close, is_optionable. Includes per-ticker `upcoming_macro_events_7d` (FOMC/CPI/NFP/PCE within 7 days). Output: `signals.json`. Replaces the v1 screener + bull/bear research + scenarios chain entirely.
 1b. **Cycle dedup** (Python, $0) — If the signals fingerprint AND broker-position fingerprint both match the prior cycle's, skip strategist + construct + execute and reuse the cached portfolio. Stored in `state/last_cycle_hash.json`.
 2. **Strategist** (Sonnet 4.6 medium effort, ~$0.05) — Reads `signals.json` + current broker positions + recent PnL history (last 5 cycles); emits a regime classification + up to 6 candidate ideas with `instrument_kind` (etf / option_call / option_put), `thesis` (signal-citing), `confidence` ∈ [0, 1]. Bear theses are long bear ETFs or long puts. Output: `view.json`.
 2.5. **Chain lookup** (Python, $0) — For each option candidate in `view.json`, queries Alpaca for the nearest-OTM tradable contract at target DTE 37 (±14d). Output: `chain_lookups.json` — gives the constructor real OSI symbols so it doesn't invent untradable strikes.

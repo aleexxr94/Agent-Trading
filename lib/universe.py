@@ -57,14 +57,24 @@ class UniverseEntry:
 
 
 # Factor classification — short identifiers shared across bull/bear pairs.
-F_NASDAQ      = "nasdaq"
-F_SP500       = "sp500"
-F_SMALL_CAPS  = "small-caps"
-F_SEMIS       = "semis"
-F_FIN_BROAD   = "financials-broad"
-F_VOL         = "vol"
-F_CRYPTO_BTC  = "crypto-btc"
-F_RATES       = "rates"
+F_NASDAQ       = "nasdaq"
+F_SP500        = "sp500"
+F_SMALL_CAPS   = "small-caps"
+F_SEMIS        = "semis"
+F_FIN_BROAD    = "financials-broad"
+F_VOL          = "vol"
+F_CRYPTO_BTC   = "crypto-btc"
+F_RATES        = "rates"
+# Gold added on 2026-05-13 (post-v2 universe expansion). Gold miners
+# (NUGT/DUST) and spot gold (GLD) share gold beta but are NOT identical:
+# miners carry operational leverage + equity beta on top of the gold
+# move, while spot gold (GLD) is the pure metal tracker. Distinct
+# factors so the strategist can pair them without the per-underlying
+# concentration sanity rule treating them as one position. The
+# constructor's correlation check should still bias against loading
+# both heavily — they ARE correlated, just not identical.
+F_GOLD_MINERS  = "gold-miners"
+F_GOLD_SPOT    = "gold-spot"
 
 
 def _e(symbol: str, kind: InstrumentKind, lev: float, family: str,
@@ -104,6 +114,14 @@ _LEVERAGED_ETFS: tuple[UniverseEntry, ...] = (
     # ---- Crypto ----
     _e("BITX", "etf",  2.0, "Bitcoin 2x long",
        "Volatility Shares 2x Bitcoin Strategy ETF — 2x daily long BTC futures", F_CRYPTO_BTC),
+    # ---- Gold miners (added 2026-05-13) ----
+    # Factor-diversifier vs the equity bull/bear pairs above. Gold tends
+    # to anti-correlate with risk-on regimes — NUGT rallies in inflation
+    # shocks / dollar weakness. 2x (was 3x pre-2020 reverse split).
+    _e("NUGT", "etf",  2.0, "Gold Miners 2x long",
+       "Direxion Daily Gold Miners Bull 2x — 2x daily long NYSE Arca Gold Miners", F_GOLD_MINERS),
+    _e("DUST", "etf", -2.0, "Gold Miners 2x short",
+       "Direxion Daily Gold Miners Bear 2x — 2x daily inverse NYSE Arca Gold Miners", F_GOLD_MINERS),
 )
 
 
@@ -117,6 +135,15 @@ _OPTION_UNDERLYINGS: tuple[UniverseEntry, ...] = (
        "Tech-heavy options chain, very liquid", F_NASDAQ),
     _e("TLT", "option_underlying", 1.0, "20+ Year Treasury Bond ETF",
        "Bond/rates exposure — anti-correlated to equity-long positions", F_RATES),
+    # GLD added 2026-05-13 alongside NUGT/DUST. Distinct factor
+    # (gold-spot vs gold-miners) because spot gold has no operational
+    # leverage or equity beta — it's the cleanest gold expression for
+    # long-call/long-put plays around inflation prints, FOMC, currency
+    # moves. Options chain is extremely liquid (~$1B+ ADV on the ETF).
+    _e("GLD", "option_underlying", 1.0, "SPDR Gold Shares",
+       "Pure spot-gold tracker — long calls/puts express directional "
+       "gold view without the equity-beta + operational-leverage overlay "
+       "that NUGT/DUST carry", F_GOLD_SPOT),
 )
 
 

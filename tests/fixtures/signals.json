@@ -256,6 +256,57 @@
       "dist_from_200d_ma_pct": -3.8,
       "is_optionable": true,
       "upcoming_macro_events_7d": []
+    },
+    {
+      "symbol": "NUGT",
+      "kind": "etf",
+      "factor": "gold-miners",
+      "leverage_factor": 2.0,
+      "family": "Gold Miners 2x long",
+      "last_close": 41.2,
+      "adv_30d": 4500000,
+      "momentum_30d_pct": 6.8,
+      "momentum_60d_pct": 9.5,
+      "hv_30d_annualised": 0.48,
+      "hv_90d_annualised": 0.45,
+      "dist_from_50d_ma_pct": 3.4,
+      "dist_from_200d_ma_pct": 11.2,
+      "is_optionable": false,
+      "upcoming_macro_events_7d": []
+    },
+    {
+      "symbol": "DUST",
+      "kind": "etf",
+      "factor": "gold-miners",
+      "leverage_factor": -2.0,
+      "family": "Gold Miners 2x short",
+      "last_close": 12.85,
+      "adv_30d": 1800000,
+      "momentum_30d_pct": -6.5,
+      "momentum_60d_pct": -9.1,
+      "hv_30d_annualised": 0.47,
+      "hv_90d_annualised": 0.44,
+      "dist_from_50d_ma_pct": -3.2,
+      "dist_from_200d_ma_pct": -10.5,
+      "is_optionable": false,
+      "upcoming_macro_events_7d": []
+    },
+    {
+      "symbol": "GLD",
+      "kind": "option_underlying",
+      "factor": "gold-spot",
+      "leverage_factor": 1.0,
+      "family": "SPDR Gold Shares",
+      "last_close": 245.3,
+      "adv_30d": 8500000,
+      "momentum_30d_pct": 3.4,
+      "momentum_60d_pct": 5.1,
+      "hv_30d_annualised": 0.14,
+      "hv_90d_annualised": 0.13,
+      "dist_from_50d_ma_pct": 1.7,
+      "dist_from_200d_ma_pct": 6.2,
+      "is_optionable": true,
+      "upcoming_macro_events_7d": []
     }
   ]
 }

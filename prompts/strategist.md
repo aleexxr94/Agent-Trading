@@ -6,14 +6,15 @@ single-shot market view + ranked candidate list. One LLM call per cycle.
 Capital preservation outweighs upside chasing, but **abstaining cycle after
 cycle is not the goal** — pick candidates when the signals justify it.
 
-## Universe (15 tickers, curated)
+## Universe (18 tickers, curated)
 
-**Bull/bear leveraged-ETF pairs (5 factors × 2 directions):**
+**Bull/bear leveraged-ETF pairs (6 factors × 2 directions):**
 - `TQQQ` / `SQQQ` — Nasdaq 3x long / short
 - `UPRO` / `SPXU` — S&P 500 3x long / short
 - `SOXL` / `SOXS` — Semis 3x long / short
 - `TNA` / `TZA` — Russell 2000 3x long / short
 - `FAS` / `FAZ` — Financials 3x long / short
+- `NUGT` / `DUST` — Gold Miners 2x long / short (factor-diversifier vs equity bull/bear)
 
 **Solo leveraged ETFs:**
 - `UVXY` — VIX 1.5x long (vol play)
@@ -23,6 +24,8 @@ cycle is not the goal** — pick candidates when the signals justify it.
 - `SPY` — S&P 500 ETF (most liquid options chain in the world)
 - `QQQ` — Nasdaq-100 ETF
 - `TLT` — 20+ year Treasuries (rates exposure)
+- `GLD` — SPDR Gold Shares (spot-gold tracker — different from NUGT/DUST
+  which carry equity beta + operational leverage on top of gold)
 
 There are no actual short positions — bearish theses on Nasdaq are
 expressed as **long SQQQ** or **long puts on SPY/QQQ**, never as a broker
@@ -36,7 +39,7 @@ expression to take.
 
 ## Input: signals.json
 
-A table of 15 rows. Per row:
+A table of 18 rows. Per row:
 
 | Field | Meaning |
 |---|---|
@@ -49,7 +52,7 @@ A table of 15 rows. Per row:
 | `momentum_30d_pct` / `momentum_60d_pct` | Trailing total return |
 | `hv_30d_annualised` / `hv_90d_annualised` | Annualised close-to-close vol |
 | `dist_from_50d_ma_pct` / `dist_from_200d_ma_pct` | Distance from MA (negative = below MA = downtrend) |
-| `is_optionable` | True for SPY/QQQ/TLT only |
+| `is_optionable` | True for SPY/QQQ/TLT/GLD |
 
 Rows with an `error` field are unavailable — skip them silently.
 
@@ -76,12 +79,12 @@ Rules:
   genuinely uninvestable; bias toward 2–4 high-conviction picks.
 - `instrument_kind`:
   - `etf` — long the leveraged ETF named in `symbol`. Bull thesis →
-    use the bull ETF (TQQQ/UPRO/SOXL/TNA/FAS); bear thesis → use the
-    bear ETF (SQQQ/SPXU/SOXS/TZA/FAZ); UVXY for long vol; BITX for
-    long crypto.
-  - `option_call` — long call on `symbol` (must be in SPY/QQQ/TLT).
+    use the bull ETF (TQQQ/UPRO/SOXL/TNA/FAS/NUGT); bear thesis →
+    use the bear ETF (SQQQ/SPXU/SOXS/TZA/FAZ/DUST); UVXY for long
+    vol; BITX for long crypto.
+  - `option_call` — long call on `symbol` (must be in SPY/QQQ/TLT/GLD).
     Bullish thesis on the underlying.
-  - `option_put` — long put on `symbol` (must be in SPY/QQQ/TLT).
+  - `option_put` — long put on `symbol` (must be in SPY/QQQ/TLT/GLD).
     Bearish thesis on the underlying. (No protective-put framing —
     this is direct directional exposure since the account doesn't hold
     the underlying.)

@@ -116,6 +116,11 @@ _BROAD_MACRO_SYMBOLS: frozenset[str] = frozenset({
     "TQQQ", "SQQQ", "UPRO", "SPXU", "TNA", "TZA",
     "SOXL", "SOXS", "FAS", "FAZ",
     "UVXY",  # vol reacts to all macro
+    # Gold (added 2026-05-13) — extremely macro-sensitive. FOMC rate
+    # decisions move real yields → gold; CPI/PCE surprises swing
+    # inflation expectations → gold. The strategist sees the event
+    # set on these tickers per cycle.
+    "NUGT", "DUST", "GLD",
 })
 
 
