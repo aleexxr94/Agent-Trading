@@ -450,9 +450,27 @@ def wipe_run_history(*, include_costs: bool = True, backup: bool = True) -> dict
     }
 
     # Backup first — fail-safe rope-and-pulley.
+    #
+    # Naming: microsecond precision in the timestamp covers human-pace
+    # double-clicks; a numeric suffix retry loop covers the pathological
+    # case where two wipes land in the same microsecond (e.g. concurrent
+    # automation, test calls). Without this, a same-second collision
+    # would have OSError-raised inside the existing try/except, blanked
+    # backup_dir to None, and let the wipe proceed without a safety net —
+    # exactly the scenario where the operator needs rollback (Codex P2
+    # on PR #70).
     if backup:
-        backup_dir = STATE_DIR / f"backup_{utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+        base_stamp = utcnow().strftime('%Y%m%dT%H%M%S%fZ')
+        backup_dir = STATE_DIR / f"backup_{base_stamp}"
+        suffix = 1
         try:
+            while backup_dir.exists():
+                suffix += 1
+                backup_dir = STATE_DIR / f"backup_{base_stamp}_{suffix}"
+                if suffix > 1000:
+                    # Pathological — bail out and proceed without backup
+                    # rather than spinning forever.
+                    raise OSError("backup dir naming exhausted suffix space")
             backup_dir.mkdir(parents=True, exist_ok=False)
             for f in STATE_DIR.iterdir():
                 if f.name.startswith("backup_"):

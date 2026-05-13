@@ -361,6 +361,51 @@ def test_wipe_run_history_succeeds_when_state_is_already_empty(tmp_state):
     assert result["snapshots_removed"] == []
 
 
+def test_wipe_run_history_backup_dir_collision_safe(tmp_state, monkeypatch):
+    """Codex P2 on PR #70: when two wipes land in the same microsecond
+    (rapid double-click, automation), the second backup must NOT
+    silently fail and let the wipe proceed without a safety net.
+
+    Simulate by freezing utcnow() so both calls produce the same
+    timestamp. The retry-with-suffix loop should give the second
+    backup dir an alternate name and still succeed.
+    """
+    from datetime import datetime, timezone
+    frozen = datetime(2026, 5, 13, 22, 0, 0, 123456, tzinfo=timezone.utc)
+    monkeypatch.setattr(state, "utcnow", lambda: frozen)
+
+    state.append_decision({
+        "run_id": "r1", "stage": "signals", "model": "x",
+        "inputs_hash": "deadbeefcafebabe1234", "output_ref": "signals.json",
+        "prompt_cache_hit_pct": 0.0, "cost_usd": 0.0,
+        "started_at": "2026-05-13T14:00:00Z",
+        "ended_at": "2026-05-13T14:00:01Z",
+        "status": "ok", "risk_warning": "t",
+    })
+
+    r1 = state.wipe_run_history(backup=True)
+    state.append_decision({
+        "run_id": "r2", "stage": "signals", "model": "x",
+        "inputs_hash": "deadbeefcafebabe1234", "output_ref": "signals.json",
+        "prompt_cache_hit_pct": 0.0, "cost_usd": 0.0,
+        "started_at": "2026-05-13T14:00:00Z",
+        "ended_at": "2026-05-13T14:00:01Z",
+        "status": "ok", "risk_warning": "t",
+    })
+    r2 = state.wipe_run_history(backup=True)
+
+    # Both wipes must have created distinct backup directories.
+    assert r1["backup_dir"] is not None, "first wipe should have backed up"
+    assert r2["backup_dir"] is not None, (
+        "second same-microsecond wipe must NOT silently skip backup"
+    )
+    assert r1["backup_dir"] != r2["backup_dir"], (
+        "collision-safe naming must yield distinct paths"
+    )
+    assert Path(r1["backup_dir"]).exists()
+    assert Path(r2["backup_dir"]).exists()
+
+
 def test_wipe_run_history_idempotent(tmp_state):
     """Two consecutive wipes must both succeed (second is a no-op)."""
     state.append_decision({
