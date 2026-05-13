@@ -110,6 +110,32 @@ def constructor() -> StageConfig:
     )
 
 
+def critic() -> StageConfig:
+    """v2 stage 3.5 — adversarial review of the constructor's portfolio.
+
+    Sonnet 4.6 (effort=low — keep cost trivial). Reads the strategist's
+    view + the constructor's portfolio, returns either {accept: true}
+    or {accept: false, critique, suggested_changes}. If the critic
+    rejects, the orchestrator re-runs the constructor ONCE with the
+    critique fed back. Adds ~$0.03 per cycle worst-case (1 critic +
+    1 retry); typically just $0.02 (accept on first pass).
+
+    This is the "two agents discussing" pattern. Strategist proposes
+    candidates; constructor sizes them; critic argues against the
+    construction. The schema constrains the critic to either ACCEPT
+    or propose specific changes — no free-form bickering allowed.
+    """
+    return StageConfig(
+        stage="critic",
+        model=_model("MODEL_CRITIC", "claude-sonnet-4-6"),
+        system_prompt=_load("critic.md"),
+        schema_filename="critique.schema.json",
+        max_tokens=4096,
+        thinking={"type": "adaptive"},
+        output_config_extras={"effort": "low"},
+    )
+
+
 def orchestrator_meta() -> StageConfig:
     """v2 stage 5 — chooses next-run cadence within market hours.
 

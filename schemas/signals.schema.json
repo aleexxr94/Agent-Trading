@@ -26,6 +26,20 @@
           "dist_from_50d_ma_pct": {"type": ["number", "null"]},
           "dist_from_200d_ma_pct": {"type": ["number", "null"]},
           "is_optionable": {"type": "boolean"},
+          "upcoming_macro_events_7d": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "date": {"type": "string", "format": "date"},
+                "type": {"type": "string"},
+                "description": {"type": "string"},
+                "days_away": {"type": "integer"}
+              },
+              "required": ["date", "type"],
+              "additionalProperties": true
+            }
+          },
           "error": {"type": "string"}
         },
         "required": ["symbol", "kind", "factor", "leverage_factor", "is_optionable"],

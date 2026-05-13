@@ -1023,13 +1023,15 @@ with tabs[5]:
                     )
 
         artifact_icons = {
-            "market_gate.json": "🕰️",
-            "signals.json":     "📊",
-            "view.json":        "🧠",
-            "portfolio.json":   "🧩",
-            "sanity.json":      "🛡️",
-            "orders.json":      "💱",
-            "next_run.json":    "🕒",
+            "market_gate.json":   "🕰️",
+            "signals.json":       "📊",
+            "view.json":          "🧠",
+            "chain_lookups.json": "🔗",
+            "portfolio.json":     "🧩",
+            "critique.json":      "⚖️",
+            "sanity.json":        "🛡️",
+            "orders.json":        "💱",
+            "next_run.json":      "🕒",
         }
         for name, icon in artifact_icons.items():
             f = run_dir / name

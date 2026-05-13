@@ -55,14 +55,17 @@ The v2 pipeline (2026-05-13) replaced 5 LLM-bearing stages with 2: deterministic
 
 Sub-agents are separate Anthropic API calls with role-specific system prompts and structured output schemas — not Claude Code's sub-agent feature.
 
-## 6-stage v2 pipeline
+## v2 pipeline (with winrate add-ons)
 Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-failed LLM outputs are retried once with the validation error fed back; second failure aborts the run and logs.
 
 0. **Market Gate** (Python, $0) — Alpaca `/v2/clock` query. If markets are closed → write `market_gate.json` + closed-market `next_run.json` and exit. No LLM calls billed on closed-market cycles.
-1. **Signals** (Python, $0) — For each of the 15 universe tickers, compute deterministic features from yfinance daily history: momentum (30/60d), HV (30/90d), distance from 50/200d MAs, ADV, last close, is_optionable. Output: `signals.json`. Replaces the v1 screener + bull/bear research + scenarios chain entirely.
-2. **Strategist** (Sonnet 4.6, ~$0.05) — Reads `signals.json`, emits a regime classification + up to 6 candidate ideas with `instrument_kind` (etf / option_call / option_put), `thesis` (signal-citing), `confidence` ∈ [0, 1]. Bear theses are expressed as long bear ETFs (SQQQ, SPXU, etc.) or long puts. Output: `view.json`.
-3. **Portfolio Construction** (Opus 4.7, ~$0.20) — Converge on 1–12 positions (or all-cash if strategist returned zero candidates and regime is genuinely uninvestable). Each position carries: rationale, kill conditions, sizing math. Output: `portfolio.json`. Bias: take a position if any strategist candidate has confidence ≥ 0.6 — abstaining cycle after cycle is not the goal.
-4. **Sanity** (Python, $0) — Deterministic post-construct rules (per-underlying ≤ 20% NAV, straddle requires low IV, kill_conditions complete, position backed by strategist, premium ≥ $0.05, rationale meaningful). Non-blocking by default; `SANITY_BLOCK_ON_FAIL=true` escalates `fail` to a hard skip of stage_execute. Output: `sanity.json`.
+1. **Signals** (Python, $0) — For each of the 15 universe tickers, compute deterministic features from yfinance daily history: momentum (30/60d), HV (30/90d), distance from 50/200d MAs, ADV, last close, is_optionable. Includes per-ticker `upcoming_macro_events_7d` (FOMC/CPI/NFP/PCE within 7 days). Output: `signals.json`. Replaces the v1 screener + bull/bear research + scenarios chain entirely.
+1b. **Cycle dedup** (Python, $0) — If the signals fingerprint AND broker-position fingerprint both match the prior cycle's, skip strategist + construct + execute and reuse the cached portfolio. Stored in `state/last_cycle_hash.json`.
+2. **Strategist** (Sonnet 4.6 medium effort, ~$0.05) — Reads `signals.json` + current broker positions + recent PnL history (last 5 cycles); emits a regime classification + up to 6 candidate ideas with `instrument_kind` (etf / option_call / option_put), `thesis` (signal-citing), `confidence` ∈ [0, 1]. Bear theses are long bear ETFs or long puts. Output: `view.json`.
+2.5. **Chain lookup** (Python, $0) — For each option candidate in `view.json`, queries Alpaca for the nearest-OTM tradable contract at target DTE 37 (±14d). Output: `chain_lookups.json` — gives the constructor real OSI symbols so it doesn't invent untradable strikes.
+3. **Portfolio Construction** (Opus 4.7 high effort, ~$0.20) — Converge on 1–12 positions (or all-cash). Reads signals + view + chain_lookups + current positions + PnL history + adaptive per-position cap. Output: `portfolio.json`.
+3.5. **Critic** (Sonnet 4.6 low effort, ~$0.03) — Adversarial review. Returns `{accept, critique, suggested_changes}`. On reject, the constructor reruns ONCE with the critique fed back. Output: `critique.json`.
+4. **Sanity** (Python, $0) — 10 deterministic post-construct rules covering concentration, IV-aware straddle gating, kill_conditions, strategist endorsement, adaptive-cap enforcement (lower in drawdown), confidence-weighted sizing, notional floor ($50), and ADV liquidity (≤1% of dollar ADV). Non-blocking by default; `SANITY_BLOCK_ON_FAIL=true` escalates `fail` to a hard skip of stage_execute. Output: `sanity.json`.
 5. **Execution + Monitoring** — submit paper orders via Alpaca (close before open; no-cross-zero invariant); orchestrator-meta picks next-run window in 1–24h and writes `next_run.json`. A lightweight `monitor.py` runs more frequently and only checks kill conditions; it can flatten a position but cannot open new ones.
 
 ## Repo structure

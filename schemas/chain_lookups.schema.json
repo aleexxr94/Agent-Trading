@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-trading.local/schemas/chain_lookups.schema.json",
+  "title": "ChainLookups",
+  "description": "Output of v2 pipeline stage 2.5 (chain_lookup). For each option candidate the strategist named (instrument_kind=option_call or option_put), the constructor needs the actual nearest-OTM tradable contract from the broker — strike, expiry, OSI symbol — so it doesn't invent OSI symbols at construct time. This payload is the lookup table.",
+  "type": "object",
+  "properties": {
+    "run_id": {"type": "string"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "lookups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "candidate": {
+            "type": "object",
+            "properties": {
+              "symbol": {"type": "string"},
+              "instrument_kind": {"enum": ["option_call", "option_put"]},
+              "confidence": {"type": ["number", "null"]}
+            },
+            "required": ["symbol", "instrument_kind"],
+            "additionalProperties": false
+          },
+          "contract": {
+            "anyOf": [
+              {"type": "null"},
+              {
+                "type": "object",
+                "properties": {
+                  "osi_symbol": {"type": "string"},
+                  "underlying": {"type": "string"},
+                  "type": {"enum": ["call", "put"]},
+                  "strike": {"type": "number"},
+                  "expiry": {"type": "string", "format": "date"},
+                  "dte": {"type": "integer"},
+                  "premium_estimate": {"type": ["number", "null"]},
+                  "bid": {"type": ["number", "null"]},
+                  "ask": {"type": ["number", "null"]},
+                  "open_interest": {"type": ["integer", "null"]}
+                },
+                "required": ["osi_symbol", "underlying", "type", "strike", "expiry", "dte"],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "error": {"type": ["string", "null"]}
+        },
+        "required": ["candidate", "contract", "error"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["run_id", "generated_at", "lookups"],
+  "additionalProperties": false
+}
