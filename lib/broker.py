@@ -63,6 +63,21 @@ class OrderResult:
     status: str
 
 
+@dataclass(frozen=True)
+class MarketClock:
+    """Broker-reported market state, used by lib/market_gate.
+
+    `next_open` / `next_close` are ISO-8601 UTC strings when known.
+    `timestamp` is the broker's server time as ISO-8601 UTC. Empty string
+    is allowed when a field is irrelevant (e.g. ``next_open`` while the
+    market IS currently open) — callers must not assume non-empty.
+    """
+    is_open: bool
+    next_open: str
+    next_close: str
+    timestamp: str
+
+
 class Broker(ABC):
     @property
     @abstractmethod
@@ -82,6 +97,15 @@ class Broker(ABC):
 
     @abstractmethod
     def flatten(self, symbol: str) -> OrderResult | None: ...
+
+    def get_clock(self) -> MarketClock | None:
+        """Return the broker's market-clock snapshot, or None if unsupported.
+
+        Used by lib/market_gate to short-circuit the orchestrator pipeline
+        when markets are closed (weekends, holidays, after-hours). The
+        default returns None — concrete brokers must override.
+        """
+        return None
 
     def option_contract_tradable(self, symbol: str) -> bool:
         """Return True iff the OSI option contract exists and is tradable.

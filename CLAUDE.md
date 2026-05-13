@@ -14,26 +14,28 @@ You are a senior quant systems engineer. Build a complete, **paper-trading-only*
 6. If anything below is ambiguous, bundle all clarifying questions into one message before starting. Do not guess on capital allocation, position counts, kill switches, or broker behaviour.
 
 ## System scope
-- Universe: leveraged ETFs (2x/3x equity, sector, vol) + listed options on liquid underlyings (SPY, QQQ, IWM, and high-volume leveraged ETFs).
-- **No spot single-name equities. No unleveraged broad-market ETFs as core positions.**
-- Portfolio target: **1–12 open positions** at the end of each rebalance cycle (or all-cash if conviction is genuinely absent). The original "exactly 10" target was infeasible on a $2,500 leveraged-ETF + listed-options universe — every cycle abstained to all-cash, paying LLM cost for zero trades. The 1-position floor lets a single strong positive-EV thesis (e.g. an option with +20%+ EV) fire even when broader diversification isn't available. Concentration risk is bounded by the per-position 15% NAV cap and kill conditions, not by a count rule.
+- Universe (v2, 15 tickers): bull/bear leveraged-ETF pairs (TQQQ/SQQQ, UPRO/SPXU, SOXL/SOXS, TNA/TZA, FAS/FAZ), solo leveraged ETFs (UVXY, BITX), and option underlyings (SPY, QQQ, TLT). Trimmed from v1's 33 tickers.
+- **No spot single-name equities. No unleveraged broad-market ETFs as core positions** (SPY/QQQ/TLT only via options).
+- **No broker shorts.** Bear theses are expressed as long bear ETFs (SQQQ, SPXU, etc.) or long puts. Cash account only.
+- Portfolio target: **1–12 open positions** at the end of each cycle (or all-cash if conviction is genuinely absent). The 1-position floor lets a single strong-conviction thesis fire even when broader diversification isn't available. Concentration risk is bounded by the per-position 15% NAV cap and kill conditions.
 - Per-position cap at entry: **≤15% of portfolio NAV**.
-- Per-position kill condition: **≤25% loss of position NAV** (or 100% premium for long options).
+- Per-position kill condition: **≤25% loss of position NAV** (or 100% premium for long options). Each position must also carry at least one of `underlying_price_below`, `underlying_price_above`, or `time_stop_utc` (sanity rule fail otherwise).
 - Daily portfolio drawdown circuit breaker: **≥8% in a single UTC day** halts new orders and triggers monitor-only mode until next manual review.
-- All timing decisions (review window, horizon, holding period, expiry, strike, leverage choice) are made by the Orchestrator from market regime, IV, liquidity, and its own scenario models. No hard-coded calendar rules.
+- Cycle cadence: **every 4 hours during market hours, weekdays only**. The market_gate stage queries Alpaca's clock and short-circuits weekends/holidays/after-hours without LLM cost. Within market hours, the orchestrator-meta agent picks the actual next-run timestamp (bounded 1–24h).
 
 ## Architecture (locked)
 
 ```
 ┌─────────────────────┐    ┌──────────────────────────────┐
 │ Windows Task Schedr │───▶│ orchestrator.py              │
-│ (next-run set by AI)│    │  Stage 1: Universe Screening │
-└─────────────────────┘    │  Stage 2: Bull/Bear Research │
-                           │  Stage 3: Scenario Modeling  │
-                           │  Stage 4: Portfolio Construct│
+│ (next-run set by AI)│    │  Stage 0: Market Gate        │
+└─────────────────────┘    │  Stage 1: Signals (Python)   │
+                           │  Stage 2: Strategist (LLM)   │
+                           │  Stage 3: Portfolio Construct│
+                           │  Stage 4: Sanity (Python)    │
                            │  Stage 5: Execute + Schedule │
                            └────────┬─────────────────────┘
-                                    │ Anthropic API (prompt cached)
+                                    │ Anthropic API (prompt cached, 2 calls/cycle)
                                     │ Alpaca paper API
                                     │ yfinance
                                     ▼
@@ -49,16 +51,19 @@ You are a senior quant systems engineer. Build a complete, **paper-trading-only*
                            └──────────────────────────────┘
 ```
 
+The v2 pipeline (2026-05-13) replaced 5 LLM-bearing stages with 2: deterministic signals + a single strategist LLM call, plus the construct LLM call that remained. Per-cycle LLM cost dropped from ~$1.50–2.50 to ~$0.25.
+
 Sub-agents are separate Anthropic API calls with role-specific system prompts and structured output schemas — not Claude Code's sub-agent feature.
 
-## 5-stage pipeline
-Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-failed outputs are retried once with the validation error fed back; second failure aborts the run and logs.
+## 6-stage v2 pipeline
+Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-failed LLM outputs are retried once with the validation error fed back; second failure aborts the run and logs.
 
-1. **Universe Screening** — yfinance + Alpaca options chain. Apply liquidity filters (min average daily volume, options OI ≥ threshold, bid-ask spread cap). Output: `screen.json`.
-2. **Adversarial Research** — for each top candidate, run a bull and bear sub-agent **in parallel**. Bear must steel-man the bull case before disagreeing. Includes Greeks, IV percentile, IV vs HV. Output: `research.json` with confidence delta per candidate.
-3. **Scenario Modeling** — probability-weighted base/bull/bear cases with explicit horizon chosen by the agent. For options candidates, include expiry rationale (DTE choice) and strike rationale. Output: `scenarios.json`.
-4. **Portfolio Construction** — converge on 1–12 positions (or all-cash if conviction is genuinely absent). Each position carries: rationale, "why this instrument vs alternatives", "why now", explicit kill conditions, sizing math. Output: `portfolio.json`.
-5. **Execution + Monitoring** — submit paper orders via Alpaca; on success, orchestrator decides next-run window in minutes or hours and writes `next_run.json`. A lightweight `monitor.py` runs more frequently and only checks kill conditions; it can flatten a position but cannot open new ones.
+0. **Market Gate** (Python, $0) — Alpaca `/v2/clock` query. If markets are closed → write `market_gate.json` + closed-market `next_run.json` and exit. No LLM calls billed on closed-market cycles.
+1. **Signals** (Python, $0) — For each of the 15 universe tickers, compute deterministic features from yfinance daily history: momentum (30/60d), HV (30/90d), distance from 50/200d MAs, ADV, last close, is_optionable. Output: `signals.json`. Replaces the v1 screener + bull/bear research + scenarios chain entirely.
+2. **Strategist** (Sonnet 4.6, ~$0.05) — Reads `signals.json`, emits a regime classification + up to 6 candidate ideas with `instrument_kind` (etf / option_call / option_put), `thesis` (signal-citing), `confidence` ∈ [0, 1]. Bear theses are expressed as long bear ETFs (SQQQ, SPXU, etc.) or long puts. Output: `view.json`.
+3. **Portfolio Construction** (Opus 4.7, ~$0.20) — Converge on 1–12 positions (or all-cash if strategist returned zero candidates and regime is genuinely uninvestable). Each position carries: rationale, kill conditions, sizing math. Output: `portfolio.json`. Bias: take a position if any strategist candidate has confidence ≥ 0.6 — abstaining cycle after cycle is not the goal.
+4. **Sanity** (Python, $0) — Deterministic post-construct rules (per-underlying ≤ 20% NAV, straddle requires low IV, kill_conditions complete, position backed by strategist, premium ≥ $0.05, rationale meaningful). Non-blocking by default; `SANITY_BLOCK_ON_FAIL=true` escalates `fail` to a hard skip of stage_execute. Output: `sanity.json`.
+5. **Execution + Monitoring** — submit paper orders via Alpaca (close before open; no-cross-zero invariant); orchestrator-meta picks next-run window in 1–24h and writes `next_run.json`. A lightweight `monitor.py` runs more frequently and only checks kill conditions; it can flatten a position but cannot open new ones.
 
 ## Repo structure
 
@@ -73,25 +78,29 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
 ├── monitor.py                  # kill-condition checker
 ├── dashboard.py                # Streamlit app
 ├── prompts/
-│   ├── orchestrator.md
-│   ├── screener.md
-│   ├── bull.md
-│   ├── bear.md
-│   ├── scenarios.md
-│   └── constructor.md
+│   ├── orchestrator.md         # meta-scheduler prompt
+│   ├── strategist.md           # v2 stage 2 — single LLM call producing the view
+│   └── constructor.md          # v2 stage 3 — single LLM call producing the portfolio
 ├── schemas/
 │   ├── position.schema.json    # discriminated union: ETF | option
 │   ├── portfolio.schema.json
-│   ├── research.schema.json
-│   ├── scenarios.schema.json
+│   ├── signals.schema.json     # v2 stage 1 output
+│   ├── view.schema.json        # v2 stage 2 output
+│   ├── sanity.schema.json
 │   └── decision_log.schema.json
 ├── lib/
 │   ├── broker.py               # interface; Alpaca impl behind it
-│   ├── alpaca_client.py
-│   ├── market_data.py          # yfinance wrappers
-│   ├── options.py              # Greeks, IV, chain helpers
+│   ├── alpaca_client.py        # AlpacaBroker — implements get_clock for market_gate
+│   ├── market_gate.py          # v2 stage 0 — Alpaca clock short-circuit
+│   ├── signals.py              # v2 stage 1 — deterministic feature generator
+│   ├── market_data.py          # yfinance wrappers (history, ADV, HV)
+│   ├── options.py              # Greeks, IV helpers (single-leg only)
+│   ├── orders.py               # diff_portfolio + no-cross-zero invariant
+│   ├── sanity.py               # v2 stage 4 — deterministic post-construct rules
+│   ├── stages.py               # StageConfig per LLM stage
 │   ├── llm.py                  # Anthropic client + prompt caching + cost tracking
 │   ├── risk.py                 # sizing, caps, kill checks, circuit breakers
+│   ├── universe.py             # 15-ticker v2 universe metadata
 │   └── state.py                # JSON read/write, run_id, halt-flag
 ├── scheduling/
 │   ├── orchestrator_task.xml   # Task Scheduler import

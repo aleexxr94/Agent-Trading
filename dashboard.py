@@ -14,7 +14,7 @@ Layout:
     📜 Decisions — chronological stage decisions with full agent reasoning
     📈 Performance — equity curve, LLM-cost-over-time, trading-fees-over-time, monthly cost breakdown
     💱 Trades — per-trade PnL (gross − fees − attributed LLM cost), closed + open lots, totals
-    🤖 Agent Logs — latest artifacts (research/scenarios/portfolio/sanity), next-run plan
+    🤖 Agent Logs — latest artifacts (market_gate/signals/view/portfolio/sanity/orders), next-run plan
     ⚙️ Settings — halt flag toggle, cost totals, README link
 """
 from __future__ import annotations
@@ -1023,11 +1023,13 @@ with tabs[5]:
                     )
 
         artifact_icons = {
-            "research.json":  "⚖️",
-            "scenarios.json": "🎲",
-            "portfolio.json": "🧩",
-            "sanity.json":    "🛡️",
-            "next_run.json":  "🕒",
+            "market_gate.json": "🕰️",
+            "signals.json":     "📊",
+            "view.json":        "🧠",
+            "portfolio.json":   "🧩",
+            "sanity.json":      "🛡️",
+            "orders.json":      "💱",
+            "next_run.json":    "🕒",
         }
         for name, icon in artifact_icons.items():
             f = run_dir / name

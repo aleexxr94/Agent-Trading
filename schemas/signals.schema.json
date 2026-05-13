@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-trading.local/schemas/signals.schema.json",
+  "title": "Signals",
+  "description": "Output of v2 pipeline stage 1 (signals). Deterministic per-ticker feature table built from market_data. Zero LLM cost. Replaces the v1 screen + research + scenarios stages.",
+  "type": "object",
+  "properties": {
+    "run_id": {"type": "string", "minLength": 1},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "tickers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "symbol": {"type": "string", "pattern": "^[A-Z][A-Z0-9.\\-]{0,9}$"},
+          "kind": {"enum": ["etf", "option_underlying", "unknown"]},
+          "factor": {"type": "string"},
+          "leverage_factor": {"type": "number"},
+          "family": {"type": "string"},
+          "last_close": {"type": ["number", "null"]},
+          "adv_30d": {"type": ["integer", "null"]},
+          "momentum_30d_pct": {"type": ["number", "null"]},
+          "momentum_60d_pct": {"type": ["number", "null"]},
+          "hv_30d_annualised": {"type": ["number", "null"]},
+          "hv_90d_annualised": {"type": ["number", "null"]},
+          "dist_from_50d_ma_pct": {"type": ["number", "null"]},
+          "dist_from_200d_ma_pct": {"type": ["number", "null"]},
+          "is_optionable": {"type": "boolean"},
+          "error": {"type": "string"}
+        },
+        "required": ["symbol", "kind", "factor", "leverage_factor", "is_optionable"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["run_id", "generated_at", "tickers"],
+  "additionalProperties": false
+}

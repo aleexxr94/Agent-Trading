@@ -1,0 +1,26 @@
+{
+  "run_id": "fixture",
+  "generated_at": "2026-05-13T14:00:30Z",
+  "regime": "trending_up",
+  "regime_rationale": "Broad equity uptrend: TQQQ momentum_30d_pct=8.4 and dist_from_50d_ma_pct=4.2; UPRO +6.2/+3.1; SOXL leading at +11.2. Vol contained (SPY HV30=0.11). Bear ETFs all negative-momentum confirming directional bias. No defensive rotation into TLT (-2.1).",
+  "candidates": [
+    {
+      "symbol": "TQQQ",
+      "instrument_kind": "etf",
+      "thesis": "Long Nasdaq via TQQQ on momentum_30d_pct=8.4 + dist_from_50d_ma_pct=4.2; momentum_60d=12.1 confirms 2-month trend. Position size capped by 3x leverage decay risk.",
+      "confidence": 0.72
+    },
+    {
+      "symbol": "SOXL",
+      "instrument_kind": "etf",
+      "thesis": "Semis leadership: momentum_30d_pct=11.2 strongest in universe; dist_from_200d_ma_pct=22.1 shows multi-month structural strength. HV90=0.48 is elevated but matches the trend.",
+      "confidence": 0.68
+    },
+    {
+      "symbol": "SPY",
+      "instrument_kind": "option_call",
+      "thesis": "Cheap SPY call as broad-market expression: HV30=0.11 is bottom-quartile (cheap IV proxy); momentum_30d_pct=2.1 modest but positive. Defined-risk alternative to UPRO with no leverage decay.",
+      "confidence": 0.61
+    }
+  ]
+}

@@ -14,6 +14,7 @@ from .broker import (
     Account,
     Broker,
     BrokerPosition,
+    MarketClock,
     OrderRequest,
     OrderResult,
 )
@@ -101,6 +102,34 @@ class AlpacaBroker(Broker):
                 )
             )
         return out
+
+    def get_clock(self) -> MarketClock | None:
+        """Alpaca-reported market clock — used by lib/market_gate to skip
+        cycles when markets are closed. Returns None on any error so the
+        market_gate stage falls back to its "conservative closed" branch
+        rather than crashing the pipeline on a transient API hiccup.
+        """
+        try:
+            c = self._client.get_clock()
+        except Exception:
+            return None
+
+        def _iso(v) -> str:
+            if v is None:
+                return ""
+            # alpaca-py returns datetime objects; convert to ISO-8601 UTC.
+            iso = getattr(v, "isoformat", lambda: str(v))()
+            # Normalise to ...Z form for consistency with rest of codebase.
+            if iso.endswith("+00:00"):
+                iso = iso[:-6] + "Z"
+            return iso
+
+        return MarketClock(
+            is_open=bool(getattr(c, "is_open", False)),
+            next_open=_iso(getattr(c, "next_open", None)),
+            next_close=_iso(getattr(c, "next_close", None)),
+            timestamp=_iso(getattr(c, "timestamp", None)),
+        )
 
     def submit_order(self, order: OrderRequest) -> OrderResult:
         from alpaca.trading.enums import OrderSide, OrderType, TimeInForce  # noqa: WPS433

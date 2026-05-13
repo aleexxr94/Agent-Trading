@@ -1,14 +1,34 @@
-"""Per-stage LLM configuration.
+"""Per-stage LLM configuration — v2 pipeline.
 
-Reads model IDs from env (Opus 4.7 / Sonnet 4.6 / Haiku 4.5 by default) and
-loads system prompts from prompts/.
+The v2 pipeline has TWO LLM-bearing stages (was 5 in v1: screen,
+research, scenarios, construct, meta). v1's screener was replaced by
+the deterministic ``lib.signals`` module; bull/bear research and
+scenarios were collapsed into a single strategist call that reads the
+signals table directly.
+
+Stages:
+  - screener   — DELETED (replaced by lib.signals)
+  - bull/bear  — DELETED (replaced by strategist)
+  - scenarios  — DELETED (replaced by strategist)
+  - strategist — Sonnet 4.6, ~$0.05/call. Reads signals.json, emits
+    a regime classification + up to 6 candidate ideas with thesis +
+    confidence per row.
+  - construct  — Opus 4.7, ~$0.20/call. Reads signals + view, emits
+    portfolio.json.
+  - meta       — Sonnet 4.6, ~$0.02/call. Picks the next-run cadence.
+
+Reads model IDs from env (Opus 4.7 / Sonnet 4.6 / Haiku 4.5 by default)
+and loads system prompts from prompts/.
 
 Effort/thinking notes:
-  - Haiku 4.5 does NOT accept output_config.effort and will 400 if passed.
-  - Sonnet 4.6 supports low/medium/high; Opus 4.6/4.7 supports the full set
-    incl. "max" (Opus-tier) and "xhigh" (Opus 4.7-only).
-  - Adaptive thinking is recommended for the 4.6/4.7 family. For Haiku we
-    leave thinking unset (the screener doesn't need it).
+  - Haiku 4.5 does NOT accept output_config.effort and will 400 if
+    passed (not used by v2 — kept here for completeness).
+  - Sonnet 4.6 supports low/medium/high; Opus 4.6/4.7 supports the
+    full set incl. "max" (Opus-tier) and "xhigh" (Opus 4.7-only).
+  - Adaptive thinking is recommended for the 4.6/4.7 family.
+  - Strategist effort is "medium" (same rationale as v1 scenarios in
+    PR ε: high+adaptive can starve output on multi-candidate inputs).
+  - Constructor effort is "high" — it IS the soft-judgement call.
 """
 from __future__ import annotations
 
@@ -40,111 +60,50 @@ def _model(env_var: str, default: str) -> str:
     return os.environ.get(env_var, default)
 
 
-# Lazy loaders so test runs that mock stages don't need every prompt file.
-def screener() -> StageConfig:
-    return StageConfig(
-        stage="screen",
-        model=_model("MODEL_SCREENER", "claude-haiku-4-5"),
-        system_prompt=_load("screener.md"),
-        schema_filename=None,  # screen.json is free-form universe summary
-        max_tokens=4096,
-        thinking=None,                # Haiku: no thinking
-        output_config_extras={},      # Haiku: NO effort (would 400)
-    )
+def strategist() -> StageConfig:
+    """v2 stage 2 — reads signals.json, emits view.json.
 
+    Sonnet 4.6 + effort=medium + 32k max_tokens. Output is a regime
+    classification (one of 7 enum values) plus 0–6 ranked candidate
+    ideas. Schema-bounded; no markdown fences allowed.
 
-def bull() -> StageConfig:
+    Why medium effort: same lesson as PR ε on the v1 scenarios stage —
+    Sonnet+adaptive+effort=high can consume the entire token budget on
+    thinking and return an empty body. Strategist input is ~15 rows
+    (vs v1 scenarios' ~14), so the same failure mode applies. Medium
+    caps thinking-budget allocation, leaves headroom for the structured
+    JSON output.
+    """
     return StageConfig(
-        stage="research_bull",
-        model=_model("MODEL_RESEARCH", "claude-sonnet-4-6"),
-        system_prompt=_load("bull.md"),
-        schema_filename=None,  # bull/bear merged into research.json by orchestrator
-        max_tokens=4096,
+        stage="strategist",
+        model=_model("MODEL_STRATEGIST", "claude-sonnet-4-6"),
+        system_prompt=_load("strategist.md"),
+        schema_filename="view.schema.json",
+        max_tokens=32_000,
         thinking={"type": "adaptive"},
-        output_config_extras={"effort": "high"},
-    )
-
-
-def bear() -> StageConfig:
-    return StageConfig(
-        stage="research_bear",
-        model=_model("MODEL_RESEARCH", "claude-sonnet-4-6"),
-        system_prompt=_load("bear.md"),
-        schema_filename=None,
-        max_tokens=4096,
-        thinking={"type": "adaptive"},
-        output_config_extras={"effort": "high"},
-    )
-
-
-def scenarios() -> StageConfig:
-    return StageConfig(
-        stage="scenarios",
-        model=_model("MODEL_SCENARIOS", "claude-sonnet-4-6"),
-        system_prompt=_load("scenarios.md"),
-        schema_filename="scenarios.schema.json",
-        # 64000 (was 32768, originally 8192): PRs #39-41 expanded scenarios
-        # output (option underlyings now emit BOTH call and put rows + full
-        # option_rationale with strike, expiry, dte, dte_rationale,
-        # strike_rationale per side). With 8 ETF rows + up to 6 option-direction
-        # rows × ~1000 tokens each, combined with `thinking: adaptive` consuming
-        # most of the budget, 32k truncated at char 8697 on a real paper run
-        # (Sonnet returned nothing on the first attempt — all tokens went to
-        # thinking — and the retry got ~2200 output tokens of JSON before
-        # running out).
-        # 64000 is Sonnet 4.6's actual max_tokens cap. Setting 65536 (a power
-        # of two) trips a 400 at request validation BEFORE the retry/schema
-        # logic can run — Codex P1 on PR #42. Sonnet's hard ceiling is 64k,
-        # so this is now the highest legal value.
-        max_tokens=64_000,
-        thinking={"type": "adaptive"},
-        # 2026-05-13 PR ε: effort "high" → "medium". With ``high``, Sonnet's
-        # adaptive thinking on a 10-candidate input (~14 scenarios rows
-        # post-PRs #39-41) consumed the entire 64k budget on thinking and
-        # returned an empty body TWICE in the live 12:12 UTC run (26.5
-        # minutes wasted, then SchemaRetryFailed: "non-JSON response:
-        # Expecting value: line 1 column 1 (char 0)"). The PR #42 64k bump
-        # was a half-fix — adaptive+effort:high can still eat the full
-        # budget on a wider-than-fixture candidate set. Dropping to
-        # ``medium`` caps thinking-budget allocation, prioritises output
-        # tokens, and is plenty for the scenarios task (data-producing
-        # probability-weighted base/bull/bear case modelling — not a
-        # soft-judgement task). The construct stage on Opus 4.7 stays at
-        # ``high`` because that IS the soft-judgement call.
         output_config_extras={"effort": "medium"},
     )
 
 
 def constructor() -> StageConfig:
+    """v2 stage 3 — reads signals + view, emits portfolio.json.
+
+    Opus 4.7 + effort=high + 32k max_tokens. This IS the soft-judgement
+    call — multi-position trade-off reasoning under correlation and
+    the 15%/position cap, kill-condition tailoring, EV thresholding.
+
+    Why Opus 4.7 specifically: same family pricing as 4.6 ($5/M in,
+    $25/M out) but newer reasoning + supports xhigh effort. Cost
+    differential vs Sonnet on construct is ~$0.50/cycle (~$10/month
+    at 2 cycles/weekday) — well inside the $3/run cap and the
+    quality-vs-cost asymmetry favours Opus on the actual trade
+    decision. Override via MODEL_CONSTRUCTOR if cost dominates.
+    """
     return StageConfig(
         stage="construct",
         model=_model("MODEL_CONSTRUCTOR", "claude-opus-4-7"),
         system_prompt=_load("constructor.md"),
         schema_filename="portfolio.schema.json",
-        # 32000: constructor consumes a 14-row scenarios payload (8 ETFs +
-        # up to 6 option-direction rows per PRs #39-41) and emits a 1–12
-        # position portfolio.json with sizing math + kill conditions per
-        # row. The cap was originally tuned for Opus 4.6 (interleaved-
-        # thinking-free ceiling). Opus 4.7 has the same default cap, so
-        # 32k is safe; if we ever bump to Sonnet (via env override) the
-        # 32k value sits comfortably inside Sonnet 4.6's 64k cap too.
-        #
-        # Model: claude-opus-4-7. The construct stage is where actual
-        # trade decisions are made on a $2,500 leveraged-ETF+options
-        # account — multi-position sizing under correlation, kill-
-        # condition tailoring, EV thresholding. Reasoning quality has
-        # direct PnL impact and the cost difference vs Sonnet
-        # (~$0.50/run on construct alone) is meaningful but well
-        # within the $3/run cap. Opus 4.7 specifically (not 4.6):
-        # same price, newer model, supports "xhigh" effort which 4.6
-        # doesn't. The PR β downgrade to Sonnet (2026-05-13) was
-        # reverted on 2026-05-13 after honestly re-thinking the
-        # asymmetry: cost delta is ~$60/month at 4 cycles/day; a 5%
-        # PnL improvement from better position-picking is ~$50/month
-        # on $2,500 NAV, but the downside of a single bad construct
-        # decision (4h of bad positions before re-evaluation) is
-        # disproportionately large vs the saved cents. Override with
-        # MODEL_CONSTRUCTOR=claude-sonnet-4-6 if cost dominates.
         max_tokens=32_000,
         thinking={"type": "adaptive"},
         output_config_extras={"effort": "high"},
@@ -152,15 +111,11 @@ def constructor() -> StageConfig:
 
 
 def orchestrator_meta() -> StageConfig:
-    """Used for the next-run scheduling / meta-decision call.
+    """v2 stage 5 — chooses next-run cadence within market hours.
 
-    Sonnet 4.6 (downgraded from Opus 4.6 on 2026-05-13 PR β; kept on
-    Sonnet when constructor was promoted back to Opus 4.7 on the same
-    day). This call is small (2k output, schema-free free-form text)
-    and the deterministic 4h/6h fallback heuristic kicks in cleanly
-    if the LLM output is unusable — Sonnet is plenty for choosing a
-    1–24h next-run window. Override with MODEL_ORCHESTRATOR=claude-opus-4-7
-    if a quality regression on scheduling decisions ever shows up.
+    Sonnet 4.6, 2k max_tokens, no schema (free-form ISO timestamp +
+    rationale). Has a deterministic 4h/6h fallback heuristic in
+    orchestrator.py so an unusable LLM output never breaks cadence.
     """
     return StageConfig(
         stage="meta",

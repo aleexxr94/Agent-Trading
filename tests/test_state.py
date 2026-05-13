@@ -40,11 +40,11 @@ def test_read_costs_today_filters_by_reset_marker(tmp_state, monkeypatch):
     today = state.utcnow().date().isoformat()
     # Rows: two before the reset, one after.
     state.append_cost({
-        "run_id": "r1", "stage": "screen", "model": "x", "cost_usd": 0.10,
+        "run_id": "r1", "stage": "signals", "model": "x", "cost_usd": 0.10,
         "at": f"{today}T05:00:00Z",
     })
     state.append_cost({
-        "run_id": "r2", "stage": "screen", "model": "x", "cost_usd": 0.20,
+        "run_id": "r2", "stage": "signals", "model": "x", "cost_usd": 0.20,
         "at": f"{today}T09:00:00Z",
     })
     # Plant a reset marker at 10:00 today
@@ -54,7 +54,7 @@ def test_read_costs_today_filters_by_reset_marker(tmp_state, monkeypatch):
         encoding="utf-8",
     )
     state.append_cost({
-        "run_id": "r3", "stage": "screen", "model": "x", "cost_usd": 0.40,
+        "run_id": "r3", "stage": "signals", "model": "x", "cost_usd": 0.40,
         "at": f"{today}T11:00:00Z",
     })
 
@@ -68,7 +68,7 @@ def test_read_costs_today_ignores_yesterday_reset(tmp_state):
     """A reset marker from yesterday's UTC day must not filter today's rows."""
     today = state.utcnow().date().isoformat()
     state.append_cost({
-        "run_id": "r1", "stage": "screen", "model": "x", "cost_usd": 0.10,
+        "run_id": "r1", "stage": "signals", "model": "x", "cost_usd": 0.10,
         "at": f"{today}T05:00:00Z",
     })
     # Plant a yesterday-dated reset marker
@@ -100,7 +100,7 @@ def test_write_json_validates_against_schema(tmp_state):
 def test_append_decision_validates(tmp_state):
     good = {
         "run_id": "rid",
-        "stage": "screen",
+        "stage": "signals",
         "model": "claude-haiku-4-5-20251001",
         "inputs_hash": "deadbeef" * 2,
         "output_ref": "screen.json",
@@ -112,7 +112,7 @@ def test_append_decision_validates(tmp_state):
         "risk_warning": "PAPER TRADING.",
     }
     state.append_decision(good)
-    state.append_decision({**good, "stage": "research"})
+    state.append_decision({**good, "stage": "strategist"})
     lines = state.DECISIONS_LOG.read_text().strip().splitlines()
     assert len(lines) == 2
 
@@ -122,9 +122,9 @@ def test_append_decision_validates(tmp_state):
 
 def test_append_cost_filters_today_and_run(tmp_state, monkeypatch):
     today_iso = state.utcnow_iso()
-    state.append_cost({"run_id": "r1", "stage": "screen", "model": "m", "cost_usd": 0.01, "at": today_iso})
-    state.append_cost({"run_id": "r2", "stage": "screen", "model": "m", "cost_usd": 0.02, "at": today_iso})
-    state.append_cost({"run_id": "r1", "stage": "research", "model": "m", "cost_usd": 0.03, "at": "2020-01-01T00:00:00Z"})
+    state.append_cost({"run_id": "r1", "stage": "signals", "model": "m", "cost_usd": 0.01, "at": today_iso})
+    state.append_cost({"run_id": "r2", "stage": "signals", "model": "m", "cost_usd": 0.02, "at": today_iso})
+    state.append_cost({"run_id": "r1", "stage": "strategist", "model": "m", "cost_usd": 0.03, "at": "2020-01-01T00:00:00Z"})
 
     today_rows = state.read_costs_today()
     assert len(today_rows) == 2

@@ -83,7 +83,7 @@ def _make_apistatus_error(anthropic_mod, *, status_code: int, body: dict, messag
 
 _DECISION_PAYLOAD = {
     "run_id": "rid",
-    "stage": "screen",
+    "stage": "signals",
     "model": "claude-haiku-4-5",
     "inputs_hash": "deadbeef" * 2,
     "output_ref": "screen.json",
@@ -99,7 +99,7 @@ _DECISION_PAYLOAD = {
 def _call(**overrides) -> llm.StageCall:
     base = dict(
         run_id="rid",
-        stage="screen",
+        stage="signals",
         model="claude-haiku-4-5",
         system_blocks=[{"type": "text", "text": "you are an agent"}],
         user_messages=[{"role": "user", "content": "do work"}],
@@ -113,7 +113,7 @@ def test_structured_call_happy_path(tmp_state):
     fm = FakeMessages([json.dumps(_DECISION_PAYLOAD)],
                        [FakeUsage(input_tokens=1000, output_tokens=200)])
     res = llm.structured_call(_call(), client_factory=lambda: _fake_client(fm))
-    assert res.payload["stage"] == "screen"
+    assert res.payload["stage"] == "signals"
     assert res.cost_usd > 0
     assert state.read_costs_for_run("rid")
 
@@ -188,7 +188,7 @@ def test_structured_call_retries_on_transient_stream_error(tmp_state, monkeypatc
     fm = _FlakyMessages(fail_count=2, payload=json.dumps(_DECISION_PAYLOAD))
     res = llm.structured_call(_call(), client_factory=lambda: _fake_client(fm))
     assert attempts["n"] == 3
-    assert res.payload["stage"] == "screen"
+    assert res.payload["stage"] == "signals"
 
 
 def test_structured_call_gives_up_after_max_retries(tmp_state, monkeypatch):
@@ -259,7 +259,7 @@ def test_structured_call_retries_on_anthropic_overloaded(tmp_state, monkeypatch)
 
     res = llm.structured_call(_call(), client_factory=lambda: _fake_client(_OverloadedMessages()))
     assert attempts["n"] == 3, "should retry past 2 overloaded errors and succeed on the 3rd"
-    assert res.payload["stage"] == "screen"
+    assert res.payload["stage"] == "signals"
 
 
 def test_structured_call_retries_on_base_apistatuserror_overloaded(tmp_state, monkeypatch):
@@ -313,7 +313,7 @@ def test_structured_call_retries_on_base_apistatuserror_overloaded(tmp_state, mo
 
     res = llm.structured_call(_call(), client_factory=lambda: _fake_client(_OverloadedMessages()))
     assert attempts["n"] == 3, "should retry past 2 base-APIStatusError overloads and succeed on the 3rd"
-    assert res.payload["stage"] == "screen"
+    assert res.payload["stage"] == "signals"
 
 
 def test_structured_call_does_not_retry_base_apistatuserror_4xx(tmp_state, monkeypatch):
@@ -407,7 +407,7 @@ def test_schema_retry_then_success(tmp_state):
     good = json.dumps(_DECISION_PAYLOAD)
     fm = FakeMessages([bad, good])
     res = llm.structured_call(_call(), client_factory=lambda: _fake_client(fm))
-    assert res.payload["stage"] == "screen"
+    assert res.payload["stage"] == "signals"
     assert fm.calls == 2
 
 
@@ -844,5 +844,5 @@ def test_structured_call_parses_fenced_response(tmp_state):
     fenced = '```json\n' + json.dumps(_DECISION_PAYLOAD) + '\n```'
     fm = FakeMessages([fenced])
     res = llm.structured_call(_call(), client_factory=lambda: _fake_client(fm))
-    assert res.payload["stage"] == "screen"
+    assert res.payload["stage"] == "signals"
     assert fm.calls == 1  # no retry needed

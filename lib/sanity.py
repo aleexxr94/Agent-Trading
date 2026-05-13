@@ -1,52 +1,41 @@
-"""Deterministic post-construct sanity rules.
+"""Deterministic post-construct sanity rules — v2.
 
-Runs after ``stage_construct`` emits ``portfolio.json``. Applies a set of
-structural checks against the portfolio (and the upstream scenarios
-payload where useful) and emits ``sanity.json`` alongside the portfolio.
+Runs after ``stage_construct`` emits ``portfolio.json``. Applies a set
+of structural checks against the portfolio (and the upstream
+strategist view, where useful) and emits ``sanity.json`` alongside.
 
 Why deterministic? The CLAUDE.md spec already has cost caps, a halt
-flag, and prompt-level guardrails. What it was missing was a cheap fast
-way to catch *patterns* — "the agent is constructing a long straddle
-on TLT and the iv_percentile is 65" — that no single LLM agent has the
-shape to notice (bull is bullish, bear is bearish, constructor merges
-them, nobody sees the meta-pattern). Sanity rules are zero-cost
-(no API calls) and surface those patterns in the Agent Logs tab.
+flag, and prompt-level guardrails. What it was missing was a cheap
+fast way to catch *patterns* — "the agent is constructing a long
+straddle on TLT and the iv_percentile is 65" — that no single LLM
+agent has the shape to notice. Sanity rules are zero-cost (no API
+calls) and surface those patterns in the Agent Logs tab.
 
-Non-blocking by default. Each rule has a fixed ``severity`` (``warn`` or
-``fail``); when fired, the rule's ``status`` matches its severity, and
-the overall sanity status is the worst of any rule's status. Set
+Non-blocking by default. Each rule has a fixed ``severity`` (``warn``
+or ``fail``); when fired, the rule's ``status`` matches its severity.
+Overall status is the worst rule status seen. Set
 ``SANITY_BLOCK_ON_FAIL=true`` to escalate ``fail`` rules into a hard
-runtime block (orchestrator skips ``stage_execute`` and writes a
-``next_run.json`` indicating why).
+runtime block (orchestrator skips ``stage_execute`` and preserves
+cadence via the default heuristic — see fix(sanity) commit on PR γ).
 
 Add a new rule by writing a ``_r_*`` function returning ``RuleResult``
 and appending it to ``RULES``. Each rule receives ``(portfolio,
-scenarios)`` and decides for itself how much of either to consume.
+view)`` and decides for itself how much of either to consume.
+
+v1 → v2: the ``expected_value_positive`` rule (which read
+scenarios.json) was replaced by ``position_backed_by_strategist``
+which reads the v2 view.json — same intent (don't take positions
+upstream agents didn't endorse) but the upstream signal is now
+``confidence`` instead of ``expected_value_pct``.
 
 Rule list (see docstrings on each ``_r_*`` for full rationale):
 
-  - ``per_underlying_pct_cap_20``        (warn) — Σ position_pct on a
-    single underlying must stay ≤ 20%. The 15%-per-position cap doesn't
-    stop a call+put pair on the same underlying from concentrating
-    26%+ NAV on one ticker (see TLT-straddle observation 2026-05-13).
-  - ``straddle_requires_low_iv``         (fail) — long call+put on the
-    same underlying must have ``greeks.iv_percentile ≤ 40`` on every
-    leg. Otherwise the agent is paying for vol that isn't statistically
-    cheap — the failure mode of "no directional conviction, just buy
-    gamma both ways."
-  - ``kill_conditions_complete``         (fail) — every position has a
-    parseable ``max_loss_pct`` ∈ (0, 100] AND at least one of
-    {underlying_price_below, underlying_price_above, time_stop_utc}.
-    Without one of these monitor.py has nothing to flatten on.
-  - ``expected_value_positive``          (fail) — every position's
-    symbol/underlying has ``expected_value_pct > 0`` in
-    ``scenarios.candidates``. Constructor is supposed to filter
-    negative-EV candidates; this rule asserts it actually did.
-  - ``option_premium_above_floor``       (warn) — option positions have
-    ``premium_paid ≥ 0.05``. Penny premiums signal illiquidity that
-    Alpaca paper often won't fill cleanly.
-  - ``construction_rationale_meaningful`` (fail) — non-empty,
-    ≥ 80 characters. Forces the constructor to actually explain itself.
+  - ``per_underlying_pct_cap_20``        (warn)
+  - ``straddle_requires_low_iv``         (fail)
+  - ``kill_conditions_complete``         (fail)
+  - ``position_backed_by_strategist``    (fail) — v2
+  - ``option_premium_above_floor``       (warn)
+  - ``construction_rationale_meaningful`` (fail)
 """
 from __future__ import annotations
 
@@ -83,7 +72,7 @@ def _position_underlying(p: dict) -> str | None:
     return p.get("symbol")
 
 
-def _r_per_underlying_pct_cap_20(portfolio: dict, scenarios: dict | None) -> RuleResult:
+def _r_per_underlying_pct_cap_20(portfolio: dict, view: dict | None) -> RuleResult:
     """Σ position_pct per underlying ≤ 20%.
 
     The 15%-per-position cap (enforced by portfolio.schema.json) doesn't
@@ -121,7 +110,7 @@ def _r_per_underlying_pct_cap_20(portfolio: dict, scenarios: dict | None) -> Rul
     )
 
 
-def _r_straddle_requires_low_iv(portfolio: dict, scenarios: dict | None) -> RuleResult:
+def _r_straddle_requires_low_iv(portfolio: dict, view: dict | None) -> RuleResult:
     """Long-straddle pattern requires cheap vol on every leg.
 
     Pattern detection: an underlying that has BOTH a long call and a
@@ -197,7 +186,7 @@ def _r_straddle_requires_low_iv(portfolio: dict, scenarios: dict | None) -> Rule
     )
 
 
-def _r_kill_conditions_complete(portfolio: dict, scenarios: dict | None) -> RuleResult:
+def _r_kill_conditions_complete(portfolio: dict, view: dict | None) -> RuleResult:
     """Every position needs an enforceable kill condition.
 
     The schema requires ``max_loss_pct`` to be present, but doesn't
@@ -244,53 +233,78 @@ def _r_kill_conditions_complete(portfolio: dict, scenarios: dict | None) -> Rule
     return RuleResult(name, severity, "pass")
 
 
-def _r_expected_value_positive(portfolio: dict, scenarios: dict | None) -> RuleResult:
-    """Every traded position must have positive EV in scenarios.
+def _r_position_backed_by_strategist(portfolio: dict, view: dict | None) -> RuleResult:
+    """Every traded position must be endorsed by the strategist.
 
-    Constructor.md says it filters out negative-EV candidates. This
-    rule asserts the filter actually ran. If scenarios.json shows
-    ``expected_value_pct ≤ 0`` for a candidate that nonetheless made
-    it into the portfolio, something went wrong upstream.
+    v2 successor to the v1 ``expected_value_positive`` rule. Reads the
+    strategist's view.json instead of scenarios.json. The strategist's
+    ``confidence`` field is the v2 analogue of expected_value_pct —
+    confidence ≥ 0.5 means "endorsed enough to surface this idea."
 
-    Skip if scenarios payload isn't available (e.g. dry-run path
-    without fixture scenarios).
+    Constructor.md says it should be taking strategist picks, not
+    inventing positions out of band. This rule asserts that:
+      - Every ETF position's symbol appears in view.candidates with
+        confidence ≥ 0.5
+      - Every option position's underlying appears in view.candidates
+        with matching instrument_kind (option_call or option_put) AND
+        confidence ≥ 0.5
+
+    Skip if view payload isn't available (e.g. dry-run path without
+    fixture view).
     """
-    name = "expected_value_positive"
+    name = "position_backed_by_strategist"
     severity: Severity = "fail"
     positions = portfolio.get("positions") or []
     if not positions:
         return RuleResult(name, severity, "skip", "all-cash portfolio")
-    if not scenarios or not scenarios.get("candidates"):
-        return RuleResult(name, severity, "skip", "scenarios payload unavailable")
+    if not view or not view.get("candidates"):
+        return RuleResult(name, severity, "skip", "view payload unavailable")
 
-    ev_by_symbol: dict[str, float | None] = {}
-    for c in scenarios["candidates"]:
+    # Build endorsement index keyed by (symbol, instrument_kind). For
+    # ETFs the kind tag is "etf"; for options it's "option_call" or
+    # "option_put".
+    endorsed: dict[tuple[str, str], float] = {}
+    for c in view["candidates"]:
         sym = c.get("symbol")
-        if sym:
-            ev = c.get("expected_value_pct")
-            ev_by_symbol[sym] = ev if isinstance(ev, (int, float)) else None
+        kind = c.get("instrument_kind")
+        conf = c.get("confidence")
+        if sym and kind and isinstance(conf, (int, float)):
+            endorsed[(sym, kind)] = float(conf)
 
     bad: list[dict] = []
     for p in positions:
-        und = _position_underlying(p)
-        if und is None:
+        if p.get("kind") == "etf":
+            key = (p.get("symbol", ""), "etf")
+        elif p.get("kind") == "option":
+            key = (
+                p.get("underlying", ""),
+                "option_call" if p.get("type") == "call" else "option_put",
+            )
+        else:
             continue
-        ev = ev_by_symbol.get(und)
-        if ev is None:
-            bad.append({"sym": und, "issue": "no scenarios entry"})
-        elif ev <= 0:
-            bad.append({"sym": und, "expected_value_pct": ev})
+        conf = endorsed.get(key)
+        if conf is None:
+            bad.append({
+                "symbol": key[0], "instrument_kind": key[1],
+                "issue": "not in strategist candidates",
+            })
+        elif conf < 0.5:
+            bad.append({
+                "symbol": key[0], "instrument_kind": key[1],
+                "confidence": conf,
+                "issue": "strategist confidence < 0.5",
+            })
 
     if bad:
         return RuleResult(
             name, severity, severity,
-            detail=f"{len(bad)} position(s) have non-positive EV (or no scenarios entry)",
+            detail=f"{len(bad)} position(s) not endorsed by strategist with confidence ≥ 0.5",
             meta={"offenders": bad},
         )
     return RuleResult(name, severity, "pass")
 
 
-def _r_option_premium_above_floor(portfolio: dict, scenarios: dict | None) -> RuleResult:
+def _r_option_premium_above_floor(portfolio: dict, view: dict | None) -> RuleResult:
     """Option positions priced above the penny-illiquid floor.
 
     Long options below $0.05 premium tend to be deep OTM and illiquid;
@@ -326,7 +340,7 @@ def _r_option_premium_above_floor(portfolio: dict, scenarios: dict | None) -> Ru
     return RuleResult(name, severity, "pass")
 
 
-def _r_construction_rationale_meaningful(portfolio: dict, scenarios: dict | None) -> RuleResult:
+def _r_construction_rationale_meaningful(portfolio: dict, view: dict | None) -> RuleResult:
     """``construction_rationale`` non-empty and ≥ 80 characters.
 
     The schema requires it to be non-empty (minLength 1). 80 chars is
@@ -353,14 +367,14 @@ def _r_construction_rationale_meaningful(portfolio: dict, scenarios: dict | None
 RULES: list[Callable[[dict, dict | None], RuleResult]] = [
     _r_construction_rationale_meaningful,
     _r_kill_conditions_complete,
-    _r_expected_value_positive,
+    _r_position_backed_by_strategist,
     _r_straddle_requires_low_iv,
     _r_per_underlying_pct_cap_20,
     _r_option_premium_above_floor,
 ]
 
 
-def run_sanity_checks(portfolio: dict, scenarios: dict | None = None) -> dict:
+def run_sanity_checks(portfolio: dict, view: dict | None = None) -> dict:
     """Run all registered rules. Return a sanity-report dict ready to
     write to ``sanity.json`` (run_id + generated_at are filled in by
     the orchestrator caller, not here, so this function stays pure).
@@ -368,7 +382,7 @@ def run_sanity_checks(portfolio: dict, scenarios: dict | None = None) -> dict:
     Overall status is the worst per-rule status seen. Skips don't
     degrade the overall status.
     """
-    results = [r(portfolio, scenarios) for r in RULES]
+    results = [r(portfolio, view) for r in RULES]
     summary: dict[Status, int] = {"pass": 0, "warn": 0, "fail": 0, "skip": 0}
     worst_rank = 0
     worst_status: Status = "pass"

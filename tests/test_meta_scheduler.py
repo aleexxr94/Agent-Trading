@@ -61,7 +61,7 @@ def test_dry_run_skips_llm_uses_heuristic(tmp_state, monkeypatch):
     )
     at, why = orchestrator._compute_next_run_at(
         ctx=_ctx(dry_run=True), portfolio=_portfolio(all_cash=False),
-        scenarios_out={"candidates": []},
+        view={"candidates": [], "regime": "neutral", "regime_rationale": "x"},
     )
     assert called == []
     assert "heuristic" in why
@@ -79,7 +79,7 @@ def test_meta_returns_valid_timestamp_uses_it(tmp_state, monkeypatch):
         _fake_call_factory({"next_run_at": iso, "rationale": "volatile day, tighten", "hours_from_now": 2.0}),
     )
     at, why = orchestrator._compute_next_run_at(
-        ctx=_ctx(), portfolio=_portfolio(), scenarios_out={"candidates": []},
+        ctx=_ctx(), portfolio=_portfolio(), view={"candidates": [], "regime": "neutral", "regime_rationale": "x"},
     )
     assert at == iso
     assert "orchestrator-meta" in why and "volatile day" in why
@@ -91,7 +91,7 @@ def test_meta_llm_exception_falls_back_to_heuristic(tmp_state, monkeypatch):
         _fake_call_factory(RuntimeError("simulated 500")),
     )
     at, why = orchestrator._compute_next_run_at(
-        ctx=_ctx(), portfolio=_portfolio(all_cash=True), scenarios_out={"candidates": []},
+        ctx=_ctx(), portfolio=_portfolio(all_cash=True), view={"candidates": [], "regime": "neutral", "regime_rationale": "x"},
     )
     assert "meta call failed" in why
     # All-cash heuristic = 6h
@@ -105,7 +105,7 @@ def test_meta_malformed_json_falls_back(tmp_state, monkeypatch):
         _fake_call_factory("this is not JSON"),
     )
     at, why = orchestrator._compute_next_run_at(
-        ctx=_ctx(), portfolio=_portfolio(), scenarios_out={"candidates": []},
+        ctx=_ctx(), portfolio=_portfolio(), view={"candidates": [], "regime": "neutral", "regime_rationale": "x"},
     )
     assert "meta call failed" in why  # JSON parse error caught in same except
 
@@ -116,7 +116,7 @@ def test_meta_malformed_timestamp_falls_back(tmp_state, monkeypatch):
         _fake_call_factory({"next_run_at": "yesterday", "rationale": "lol"}),
     )
     at, why = orchestrator._compute_next_run_at(
-        ctx=_ctx(), portfolio=_portfolio(), scenarios_out={"candidates": []},
+        ctx=_ctx(), portfolio=_portfolio(), view={"candidates": [], "regime": "neutral", "regime_rationale": "x"},
     )
     assert "malformed" in why
 
@@ -131,7 +131,7 @@ def test_meta_out_of_bounds_falls_back(tmp_state, monkeypatch, hours_away):
         _fake_call_factory({"next_run_at": iso, "rationale": "x"}),
     )
     at, why = orchestrator._compute_next_run_at(
-        ctx=_ctx(), portfolio=_portfolio(), scenarios_out={"candidates": []},
+        ctx=_ctx(), portfolio=_portfolio(), view={"candidates": [], "regime": "neutral", "regime_rationale": "x"},
     )
     assert "out-of-bounds" in why
 
@@ -157,7 +157,7 @@ def test_meta_at_exactly_min_boundary_accepted(tmp_state, monkeypatch):
         _fake_call_factory({"next_run_at": iso, "rationale": "tight cadence ok"}),
     )
     at, why = orchestrator._compute_next_run_at(
-        ctx=_ctx(), portfolio=_portfolio(), scenarios_out={"candidates": []},
+        ctx=_ctx(), portfolio=_portfolio(), view={"candidates": [], "regime": "neutral", "regime_rationale": "x"},
     )
     assert at == iso, f"1h boundary should be accepted, got fallback: {why}"
     assert "orchestrator-meta" in why
@@ -173,7 +173,7 @@ def test_meta_at_exactly_max_boundary_accepted(tmp_state, monkeypatch):
         _fake_call_factory({"next_run_at": iso, "rationale": "max cadence ok"}),
     )
     at, why = orchestrator._compute_next_run_at(
-        ctx=_ctx(), portfolio=_portfolio(), scenarios_out={"candidates": []},
+        ctx=_ctx(), portfolio=_portfolio(), view={"candidates": [], "regime": "neutral", "regime_rationale": "x"},
     )
     assert at == iso
     assert "orchestrator-meta" in why
@@ -189,7 +189,7 @@ def test_meta_just_below_min_boundary_still_rejected(tmp_state, monkeypatch):
         _fake_call_factory({"next_run_at": iso, "rationale": "too tight"}),
     )
     _, why = orchestrator._compute_next_run_at(
-        ctx=_ctx(), portfolio=_portfolio(), scenarios_out={"candidates": []},
+        ctx=_ctx(), portfolio=_portfolio(), view={"candidates": [], "regime": "neutral", "regime_rationale": "x"},
     )
     assert "out-of-bounds" in why
 
@@ -203,7 +203,7 @@ def test_meta_rationale_truncated_to_300_chars(tmp_state, monkeypatch):
         _fake_call_factory({"next_run_at": iso, "rationale": "X" * 1000}),
     )
     _, why = orchestrator._compute_next_run_at(
-        ctx=_ctx(), portfolio=_portfolio(), scenarios_out={"candidates": []},
+        ctx=_ctx(), portfolio=_portfolio(), view={"candidates": [], "regime": "neutral", "regime_rationale": "x"},
     )
     # 'orchestrator-meta: ' prefix + 300 chars of rationale
     assert len(why) < 350
@@ -221,7 +221,7 @@ def test_stage_execute_uses_meta_decision(tmp_state, monkeypatch):
     out = orchestrator.stage_execute(
         _ctx(dry_run=False),
         _portfolio(),
-        scenarios_out={"candidates": [{"symbol": "TQQQ", "horizon_days": 21}]},
+        view={"candidates": [], "regime": "neutral", "regime_rationale": "x"},
     )
     assert out["next_run_at"] == iso
     assert "orchestrator-meta" in out["rationale"]

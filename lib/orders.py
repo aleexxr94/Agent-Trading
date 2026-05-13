@@ -95,18 +95,66 @@ def _current_option_qty(positions: list[BrokerPosition]) -> dict[str, float]:
     }
 
 
-def diff_portfolio(target_portfolio: dict, broker_positions: list[BrokerPosition]) -> OrderPlan:
-    """Compare target portfolio (output of stage_construct) with what the
-    broker actually holds; return an OrderPlan.
+def _plan_for_symbol(
+    *, symbol: str, current_qty: float, target_qty: float,
+) -> tuple[list[OrderRequest], list[OrderRequest]]:
+    """Compute (closes, opens) for a single symbol with the no-cross-zero
+    invariant.
 
-    Algorithm:
-      1. ETFs: target_qty - current_qty drives buy/sell/skip; symbols held
-         but not in target → full close.
-      2. Options: same algorithm, but symbols are OSI-format (underlying+
-         expiry+type+strike). Target options OSIs are derived from the
-         portfolio's option-position fields.
-      3. `skipped` is now only used for malformed positions (e.g. missing
-         OSI fields); fully-specified options go through the normal flow.
+    Invariant: a single OrderRequest never causes the broker's position
+    to cross zero in one ticket. If current and target have opposite
+    signs (e.g. currently long 4, target short 2), the path is split:
+    first close the existing position (sell 4 → flat), then open the
+    opposite (sell 2 short). Two tickets, never one.
+
+    For v2's long-only schema this never triggers — the constructor
+    can't produce a short target. But the invariant is here as a
+    defensive rail in case the schema ever gains shorts, AND as a
+    correctness contract on the close-before-open ordering (closes
+    list is submitted first by submit_plan, so cash is freed before
+    opens consume buying power).
+
+    Returns (closes, opens) where each list contains 0-1 OrderRequest.
+    Combined, the net effect is: broker holds exactly target_qty after
+    all orders fill.
+    """
+    if current_qty == target_qty:
+        return [], []
+
+    # Same-sign or one-side-zero: a single delta order suffices.
+    if current_qty == 0:
+        # 0 → target: pure open.
+        side = "buy" if target_qty > 0 else "sell"
+        return [], [OrderRequest(symbol=symbol, qty=abs(target_qty), side=side, order_type="market")]
+    if target_qty == 0:
+        # current → 0: pure close.
+        side = "sell" if current_qty > 0 else "buy"
+        return [OrderRequest(symbol=symbol, qty=abs(current_qty), side=side, order_type="market")], []
+    if (current_qty > 0) == (target_qty > 0):
+        # Same sign: single delta order. abs(delta) is correct size and
+        # the side depends on whether we're growing or shrinking the
+        # position.
+        delta = target_qty - current_qty
+        side = "buy" if (delta > 0 and current_qty > 0) or (delta < 0 and current_qty < 0) else "sell"
+        return [], [OrderRequest(symbol=symbol, qty=abs(delta), side=side, order_type="market")]
+
+    # Opposite signs — the dangerous case. Split into close + open.
+    # Step 1: close current (sell if long, buy-to-cover if short).
+    close_side = "sell" if current_qty > 0 else "buy"
+    close = OrderRequest(symbol=symbol, qty=abs(current_qty), side=close_side, order_type="market")
+    # Step 2: open opposite-sign target.
+    open_side = "buy" if target_qty > 0 else "sell"
+    opn = OrderRequest(symbol=symbol, qty=abs(target_qty), side=open_side, order_type="market")
+    return [close], [opn]
+
+
+def diff_portfolio(target_portfolio: dict, broker_positions: list[BrokerPosition]) -> OrderPlan:
+    """Compare target portfolio with broker's current positions; return
+    an OrderPlan that closes-before-opens AND never crosses zero in a
+    single ticket. See ``_plan_for_symbol`` for the invariant.
+
+    For v2's long-only schema the no-cross-zero rail never triggers,
+    but it stays here as a defensive contract.
     """
     requests: list[OrderRequest] = []
     closes: list[OrderRequest] = []
@@ -123,19 +171,11 @@ def diff_portfolio(target_portfolio: dict, broker_positions: list[BrokerPosition
     for sym in sorted(set(target_etfs) | set(current_etfs)):
         target_qty = target_etfs.get(sym, 0)
         current_qty = current_etfs.get(sym, 0)
-        delta = target_qty - current_qty
-        if delta == 0:
-            continue
-        if target_qty == 0:
-            closes.append(OrderRequest(
-                symbol=sym, qty=abs(current_qty),
-                side="sell" if current_qty > 0 else "buy",
-                order_type="market",
-            ))
-        elif delta > 0:
-            requests.append(OrderRequest(symbol=sym, qty=abs(delta), side="buy", order_type="market"))
-        else:
-            requests.append(OrderRequest(symbol=sym, qty=abs(delta), side="sell", order_type="market"))
+        sym_closes, sym_opens = _plan_for_symbol(
+            symbol=sym, current_qty=current_qty, target_qty=target_qty,
+        )
+        closes.extend(sym_closes)
+        requests.extend(sym_opens)
 
     # ---- Options ----
     target_options: dict[str, int] = {}
@@ -159,19 +199,11 @@ def diff_portfolio(target_portfolio: dict, broker_positions: list[BrokerPosition
     for osi in sorted(set(target_options) | set(current_options)):
         target_qty = target_options.get(osi, 0)
         current_qty = current_options.get(osi, 0)
-        delta = target_qty - current_qty
-        if delta == 0:
-            continue
-        if target_qty == 0:
-            closes.append(OrderRequest(
-                symbol=osi, qty=abs(current_qty),
-                side="sell" if current_qty > 0 else "buy",
-                order_type="market",
-            ))
-        elif delta > 0:
-            requests.append(OrderRequest(symbol=osi, qty=abs(delta), side="buy", order_type="market"))
-        else:
-            requests.append(OrderRequest(symbol=osi, qty=abs(delta), side="sell", order_type="market"))
+        osi_closes, osi_opens = _plan_for_symbol(
+            symbol=osi, current_qty=current_qty, target_qty=target_qty,
+        )
+        closes.extend(osi_closes)
+        requests.extend(osi_opens)
 
     return OrderPlan(requests=requests, skipped=skipped, closes=closes)
 

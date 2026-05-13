@@ -476,3 +476,113 @@ def test_broker_default_option_tradable_returns_true():
         def flatten(self, sym): return None
 
     assert _Stub().option_contract_tradable("TLT260619P00088000") is True
+
+
+# ---------- _plan_for_symbol: no-cross-zero invariant (v2) ----------
+
+
+def test_plan_for_symbol_zero_to_long():
+    """0 → long N: single buy of N."""
+    closes, opens = orders._plan_for_symbol(symbol="TQQQ", current_qty=0, target_qty=5)
+    assert closes == []
+    assert len(opens) == 1
+    assert opens[0].side == "buy" and opens[0].qty == 5
+
+
+def test_plan_for_symbol_long_to_zero_is_pure_close():
+    """long N → 0: single sell of N, in the closes list (submitted
+    before opens to free cash)."""
+    closes, opens = orders._plan_for_symbol(symbol="TQQQ", current_qty=4, target_qty=0)
+    assert opens == []
+    assert len(closes) == 1
+    assert closes[0].side == "sell" and closes[0].qty == 4
+
+
+def test_plan_for_symbol_long_to_larger_long_is_single_buy():
+    """long 2 → long 5: single buy of 3 (delta), no close needed."""
+    closes, opens = orders._plan_for_symbol(symbol="TQQQ", current_qty=2, target_qty=5)
+    assert closes == []
+    assert len(opens) == 1
+    assert opens[0].side == "buy" and opens[0].qty == 3
+
+
+def test_plan_for_symbol_long_to_smaller_long_is_single_sell():
+    """long 5 → long 2: single sell of 3 (delta), no close needed."""
+    closes, opens = orders._plan_for_symbol(symbol="TQQQ", current_qty=5, target_qty=2)
+    assert closes == []
+    assert len(opens) == 1
+    assert opens[0].side == "sell" and opens[0].qty == 3
+
+
+def test_plan_for_symbol_no_change_emits_no_orders():
+    """current == target: zero orders."""
+    closes, opens = orders._plan_for_symbol(symbol="TQQQ", current_qty=3, target_qty=3)
+    assert closes == []
+    assert opens == []
+    closes, opens = orders._plan_for_symbol(symbol="TQQQ", current_qty=0, target_qty=0)
+    assert closes == []
+    assert opens == []
+
+
+def test_plan_for_symbol_long_to_short_splits_into_close_then_open():
+    """long N → short M: MUST split into close-N then open-M, never a
+    single sell of N+M that crosses zero in one ticket.
+
+    For v2's long-only schema this never triggers, but the invariant
+    is defensive. Don't remove this test even if the schema stays
+    long-only forever — its absence would make a future short-enabling
+    change silently break the no-cross-zero rail.
+    """
+    closes, opens = orders._plan_for_symbol(symbol="TQQQ", current_qty=4, target_qty=-3)
+    assert len(closes) == 1
+    assert closes[0].side == "sell" and closes[0].qty == 4
+    assert len(opens) == 1
+    assert opens[0].side == "sell" and opens[0].qty == 3
+
+
+def test_plan_for_symbol_short_to_long_splits_into_close_then_open():
+    """short N → long M: split into buy-to-cover-N then open-buy-M."""
+    closes, opens = orders._plan_for_symbol(symbol="TQQQ", current_qty=-4, target_qty=3)
+    assert len(closes) == 1
+    assert closes[0].side == "buy" and closes[0].qty == 4
+    assert len(opens) == 1
+    assert opens[0].side == "buy" and opens[0].qty == 3
+
+
+def test_plan_for_symbol_short_to_zero_is_buy_to_cover():
+    """short N → 0: single buy to cover, in the closes list."""
+    closes, opens = orders._plan_for_symbol(symbol="TQQQ", current_qty=-4, target_qty=0)
+    assert opens == []
+    assert len(closes) == 1
+    assert closes[0].side == "buy" and closes[0].qty == 4
+
+
+def test_diff_portfolio_close_long_then_open_different_etf_uses_separate_orders():
+    """The plan-for-symbol invariant is per-symbol, so two unrelated
+    long positions (close TQQQ, open SOXL) end up as two independent
+    orders in the right buckets (close in `closes`, open in
+    `requests`)."""
+    from lib.broker import BrokerPosition
+    target = {
+        "positions": [{
+            "kind": "etf", "symbol": "SOXL", "shares": 3,
+            "avg_cost": 25.0, "leverage_factor": 3.0,
+            "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25},
+            "position_pct": 5.0,
+        }],
+        "all_cash": False,
+    }
+    current = [BrokerPosition(
+        symbol="TQQQ", qty=4.0, avg_cost=70.0,
+        market_value=280.0, unrealized_pl_usd=0.0,
+        asset_class="us_equity",
+    )]
+    plan = orders.diff_portfolio(target, current)
+    # One close (TQQQ sell 4) + one open (SOXL buy 3).
+    assert len(plan.closes) == 1
+    assert plan.closes[0].symbol == "TQQQ"
+    assert plan.closes[0].side == "sell" and plan.closes[0].qty == 4
+    assert len(plan.requests) == 1
+    assert plan.requests[0].symbol == "SOXL"
+    assert plan.requests[0].side == "buy" and plan.requests[0].qty == 3
