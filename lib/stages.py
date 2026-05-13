@@ -98,7 +98,20 @@ def scenarios() -> StageConfig:
         # so this is now the highest legal value.
         max_tokens=64_000,
         thinking={"type": "adaptive"},
-        output_config_extras={"effort": "high"},
+        # 2026-05-13 PR ε: effort "high" → "medium". With ``high``, Sonnet's
+        # adaptive thinking on a 10-candidate input (~14 scenarios rows
+        # post-PRs #39-41) consumed the entire 64k budget on thinking and
+        # returned an empty body TWICE in the live 12:12 UTC run (26.5
+        # minutes wasted, then SchemaRetryFailed: "non-JSON response:
+        # Expecting value: line 1 column 1 (char 0)"). The PR #42 64k bump
+        # was a half-fix — adaptive+effort:high can still eat the full
+        # budget on a wider-than-fixture candidate set. Dropping to
+        # ``medium`` caps thinking-budget allocation, prioritises output
+        # tokens, and is plenty for the scenarios task (data-producing
+        # probability-weighted base/bull/bear case modelling — not a
+        # soft-judgement task). The construct stage on Opus 4.7 stays at
+        # ``high`` because that IS the soft-judgement call.
+        output_config_extras={"effort": "medium"},
     )
 
 

@@ -112,3 +112,39 @@ def test_orchestrator_meta_default_model_is_sonnet():
     finally:
         if prev is not None:
             os.environ["MODEL_ORCHESTRATOR"] = prev
+
+
+def test_scenarios_effort_is_medium():
+    """Lock the PR ε downgrade: scenarios effort is "medium", not "high".
+
+    Live regression 2026-05-13T12:14-12:41 UTC: Sonnet 4.6 on
+    scenarios with effort=high and adaptive thinking consumed the
+    entire 64k max_tokens budget on thinking, returned an empty body
+    TWICE in a row, and the structured_call retry handler raised
+    SchemaRetryFailed: "non-JSON response: Expecting value: line 1
+    column 1 (char 0)". 26.5 min wasted; the run blew through screen
+    + research + chains for nothing.
+
+    The PR #42 64k cap bump was a half-fix — it set the BUDGET upper
+    bound to Sonnet's hard provider cap, but didn't constrain how
+    thinking consumes that budget. With effort=high + adaptive
+    thinking on a 10-candidate input (~14 scenarios rows), Sonnet
+    can still allocate the entire budget to thinking.
+
+    effort=medium caps thinking-budget allocation, leaving headroom
+    for the structured-output JSON. Scenarios is a data-producing
+    stage (probability tables + options rationale) — not a
+    soft-judgement task — so the small reasoning-depth drop is the
+    right trade.
+
+    If MODEL_SCENARIOS is overridden to Opus, "medium" still works
+    cleanly — Opus has more efficient adaptive thinking and won't
+    starve output even on "high". The setting can be revisited then.
+    """
+    cfg = stages.scenarios()
+    assert cfg.output_config_extras.get("effort") == "medium", (
+        f"scenarios effort={cfg.output_config_extras.get('effort')!r}; "
+        f'expected "medium". The empty-output failure mode at "high" '
+        f"will recur. Override the model rather than the effort if the "
+        f"reasoning depth is genuinely insufficient."
+    )
