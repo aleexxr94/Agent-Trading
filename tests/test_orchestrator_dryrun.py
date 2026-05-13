@@ -329,6 +329,58 @@ def test_signals_fingerprint_differs_when_momentum_moves(tmp_state):
     assert orchestrator._signals_fingerprint(a) != orchestrator._signals_fingerprint(b)
 
 
+def test_signals_fingerprint_changes_when_new_macro_event_enters_window(tmp_state):
+    """Codex P1 regression: an FOMC/CPI/NFP/PCE moving into the 7-day
+    window MUST invalidate the dedup. Otherwise the agent skips the
+    cycle exactly when new event risk appears — the opposite of what
+    the event-aware signals were added for.
+
+    Before the fix, the fingerprint only hashed numeric features and
+    these two signals payloads (identical numerics, different events)
+    would produce the same hash.
+    """
+    quiet = {"tickers": [{
+        "symbol": "SPY", "last_close": 540.0,
+        "momentum_30d_pct": 2.1, "momentum_60d_pct": 3.1,
+        "hv_30d_annualised": 0.11, "hv_90d_annualised": 0.10,
+        "dist_from_50d_ma_pct": 1.0, "dist_from_200d_ma_pct": 4.1,
+        "upcoming_macro_events_7d": [],
+    }]}
+    with_fomc = {"tickers": [{
+        "symbol": "SPY", "last_close": 540.0,
+        "momentum_30d_pct": 2.1, "momentum_60d_pct": 3.1,
+        "hv_30d_annualised": 0.11, "hv_90d_annualised": 0.10,
+        "dist_from_50d_ma_pct": 1.0, "dist_from_200d_ma_pct": 4.1,
+        "upcoming_macro_events_7d": [
+            {"date": "2026-05-15", "type": "FOMC", "description": "FOMC"},
+        ],
+    }]}
+    assert orchestrator._signals_fingerprint(quiet) != orchestrator._signals_fingerprint(with_fomc), (
+        "dedup hash must invalidate when a new macro event enters the 7-day "
+        "window — otherwise the agent skips strategist/construct exactly when "
+        "event risk appears."
+    )
+
+
+def test_signals_fingerprint_stable_when_events_reordered(tmp_state):
+    """Two events on different dates returned in different order
+    produce the same hash — the events list is canonically sorted by
+    (date, type) before hashing."""
+    a = {"tickers": [{
+        "symbol": "SPY", "upcoming_macro_events_7d": [
+            {"date": "2026-05-15", "type": "FOMC"},
+            {"date": "2026-05-14", "type": "CPI"},
+        ],
+    }]}
+    b = {"tickers": [{
+        "symbol": "SPY", "upcoming_macro_events_7d": [
+            {"date": "2026-05-14", "type": "CPI"},
+            {"date": "2026-05-15", "type": "FOMC"},
+        ],
+    }]}
+    assert orchestrator._signals_fingerprint(a) == orchestrator._signals_fingerprint(b)
+
+
 def test_positions_fingerprint_changes_when_qty_changes(tmp_state):
     a = [{"symbol": "TQQQ", "qty": 4.0}]
     b = [{"symbol": "TQQQ", "qty": 5.0}]

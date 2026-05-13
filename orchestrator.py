@@ -372,15 +372,28 @@ def _recent_pnl_history(*, limit: int = 5) -> list[dict]:
 
 def _signals_fingerprint(signals_out: dict) -> str:
     """Hash of the per-ticker feature payload used for cycle dedup.
-    Only fingerprints the numeric features — last_close, momentum,
-    HV, MA distances. Excludes generated_at + run_id so the same data
-    on two different cycles produces the same hash.
 
-    Rounds to 4dp first so noise from yfinance recompute doesn't make
-    every cycle look unique.
+    Fingerprints (a) numeric price/vol/MA features rounded to 4dp so
+    yfinance recompute noise doesn't make every cycle look unique,
+    AND (b) the set of upcoming macro events per ticker — Codex P1
+    on PR #68 caught that fingerprinting only the numerics meant a
+    new FOMC/CPI/NFP/PCE moving into the 7-day window wouldn't bump
+    the hash, so dedup would skip strategist + construct *exactly*
+    when new event risk appeared. Now any change in the event set
+    (new event added, event date changed, event count shifted)
+    invalidates the dedup and forces a fresh cycle.
+
+    Excludes generated_at + run_id so the same data on two different
+    cycles produces the same hash.
     """
     rows = []
     for t in signals_out.get("tickers", []):
+        # Compact-but-stable representation of the macro event list:
+        # sort by date so reordering doesn't spuriously change the hash.
+        events_summary = sorted(
+            ((e.get("date"), e.get("type")) for e in (t.get("upcoming_macro_events_7d") or [])),
+            key=lambda p: (p[0] or "", p[1] or ""),
+        )
         rows.append({
             "sym": t.get("symbol"),
             "last_close": round(t.get("last_close") or 0.0, 4),
@@ -390,6 +403,7 @@ def _signals_fingerprint(signals_out: dict) -> str:
             "hv90": round(t.get("hv_90d_annualised") or 0.0, 4),
             "d50": round(t.get("dist_from_50d_ma_pct") or 0.0, 2),
             "d200": round(t.get("dist_from_200d_ma_pct") or 0.0, 2),
+            "events": events_summary,
         })
     rows.sort(key=lambda r: r["sym"] or "")
     return _hash_inputs(json.dumps(rows, sort_keys=True))

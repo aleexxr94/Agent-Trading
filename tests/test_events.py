@@ -37,3 +37,25 @@ def test_events_for_symbol_returns_empty_for_crypto():
     """BITX (crypto) doesn't react to FOMC/CPI in the same way; exempt."""
     ev = events.events_for_symbol("BITX", within_days=60, from_date=date(2026, 5, 13))
     assert ev == []
+
+
+def test_calendar_includes_all_four_event_types():
+    """Codex P2 regression: the module docstring documents FOMC + CPI +
+    NFP + PCE as the four supported event types. The static tuple
+    originally ended after NFP and emitted no PCE catalysts at all,
+    so the strategist systematically missed one event type per cycle.
+    This test pins that all four types are present in the calendar.
+    """
+    seen_types = {e["type"] for e in events._EVENTS_2026}
+    assert {"FOMC", "CPI", "NFP", "PCE"}.issubset(seen_types)
+
+
+def test_pce_dates_are_late_in_month():
+    """PCE releases are last business Friday of the month. Sanity
+    check: every PCE date is day-of-month ≥ 23."""
+    from datetime import datetime
+    for e in events._EVENTS_2026:
+        if e["type"] != "PCE":
+            continue
+        d = datetime.strptime(e["date"], "%Y-%m-%d")
+        assert d.day >= 23, f"PCE {e['date']} not late-in-month — verify against BEA calendar"

@@ -63,6 +63,24 @@ _EVENTS_2026: tuple[dict, ...] = (
     {"date": "2026-10-02", "type": "NFP", "description": "NFP release (Sep)"},
     {"date": "2026-11-06", "type": "NFP", "description": "NFP release (Oct)"},
     {"date": "2026-12-04", "type": "NFP", "description": "NFP release (Nov)"},
+
+    # PCE (BEA Personal Consumption Expenditures — typically last
+    # Friday of each month; the Fed's preferred inflation gauge).
+    # Codex P2 on PR #68: I documented PCE in the module docstring
+    # but never added the dates. Adding them so the calendar matches
+    # the documented scope.
+    {"date": "2026-01-30", "type": "PCE", "description": "PCE release (Dec 2025)"},
+    {"date": "2026-02-27", "type": "PCE", "description": "PCE release (Jan)"},
+    {"date": "2026-03-27", "type": "PCE", "description": "PCE release (Feb)"},
+    {"date": "2026-04-30", "type": "PCE", "description": "PCE release (Mar)"},
+    {"date": "2026-05-29", "type": "PCE", "description": "PCE release (Apr)"},
+    {"date": "2026-06-26", "type": "PCE", "description": "PCE release (May)"},
+    {"date": "2026-07-31", "type": "PCE", "description": "PCE release (Jun)"},
+    {"date": "2026-08-28", "type": "PCE", "description": "PCE release (Jul)"},
+    {"date": "2026-09-25", "type": "PCE", "description": "PCE release (Aug)"},
+    {"date": "2026-10-30", "type": "PCE", "description": "PCE release (Sep)"},
+    {"date": "2026-11-25", "type": "PCE", "description": "PCE release (Oct)"},
+    {"date": "2026-12-23", "type": "PCE", "description": "PCE release (Nov)"},
 )
 
 
