@@ -21,7 +21,7 @@ systemd timer (Linux) / Task Scheduler (Windows) ──▶ orchestrator.py
                                                       ├─ Stage 1: screen      (Haiku 4.5)
                                                       ├─ Stage 2: research    (Sonnet 4.6, bull+bear in parallel)
                                                       ├─ Stage 3: scenarios   (Sonnet 4.6)
-                                                      ├─ Stage 4: construct   (Opus 4.6, 1–12 or all-cash)
+                                                      ├─ Stage 4: construct   (Sonnet 4.6, 1–12 or all-cash)
                                                       └─ Stage 5: execute     (Alpaca paper) + write next_run.json
                                                             │
                                                             ▼
@@ -42,8 +42,8 @@ Per-stage model assignment matches the cost/quality demand of each decision. All
 | **screen** | `claude-haiku-4-5` | Structured liquidity-filter step. Cheap, fast, sufficient. |
 | **research** (bull + bear, parallel) | `claude-sonnet-4-6` | Fans out 2× per candidate (~16 calls/run). Sonnet is the right cost/quality sweet spot at this fan-out. |
 | **scenarios** | `claude-sonnet-4-6` | Probability-weighted base/bull/bear case modelling. Well-defined output shape. |
-| **construct** | `claude-opus-4-6` | **The actual trade decision** — picks positions, sizing, kill conditions. Highest-stakes call on a $2,500 account where each trade matters disproportionately; gets the Opus tier. |
-| **orchestrator-meta** *(timing only)* | `claude-opus-4-6` | Decides next-run window from regime + portfolio state. Bounded 1–24h, falls back to a 4h/6h heuristic if the LLM output is unusable. |
+| **construct** | `claude-sonnet-4-6` | **The actual trade decision** — picks positions, sizing, kill conditions. Output is heavily constrained by `portfolio.schema.json`, so the structured-output server-side validator already does much of the work the Opus tier used to. Sonnet 4.6 here ≈ 40% cheaper per run vs. Opus 4.6 with no observed quality regression in paper. Override with `MODEL_CONSTRUCTOR=claude-opus-4-6` if needed. |
+| **orchestrator-meta** *(timing only)* | `claude-sonnet-4-6` | Decides next-run window from regime + portfolio state. Bounded 1–24h, falls back to a 4h/6h heuristic if the LLM output is unusable. Small payload, no schema — Sonnet is right-sized; downgraded from Opus on 2026-05-13. |
 
 Typical cost per orchestrator run on a real universe: **~$0.10–$0.50** (most of it in `construct`). Per-run cap defaults to $2; daily cap defaults to $10.
 
@@ -117,7 +117,7 @@ For **every** researched candidate (including likely-negative-EV ones — *the c
 
 This is a **data-producing** stage, not a gating one. Output: `scenarios.json`.
 
-### 4. Portfolio construction — Opus 4.6 (the actual trade decision)
+### 4. Portfolio construction — Sonnet 4.6 (the actual trade decision)
 Reads all scenarios, filters by:
 - Positive `expected_value_pct` (drops negative-EV candidates here)
 - Correlation across surviving positions (bull/bear pairs of the same factor count as one)
@@ -133,7 +133,7 @@ If every candidate is negative-EV, outputs **all-cash** with rationale. **A sing
 
 ### 5. Execution + meta-scheduling
 - **execute**: diffs target portfolio vs current Alpaca positions, emits **close orders first** (free cash) then **open orders**. Single-leg market orders for ETFs and options (option symbols built via OSI: `SPY260619C00530000` etc.). Gated behind `ORDERS_ENABLED=true` — default off so dry-runs are safe.
-- **meta** — Opus 4.6: given the freshly-built portfolio + recent NAV trend + time of day, decides when the **next cycle fires** (bounded 1–24h, falls back to a 4h/6h heuristic if the LLM output is unusable). Writes `state/next_run.json` for the systemd timer to pick up.
+- **meta** — Sonnet 4.6: given the freshly-built portfolio + recent NAV trend + time of day, decides when the **next cycle fires** (bounded 1–24h, falls back to a 4h/6h heuristic if the LLM output is unusable). Writes `state/next_run.json` for the systemd timer to pick up.
 
 ### Risk controls (always-on)
 

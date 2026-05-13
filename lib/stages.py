@@ -105,20 +105,25 @@ def scenarios() -> StageConfig:
 def constructor() -> StageConfig:
     return StageConfig(
         stage="construct",
-        model=_model("MODEL_CONSTRUCTOR", "claude-opus-4-6"),
+        model=_model("MODEL_CONSTRUCTOR", "claude-sonnet-4-6"),
         system_prompt=_load("constructor.md"),
         schema_filename="portfolio.schema.json",
-        # 32000 (was 16384, originally 8192): the same growth that pushed
-        # scenarios to 64k (PR #42) also widened constructor's input — it
-        # now reads 14-row scenarios payloads (8 ETFs + up to 6 option-
-        # direction rows per PRs #39-41). Combined with `thinking: adaptive`
-        # on Opus 4.6 (deep thinking, expensive per token), the original
-        # 16k cap left the model emitting only ~340 output tokens before
-        # truncation in the regime-aware run — constructor crashed before
-        # writing portfolio.json, taking the whole cycle with it.
-        # 32k is Opus 4.6's default max_tokens cap without the
-        # interleaved-thinking beta. Going higher than 32k would need
-        # extra headers; this is the safe ceiling.
+        # 32000: constructor consumes a 14-row scenarios payload (8 ETFs +
+        # up to 6 option-direction rows per PRs #39-41) and emits a 1–12
+        # position portfolio.json with sizing math + kill conditions per
+        # row. The cap was originally tuned for Opus 4.6 (interleaved-
+        # thinking-free ceiling). Sonnet 4.6's max_tokens cap is 64k, so
+        # 32k is comfortably inside the SDK limit on Sonnet too and
+        # leaves room for adaptive thinking + structured-output JSON
+        # without truncation.
+        #
+        # Model: claude-sonnet-4-6 (was claude-opus-4-6 pre-PR-β,
+        # 2026-05-13). Constructor is the highest-stakes call but it's
+        # also the heaviest per-token: dropping to Sonnet saves ~40%/run
+        # vs. Opus on this stage alone, and the structured output schema
+        # already constrains what the model can emit. Override with
+        # MODEL_CONSTRUCTOR=claude-opus-4-6 if a quality regression shows
+        # up in paper running.
         max_tokens=32_000,
         thinking={"type": "adaptive"},
         output_config_extras={"effort": "high"},
@@ -126,10 +131,18 @@ def constructor() -> StageConfig:
 
 
 def orchestrator_meta() -> StageConfig:
-    """Used for the next-run scheduling / meta-decision call (Opus tier)."""
+    """Used for the next-run scheduling / meta-decision call.
+
+    Downgraded from Opus 4.6 → Sonnet 4.6 on 2026-05-13 (PR β to the
+    cost-reduction trio). This call is small (2k output, schema-free
+    free-form text) and the fallback heuristic kicks in cleanly if the
+    LLM output is unusable — Sonnet is plenty for choosing a 1–24h
+    next-run window. Override with MODEL_ORCHESTRATOR=claude-opus-4-6 if
+    needed.
+    """
     return StageConfig(
         stage="meta",
-        model=_model("MODEL_ORCHESTRATOR", "claude-opus-4-6"),
+        model=_model("MODEL_ORCHESTRATOR", "claude-sonnet-4-6"),
         system_prompt=_load("orchestrator.md"),
         schema_filename=None,
         max_tokens=2048,
