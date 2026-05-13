@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-trading.local/schemas/sanity.schema.json",
+  "title": "Sanity",
+  "description": "Output of post-construct deterministic sanity checks. Written next to portfolio.json. Non-blocking by default; SANITY_BLOCK_ON_FAIL=true escalates 'fail' status into a hard runtime block.",
+  "type": "object",
+  "properties": {
+    "run_id": {"type": "string", "minLength": 1},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "status": {"enum": ["pass", "warn", "fail"]},
+    "summary": {
+      "type": "object",
+      "properties": {
+        "pass": {"type": "integer", "minimum": 0},
+        "warn": {"type": "integer", "minimum": 0},
+        "fail": {"type": "integer", "minimum": 0},
+        "skip": {"type": "integer", "minimum": 0}
+      },
+      "required": ["pass", "warn", "fail", "skip"],
+      "additionalProperties": false
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "severity": {"enum": ["warn", "fail"]},
+          "status": {"enum": ["pass", "warn", "fail", "skip"]},
+          "detail": {"type": "string"},
+          "meta": {"type": "object"}
+        },
+        "required": ["name", "severity", "status"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["run_id", "generated_at", "status", "summary", "rules"],
+  "additionalProperties": false
+}

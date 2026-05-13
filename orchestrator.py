@@ -35,7 +35,7 @@ except ImportError:
     pass
 from typing import Callable
 
-from lib import llm, market_data, risk, stages, state, universe
+from lib import llm, market_data, risk, sanity, stages, state, universe
 from lib.broker import Broker
 
 ROOT = Path(__file__).resolve().parent
@@ -809,12 +809,79 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
     if not risk.position_band_ok(len(portfolio["positions"]), portfolio["all_cash"]):
         raise RuntimeError("portfolio violates 1–12 band / all-cash invariant")
 
-    next_run = _run_stage(
-        ctx=ctx, stage_id="execute", schema="", output_filename="next_run.json",
-        runner=lambda: stage_execute(ctx, portfolio, scenarios_out),
-        inputs_hash_parts=(rid, json.dumps(portfolio, sort_keys=True)),
-        model="local",
+    # Deterministic post-construct sanity rules. Zero LLM cost; reads
+    # portfolio + scenarios and writes sanity.json alongside the
+    # portfolio. Non-blocking by default — failures surface in the
+    # Agent Logs dashboard tab. Set SANITY_BLOCK_ON_FAIL=true to
+    # escalate `fail` status into a hard skip of stage_execute (the
+    # cycle still writes portfolio + sanity + next_run so the operator
+    # can see what was rejected and why). See lib/sanity.py for the
+    # rule list and rationale.
+    sanity_report = sanity.run_sanity_checks(portfolio, scenarios_out)
+    sanity_report["run_id"] = rid
+    sanity_report["generated_at"] = state.utcnow_iso()
+    state.write_json(
+        state.run_dir(rid) / "sanity.json", sanity_report, schema="sanity.schema.json",
     )
+    sanity_blocked = (
+        sanity.block_on_fail_enabled() and sanity_report["status"] == "fail"
+    )
+
+    if sanity_blocked:
+        # Skip stage_execute entirely. Write a minimal next_run.json so
+        # the dashboard's Agent Logs tab + meta scheduler still have a
+        # row to show; flag the block reason so it's not silently lost.
+        #
+        # Codex P1 on PR #64: an earlier version wrote next_run_at=None
+        # here. The root-level run_scheduler.sh (deploy/run_scheduler.sh)
+        # reads `.next_run_at // empty` from next_run.json and skips its
+        # tick when empty — so a single sanity-fail would silently drop
+        # the orchestrator from its normal 1-24h cadence to the coarse
+        # daily fallback timer (~24h gap). Sanity blocking is supposed
+        # to skip ONE cycle's order submission, not stall cadence
+        # entirely. Use the existing _default_next_run_at heuristic
+        # (4h if positions exist, 6h all-cash) so the scheduler keeps
+        # firing and the agent re-evaluates after the failed cycle.
+        next_run = {
+            "run_id": rid,
+            "next_run_at": _default_next_run_at(portfolio),
+            "rationale": (
+                "stage_execute skipped: SANITY_BLOCK_ON_FAIL=true and sanity "
+                f"report status=fail ({sanity_report['summary']['fail']} rule "
+                "failure(s)). Cadence preserved via heuristic so the scheduler "
+                "keeps firing; see sanity.json for offender details."
+            ),
+            "sanity_block": {
+                "status": sanity_report["status"],
+                "failed_rules": [
+                    r["name"] for r in sanity_report["rules"] if r["status"] == "fail"
+                ],
+            },
+        }
+        state.write_json(state.run_dir(rid) / "next_run.json", next_run)
+        if not dry_run:
+            state.write_json(state.NEXT_RUN, next_run)
+    else:
+        next_run = _run_stage(
+            ctx=ctx, stage_id="execute", schema="", output_filename="next_run.json",
+            runner=lambda: stage_execute(ctx, portfolio, scenarios_out),
+            inputs_hash_parts=(rid, json.dumps(portfolio, sort_keys=True)),
+            model="local",
+        )
+        # Surface sanity outcome on next_run for the dashboard meter
+        # without re-parsing sanity.json on every render. _run_stage
+        # already wrote next_run.json (without the sanity field, since
+        # the report is computed afterwards), so re-write the per-run
+        # copy to include it. The global state.NEXT_RUN pointer is only
+        # touched on live runs — dry-runs already avoid it via the
+        # existing `if not ctx.dry_run` inside stage_execute.
+        next_run["sanity"] = {
+            "status": sanity_report["status"],
+            "summary": sanity_report["summary"],
+        }
+        state.write_json(state.run_dir(rid) / "next_run.json", next_run)
+        if not dry_run:
+            state.write_json(state.NEXT_RUN, next_run)
 
     if not dry_run:
         state.write_json(state.CURRENT_PORTFOLIO, portfolio)

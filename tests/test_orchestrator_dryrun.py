@@ -25,7 +25,7 @@ def test_dry_run_writes_all_artifacts(tmp_state):
 
     expected = {
         "screen.json", "research.json", "chains.json",
-        "scenarios.json", "portfolio.json", "next_run.json",
+        "scenarios.json", "portfolio.json", "sanity.json", "next_run.json",
     }
     assert {p.name for p in rdir.iterdir()} == expected
 
@@ -33,6 +33,7 @@ def test_dry_run_writes_all_artifacts(tmp_state):
     state.validate(json.loads((rdir / "research.json").read_text()), "research.schema.json")
     state.validate(json.loads((rdir / "scenarios.json").read_text()), "scenarios.schema.json")
     state.validate(json.loads((rdir / "portfolio.json").read_text()), "portfolio.schema.json")
+    state.validate(json.loads((rdir / "sanity.json").read_text()), "sanity.schema.json")
 
 
 def test_dry_run_emits_decision_log(tmp_state):
@@ -464,6 +465,95 @@ def test_dry_run_pipeline_passes_chains_through_to_scenarios(tmp_state):
     result = orchestrator.run_pipeline(dry_run=True)
     assert "chains" in result
     assert "underlyings" in result["chains"]
+
+
+def test_dry_run_writes_sanity_json_with_known_status(tmp_state):
+    """Sanity report is written next to portfolio.json on every run.
+
+    The fixture portfolio's kill_conditions only carry max_loss_pct (no
+    price-stop or time-stop fields), which is exactly the gap the
+    kill_conditions_complete rule was built to catch. So we expect at
+    least one rule to fire on the existing fixture — confirms sanity
+    is actually evaluating, not just emitting an empty report.
+    """
+    result = orchestrator.run_pipeline(dry_run=True)
+    rid = result["run_id"]
+    rdir = state.RUNS_DIR / rid
+    sanity_doc = json.loads((rdir / "sanity.json").read_text())
+    assert sanity_doc["run_id"] == rid
+    assert sanity_doc["status"] in ("pass", "warn", "fail")
+    # Schema validation already enforced on write (orchestrator passes
+    # schema=sanity.schema.json to state.write_json), but re-validate to
+    # surface intent in the test.
+    state.validate(sanity_doc, "sanity.schema.json")
+    # Rule list mirrors lib/sanity.RULES — pin the count so a future
+    # rule add/remove gets a heads-up in the dry-run test rather than
+    # only in test_sanity.py.
+    assert len(sanity_doc["rules"]) == 6
+
+
+def test_sanity_block_on_fail_skips_execute_and_writes_block_reason(tmp_state, monkeypatch):
+    """SANITY_BLOCK_ON_FAIL=true + fixture-known fail → stage_execute is
+    skipped, next_run.json carries the sanity_block field, current
+    portfolio is still written (so the dashboard can show what was
+    rejected). The fixture's kill_conditions incompleteness is the
+    "failing rule" trigger here — no need to construct a synthetic
+    portfolio.
+
+    Codex P1 on PR #64: the sanity-block path MUST still populate
+    next_run_at with a sensible future timestamp. The root-level
+    run_scheduler.sh reads `.next_run_at // empty` and skips its tick
+    when empty — without this, enabling sanity-blocking would silently
+    drop the orchestrator from 1-24h cadence to the ~24h daily
+    fallback timer. Reuse the existing _default_next_run_at heuristic
+    so a sanity-fail skips ONE cycle's execute but cadence is
+    preserved.
+    """
+    monkeypatch.setenv("SANITY_BLOCK_ON_FAIL", "true")
+    result = orchestrator.run_pipeline(dry_run=True)
+    rid = result["run_id"]
+    rdir = state.RUNS_DIR / rid
+
+    sanity_doc = json.loads((rdir / "sanity.json").read_text())
+    assert sanity_doc["status"] == "fail", (
+        "fixture expected to fail at least one rule "
+        "(kill_conditions_complete on the all-max_loss-only kill blocks)"
+    )
+
+    next_run = json.loads((rdir / "next_run.json").read_text())
+    assert "sanity_block" in next_run
+    assert next_run["sanity_block"]["status"] == "fail"
+    assert len(next_run["sanity_block"]["failed_rules"]) >= 1
+
+    # Cadence preserved — scheduler keeps firing.
+    assert isinstance(next_run["next_run_at"], str)
+    from datetime import datetime, timezone
+    parsed = datetime.strptime(next_run["next_run_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    # _default_next_run_at returns 4h (positions held) or 6h (all-cash)
+    # ahead. Be generous on both ends to absorb test timing.
+    delta_hours = (parsed - datetime.now(timezone.utc)).total_seconds() / 3600.0
+    assert 0.5 <= delta_hours <= 8.0, (
+        f"next_run_at delta {delta_hours:.2f}h outside 0.5h-8h expected band; "
+        f"sanity-block path must use the same heuristic as the meta-scheduler "
+        f"fallback so deploy/run_scheduler.sh keeps firing."
+    )
+
+
+def test_sanity_pass_path_writes_summary_into_next_run(tmp_state, monkeypatch):
+    """Default path (SANITY_BLOCK_ON_FAIL unset): stage_execute proceeds
+    normally; next_run.json carries a `sanity` field with the rollup so
+    the dashboard meter can render without re-parsing sanity.json.
+    """
+    monkeypatch.delenv("SANITY_BLOCK_ON_FAIL", raising=False)
+    result = orchestrator.run_pipeline(dry_run=True)
+    rid = result["run_id"]
+    rdir = state.RUNS_DIR / rid
+    next_run = json.loads((rdir / "next_run.json").read_text())
+    assert "sanity" in next_run
+    assert next_run["sanity"]["status"] in ("pass", "warn", "fail")
+    assert set(next_run["sanity"]["summary"].keys()) == {"pass", "warn", "fail", "skip"}
+    # Confirms the non-blocking path didn't trip the block branch.
+    assert "sanity_block" not in next_run
 
 
 def test_main_passes_broker_to_run_pipeline(tmp_state, monkeypatch):
