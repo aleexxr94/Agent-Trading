@@ -408,3 +408,106 @@ def read_nav_history(limit: int | None = None) -> list[dict]:
     if limit is not None:
         return rows[-limit:]
     return rows
+
+
+# --------- wipe history (dashboard "start fresh" button) ---------
+
+
+def wipe_run_history(*, include_costs: bool = True, backup: bool = True) -> dict:
+    """Clear all per-cycle history so the dashboard renders from a blank
+    slate. Triggered by the Settings tab "Wipe history" button.
+
+    What this removes:
+      - state/runs/* (every per-cycle artifact dir)
+      - state/decisions.jsonl (decision log)
+      - state/nav_history.jsonl (NAV-per-cycle history)
+      - state/trades.jsonl (Alpaca fill log)
+      - state/current_portfolio.json (last portfolio snapshot)
+      - state/next_run.json (last scheduler target)
+      - state/last_cycle_hash.json (cycle-dedup fingerprint)
+      - state/scheduler_last_fired.txt (scheduler dedup)
+      - state/cost_reset.json + cost_all_time_reset.json (display
+        markers — meaningless without an audit log behind them)
+      - state/costs.jsonl ONLY if include_costs=True (the audit log
+        backing per-run / daily cap enforcement)
+
+    What this PRESERVES:
+      - state/halt.flag (operator's emergency-stop intent — not for
+        this button to override)
+      - The state/ directory itself
+
+    Backup: when backup=True (default), copies every file we're about
+    to clobber into state/backup_<utc_iso>/ first. ~30s of disk; if
+    something goes wrong the operator restores by cp-ing files back.
+    """
+    import shutil
+
+    cleared: dict = {
+        "runs_dirs_removed": 0,
+        "jsonl_truncated": [],
+        "snapshots_removed": [],
+        "backup_dir": None,
+    }
+
+    # Backup first — fail-safe rope-and-pulley.
+    if backup:
+        backup_dir = STATE_DIR / f"backup_{utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=False)
+            for f in STATE_DIR.iterdir():
+                if f.name.startswith("backup_"):
+                    continue
+                if f.name == "halt.flag":
+                    continue
+                if f.is_file():
+                    shutil.copy2(f, backup_dir / f.name)
+                elif f.is_dir() and f.name == "runs":
+                    # Recursive copy — small but per-run cache files
+                    # add up. Skip on permission/disk errors so the
+                    # main wipe still proceeds.
+                    try:
+                        shutil.copytree(f, backup_dir / "runs")
+                    except (OSError, shutil.Error):
+                        pass
+            cleared["backup_dir"] = str(backup_dir)
+        except OSError:
+            cleared["backup_dir"] = None  # fail soft — proceed without backup
+
+    # Truncate (don't unlink) the JSONL audit logs so anything that holds
+    # a file handle keeps writing without recreating mode/owner issues.
+    jsonl_files = [DECISIONS_LOG, TRADES_LOG, NAV_HISTORY_LOG]
+    if include_costs:
+        jsonl_files.append(COSTS_LOG)
+    for f in jsonl_files:
+        if f.exists():
+            try:
+                f.write_text("")
+                cleared["jsonl_truncated"].append(f.name)
+            except OSError:
+                pass
+
+    # Remove snapshot files entirely (orchestrator regenerates them).
+    snapshots = [
+        CURRENT_PORTFOLIO, NEXT_RUN, LAST_CYCLE_HASH,
+        STATE_DIR / "scheduler_last_fired.txt",
+        COST_RESET_FLAG, ALL_TIME_COST_RESET_FLAG,
+    ]
+    for f in snapshots:
+        if f.exists():
+            try:
+                f.unlink()
+                cleared["snapshots_removed"].append(f.name)
+            except OSError:
+                pass
+
+    # Wipe per-cycle run dirs.
+    if RUNS_DIR.exists():
+        for run_dir in RUNS_DIR.iterdir():
+            if run_dir.is_dir():
+                try:
+                    shutil.rmtree(run_dir)
+                    cleared["runs_dirs_removed"] += 1
+                except OSError:
+                    pass
+
+    return cleared

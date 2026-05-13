@@ -1170,6 +1170,56 @@ with tabs[6]:
             state.set_all_time_cost_reset("dashboard")
             st.rerun()
 
+    st.markdown('<div class="at-section-label">Wipe history (start fresh)</div>', unsafe_allow_html=True)
+    st.caption(
+        "Clears `state/decisions.jsonl`, `state/trades.jsonl`, "
+        "`state/nav_history.jsonl`, `state/runs/*`, and the portfolio / "
+        "next-run / dedup-hash snapshots. By default also clears "
+        "`state/costs.jsonl` so per-run + daily caps reset to $0. "
+        "`state/halt.flag` is preserved (this button doesn't override your stop intent). "
+        "A timestamped backup is dropped under `state/backup_<utc>/` "
+        "before anything is deleted — you can restore from there if "
+        "needed."
+    )
+
+    include_costs = st.checkbox(
+        "Also clear `state/costs.jsonl` (audit log + cap enforcement reset to $0)",
+        value=True,
+        help="Uncheck this if you want to keep the cost audit log untouched. "
+             "Caps continue to enforce against historical spend.",
+    )
+
+    if not st.session_state.get("wipe_confirm_pending"):
+        if st.button(
+            "🧹 Wipe history & runs",
+            help="Removes all per-cycle artifacts and decision/trade/NAV logs. "
+                 "Two-step confirmation; backup created first.",
+        ):
+            st.session_state["wipe_confirm_pending"] = True
+            st.rerun()
+    else:
+        st.warning(
+            "⚠️ Press **Confirm wipe** to delete all run history "
+            f"({'including' if include_costs else 'excluding'} the cost "
+            "audit log). The backup will land in `state/backup_<utc>/`."
+        )
+        wc_cols = st.columns(2)
+        with wc_cols[0]:
+            if st.button("✅ Confirm wipe", type="primary"):
+                result = state.wipe_run_history(include_costs=include_costs)
+                st.session_state["wipe_confirm_pending"] = False
+                st.success(
+                    f"Wiped {result['runs_dirs_removed']} run dirs, "
+                    f"truncated {len(result['jsonl_truncated'])} log files, "
+                    f"removed {len(result['snapshots_removed'])} snapshots. "
+                    f"Backup: `{result['backup_dir'] or '<failed>'}`"
+                )
+                st.rerun()
+        with wc_cols[1]:
+            if st.button("↩ Cancel"):
+                st.session_state["wipe_confirm_pending"] = False
+                st.rerun()
+
     st.markdown('<div class="at-section-label">Halt flag</div>', unsafe_allow_html=True)
     if halted:
         st.error(f"Orchestrator is HALTED. Flag file: `{state.HALT_FLAG}`")
