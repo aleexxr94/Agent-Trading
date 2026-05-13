@@ -1,12 +1,9 @@
 """Schema tests — validate fixtures against schemas/*.schema.json.
 
-Covers the 1–12 position band, all-cash empty case, the 15% per-position cap,
-the option/ETF discriminator, scenario probability shape, and the decision-log
-required fields.
+v2 covers: position, portfolio, signals, view, sanity, decision_log.
 """
 from __future__ import annotations
 
-import copy
 import json
 from pathlib import Path
 
@@ -133,7 +130,7 @@ def test_position_pct_cap_15(registry):
 
 def test_etf_rejects_option_only_field(registry):
     bad = _etf_position()
-    bad["strike"] = 100  # unexpected for ETF
+    bad["strike"] = 100
     with pytest.raises(Exception):
         _validator("position.schema.json", registry).validate(bad)
 
@@ -150,18 +147,13 @@ def test_option_requires_greeks(registry):
 
 @pytest.mark.parametrize("count", [1, 2, 3, 5, 8, 10, 12])
 def test_portfolio_position_band_valid(registry, count):
-    """Position band relaxed from 3-12 → 1-12 — the 3-position floor was
-    suppressing single strong positive-EV trades (e.g. a +26%-EV option) when
-    the rest of the surviving candidate set was too correlated or negative-EV
-    to clear the count rule. Concentration risk is bounded by the per-position
-    15% NAV cap, not by a minimum count."""
+    """1–12 positions allowed; concentration bounded by 15%/position."""
     positions = [_etf_position(symbol=f"AAA{i}", position_pct=5.0) for i in range(count)]
     _validator("portfolio.schema.json", registry).validate(_portfolio(positions))
 
 
 @pytest.mark.parametrize("count", [0, 13])
 def test_portfolio_position_band_rejects_out_of_range(registry, count):
-    """0 positions = use all_cash:true instead. 13+ = beyond the cap."""
     positions = [_etf_position(symbol=f"AAA{i}", position_pct=2.0) for i in range(count)]
     with pytest.raises(Exception):
         _validator("portfolio.schema.json", registry).validate(_portfolio(positions))
@@ -199,93 +191,124 @@ def test_portfolio_mixed_etf_and_option(registry):
     _validator("portfolio.schema.json", registry).validate(_portfolio(positions))
 
 
-# ---------- research.schema ----------
+# ---------- signals.schema (v2) ----------
 
 
-def _research(candidate_overrides=None):
-    side = {
-        "thesis": "x",
-        "key_drivers": ["macro tailwind"],
-        "counterarguments": ["rate shock risk"],
-        "confidence": 0.6,
+def _signals_row(**overrides) -> dict:
+    base = {
+        "symbol": "TQQQ",
+        "kind": "etf",
+        "factor": "nasdaq",
+        "leverage_factor": 3.0,
+        "family": "Nasdaq 3x long",
+        "last_close": 72.45,
+        "adv_30d": 85_000_000,
+        "momentum_30d_pct": 8.4,
+        "momentum_60d_pct": 12.1,
+        "hv_30d_annualised": 0.42,
+        "hv_90d_annualised": 0.38,
+        "dist_from_50d_ma_pct": 4.2,
+        "dist_from_200d_ma_pct": 15.7,
+        "is_optionable": False,
     }
-    candidate = {
+    base.update(overrides)
+    return base
+
+
+def _signals(rows: list[dict] | None = None) -> dict:
+    if rows is None:
+        rows = [_signals_row()]
+    return {
+        "run_id": "rid",
+        "generated_at": "2026-05-13T14:00:00Z",
+        "tickers": rows,
+    }
+
+
+def test_signals_valid(registry):
+    _validator("signals.schema.json", registry).validate(_signals())
+
+
+def test_signals_accepts_null_metrics(registry):
+    """yfinance failures leave numeric fields as null; the schema must
+    accept that (the row also carries an error string so downstream
+    stages can decide whether to skip)."""
+    row = _signals_row(
+        last_close=None, adv_30d=None,
+        momentum_30d_pct=None, momentum_60d_pct=None,
+        hv_30d_annualised=None, hv_90d_annualised=None,
+        dist_from_50d_ma_pct=None, dist_from_200d_ma_pct=None,
+        error="yfinance: 404 not found",
+    )
+    _validator("signals.schema.json", registry).validate(_signals([row]))
+
+
+def test_signals_rejects_unknown_kind(registry):
+    bad = _signals([_signals_row(kind="future")])
+    with pytest.raises(Exception):
+        _validator("signals.schema.json", registry).validate(bad)
+
+
+# ---------- view.schema (v2) ----------
+
+
+def _view_candidate(**overrides) -> dict:
+    base = {
         "symbol": "TQQQ",
         "instrument_kind": "etf",
-        "bull": copy.deepcopy(side),
-        "bear": {**copy.deepcopy(side), "confidence": 0.3, "thesis": "y"},
-        "confidence_delta": 0.3,
-        "abstain": False,
+        "thesis": "Strong momentum_30d_pct=8.4 confirms uptrend.",
+        "confidence": 0.7,
     }
-    if candidate_overrides:
-        candidate.update(candidate_overrides)
-    return {
+    base.update(overrides)
+    return base
+
+
+def _view(candidates: list[dict] | None = None, **overrides) -> dict:
+    base = {
         "run_id": "rid",
-        "generated_at": "2026-05-10T12:00:00Z",
-        "candidates": [candidate],
+        "generated_at": "2026-05-13T14:00:30Z",
+        "regime": "trending_up",
+        "regime_rationale": "Broad equity uptrend across multiple factors.",
+        "candidates": candidates if candidates is not None else [_view_candidate()],
     }
+    base.update(overrides)
+    return base
 
 
-def test_research_valid(registry):
-    _validator("research.schema.json", registry).validate(_research())
+def test_view_valid(registry):
+    _validator("view.schema.json", registry).validate(_view())
 
 
-def test_research_requires_counterarguments(registry):
-    bad = _research()
-    bad["candidates"][0]["bull"]["counterarguments"] = []
+def test_view_zero_candidates_allowed(registry):
+    """Flash-crash regime: strategist may return empty candidate list
+    with regime_rationale explaining the abstain."""
+    v = _view(candidates=[], regime="vol_elevated",
+              regime_rationale="UVXY +40% in session; abstain.")
+    _validator("view.schema.json", registry).validate(v)
+
+
+def test_view_rejects_more_than_6_candidates(registry):
+    v = _view(candidates=[_view_candidate(symbol=f"X{i}") for i in range(7)])
     with pytest.raises(Exception):
-        _validator("research.schema.json", registry).validate(bad)
+        _validator("view.schema.json", registry).validate(v)
 
 
-# ---------- scenarios.schema ----------
-
-
-def _scenarios(option=False):
-    cases = [
-        {"label": "base", "probability": 0.5, "expected_return_pct": 4.0, "narrative": "n"},
-        {"label": "bull", "probability": 0.3, "expected_return_pct": 12.0, "narrative": "n"},
-        {"label": "bear", "probability": 0.2, "expected_return_pct": -8.0, "narrative": "n"},
-    ]
-    candidate = {
-        "symbol": "SPY" if option else "TQQQ",
-        "instrument_kind": "option" if option else "etf",
-        "horizon_days": 30,
-        "cases": cases,
-        "expected_value_pct": 2.5,
-        "option_rationale": None,
-    }
-    if option:
-        candidate["option_rationale"] = {
-            "type": "call",
-            "strike": 530.0,
-            "expiry": "2026-06-19",
-            "dte": 40,
-            "dte_rationale": "Through next CPI + FOMC.",
-            "strike_rationale": "ATM-ish for delta exposure with manageable theta.",
-        }
-    return {
-        "run_id": "rid",
-        "generated_at": "2026-05-10T12:00:00Z",
-        "candidates": [candidate],
-    }
-
-
-def test_scenarios_etf_valid(registry):
-    _validator("scenarios.schema.json", registry).validate(_scenarios())
-
-
-def test_scenarios_option_requires_rationale(registry):
-    bad = _scenarios(option=True)
-    bad["candidates"][0]["option_rationale"] = None
+def test_view_rejects_unknown_regime(registry):
+    v = _view(regime="bull_run_2.0")
     with pytest.raises(Exception):
-        _validator("scenarios.schema.json", registry).validate(bad)
+        _validator("view.schema.json", registry).validate(v)
 
 
-def test_scenarios_requires_three_cases(registry):
-    bad = _scenarios()
-    bad["candidates"][0]["cases"] = bad["candidates"][0]["cases"][:2]
+def test_view_rejects_unknown_instrument_kind(registry):
+    v = _view(candidates=[_view_candidate(instrument_kind="future")])
     with pytest.raises(Exception):
-        _validator("scenarios.schema.json", registry).validate(bad)
+        _validator("view.schema.json", registry).validate(v)
+
+
+def test_view_confidence_in_range(registry):
+    v = _view(candidates=[_view_candidate(confidence=1.5)])
+    with pytest.raises(Exception):
+        _validator("view.schema.json", registry).validate(v)
 
 
 # ---------- decision_log.schema ----------
@@ -294,14 +317,14 @@ def test_scenarios_requires_three_cases(registry):
 def _decision():
     return {
         "run_id": "rid",
-        "stage": "screen",
-        "model": "claude-haiku-4-5-20251001",
+        "stage": "signals",
+        "model": "local-deterministic",
         "inputs_hash": "deadbeefcafebabe",
-        "output_ref": "screen.json",
-        "prompt_cache_hit_pct": 80.0,
-        "cost_usd": 0.04,
-        "started_at": "2026-05-10T12:00:00Z",
-        "ended_at": "2026-05-10T12:00:05Z",
+        "output_ref": "signals.json",
+        "prompt_cache_hit_pct": 0.0,
+        "cost_usd": 0.0,
+        "started_at": "2026-05-13T14:00:00Z",
+        "ended_at": "2026-05-13T14:00:05Z",
         "status": "ok",
         "risk_warning": "PAPER TRADING — leveraged ETFs and options are high-risk.",
     }
@@ -311,11 +334,31 @@ def test_decision_log_valid(registry):
     _validator("decision_log.schema.json", registry).validate(_decision())
 
 
-def test_decision_log_rejects_unknown_stage(registry):
-    bad = _decision()
-    bad["stage"] = "magic"
-    with pytest.raises(Exception):
-        _validator("decision_log.schema.json", registry).validate(bad)
+def test_decision_log_accepts_v2_stages(registry):
+    for stage in ("market_gate", "signals", "strategist", "construct", "execute", "monitor"):
+        d = _decision()
+        d["stage"] = stage
+        _validator("decision_log.schema.json", registry).validate(d)
+
+
+def test_decision_log_accepts_skipped_market_closed(registry):
+    """Market-gate stage logs `skipped_market_closed` when Alpaca clock
+    reports the market is closed — distinct from the generic `skipped`."""
+    d = _decision()
+    d["stage"] = "market_gate"
+    d["status"] = "skipped_market_closed"
+    _validator("decision_log.schema.json", registry).validate(d)
+
+
+def test_decision_log_rejects_v1_stage(registry):
+    """v1 stages (screen, research, chains, scenarios) are gone from
+    the enum — no historical-decision rows with these stage values can
+    be written by the v2 orchestrator."""
+    for stage in ("screen", "research", "chains", "scenarios"):
+        d = _decision()
+        d["stage"] = stage
+        with pytest.raises(Exception):
+            _validator("decision_log.schema.json", registry).validate(d)
 
 
 def test_decision_log_requires_risk_warning(registry):

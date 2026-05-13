@@ -1,24 +1,38 @@
-"""Static universe of tradeable instruments for the screener.
+"""Static universe of tradeable instruments — v2 (15 tickers).
 
-Per CLAUDE.md §System scope:
-  - Leveraged ETFs (2x/3x equity, sector, vol, commodity, crypto-futures)
-  - Listed options on liquid underlyings: the unleveraged index/bond ETFs
-    we include here (SPY, QQQ, IWM, DIA, TLT), plus high-volume leveraged ETFs.
-  - **No spot single-name equities. No unleveraged broad-market ETFs as
-    core positions** — they're entered only via their listed options.
+Trimmed from the v1 33-instrument universe (PR ε predecessor) after the
+LLM pipeline was simplified to a single deterministic-signals stage + one
+LLM constructor call. Fewer candidates means sharper decisions; the v1
+universe produced the same TLT-straddle outcome cycle after cycle, which
+is the failure mode this trim is designed to fix.
 
-This list is curated, not exhaustive. Add/remove entries as the universe
-evolves. The screener still applies liquidity filters strictly — anything
-that fails ADV / spread checks at runtime is rejected even if listed here.
+Universe composition (15):
+  - 5 bull/bear leveraged-ETF pairs (10): Nasdaq, S&P 500, semis,
+    Russell 2000, financials. Each pair covers one factor in both
+    directions — "short Nasdaq" is expressed as long SQQQ, not as a
+    margin short of TQQQ. No actual broker shorts (synthetic only).
+  - 2 solo leveraged ETFs: UVXY (vol), BITX (crypto bull). Different
+    factor space from the equity bull/bear pairs.
+  - 3 option underlyings: SPY, QQQ, TLT. SPY+QQQ for broad-market
+    options (most liquid chains); TLT for rates exposure (no
+    leveraged bond ETF in this universe, so options are the entry).
 
-`factor` is the explicit factor-classification field. Bull/bear pairs of
-the same index share the same `factor` (e.g. TQQQ + SQQQ both → "nasdaq",
-UPRO + SPXU both → "sp500"). Used by:
-  - the screener prompt for diversification ranking across candidates
-  - test_universe_covers_multiple_uncorrelated_factors as the robust
-    metric for "is the universe still single-factor?" (Codex P2 on PR #30
-    flagged that splitting `family` on whitespace was a string-format
-    artifact rather than a real classification).
+Dropped from v1:
+  - Russell 2000 alts (URTY/SRTY) — TNA/TZA already cover the factor
+  - Regional banks (DPST) — no bear pair; redundant with FAS/FAZ broad
+  - Biotech (LABU/LABD), healthcare (CURE), China (YINN/YANG), energy
+    (ERX/ERY), gold miners (NUGT/DUST), nat gas (BOIL), Ether (ETHU),
+    bitcoin alts (BITU/SBIT) — lower ADV; factor-redundant or speculative
+  - IWM, DIA as option underlyings — Russell 2000 is covered via
+    TNA/TZA already; DIA correlates ~99% with SPY.
+
+`factor` is the short factor identifier, shared across bull/bear pairs
+(e.g. TQQQ + SQQQ both → "nasdaq"). Used by:
+  - the strategist prompt for diversification ranking
+  - the constructor prompt to avoid double-loading (e.g. don't pick
+    both QQQ call and TQQQ long — same factor)
+  - test_universe_covers_multiple_uncorrelated_factors as the metric
+    for "is the universe still single-factor?"
 """
 from __future__ import annotations
 
@@ -43,29 +57,18 @@ class UniverseEntry:
 
 
 # Factor classification — short identifiers shared across bull/bear pairs.
-# Adding a new factor here is a deliberate diversification expansion.
 F_NASDAQ      = "nasdaq"
 F_SP500       = "sp500"
 F_SMALL_CAPS  = "small-caps"
 F_SEMIS       = "semis"
 F_FIN_BROAD   = "financials-broad"
-F_FIN_REGNL   = "financials-regional"
-F_BIOTECH     = "biotech"
-F_HEALTHCARE  = "healthcare"
-F_CHINA       = "china"
-F_ENERGY      = "energy"
-F_GOLD_MINERS = "gold-miners"
 F_VOL         = "vol"
-F_NATGAS      = "natgas"
 F_CRYPTO_BTC  = "crypto-btc"
-F_CRYPTO_ETH  = "crypto-eth"
-F_DOW         = "dow"
 F_RATES       = "rates"
 
 
 def _e(symbol: str, kind: InstrumentKind, lev: float, family: str,
         description: str, factor: str) -> UniverseEntry:
-    """Helper to keep entry construction readable below."""
     return UniverseEntry(symbol, kind, lev, family, description, factor)
 
 
@@ -85,10 +88,6 @@ _LEVERAGED_ETFS: tuple[UniverseEntry, ...] = (
        "Direxion Daily Small Cap Bull 3x — 3x daily long Russell 2000", F_SMALL_CAPS),
     _e("TZA",  "etf", -3.0, "Russell 2000 3x short",
        "Direxion Daily Small Cap Bear 3x — 3x daily inverse Russell 2000", F_SMALL_CAPS),
-    _e("URTY", "etf",  3.0, "Russell 2000 3x long (alt)",
-       "ProShares UltraPro Russell2000 — 3x daily long Russell 2000", F_SMALL_CAPS),
-    _e("SRTY", "etf", -3.0, "Russell 2000 3x short (alt)",
-       "ProShares UltraPro Short Russell2000 — 3x daily inverse Russell 2000", F_SMALL_CAPS),
     # ---- Semiconductors ----
     _e("SOXL", "etf",  3.0, "Semis 3x long",
        "Direxion Daily Semiconductor Bull 3x — 3x daily long PHLX Semi", F_SEMIS),
@@ -99,61 +98,23 @@ _LEVERAGED_ETFS: tuple[UniverseEntry, ...] = (
        "Direxion Daily Financial Bull 3x — 3x daily long Russell 1000 Financials", F_FIN_BROAD),
     _e("FAZ",  "etf", -3.0, "Financials 3x short",
        "Direxion Daily Financial Bear 3x — 3x daily inverse Russell 1000 Financials", F_FIN_BROAD),
-    # ---- Regional banks (different factor from broad financials) ----
-    _e("DPST", "etf",  3.0, "Regional Banks 3x long",
-       "Direxion Daily Regional Banks Bull 3x — 3x daily long S&P Regional Banks", F_FIN_REGNL),
-    # ---- Biotech ----
-    _e("LABU", "etf",  3.0, "Biotech 3x long",
-       "Direxion Daily S&P Biotech Bull 3x — 3x daily long S&P Biotech", F_BIOTECH),
-    _e("LABD", "etf", -3.0, "Biotech 3x short",
-       "Direxion Daily S&P Biotech Bear 3x — 3x daily inverse S&P Biotech", F_BIOTECH),
-    # ---- Healthcare ----
-    _e("CURE", "etf",  3.0, "Healthcare 3x long",
-       "Direxion Daily Healthcare Bull 3x — 3x daily long Russell 1000 Healthcare", F_HEALTHCARE),
-    # ---- China ----
-    _e("YINN", "etf",  3.0, "China 3x long",
-       "Direxion Daily FTSE China Bull 3x — 3x daily long FTSE China 50", F_CHINA),
-    _e("YANG", "etf", -3.0, "China 3x short",
-       "Direxion Daily FTSE China Bear 3x — 3x daily inverse FTSE China 50", F_CHINA),
-    # ---- Energy ----
-    _e("ERX",  "etf",  2.0, "Energy 2x long",
-       "Direxion Daily Energy Bull 2x — 2x daily long S&P Energy Select", F_ENERGY),
-    _e("ERY",  "etf", -2.0, "Energy 2x short",
-       "Direxion Daily Energy Bear 2x — 2x daily inverse S&P Energy Select", F_ENERGY),
-    # ---- Gold miners ----
-    _e("NUGT", "etf",  2.0, "Gold Miners 2x long",
-       "Direxion Daily Gold Miners Bull 2x — 2x daily long NYSE Arca Gold Miners", F_GOLD_MINERS),
-    _e("DUST", "etf", -2.0, "Gold Miners 2x short",
-       "Direxion Daily Gold Miners Bear 2x — 2x daily inverse NYSE Arca Gold Miners", F_GOLD_MINERS),
-    # ---- Volatility / commodity ----
+    # ---- Vol / commodity ----
     _e("UVXY", "etf",  1.5, "VIX 1.5x long",
        "ProShares Ultra VIX Short-Term Futures — 1.5x daily long VIX front-month", F_VOL),
-    _e("BOIL", "etf",  2.0, "Natural Gas 2x long",
-       "ProShares Ultra Bloomberg Natural Gas — 2x daily long NatGas futures", F_NATGAS),
-    # ---- Crypto (leveraged-ETF exposure, in-spirit with spec) ----
-    _e("BITX", "etf",  2.0, "Bitcoin 2x long (Volatility Shares)",
+    # ---- Crypto ----
+    _e("BITX", "etf",  2.0, "Bitcoin 2x long",
        "Volatility Shares 2x Bitcoin Strategy ETF — 2x daily long BTC futures", F_CRYPTO_BTC),
-    _e("BITU", "etf",  2.0, "Bitcoin 2x long (ProShares)",
-       "ProShares Ultra Bitcoin Strategy ETF — 2x daily long BTC futures", F_CRYPTO_BTC),
-    _e("SBIT", "etf", -2.0, "Bitcoin 2x short",
-       "ProShares UltraShort Bitcoin Strategy ETF — 2x daily inverse BTC futures", F_CRYPTO_BTC),
-    _e("ETHU", "etf",  2.0, "Ether 2x long",
-       "Volatility Shares 2x Ether ETF — 2x daily long ETH futures", F_CRYPTO_ETH),
 )
 
 
 _OPTION_UNDERLYINGS: tuple[UniverseEntry, ...] = (
-    # SPY/QQQ/IWM share factors with their leveraged-ETF counterparts above —
-    # an option on SPY hits the same underlying factor as UPRO/SPXU. Same for
-    # QQQ↔TQQQ and IWM↔TNA. The constructor uses this to avoid double-loading.
+    # SPY shares factor with UPRO/SPXU; QQQ with TQQQ/SQQQ. The constructor
+    # uses `factor` to avoid double-loading the same factor across an ETF
+    # and an option leg.
     _e("SPY", "option_underlying", 1.0, "S&P 500 ETF",
        "Most liquid options chain in the world", F_SP500),
     _e("QQQ", "option_underlying", 1.0, "Nasdaq-100 ETF",
        "Tech-heavy options chain, very liquid", F_NASDAQ),
-    _e("IWM", "option_underlying", 1.0, "Russell 2000 ETF",
-       "Small-cap options chain", F_SMALL_CAPS),
-    _e("DIA", "option_underlying", 1.0, "Dow Jones Industrial ETF",
-       "Large-cap value tilt — different factor than SPY/QQQ", F_DOW),
     _e("TLT", "option_underlying", 1.0, "20+ Year Treasury Bond ETF",
        "Bond/rates exposure — anti-correlated to equity-long positions", F_RATES),
 )
@@ -173,13 +134,29 @@ def by_symbol(symbol: str) -> UniverseEntry | None:
     return None
 
 
-def metadata_block() -> list[dict]:
-    """Static metadata for every universe entry — kind, leverage, family,
-    description, factor. Combined with live data from market_data.universe_snapshot()
-    to form the full universe block sent to the screener.
+def factor_pair(symbol: str) -> tuple[str | None, str | None]:
+    """Given a symbol, return (bull_symbol, bear_symbol) for its factor.
 
-    The `factor` field is what the screener uses to enforce cross-factor
-    breadth on the `passed` list."""
+    Used by the strategist prompt to surface the "go short on factor X"
+    option without making the LLM guess the right ticker. For factors
+    with no bear pair (vol, crypto-btc, rates), bear_symbol is None.
+    """
+    entry = by_symbol(symbol)
+    if entry is None:
+        return None, None
+    bull = bear = None
+    for e in UNIVERSE:
+        if e.factor == entry.factor and e.kind == "etf":
+            if e.leverage_factor > 0:
+                bull = e.symbol
+            elif e.leverage_factor < 0:
+                bear = e.symbol
+    return bull, bear
+
+
+def metadata_block() -> list[dict]:
+    """Static metadata for every universe entry — used by lib.signals to
+    decorate the deterministic feature rows it computes per ticker."""
     return [
         {
             "symbol": e.symbol,

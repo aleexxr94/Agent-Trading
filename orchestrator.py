@@ -1,22 +1,28 @@
-"""5-stage pipeline entrypoint.
+"""v2 pipeline entrypoint.
 
 Stages:
-  1. screen      → state/runs/{run_id}/screen.json   (Haiku)
-  2. research    → state/runs/{run_id}/research.json (Sonnet — bull+bear in parallel per candidate)
-  3. chains      → state/runs/{run_id}/chains.json   (Alpaca data — real bid/ask/IV/delta per option underlying)
-  4. scenarios   → state/runs/{run_id}/scenarios.json (Sonnet)
-  5. construct   → state/runs/{run_id}/portfolio.json (Opus, 1–12 or all-cash)
-  6. execute     → submit paper orders, write state/next_run.json
+  0. market_gate → state/runs/{run_id}/market_gate.json (Alpaca clock, $0)
+  1. signals     → state/runs/{run_id}/signals.json     (deterministic Python, $0)
+  2. strategist  → state/runs/{run_id}/view.json        (Sonnet 4.6, ~$0.05)
+  3. construct   → state/runs/{run_id}/portfolio.json   (Opus 4.7, ~$0.20)
+  4. sanity      → state/runs/{run_id}/sanity.json      (deterministic, $0)
+  5. execute     → state/runs/{run_id}/orders.json + next_run.json (Alpaca paper, $0)
 
-`--dry-run` reads from tests/fixtures/* (no LLM, no orders). Live mode calls
-lib.llm.structured_call per stage with prompt-cached system blocks.
+v1 → v2 migration: the bull/bear research stages, the chains stage, and
+the scenarios stage were collapsed into a single deterministic signals
+table + a single strategist LLM call. Per-cycle LLM cost dropped from
+~$1.50–2.50 to ~$0.25. The construct stage still owns position selection
++ sizing + kill-condition tailoring on Opus 4.7.
+
+``--dry-run`` reads from tests/fixtures/* (no LLM, no orders, no broker).
+Live mode loads AlpacaBroker, calls the market gate, then runs the
+pipeline.
 
 Live trading is gated by LIVE_VERSION + LIVE_TRADING_ENABLED — see spec.
 """
 from __future__ import annotations
 
 import argparse
-import asyncio
 import hashlib
 import json
 import os
@@ -26,8 +32,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # Load .env so manual `python orchestrator.py` invocations pick up API keys.
-# systemd services use EnvironmentFile= and don't strictly need this, but it
-# makes operator smoke runs from the shell work without a separate `source`.
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
@@ -35,7 +39,7 @@ except ImportError:
     pass
 from typing import Callable
 
-from lib import llm, market_data, risk, sanity, stages, state, universe
+from lib import llm, market_gate, risk, sanity, signals, stages, state
 from lib.broker import Broker
 
 ROOT = Path(__file__).resolve().parent
@@ -69,8 +73,9 @@ def _load_fixture(name: str) -> dict:
 
 
 def _system_blocks(cfg: stages.StageConfig) -> list[dict]:
-    """Cache the (large, stable) prompt as the cached prefix; let the run-specific
-    user message be the volatile suffix. One ephemeral breakpoint per stage."""
+    """Cache the (large, stable) prompt as the cached prefix; let the
+    run-specific user message be the volatile suffix. One ephemeral
+    breakpoint per stage."""
     return [
         {
             "type": "text",
@@ -81,8 +86,8 @@ def _system_blocks(cfg: stages.StageConfig) -> list[dict]:
 
 
 def _schema_ref_registry() -> dict[str, dict]:
-    """Build a $id → schema map from schemas/*.schema.json so external $refs
-    can be inlined by lib.llm.sanitize_schema_for_structured_output."""
+    """Build a $id → schema map from schemas/*.schema.json so external
+    $refs can be inlined by lib.llm.sanitize_schema_for_structured_output."""
     registry: dict[str, dict] = {}
     for path in (ROOT / "schemas").glob("*.schema.json"):
         s = json.loads(path.read_text())
@@ -92,15 +97,7 @@ def _schema_ref_registry() -> dict[str, dict]:
 
 
 def _output_config(cfg: stages.StageConfig) -> dict | None:
-    """Merge stage effort (if any) with structured-output format (if schema set).
-
-    Anthropic's structured-outputs feature only accepts a restricted JSON
-    Schema subset — numerical / string / array constraints, conditional
-    if/then/else, and external $ref URIs are rejected with a 400. The full
-    schema still drives local validation via lib.state.validate(); only the
-    network-bound copy is sanitized + inlined. See
-    lib.llm.sanitize_schema_for_structured_output.
-    """
+    """Merge stage effort with structured-output format (if schema set)."""
     out: dict = dict(cfg.output_config_extras)
     if cfg.schema_filename:
         full = json.loads((ROOT / "schemas" / cfg.schema_filename).read_text())
@@ -123,16 +120,27 @@ class StageContext:
 # ----- per-stage runners -----
 
 
-def stage_screen(ctx: StageContext) -> dict:
+def stage_signals(ctx: StageContext) -> dict:
+    """Deterministic feature table for the v2 universe. $0 cost.
+
+    In dry-run mode loads the test fixture; otherwise calls
+    lib.signals.compute_signals which hits yfinance for each ticker.
+    """
     if ctx.dry_run:
-        return _load_fixture("screen.json")
-    cfg = stages.screener()
-    # Fetch live ADV / HV / price for every entry in the static universe.
-    # Per-symbol failures surface as {error: ...} rows rather than crashing.
-    snapshot = market_data.universe_snapshot(
-        universe.all_symbols(), run_id=ctx.run_id
-    )
-    universe_block = json.dumps(snapshot, separators=(",", ":"))
+        out = _load_fixture("signals.json")
+        out["run_id"] = ctx.run_id
+        return out
+    return signals.compute_signals(run_id=ctx.run_id)
+
+
+def stage_strategist(ctx: StageContext, signals_out: dict) -> dict:
+    """One LLM call — Sonnet 4.6, ~$0.05. Reads signals.json, emits
+    view.json with regime classification + 0-6 ranked candidates."""
+    if ctx.dry_run:
+        out = _load_fixture("view.json")
+        out["run_id"] = ctx.run_id
+        return out
+    cfg = stages.strategist()
     res = llm.structured_call(llm.StageCall(
         run_id=ctx.run_id,
         stage=cfg.stage,
@@ -141,298 +149,9 @@ def stage_screen(ctx: StageContext) -> dict:
         user_messages=[{
             "role": "user",
             "content": (
-                f"Screen this universe for the current session. "
-                f"UTC: {state.utcnow_iso()}\n\n"
-                f"Universe data (last_close in USD, adv_30d in shares, "
-                f"hv_30d_annualised as decimal e.g. 0.45 = 45%):\n"
-                f"{universe_block}\n\n"
-                f"Apply liquidity filters strictly against these numbers, "
-                f"not training-data priors. Return JSON only."
-            ),
-        }],
-        schema_filename=None,
-        max_tokens=cfg.max_tokens,
-        thinking=cfg.thinking,
-        output_config=_output_config(cfg),
-    ))
-    # Best-effort JSON parse (Haiku, no schema). Strip any ```json fences the
-    # model added despite the "JSON only — no markdown fences" prompt: without
-    # this, the bare json.loads fails and every candidate gets dumped into a
-    # silent `raw` envelope — downstream stages see {"passed": []} and the
-    # agent abstains to all-cash even though the screener found candidates.
-    try:
-        parsed = json.loads(llm.strip_markdown_fences(res.raw_text))
-    except json.JSONDecodeError:
-        parsed = {
-            "generated_at": state.utcnow_iso(),
-            "raw": res.raw_text,
-            "passed": [],
-            "rejected": [],
-        }
-    # Attach a side-table of spot prices keyed by symbol. The chain stage
-    # downstream uses this to set its ATM band without re-fetching yfinance
-    # AND without relying on Haiku to echo `last_close` per passed row.
-    # Observed regression 2026-05-12T21:40 paper run: Haiku omitted the
-    # `last_close` field on each passed entry, so stage_chains' lookup
-    # found None for every option underlying and skipped every chain fetch.
-    parsed["spot_prices"] = {
-        row["symbol"]: row["last_close"]
-        for row in snapshot
-        if row.get("symbol") and isinstance(row.get("last_close"), (int, float))
-        and row["last_close"] > 0
-    }
-    return parsed
-
-
-async def _research_one(ctx: StageContext, candidate: dict) -> dict:
-    """One candidate: bull and bear in parallel, merged into a research candidate row."""
-    bull_cfg = stages.bull()
-    bear_cfg = stages.bear()
-
-    user_msg = {
-        "role": "user",
-        "content": (
-            f"Candidate: {json.dumps(candidate, sort_keys=True)}\n"
-            f"Run id: {ctx.run_id}\n"
-            "Return JSON only matching {thesis, key_drivers, counterarguments, confidence}."
-        ),
-    }
-
-    async def _call(cfg: stages.StageConfig):
-        # Anthropic SDK sync call — wrap in to_thread for parallel execution.
-        return await asyncio.to_thread(
-            llm.structured_call,
-            llm.StageCall(
-                run_id=ctx.run_id,
-                stage=cfg.stage,
-                model=cfg.model,
-                system_blocks=_system_blocks(cfg),
-                user_messages=[user_msg],
-                schema_filename=None,
-                max_tokens=cfg.max_tokens,
-                thinking=cfg.thinking,
-                output_config=_output_config(cfg),
-            ),
-        )
-
-    bull_res, bear_res = await asyncio.gather(_call(bull_cfg), _call(bear_cfg))
-
-    def _parse(r) -> dict:
-        # Same defensive fence-stripping as stage_screen — Sonnet too will
-        # occasionally wrap its JSON in ```json fences despite the prompt.
-        try:
-            return json.loads(llm.strip_markdown_fences(r.raw_text))
-        except json.JSONDecodeError:
-            return {"thesis": r.raw_text[:200], "key_drivers": ["[parse_failed]"],
-                    "counterarguments": ["[parse_failed]"], "confidence": 0.0}
-
-    bull = _parse(bull_res)
-    bear = _parse(bear_res)
-    return {
-        "symbol": candidate.get("symbol", "?"),
-        "instrument_kind": (
-            "option" if candidate.get("kind") == "option_underlying" else "etf"
-        ),
-        "bull": bull,
-        "bear": bear,
-        "confidence_delta": float(bull.get("confidence", 0)) - float(bear.get("confidence", 0)),
-        "abstain": bull.get("confidence", 0) < 0.3 and bear.get("confidence", 0) < 0.3,
-    }
-
-
-RESEARCH_CANDIDATE_CAP = 10            # total candidates that fan into bull+bear research
-RESEARCH_OPTION_UNDERLYING_CAP = 5     # max option underlyings (full SPY/QQQ/IWM/DIA/TLT set)
-
-
-def _select_research_candidates(passed: list[dict]) -> list[dict]:
-    """Pick which of the screener's `passed` rows go into bull+bear research.
-
-    Prioritises option underlyings (SPY/QQQ/IWM/DIA/TLT) so they never get
-    cut by a "first 8" slice that the screener happened to fill with ETFs.
-    In high-vol / extended-market regimes, defined-risk long puts on those
-    underlyings are frequently the only positive-EV plays — the constructor
-    can only consider candidates that survive this stage's cap.
-    """
-    options = [c for c in passed if c.get("kind") == "option_underlying"]
-    etfs    = [c for c in passed if c.get("kind") != "option_underlying"]
-    options = options[:RESEARCH_OPTION_UNDERLYING_CAP]
-    etfs    = etfs[: max(0, RESEARCH_CANDIDATE_CAP - len(options))]
-    return options + etfs
-
-
-def stage_research(ctx: StageContext, screen: dict) -> dict:
-    if ctx.dry_run:
-        out = _load_fixture("research.json")
-        out["run_id"] = ctx.run_id
-        return out
-    candidates = _select_research_candidates(screen.get("passed", []))
-
-    async def _gather():
-        return await asyncio.gather(*[_research_one(ctx, c) for c in candidates])
-
-    rows = asyncio.run(_gather()) if candidates else []
-    return {
-        "run_id": ctx.run_id,
-        "generated_at": state.utcnow_iso(),
-        "candidates": rows,
-    }
-
-
-def _option_underlyings_from_research(research: dict) -> list[str]:
-    """Pick the candidates marked as option plays. The research stage emits
-    ``instrument_kind: "option"`` for option underlyings (mirroring the
-    screener's ``kind: "option_underlying"`` flag); ETFs use
-    ``instrument_kind: "etf"``."""
-    out: list[str] = []
-    for c in research.get("candidates") or []:
-        if c.get("abstain"):
-            continue
-        if c.get("instrument_kind") == "option":
-            sym = c.get("symbol") or c.get("underlying")
-            if sym:
-                out.append(sym)
-    return out
-
-
-def _spot_lookup_from_screen(screen: dict) -> dict[str, float]:
-    """Build {symbol: last_close} from screen output so the chain stage can
-    set its ATM band without re-hitting yfinance.
-
-    Priority:
-      1. ``screen["spot_prices"]`` — explicit side-table populated by
-         stage_screen from the universe snapshot. This is the canonical
-         source: independent of whether Haiku chose to echo `last_close`
-         per row in its JSON output. Added after a 2026-05-12 paper run
-         where Haiku omitted the field on every passed row and the chain
-         stage skipped every fetch with "no spot price available".
-      2. ``passed[i].last_close`` / ``failed[i].last_close`` — legacy
-         path for older screen artifacts that don't carry spot_prices.
-
-    Falls back to None for symbols with no usable spot; the chain stage
-    skips those underlyings.
-    """
-    out: dict[str, float] = {}
-    # Preferred: explicit side-table.
-    spot_prices = screen.get("spot_prices") or {}
-    for sym, lc in spot_prices.items():
-        if isinstance(lc, (int, float)) and lc > 0:
-            out[sym] = float(lc)
-    # Fallback: per-row last_close (legacy / fixture path).
-    for c in (screen.get("passed") or []) + (screen.get("failed") or []):
-        sym = c.get("symbol")
-        lc = c.get("last_close")
-        if sym and sym not in out and isinstance(lc, (int, float)) and lc > 0:
-            out[sym] = float(lc)
-    return out
-
-
-def stage_chains(
-    ctx: StageContext, research: dict, screen: dict | None = None,
-) -> dict:
-    """Fetch live Alpaca option chains for every option-underlying candidate.
-
-    Phase 9b fix for the May 11 2026 SPY-565P incident: the scenarios
-    agent was pricing premiums and IVs from training-data priors, which
-    on a small paper account ran 5-10x off real market (agent said
-    $3.50; fill was $0.61). This stage runs BEFORE scenarios so the
-    next prompt can include real bid/ask/IV/greeks per strike.
-
-    Per-underlying failures are isolated — we record the error in the
-    artifact and continue. If every underlying fails we still emit a
-    chains.json with empty ``underlyings`` so the scenarios stage knows
-    no live chain context is available and can fall back gracefully.
-
-    Dry-run: load tests/fixtures/chains.json if present; otherwise emit
-    an empty stub. The fixture is regenerated when the chain shape
-    changes — keep tests/fixtures/chains.json in sync with PR #50's
-    ``summarise_chain`` shape.
-    """
-    if ctx.dry_run:
-        # Fixture is optional — older fixtures predate this stage. Fall back
-        # to an empty stub rather than crashing dry-runs that don't include it.
-        try:
-            out = _load_fixture("chains.json")
-            out["run_id"] = ctx.run_id
-            return out
-        except FileNotFoundError:
-            return {
-                "run_id": ctx.run_id,
-                "generated_at": state.utcnow_iso(),
-                "underlyings": {},
-            }
-
-    from datetime import date as _date
-    from lib import options_chain
-
-    underlyings = _option_underlyings_from_research(research)
-    spots = _spot_lookup_from_screen(screen or {})
-    today = _date.today()
-
-    out: dict = {
-        "run_id": ctx.run_id,
-        "generated_at": state.utcnow_iso(),
-        "underlyings": {},
-    }
-    if not underlyings:
-        return out
-
-    # Lazy fetcher construction so an all-spots-missing run doesn't burn an
-    # AlpacaBroker init (which requires API keys + a successful SDK import).
-    fetcher: options_chain.ChainFetcher | None = None
-
-    for sym in underlyings:
-        spot = spots.get(sym)
-        if spot is None:
-            out["underlyings"][sym] = {
-                "error": "no spot price available from screen — chain skip",
-            }
-            continue
-        if fetcher is None:
-            fetcher = options_chain.ChainFetcher()
-        try:
-            summary = fetcher.fetch(sym, spot=spot, today=today)
-            out["underlyings"][sym] = summary
-        except options_chain.ChainFetchError as e:
-            out["underlyings"][sym] = {"error": str(e)}
-        except Exception as e:
-            # Defensive — fetcher already wraps known failure modes as
-            # ChainFetchError. Unexpected exceptions get the same soft-fail
-            # treatment so a misbehaving SDK can't take down the whole cycle.
-            out["underlyings"][sym] = {
-                "error": f"unexpected {type(e).__name__}: {e}"
-            }
-    return out
-
-
-def stage_scenarios(ctx: StageContext, research: dict, chains: dict | None = None) -> dict:
-    if ctx.dry_run:
-        out = _load_fixture("scenarios.json")
-        out["run_id"] = ctx.run_id
-        return out
-    cfg = stages.scenarios()
-    chains_block = ""
-    if chains and chains.get("underlyings"):
-        chains_block = (
-            "\n\nLive option chains (Alpaca, ATM band ±25%, DTE 14–75, "
-            "spread ≤25%). Use THESE bid/ask/iv/delta/dte values as the "
-            "ground truth for option picks — NOT training-data priors:\n"
-            f"{json.dumps(chains.get('underlyings'), sort_keys=True)}\n"
-            "When picking strike + expiry for an option_rationale, pick "
-            "from this chain. premium_paid should equal the mid (or ask "
-            "for a market buy) of the selected OSI row."
-        )
-    res = llm.structured_call(llm.StageCall(
-        run_id=ctx.run_id,
-        stage=cfg.stage,
-        model=cfg.model,
-        system_blocks=_system_blocks(cfg),
-        user_messages=[{
-            "role": "user",
-            "content": (
-                f"Research summary: {json.dumps(research, sort_keys=True)}\n"
-                f"Run id: {ctx.run_id}"
-                f"{chains_block}\n"
-                "Return JSON conforming to scenarios.schema.json."
+                f"Signals: {json.dumps(signals_out, sort_keys=True)}\n"
+                f"Run id: {ctx.run_id}\n"
+                "Return JSON conforming to view.schema.json."
             ),
         }],
         schema_filename=cfg.schema_filename,
@@ -443,7 +162,9 @@ def stage_scenarios(ctx: StageContext, research: dict, chains: dict | None = Non
     return res.payload
 
 
-def stage_construct(ctx: StageContext, scenarios_out: dict) -> dict:
+def stage_construct(ctx: StageContext, signals_out: dict, view: dict) -> dict:
+    """One LLM call — Opus 4.7, ~$0.20. Reads signals + view; emits the
+    final portfolio.json with positions, sizing, kill conditions."""
     if ctx.dry_run:
         out = _load_fixture("portfolio.json")
         out["run_id"] = ctx.run_id
@@ -458,7 +179,8 @@ def stage_construct(ctx: StageContext, scenarios_out: dict) -> dict:
         user_messages=[{
             "role": "user",
             "content": (
-                f"Scenarios: {json.dumps(scenarios_out, sort_keys=True)}\n"
+                f"Signals: {json.dumps(signals_out, sort_keys=True)}\n"
+                f"Strategist view: {json.dumps(view, sort_keys=True)}\n"
                 f"NAV (USD): {nav:.2f}\n"
                 f"Run id: {ctx.run_id}\n"
                 "Return JSON conforming to portfolio.schema.json."
@@ -473,9 +195,8 @@ def stage_construct(ctx: StageContext, scenarios_out: dict) -> dict:
 
 
 def _account_nav(ctx: StageContext) -> float:
-    # Alpaca paper accounts ship with $100k by default. The $2.5k experimental
-    # notional in CLAUDE.md is what sizing must respect — VIRTUAL_NAV_USD lets
-    # the operator pin the agent to a smaller notional than the broker reports.
+    """$2.5k notional override unless VIRTUAL_NAV_USD set or broker
+    reports a different equity figure. Same as v1."""
     override = os.environ.get("VIRTUAL_NAV_USD")
     if override:
         try:
@@ -491,50 +212,38 @@ def _account_nav(ctx: StageContext) -> float:
 
 
 def _default_next_run_at(portfolio: dict) -> str:
-    """Heuristic next-run cadence — used as the fallback when the
-    orchestrator-meta LLM call doesn't return a usable timestamp:
-       - all-cash: 6 hours (no urgency — just sample the universe again)
-       - positions held: 4 hours (faster, to monitor kill conditions)
-    Both well above rate-limit windows, both produce a strictly future
-    timestamp so systemd-run will accept the schedule."""
+    """Heuristic fallback cadence — used when the meta LLM output is
+    unusable or the path is dry-run.
+      - all-cash: 6 hours (no urgency — just sample the universe again)
+      - positions held: 4 hours (faster, to monitor kill conditions)
+
+    Market-gate handles weekend/holiday skipping upstream; this default
+    is only the "open and operating normally" floor.
+    """
     from datetime import timedelta
     hours = 6 if portfolio.get("all_cash") else 4
     return (state.utcnow() + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# Orchestrator-meta runs after construct and decides cadence. Hard bounds
-# match the prompt — any returned timestamp outside this window falls back
-# to the heuristic.
+# Orchestrator-meta returns a next-run timestamp; bounds enforced here.
 META_MIN_HOURS = 1.0
 META_MAX_HOURS = 24.0
-
-# Tolerance applied to both bounds, accounting for:
-#   - second-precision ISO output ('YYYY-MM-DDTHH:MM:SSZ') vs microsecond `now`
-#     (model's "1 hour from now" rounds down to whole seconds, making the
-#     delta come in at 0.9998h)
-#   - LLM round-trip latency between captured `now` and the response
-#   - small clock drift between this host and the model's reference time
-#
-# 30 seconds is invisible at hour-scale cadence but absorbs all three.
-# Without it, the documented minimum (1h) is systematically rejected — see
-# Codex review on PR #19.
+# Tolerance absorbs second-precision rounding + LLM round-trip latency.
 META_BOUND_TOLERANCE_SECONDS = 30.0
 
 
 def _compute_next_run_at(
-    *, ctx: StageContext, portfolio: dict, scenarios_out: dict,
+    *, ctx: StageContext, portfolio: dict, view: dict,
 ) -> tuple[str, str]:
     """Ask the orchestrator-meta agent for a regime-adaptive cadence.
 
-    Returns (next_run_at_iso, rationale). On any failure — schema retry
-    blown, JSON malformed, timestamp out of bounds, or `ctx.dry_run=True`
-    — falls back to `_default_next_run_at(portfolio)` with an explanatory
-    rationale. Never propagates exceptions to the caller.
+    Returns (next_run_at_iso, rationale). On any failure falls back to
+    `_default_next_run_at(portfolio)` with an explanatory rationale.
     """
     if ctx.dry_run:
         return _default_next_run_at(portfolio), "dry-run: heuristic only"
 
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timezone
     cfg = stages.orchestrator_meta()
     now = state.utcnow()
     nav_history = state.read_nav_history(limit=3)
@@ -548,10 +257,9 @@ def _compute_next_run_at(
             f"  all_cash: {portfolio.get('all_cash', False)}\n"
             f"  nav_usd: {portfolio.get('nav_usd', 0.0):.2f}\n"
             f"  cash_buffer_pct: {portfolio.get('cash_buffer_pct', 0.0):.1f}\n"
+            f"Strategist regime: {view.get('regime', 'unknown')}\n"
             f"Recent NAV history (last {len(nav_history)} rows):\n"
-            f"  {json.dumps(nav_history, separators=(',', ':'))}\n"
-            f"Scenarios horizon hints:\n"
-            f"  {json.dumps([{'symbol': c.get('symbol'), 'horizon_days': c.get('horizon_days')} for c in scenarios_out.get('candidates', [])], separators=(',', ':'))}\n\n"
+            f"  {json.dumps(nav_history, separators=(',', ':'))}\n\n"
             "Choose the next-run window. Return JSON only."
         ),
     }
@@ -571,7 +279,6 @@ def _compute_next_run_at(
     except Exception as e:
         return _default_next_run_at(portfolio), f"meta call failed ({type(e).__name__}); using heuristic"
 
-    # Sanity-check the returned timestamp before we trust it.
     try:
         at = datetime.strptime(payload["next_run_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except Exception:
@@ -587,26 +294,28 @@ def _compute_next_run_at(
             f"using heuristic"
         )
 
-    rationale = (payload.get("rationale") or "")[:300]  # cap length so it stays log-friendly
+    rationale = (payload.get("rationale") or "")[:300]
     return payload["next_run_at"], f"orchestrator-meta: {rationale}"
 
 
-def stage_execute(ctx: StageContext, portfolio: dict, scenarios_out: dict | None = None) -> dict:
-    """Submit paper orders to converge actual positions on `portfolio`, then plan
-    the next run. Order submission is a no-op when broker is None."""
-    scenarios_out = scenarios_out or {"candidates": []}
+def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) -> dict:
+    """Submit paper orders to converge actual positions on `portfolio`,
+    then plan the next run. Order submission is a no-op when broker is
+    None or ORDERS_ENABLED is false.
+
+    The order-delta computation in lib.orders enforces the v2 safety
+    invariant: orders never cross zero (no long→short flips via a
+    single sell). Closes are submitted before opens to free up cash.
+    """
+    view = view or {"candidates": []}
     next_at, meta_rationale = _compute_next_run_at(
-        ctx=ctx, portfolio=portfolio, scenarios_out=scenarios_out,
+        ctx=ctx, portfolio=portfolio, view=view,
     )
     next_run = {
         "run_id": ctx.run_id,
         "next_run_at": next_at,
         "rationale": meta_rationale,
     }
-    # Order submission — gated behind ORDERS_ENABLED=true env var. Default
-    # OFF so this code can ride to main behind a flag and the operator opts
-    # in explicitly (the spec mandates paper-only and every iteration before
-    # promotion has to be deliberate).
     from lib import orders
     next_run["orders_enabled"] = orders.is_enabled()
     if (
@@ -632,20 +341,11 @@ def stage_execute(ctx: StageContext, portfolio: dict, scenarios_out: dict | None
                     "qty": r.qty,
                     "side": r.side,
                     "status": r.status,
-                    # Phase 2 per-trade PnL: surface broker_order_id so the
-                    # activities sync (lib/trades_sync.sync_fills_from_alpaca)
-                    # can attribute each fill to this run via the
-                    # order_id_to_run_id map built by
-                    # lib/trades_sync.order_id_to_run_id_from_runs.
                     "broker_order_id": r.broker_order_id,
                 }
                 for r in results
             ],
         }
-        # Per-run orders index — read by lib/trades_sync to build the
-        # order_id_to_run_id map without re-parsing the full decisions log.
-        # Atomic JSON write so concurrent dashboard reads always see a
-        # complete file (state.write_json uses a tmp+rename).
         accepted_order_ids = [
             r.broker_order_id for r in results
             if r.broker_order_id and not r.status.startswith(("error", "skipped"))
@@ -661,13 +361,8 @@ def stage_execute(ctx: StageContext, portfolio: dict, scenarios_out: dict | None
 
         # Pull fills + fees back from Alpaca and append to trades.jsonl so
         # the dashboard's per-trade PnL + fees chart reflect actual broker
-        # activity. Run EVERY cycle that reaches stage_execute with a broker
-        # connection — not just cycles that submitted new orders. Codex P1
-        # caught the earlier `if accepted_order_ids` gate: it would miss
-        # fills from prior cycles' orders that filled late (partials, slow
-        # routing, out-of-hours fills) and leave trades.jsonl stale until
-        # another new order happened to fire. The sync is idempotent (PR
-        # #52: known_ids dedupe) so re-running every cycle is cheap.
+        # activity. Run EVERY cycle that reaches stage_execute (idempotent
+        # via known_ids dedupe).
         try:
             from lib import trades_sync
             trades_sync.sync_fills_from_alpaca(
@@ -675,17 +370,15 @@ def stage_execute(ctx: StageContext, portfolio: dict, scenarios_out: dict | None
                 order_id_to_run_id=trades_sync.order_id_to_run_id_from_runs(),
             )
         except Exception as e:
-            # Failures are soft — sync is best-effort and the next cycle's
-            # sync will pick up missed fills. Label lands on next_run.json
-            # so the dashboard Agent Logs tab can surface persistent errors.
             next_run["trades_sync_error"] = (
                 f"sync_fills_from_alpaca: {type(e).__name__}: {e}"
             )
     if not ctx.dry_run:
         state.write_json(state.NEXT_RUN, next_run)
-        # NAV history: one row per run for the dashboard equity curve.
-        # Marks aren't wired in yet, so gross/net P&L only includes the
-        # modelled-cost entry-leg estimate. Real marks land in Phase 10a.
+        # NAV history: one row per cycle for the dashboard equity curve.
+        # Marks aren't wired here — gross/net P&L includes the modelled-
+        # cost entry-leg estimate only. Real marks come through the
+        # broker-position path in lib/marks.py.
         from lib import pnl as pnl_lib
         breakdown = pnl_lib.compute_portfolio_pnl(portfolio=portfolio, marks=None)
         state.append_nav({
@@ -749,75 +442,81 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
     rid = run_id or state.new_run_id()
     ctx = StageContext(run_id=rid, dry_run=dry_run, broker=broker)
 
-    screen_model = "fixture" if dry_run else stages.screener().model
-    research_model = "fixture" if dry_run else stages.bull().model
-    scen_model = "fixture" if dry_run else stages.scenarios().model
+    # ----- Stage 0: market gate -----
+    # Dry-run skips the gate (no broker); live mode calls Alpaca's clock.
+    # If markets are closed we write market_gate.json + a closed-market
+    # next_run.json pointing at the broker-reported next-open, then exit.
+    # Zero LLM cost on a closed-market cycle.
+    if not dry_run:
+        ms = market_gate.check(broker)
+        if not ms.is_open:
+            nr = market_gate.write_closed_artifacts(rid, ms)
+            state.write_json(state.NEXT_RUN, nr)
+            state.append_decision({
+                "run_id": rid,
+                "stage": "market_gate",
+                "model": "local-deterministic",
+                "inputs_hash": _hash_inputs(rid),
+                "output_ref": "market_gate.json",
+                "prompt_cache_hit_pct": 0.0,
+                "cost_usd": 0.0,
+                "started_at": state.utcnow_iso(),
+                "ended_at": state.utcnow_iso(),
+                "status": "skipped_market_closed",
+                "risk_warning": RISK_WARNING,
+            })
+            return {
+                "run_id": rid,
+                "market_gate": {"is_open": False, "next_open": ms.next_open},
+                "next_run": nr,
+            }
+        # Market is open: persist the gate result for the dashboard.
+        state.write_json(state.run_dir(rid) / "market_gate.json", {
+            "run_id": rid,
+            "generated_at": state.utcnow_iso(),
+            "is_open": True,
+            "next_open": None,
+            "rationale": ms.rationale,
+        })
+
+    strat_model = "fixture" if dry_run else stages.strategist().model
     cons_model = "fixture" if dry_run else stages.constructor().model
 
-    screen = _run_stage(
-        ctx=ctx, stage_id="screen", schema="", output_filename="screen.json",
-        runner=lambda: stage_screen(ctx),
-        inputs_hash_parts=(rid,), model=screen_model,
+    # ----- Stage 1: signals (deterministic) -----
+    signals_out = _run_stage(
+        ctx=ctx, stage_id="signals", schema="signals.schema.json",
+        output_filename="signals.json",
+        runner=lambda: stage_signals(ctx),
+        inputs_hash_parts=(rid,),
+        model="local-deterministic",
     )
-    research = _run_stage(
-        ctx=ctx, stage_id="research", schema="research.schema.json",
-        output_filename="research.json",
-        runner=lambda: stage_research(ctx, screen),
-        inputs_hash_parts=(rid, json.dumps(screen, sort_keys=True)),
-        model=research_model,
+
+    # ----- Stage 2: strategist (1 LLM call) -----
+    view = _run_stage(
+        ctx=ctx, stage_id="strategist", schema="view.schema.json",
+        output_filename="view.json",
+        runner=lambda: stage_strategist(ctx, signals_out),
+        inputs_hash_parts=(rid, json.dumps(signals_out, sort_keys=True)),
+        model=strat_model,
     )
-    # Phase 9b: real option chains fetched from Alpaca BEFORE scenarios so
-    # the scenarios agent prices off ground-truth bid/ask/IV/delta, not
-    # training-data priors that ran 5-10× off real market (May 11 2026
-    # SPY-565P regression). Per-underlying failures don't abort; scenarios
-    # degrades to "no chain context for X" and falls back to priors only
-    # where chain data is missing.
-    chains = _run_stage(
-        ctx=ctx, stage_id="chains", schema="",
-        output_filename="chains.json",
-        runner=lambda: stage_chains(ctx, research, screen=screen),
-        # Codex P2 on PR #57: chains stage consumes spot prices from screen
-        # (via _spot_lookup_from_screen). Without screen in the hash, two
-        # runs with identical research but different last_close would log
-        # the same inputs_hash even though the fetched chain set and
-        # downstream scenarios can differ — breaking the audit trail.
-        inputs_hash_parts=(
-            rid,
-            json.dumps(research, sort_keys=True),
-            json.dumps(screen, sort_keys=True),
-        ),
-        model="alpaca-data",
-    )
-    scenarios_out = _run_stage(
-        ctx=ctx, stage_id="scenarios", schema="scenarios.schema.json",
-        output_filename="scenarios.json",
-        runner=lambda: stage_scenarios(ctx, research, chains=chains),
-        inputs_hash_parts=(
-            rid,
-            json.dumps(research, sort_keys=True),
-            json.dumps(chains, sort_keys=True),
-        ),
-        model=scen_model,
-    )
+
+    # ----- Stage 3: construct (1 LLM call) -----
     portfolio = _run_stage(
         ctx=ctx, stage_id="construct", schema="portfolio.schema.json",
         output_filename="portfolio.json",
-        runner=lambda: stage_construct(ctx, scenarios_out),
-        inputs_hash_parts=(rid, json.dumps(scenarios_out, sort_keys=True)),
+        runner=lambda: stage_construct(ctx, signals_out, view),
+        inputs_hash_parts=(
+            rid,
+            json.dumps(signals_out, sort_keys=True),
+            json.dumps(view, sort_keys=True),
+        ),
         model=cons_model,
     )
     if not risk.position_band_ok(len(portfolio["positions"]), portfolio["all_cash"]):
         raise RuntimeError("portfolio violates 1–12 band / all-cash invariant")
 
-    # Deterministic post-construct sanity rules. Zero LLM cost; reads
-    # portfolio + scenarios and writes sanity.json alongside the
-    # portfolio. Non-blocking by default — failures surface in the
-    # Agent Logs dashboard tab. Set SANITY_BLOCK_ON_FAIL=true to
-    # escalate `fail` status into a hard skip of stage_execute (the
-    # cycle still writes portfolio + sanity + next_run so the operator
-    # can see what was rejected and why). See lib/sanity.py for the
-    # rule list and rationale.
-    sanity_report = sanity.run_sanity_checks(portfolio, scenarios_out)
+    # ----- Stage 4: sanity (deterministic) -----
+    sanity_report = sanity.run_sanity_checks(portfolio, view)
     sanity_report["run_id"] = rid
     sanity_report["generated_at"] = state.utcnow_iso()
     state.write_json(
@@ -828,20 +527,6 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
     )
 
     if sanity_blocked:
-        # Skip stage_execute entirely. Write a minimal next_run.json so
-        # the dashboard's Agent Logs tab + meta scheduler still have a
-        # row to show; flag the block reason so it's not silently lost.
-        #
-        # Codex P1 on PR #64: an earlier version wrote next_run_at=None
-        # here. The root-level run_scheduler.sh (deploy/run_scheduler.sh)
-        # reads `.next_run_at // empty` from next_run.json and skips its
-        # tick when empty — so a single sanity-fail would silently drop
-        # the orchestrator from its normal 1-24h cadence to the coarse
-        # daily fallback timer (~24h gap). Sanity blocking is supposed
-        # to skip ONE cycle's order submission, not stall cadence
-        # entirely. Use the existing _default_next_run_at heuristic
-        # (4h if positions exist, 6h all-cash) so the scheduler keeps
-        # firing and the agent re-evaluates after the failed cycle.
         next_run = {
             "run_id": rid,
             "next_run_at": _default_next_run_at(portfolio),
@@ -862,19 +547,13 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
         if not dry_run:
             state.write_json(state.NEXT_RUN, next_run)
     else:
+        # ----- Stage 5: execute (broker submission + meta scheduling) -----
         next_run = _run_stage(
             ctx=ctx, stage_id="execute", schema="", output_filename="next_run.json",
-            runner=lambda: stage_execute(ctx, portfolio, scenarios_out),
+            runner=lambda: stage_execute(ctx, portfolio, view),
             inputs_hash_parts=(rid, json.dumps(portfolio, sort_keys=True)),
             model="local",
         )
-        # Surface sanity outcome on next_run for the dashboard meter
-        # without re-parsing sanity.json on every render. _run_stage
-        # already wrote next_run.json (without the sanity field, since
-        # the report is computed afterwards), so re-write the per-run
-        # copy to include it. The global state.NEXT_RUN pointer is only
-        # touched on live runs — dry-runs already avoid it via the
-        # existing `if not ctx.dry_run` inside stage_execute.
         next_run["sanity"] = {
             "status": sanity_report["status"],
             "summary": sanity_report["summary"],
@@ -888,11 +567,10 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
 
     return {
         "run_id": rid,
-        "screen": screen,
-        "research": research,
-        "chains": chains,
-        "scenarios": scenarios_out,
+        "signals": signals_out,
+        "view": view,
         "portfolio": portfolio,
+        "sanity": sanity_report,
         "next_run": next_run,
     }
 
@@ -901,8 +579,7 @@ def _try_load_broker() -> Broker | None:
     """Best-effort AlpacaBroker construction. Returns None if creds are
     missing or the SDK isn't installed — orchestrator still runs (writes
     portfolio.json, decision_log, next_run.json) but stage_execute can't
-    submit orders without a broker. Same shape as monitor.py's helper —
-    deliberately duplicated so the two entrypoints can fail independently.
+    submit orders without a broker.
     """
     try:
         from lib.alpaca_client import AlpacaBroker
@@ -917,7 +594,7 @@ def _try_load_broker() -> Broker | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Multi-agent paper-trading orchestrator")
+    parser = argparse.ArgumentParser(description="v2 paper-trading orchestrator")
     parser.add_argument("--dry-run", action="store_true", help="No orders, no LLM calls — fixture mode")
     parser.add_argument("--run-id", default=None, help="Override generated run_id")
     args = parser.parse_args(argv)
@@ -929,18 +606,13 @@ def main(argv: list[str] | None = None) -> int:
         print("LIVE_TRADING_ENABLED=true but LIVE_VERSION=0 — refusing to run.", file=sys.stderr)
         return 2
 
-    # Load the broker for live (non-dry-run) cycles so stage_execute can
-    # actually submit orders. Dry runs skip broker entirely — they use
-    # fixtures end-to-end and shouldn't open a network connection.
-    # Previously this was never instantiated in main(); stage_execute saw
-    # ctx.broker=None on every cycle, silently skipped submission, and the
-    # operator had to run orders.submit_plan by hand to produce trades.
     broker = None if args.dry_run else _try_load_broker()
 
     t0 = time.time()
     result = run_pipeline(dry_run=args.dry_run, run_id=args.run_id, broker=broker)
     dt = time.time() - t0
-    print(f"run_id={result['run_id']} stages=5 elapsed={dt:.2f}s dry_run={args.dry_run}")
+    stage_count = 6 if result.get("market_gate", {}).get("is_open", True) else 1
+    print(f"run_id={result['run_id']} stages={stage_count} elapsed={dt:.2f}s dry_run={args.dry_run}")
     return 0
 
 

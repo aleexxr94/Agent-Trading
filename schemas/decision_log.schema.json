@@ -7,7 +7,9 @@
   "properties": {
     "run_id": {"type": "string", "minLength": 1},
     "stage": {
-      "enum": ["screen", "research", "chains", "scenarios", "construct", "execute", "monitor"]
+      "enum": [
+        "market_gate", "signals", "strategist", "construct", "execute", "monitor"
+      ]
     },
     "model": {"type": "string", "minLength": 1},
     "inputs_hash": {"type": "string", "pattern": "^[a-f0-9]{16,64}$"},
@@ -17,7 +19,7 @@
     "cost_usd": {"type": "number", "minimum": 0},
     "started_at": {"type": "string", "format": "date-time"},
     "ended_at": {"type": "string", "format": "date-time"},
-    "status": {"enum": ["ok", "schema_retry", "aborted", "skipped"]},
+    "status": {"enum": ["ok", "schema_retry", "aborted", "skipped", "skipped_market_closed"]},
     "risk_warning": {"type": "string", "minLength": 1,
                       "description": "Mandatory warning string injected by lib/llm.py per spec."}
   },

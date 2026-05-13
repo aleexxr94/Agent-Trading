@@ -72,9 +72,9 @@ def test_split_treats_empty_held_keys_as_all_closed():
 
 
 def test_split_partitions_etf_and_option_correctly():
-    """Mixed portfolio: TQQQ + SPY 530C still open at broker; rest closed."""
+    """Mixed portfolio: TQQQ + SPY 540C still open at broker; rest closed."""
     portfolio = json.loads(FIXTURE.read_text())
-    held = frozenset({"TQQQ", "SPY|530.0|2026-06-19|call"})
+    held = frozenset({"TQQQ", "SPY|540.0|2026-06-19|call"})
     open_, closed = dd.split_positions_by_broker_holdings(
         portfolio, held_keys=held,
     )
@@ -121,8 +121,8 @@ def test_broker_view_dataclass_shape():
     filter is consistent with the cost dict used for P&L."""
     view = dd.BrokerView(
         marks={"TQQQ": 80.0},
-        costs={"TQQQ": 75.0, "SPY|530.0|2026-06-19|call": 8.10},
-        held_keys=frozenset({"TQQQ", "SPY|530.0|2026-06-19|call"}),
+        costs={"TQQQ": 75.0, "SPY|540.0|2026-06-19|call": 8.10},
+        held_keys=frozenset({"TQQQ", "SPY|540.0|2026-06-19|call"}),
         available=True,
     )
     assert set(view.costs) == set(view.held_keys)

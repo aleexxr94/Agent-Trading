@@ -1,4 +1,10 @@
-"""Invariants on the static universe (lib.universe)."""
+"""Invariants on the static universe (lib.universe) — v2.
+
+v2 universe is 15 tickers (was 33 in v1). The diversification floor
+dropped from 10 factors to 8 — bull/bear pairs share a factor so 5
+pairs = 5 factors, plus vol + crypto-btc + rates from solo entries
+and SPY/QQQ option underlyings reusing sp500/nasdaq factors = 8.
+"""
 from __future__ import annotations
 
 import pytest
@@ -6,34 +12,35 @@ import pytest
 from lib import universe
 
 
-def test_universe_non_empty():
-    assert len(universe.UNIVERSE) >= 10  # we should never ship an empty universe
+def test_universe_size_is_15():
+    """v2 universe has exactly 15 tickers (10 ETFs + 2 solo + 3 option
+    underlyings). If you're adding to this list, update the factor-count
+    floor below; if you're shrinking it, double-check the strategist
+    prompt's universe section matches.
+    """
+    assert len(universe.UNIVERSE) == 15, (
+        f"universe size {len(universe.UNIVERSE)} != 15. v2 was trimmed from 33; "
+        "the strategist prompt hard-codes 15 in its universe section."
+    )
 
 
 def test_universe_covers_multiple_uncorrelated_factors():
-    """Earlier-cycle bug: every research candidate was a 3x broad-equity ETF,
-    so the constructor abstained because nothing was uncorrelated. Universe
-    must span at least 10 distinct factors (broad indices long+short, sector,
-    commodity, vol, crypto, rates) so the agent has real diversification
-    options to choose from.
-
-    Uses the explicit `factor` field on UniverseEntry — bull/bear pairs of
-    the same index share a factor, so `TQQQ` and `SQQQ` both count as
-    `"nasdaq"` (a single factor), not two. Replaces the brittle earlier
-    heuristic of splitting `family` on whitespace (Codex P2 on PR #30).
-    """
+    """v2 must span ≥8 distinct factors: nasdaq, sp500, semis, small-caps,
+    financials-broad (5 bull/bear pairs) + vol + crypto-btc + rates
+    (option underlying). Bull/bear pairs of the same index share a
+    factor (TQQQ + SQQQ both = "nasdaq")."""
     factors = {e.factor for e in universe.UNIVERSE}
-    assert len(factors) >= 10, (
+    assert len(factors) >= 8, (
         f"universe spans only {len(factors)} factors: {sorted(factors)}. "
-        "Diversification floor for this experiment is 10 — add more uncorrelated "
-        "factor families before pruning below this threshold."
+        "v2 floor is 8 — adding factors is encouraged, but pruning below "
+        "this floor weakens diversification options for the strategist."
     )
 
 
 def test_every_entry_has_non_empty_factor():
-    """The `factor` field is mandatory — used by screener for diversification
-    ranking and by the factor-coverage invariant above. Empty factor = silent
-    classification gap."""
+    """The `factor` field is mandatory — used by strategist for
+    diversification ranking and by the constructor to avoid
+    double-loading an ETF + its option underlying counterpart."""
     for e in universe.UNIVERSE:
         assert e.factor and e.factor == e.factor.lower().strip(), (
             f"{e.symbol}: factor must be a non-empty lowercase identifier, got {e.factor!r}"
@@ -41,20 +48,14 @@ def test_every_entry_has_non_empty_factor():
 
 
 def test_bull_bear_pairs_share_factor():
-    """Bull/bear pairs of the same index must share a factor so the
-    constructor's correlation check doesn't double-count them as
-    'diversified across two factors'."""
+    """v2 bull/bear pairs (5 of them) must share a factor so the
+    constructor's correlation check doesn't double-count them."""
     pairs = [
         ("TQQQ", "SQQQ"),
         ("UPRO", "SPXU"),
-        ("TNA", "TZA"),
-        ("URTY", "SRTY"),
+        ("TNA",  "TZA"),
         ("SOXL", "SOXS"),
-        ("FAS", "FAZ"),
-        ("LABU", "LABD"),
-        ("YINN", "YANG"),
-        ("ERX", "ERY"),
-        ("NUGT", "DUST"),
+        ("FAS",  "FAZ"),
     ]
     for bull_sym, bear_sym in pairs:
         bull = universe.by_symbol(bull_sym)
@@ -67,13 +68,13 @@ def test_bull_bear_pairs_share_factor():
 
 
 def test_option_underlyings_share_factor_with_their_leveraged_counterparts():
-    """An option on SPY hits the same underlying factor as UPRO/SPXU — the
-    constructor needs this to be visible so it can avoid loading the same
-    factor twice (once via the leveraged ETF, once via its option underlying)."""
-    pairs = [("SPY", "UPRO"), ("QQQ", "TQQQ"), ("IWM", "TNA")]
+    """An option on SPY hits the same underlying factor as UPRO/SPXU —
+    the constructor uses this to avoid loading the same factor twice."""
+    pairs = [("SPY", "UPRO"), ("QQQ", "TQQQ")]
     for opt_sym, etf_sym in pairs:
         opt = universe.by_symbol(opt_sym)
         etf = universe.by_symbol(etf_sym)
+        assert opt is not None and etf is not None
         assert opt.factor == etf.factor, (
             f"{opt_sym} factor={opt.factor!r} differs from {etf_sym} factor={etf.factor!r}"
         )
@@ -93,17 +94,19 @@ def test_every_entry_has_required_fields():
 
 
 def test_option_underlyings_are_unleveraged_and_liquid():
-    """The spec mandates the option-underlying sleeve consists of unleveraged
-    liquid index ETFs. SPY/QQQ/IWM/DIA cover broad-equity factors; TLT adds
-    rates/bonds (anti-correlated to equity-long, opens hedge plays)."""
+    """v2 trimmed option underlyings from 5 to 3 — dropped IWM (covered
+    via TNA/TZA leveraged ETFs already in the universe) and DIA
+    (~99% correlated with SPY). Kept SPY + QQQ for liquidity, TLT for
+    rates exposure (no leveraged bond ETF in the universe)."""
     underlyings = [e for e in universe.UNIVERSE if e.kind == "option_underlying"]
-    assert {e.symbol for e in underlyings} == {"SPY", "QQQ", "IWM", "DIA", "TLT"}
+    assert {e.symbol for e in underlyings} == {"SPY", "QQQ", "TLT"}
     for e in underlyings:
         assert e.leverage_factor == 1.0
 
 
 def test_leveraged_etfs_have_leverage_at_least_1_5x():
-    """Per CLAUDE.md the universe is 2x/3x leveraged ETFs — nothing weaker."""
+    """Per CLAUDE.md the universe is 2x/3x leveraged ETFs — UVXY at 1.5x
+    is the floor."""
     for e in universe.UNIVERSE:
         if e.kind == "etf":
             assert abs(e.leverage_factor) >= 1.5, (
@@ -131,24 +134,53 @@ def test_metadata_block_shape():
         assert set(row.keys()) == {"symbol", "kind", "leverage_factor", "family", "factor", "description"}
 
 
+def test_factor_pair_returns_bull_and_bear_for_paired_factors():
+    """factor_pair("TQQQ") returns (TQQQ, SQQQ); factor_pair("UVXY")
+    returns (UVXY, None) since vol has no bear pair in v2."""
+    assert universe.factor_pair("TQQQ") == ("TQQQ", "SQQQ")
+    assert universe.factor_pair("SOXS") == ("SOXL", "SOXS")
+    bull, bear = universe.factor_pair("UVXY")
+    assert bull == "UVXY"
+    assert bear is None
+    # Unknown symbol returns (None, None) — strategist won't see this case
+    # but the helper must not crash.
+    assert universe.factor_pair("NOT_REAL") == (None, None)
+
+
 @pytest.mark.parametrize("expected", [
     "TQQQ", "SQQQ",  # Nasdaq
     "UPRO", "SPXU",  # S&P
     "TNA",  "TZA",   # Russell
     "SOXL", "SOXS",  # Semis
     "FAS",  "FAZ",   # Financials (broad)
+    "UVXY",          # Vol
+    "BITX",          # Crypto
+    "SPY", "QQQ", "TLT",  # Option underlyings
+])
+def test_v2_universe_symbols_present(expected):
+    assert universe.by_symbol(expected) is not None, (
+        f"{expected} missing from v2 universe — confirm intentional"
+    )
+
+
+@pytest.mark.parametrize("dropped", [
+    "URTY", "SRTY",  # Russell alts (TNA/TZA cover the factor)
     "DPST",          # Regional banks
     "LABU", "LABD",  # Biotech
     "CURE",          # Healthcare
     "YINN", "YANG",  # China
     "ERX",  "ERY",   # Energy
     "NUGT", "DUST",  # Gold miners
-    "UVXY",          # Vol
     "BOIL",          # NatGas
-    "BITX", "BITU", "SBIT", "ETHU",  # Crypto (leveraged-ETF exposure)
-    "SPY", "QQQ", "IWM", "DIA", "TLT",  # Option underlyings
+    "BITU", "SBIT", "ETHU",  # Crypto alts
+    "IWM", "DIA",    # Option underlyings dropped (factor-covered or correlated)
 ])
-def test_canonical_symbols_present(expected):
-    assert universe.by_symbol(expected) is not None, (
-        f"{expected} dropped from universe — confirm intentional"
+def test_v1_dropped_symbols_absent(dropped):
+    """Lock the v2 trim: symbols intentionally cut from the v1 universe
+    must NOT come back without a deliberate decision. If a future PR
+    adds one of these back, this test fails and forces an explicit
+    update to the dropped-set list."""
+    assert universe.by_symbol(dropped) is None, (
+        f"{dropped} was dropped in v2 but is back in the universe. "
+        "If intentional, remove from this test's parametrize list."
     )

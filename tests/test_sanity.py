@@ -99,23 +99,23 @@ def _portfolio(positions: list[dict], rationale: str | None = None) -> dict:
     }
 
 
-def _scenarios_for(symbols_evs: dict[str, float]) -> dict:
+def _view_for(symbols_confidences: dict[str, float], *, default_kind: str = "etf") -> dict:
+    """Build a minimal v2 strategist view payload from
+    {symbol: confidence}. v1's `_scenarios_for` analogue —
+    expected_value_pct → confidence."""
     return {
         "run_id": "test",
         "generated_at": "2026-05-13T00:00:00Z",
+        "regime": "trending_up",
+        "regime_rationale": "fixture",
         "candidates": [
             {
                 "symbol": sym,
-                "instrument_kind": "etf",
-                "horizon_days": 30,
-                "cases": [
-                    {"label": "base", "probability": 0.5, "expected_return_pct": 0.0, "narrative": "x"},
-                    {"label": "bull", "probability": 0.3, "expected_return_pct": 10.0, "narrative": "x"},
-                    {"label": "bear", "probability": 0.2, "expected_return_pct": -5.0, "narrative": "x"},
-                ],
-                "expected_value_pct": ev,
+                "instrument_kind": default_kind,
+                "thesis": "fixture thesis citing signals",
+                "confidence": conf,
             }
-            for sym, ev in symbols_evs.items()
+            for sym, conf in symbols_confidences.items()
         ],
     }
 
@@ -234,35 +234,61 @@ def test_kill_conditions_pass_with_price_or_time_stop():
     assert r.status == "pass"
 
 
-# ---- expected value positive ----
+# ---- position-backed-by-strategist (v2 replacement for ev-positive) ----
 
 
-def test_ev_fail_when_position_has_negative_ev_in_scenarios():
+def test_position_backed_fail_when_strategist_confidence_below_threshold():
     p = _portfolio([_etf("TQQQ", position_pct=10.0)])
-    s = _scenarios_for({"TQQQ": -3.5})
-    r = sanity._r_expected_value_positive(p, s)
+    v = _view_for({"TQQQ": 0.3})
+    r = sanity._r_position_backed_by_strategist(p, v)
     assert r.status == "fail"
+    assert r.meta["offenders"][0]["issue"] == "strategist confidence < 0.5"
 
 
-def test_ev_fail_when_no_scenarios_entry_for_position():
+def test_position_backed_fail_when_no_strategist_entry():
     p = _portfolio([_etf("TQQQ", position_pct=10.0)])
-    s = _scenarios_for({"SOXL": 5.0})
-    r = sanity._r_expected_value_positive(p, s)
+    v = _view_for({"SOXL": 0.8})
+    r = sanity._r_position_backed_by_strategist(p, v)
     assert r.status == "fail"
-    assert r.meta["offenders"][0]["issue"] == "no scenarios entry"
+    assert r.meta["offenders"][0]["issue"] == "not in strategist candidates"
 
 
-def test_ev_pass_when_all_positions_have_positive_ev():
-    p = _portfolio([_etf("TQQQ", position_pct=10.0), _option("TLT", type_="call", position_pct=10.0)])
-    s = _scenarios_for({"TQQQ": 4.2, "TLT": 2.8})
-    r = sanity._r_expected_value_positive(p, s)
+def test_position_backed_pass_when_all_endorsed():
+    p = _portfolio([
+        _etf("TQQQ", position_pct=10.0),
+        _option("TLT", type_="call", position_pct=10.0),
+    ])
+    v = {
+        "run_id": "test", "generated_at": "2026-05-13T00:00:00Z",
+        "regime": "trending_up", "regime_rationale": "fixture",
+        "candidates": [
+            {"symbol": "TQQQ", "instrument_kind": "etf", "thesis": "x", "confidence": 0.7},
+            {"symbol": "TLT", "instrument_kind": "option_call", "thesis": "x", "confidence": 0.6},
+        ],
+    }
+    r = sanity._r_position_backed_by_strategist(p, v)
     assert r.status == "pass"
 
 
-def test_ev_skip_when_no_scenarios_payload():
+def test_position_backed_skip_when_no_view_payload():
     p = _portfolio([_etf("TQQQ", position_pct=10.0)])
-    r = sanity._r_expected_value_positive(p, None)
+    r = sanity._r_position_backed_by_strategist(p, None)
     assert r.status == "skip"
+
+
+def test_position_backed_distinguishes_call_and_put():
+    """A long call on SPY is NOT endorsed by an option_put SPY view
+    candidate — the strategist's direction is opposite."""
+    p = _portfolio([_option("SPY", type_="call", position_pct=10.0)])
+    v = {
+        "run_id": "test", "generated_at": "2026-05-13T00:00:00Z",
+        "regime": "trending_down", "regime_rationale": "fixture",
+        "candidates": [
+            {"symbol": "SPY", "instrument_kind": "option_put", "thesis": "x", "confidence": 0.8},
+        ],
+    }
+    r = sanity._r_position_backed_by_strategist(p, v)
+    assert r.status == "fail"
 
 
 # ---- option premium floor ----
@@ -306,33 +332,49 @@ def test_rationale_pass_at_threshold():
 
 
 def test_overall_status_is_worst_per_rule():
-    # Constructed to fire ev_fail + premium_warn + straddle_fail simultaneously.
+    # TLT call+put with iv=80 → straddle_requires_low_iv fails;
+    # premium=0.03 → premium_warn; strategist endorses TLT calls+puts so
+    # position_backed passes; rationale long so meaningful passes.
     p = _portfolio([
         _option("TLT", type_="call", iv_percentile=80.0, premium_paid=0.03),
         _option("TLT", type_="put", iv_percentile=80.0, premium_paid=0.04),
     ])
-    s = _scenarios_for({"TLT": 3.0})  # EV positive — keep ev rule passing
-    report = sanity.run_sanity_checks(p, s)
+    v = {
+        "run_id": "test", "generated_at": "2026-05-13T00:00:00Z",
+        "regime": "vol_elevated", "regime_rationale": "fixture",
+        "candidates": [
+            {"symbol": "TLT", "instrument_kind": "option_call", "thesis": "x", "confidence": 0.6},
+            {"symbol": "TLT", "instrument_kind": "option_put",  "thesis": "x", "confidence": 0.6},
+        ],
+    }
+    report = sanity.run_sanity_checks(p, v)
     assert report["status"] == "fail"
     assert report["summary"]["fail"] >= 1
     assert report["summary"]["warn"] >= 1
 
 
 def test_overall_status_warn_when_no_fails():
-    # Single warn (per-underlying), everything else passes.
+    # Single warn (per-underlying 27% on TLT), everything else passes.
     p = _portfolio([
         _option("TLT", type_="call", position_pct=13.0, iv_percentile=20.0),
         _option("TLT", type_="put",  position_pct=14.0, iv_percentile=20.0),
     ])
-    s = _scenarios_for({"TLT": 3.0})
-    report = sanity.run_sanity_checks(p, s)
+    v = {
+        "run_id": "test", "generated_at": "2026-05-13T00:00:00Z",
+        "regime": "vol_elevated", "regime_rationale": "fixture",
+        "candidates": [
+            {"symbol": "TLT", "instrument_kind": "option_call", "thesis": "x", "confidence": 0.6},
+            {"symbol": "TLT", "instrument_kind": "option_put",  "thesis": "x", "confidence": 0.6},
+        ],
+    }
+    report = sanity.run_sanity_checks(p, v)
     assert report["status"] == "warn"
 
 
 def test_overall_status_pass_when_no_rules_fire():
     p = _portfolio([_etf("TQQQ", position_pct=10.0)])
-    s = _scenarios_for({"TQQQ": 4.0})
-    report = sanity.run_sanity_checks(p, s)
+    v = _view_for({"TQQQ": 0.7})
+    report = sanity.run_sanity_checks(p, v)
     assert report["status"] == "pass"
 
 
