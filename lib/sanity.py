@@ -361,6 +361,184 @@ def _r_construction_rationale_meaningful(portfolio: dict, view: dict | None) -> 
     return RuleResult(name, severity, "pass", meta={"length": len(text)})
 
 
+# ----- v2 win-rate rules (added on top of the v2 base) -----
+
+
+def _r_position_size_matches_confidence(portfolio: dict, view: dict | None) -> RuleResult:
+    """Position size should be proportional to strategist confidence.
+
+    Heuristic ceiling: ``position_pct <= confidence × 15``. A 0.6-
+    confidence pick should size ≤ 9% NAV; a 0.95-confidence pick can
+    use up to 14.25%. This is a *warn* rule — the schema's hard 15%
+    cap still applies — but flagging mis-sizing surfaces the case where
+    the constructor uniformly sizes every position to 12% regardless
+    of how strong the upstream signal was.
+    """
+    name = "position_size_matches_confidence"
+    severity: Severity = "warn"
+    positions = portfolio.get("positions") or []
+    if not positions:
+        return RuleResult(name, severity, "skip", "all-cash portfolio")
+    if not view or not view.get("candidates"):
+        return RuleResult(name, severity, "skip", "view payload unavailable")
+
+    confidence_by_key: dict[tuple[str, str], float] = {}
+    for c in view["candidates"]:
+        sym = c.get("symbol")
+        kind = c.get("instrument_kind")
+        conf = c.get("confidence")
+        if sym and kind and isinstance(conf, (int, float)):
+            confidence_by_key[(sym, kind)] = float(conf)
+
+    bad: list[dict] = []
+    for p in positions:
+        if p.get("kind") == "etf":
+            key = (p.get("symbol", ""), "etf")
+        elif p.get("kind") == "option":
+            key = (
+                p.get("underlying", ""),
+                "option_call" if p.get("type") == "call" else "option_put",
+            )
+        else:
+            continue
+        conf = confidence_by_key.get(key)
+        if conf is None:
+            continue  # `position_backed_by_strategist` covers this case
+        ceiling = round(conf * 15.0, 2)
+        pct = float(p.get("position_pct") or 0.0)
+        if pct > ceiling + 0.01:  # tiny float-tolerance
+            bad.append({
+                "symbol": key[0], "instrument_kind": key[1],
+                "confidence": conf, "ceiling": ceiling, "position_pct": pct,
+            })
+    if bad:
+        return RuleResult(
+            name, severity, severity,
+            detail=(
+                f"{len(bad)} position(s) sized above the confidence-weighted "
+                f"ceiling (position_pct > confidence × 15)"
+            ),
+            meta={"offenders": bad},
+        )
+    return RuleResult(name, severity, "pass")
+
+
+def _r_position_within_adaptive_cap(portfolio: dict, view: dict | None) -> RuleResult:
+    """Per-position % cap enforcement against the drawdown-adaptive
+    ceiling computed by risk.adaptive_position_cap_pct.
+
+    Reads ``ctx.adaptive_cap_pct`` injected by run_sanity_checks (via
+    the ``view`` slot is awkward; we hang it on portfolio for now —
+    see run_sanity_checks ``adaptive_cap_pct`` argument). If absent,
+    falls back to the base 15.0 cap so the rule is a no-op when not
+    in drawdown.
+    """
+    name = "position_within_adaptive_cap"
+    severity: Severity = "fail"
+    positions = portfolio.get("positions") or []
+    if not positions:
+        return RuleResult(name, severity, "skip", "all-cash portfolio")
+    cap = float(portfolio.get("_adaptive_cap_pct", 15.0))
+    if cap >= 15.0:
+        return RuleResult(name, severity, "skip", "no drawdown — base cap applies")
+    bad = [
+        {"sym": p.get("symbol") or p.get("underlying"), "position_pct": p.get("position_pct"),
+         "adaptive_cap_pct": cap}
+        for p in positions
+        if float(p.get("position_pct") or 0.0) > cap + 0.01
+    ]
+    if bad:
+        return RuleResult(
+            name, severity, severity,
+            detail=(
+                f"NAV in drawdown; per-position cap reduced to "
+                f"{cap:.2f}% but {len(bad)} position(s) exceed it"
+            ),
+            meta={"offenders": bad, "adaptive_cap_pct": cap},
+        )
+    return RuleResult(name, severity, "pass", meta={"adaptive_cap_pct": cap})
+
+
+def _r_position_notional_above_floor(portfolio: dict, view: dict | None) -> RuleResult:
+    """Per-position notional value ≥ $50. On a $2,500 paper account,
+    tiny positions (e.g. 1% NAV = $25) get eaten by spread + fees
+    before they can deliver edge. The constructor is asked via prompt
+    to consolidate small picks; this rule warns when it didn't.
+
+    Notional = position_pct × nav. Requires nav from
+    ``portfolio['_nav_usd']`` (injected by run_sanity_checks).
+    """
+    name = "position_notional_above_floor"
+    severity: Severity = "warn"
+    positions = portfolio.get("positions") or []
+    nav = float(portfolio.get("_nav_usd") or portfolio.get("nav_usd") or 0.0)
+    if not positions or nav <= 0:
+        return RuleResult(name, severity, "skip", "all-cash portfolio or NAV unknown")
+    bad = []
+    for p in positions:
+        pct = float(p.get("position_pct") or 0.0)
+        notional = pct / 100.0 * nav
+        if notional < 50.0:
+            bad.append({
+                "sym": p.get("symbol") or p.get("underlying"),
+                "position_pct": pct, "notional_usd": round(notional, 2),
+            })
+    if bad:
+        return RuleResult(
+            name, severity, severity,
+            detail=(
+                f"{len(bad)} position(s) below the $50 notional floor "
+                "(spread + fees will dominate expected return)"
+            ),
+            meta={"offenders": bad},
+        )
+    return RuleResult(name, severity, "pass")
+
+
+def _r_position_adv_liquidity(portfolio: dict, view: dict | None) -> RuleResult:
+    """Per-position order size should be ≤ 1% of 30d ADV on the
+    underlying. On a $2,500 account this almost never bites, but the
+    rail prevents the constructor from picking a tiny illiquid ticker
+    where a $200 position is a noticeable fraction of daily volume.
+
+    Reads adv_30d per symbol from ``portfolio['_signals_adv']`` map
+    (injected by run_sanity_checks from signals.json).
+    """
+    name = "position_adv_liquidity"
+    severity: Severity = "warn"
+    positions = portfolio.get("positions") or []
+    adv_map: dict = portfolio.get("_signals_adv") or {}
+    nav = float(portfolio.get("_nav_usd") or portfolio.get("nav_usd") or 0.0)
+    if not positions or not adv_map or nav <= 0:
+        return RuleResult(name, severity, "skip", "no positions / no signals / no NAV")
+    bad = []
+    for p in positions:
+        sym = p.get("symbol") if p.get("kind") == "etf" else p.get("underlying")
+        if not sym:
+            continue
+        adv_dollars = adv_map.get(sym)
+        if not adv_dollars or adv_dollars <= 0:
+            continue
+        notional = float(p.get("position_pct") or 0.0) / 100.0 * nav
+        # 1% of ADV-in-dollars is the soft ceiling.
+        if notional > 0.01 * adv_dollars:
+            bad.append({
+                "sym": sym, "notional_usd": round(notional, 2),
+                "adv_dollars": round(adv_dollars, 2),
+                "frac_of_adv": round(notional / adv_dollars, 5),
+            })
+    if bad:
+        return RuleResult(
+            name, severity, severity,
+            detail=(
+                f"{len(bad)} position(s) exceed 1% of underlying's "
+                "30d ADV (slippage risk on entry/exit)"
+            ),
+            meta={"offenders": bad},
+        )
+    return RuleResult(name, severity, "pass")
+
+
 # Registration order: list rules in roughly increasing severity so
 # dashboards rendering top-to-bottom show structural issues before
 # detail-level warnings.
@@ -368,21 +546,55 @@ RULES: list[Callable[[dict, dict | None], RuleResult]] = [
     _r_construction_rationale_meaningful,
     _r_kill_conditions_complete,
     _r_position_backed_by_strategist,
+    _r_position_within_adaptive_cap,
     _r_straddle_requires_low_iv,
     _r_per_underlying_pct_cap_20,
+    _r_position_size_matches_confidence,
     _r_option_premium_above_floor,
+    _r_position_notional_above_floor,
+    _r_position_adv_liquidity,
 ]
 
 
-def run_sanity_checks(portfolio: dict, view: dict | None = None) -> dict:
+def run_sanity_checks(
+    portfolio: dict,
+    view: dict | None = None,
+    *,
+    signals: dict | None = None,
+    nav_usd: float | None = None,
+    adaptive_cap_pct: float | None = None,
+) -> dict:
     """Run all registered rules. Return a sanity-report dict ready to
     write to ``sanity.json`` (run_id + generated_at are filled in by
     the orchestrator caller, not here, so this function stays pure).
 
     Overall status is the worst per-rule status seen. Skips don't
     degrade the overall status.
+
+    The keyword args (signals, nav_usd, adaptive_cap_pct) are injected
+    into the portfolio dict on under-prefixed keys so the rule
+    functions can access them without changing the (portfolio, view)
+    signature. ``portfolio`` itself is NOT mutated — we operate on a
+    shallow copy.
     """
-    results = [r(portfolio, view) for r in RULES]
+    enriched = dict(portfolio)
+    if nav_usd is not None:
+        enriched["_nav_usd"] = nav_usd
+    if adaptive_cap_pct is not None:
+        enriched["_adaptive_cap_pct"] = adaptive_cap_pct
+    if signals is not None:
+        # adv_30d expressed in dollars (volume × last_close). The rule
+        # consumes ADV-in-dollars so it compares directly to position
+        # notional in dollars.
+        adv_map = {}
+        for t in signals.get("tickers", []):
+            sym = t.get("symbol")
+            adv = t.get("adv_30d")
+            px = t.get("last_close")
+            if sym and adv and px:
+                adv_map[sym] = float(adv) * float(px)
+        enriched["_signals_adv"] = adv_map
+    results = [r(enriched, view) for r in RULES]
     summary: dict[Status, int] = {"pass": 0, "warn": 0, "fail": 0, "skip": 0}
     worst_rank = 0
     worst_status: Status = "pass"

@@ -462,15 +462,17 @@ def latest_run_id() -> str | None:
 def load_run_summaries(limit: int = 20) -> list[dict]:
     """Return one human-readable summary per recent orchestrator run, newest first.
 
-    Each summary is built from the run-dir artifacts (screen.json, research.json,
-    scenarios.json, portfolio.json, next_run.json) + the cost log. Use this on
-    the dashboard's Cycles tab — it pre-expands what would otherwise live
-    behind expanders in the Decisions / Agent Logs tabs.
+    Each summary is built from the run-dir artifacts (signals.json,
+    view.json, portfolio.json, sanity.json, critique.json,
+    next_run.json) + the cost log. Use this on the dashboard's
+    Cycles tab — it pre-expands what would otherwise live behind
+    expanders in the Decisions / Agent Logs tabs.
 
     Returns:
         List of dicts with keys:
           run_id, generated_at, all_cash, positions_count,
-          screened_count, researched_count, scenarios_count,
+          signals_count, candidates_count, regime, sanity_status,
+          critic_accept,
           construction_rationale, all_cash_rationale,
           next_run_at, next_run_rationale,
           cost_usd
@@ -498,9 +500,11 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
             "generated_at": "",
             "all_cash": None,
             "positions_count": 0,
-            "screened_count": 0,
-            "researched_count": 0,
-            "scenarios_count": 0,
+            "signals_count": 0,
+            "candidates_count": 0,
+            "regime": "",
+            "sanity_status": "",
+            "critic_accept": None,
             "construction_rationale": "",
             "all_cash_rationale": "",
             "next_run_at": "",
@@ -526,29 +530,47 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
             except (json.JSONDecodeError, OSError, TypeError):
                 pass
 
-        # Funnel widths from screen/research/scenarios.
-        # The artifacts are LLM output and only loosely validated — a
-        # crashed/interrupted stage can persist `{"passed": null}` or
-        # other off-schema shapes. Guard the len() call so one bad
-        # artifact doesn't kill the whole Cycles tab render (Codex P1
-        # on PR #35).
-        for name, key in (
-            ("screen.json", "screened_count"),
-            ("research.json", "researched_count"),
-            ("scenarios.json", "scenarios_count"),
-        ):
-            f = run_dir / name
-            if not f.exists():
-                continue
+        # v2 funnel: signals → strategist candidates → portfolio positions.
+        # signals.json carries the full per-ticker feature table
+        # (15 in v2's curated universe); view.json carries the
+        # strategist's ranked candidate list (0-6 entries).
+        sig_path = run_dir / "signals.json"
+        if sig_path.exists():
             try:
-                data = json.loads(f.read_text())
-                field = "passed" if name == "screen.json" else "candidates"
-                val = data.get(field) if isinstance(data, dict) else None
-                s[key] = len(val) if isinstance(val, list) else 0
+                sig = json.loads(sig_path.read_text())
+                tickers = sig.get("tickers") if isinstance(sig, dict) else None
+                s["signals_count"] = len(tickers) if isinstance(tickers, list) else 0
             except (json.JSONDecodeError, OSError, TypeError):
-                # TypeError covers exotic deserialisation outcomes; leave
-                # the count at its 0 default rather than crashing the
-                # whole summary loop.
+                pass
+        view_path = run_dir / "view.json"
+        if view_path.exists():
+            try:
+                v = json.loads(view_path.read_text())
+                if isinstance(v, dict):
+                    cands = v.get("candidates")
+                    s["candidates_count"] = len(cands) if isinstance(cands, list) else 0
+                    s["regime"] = v.get("regime", "") or ""
+            except (json.JSONDecodeError, OSError, TypeError):
+                pass
+
+        # sanity.json — overall status (pass/warn/fail) for the cycle.
+        san_path = run_dir / "sanity.json"
+        if san_path.exists():
+            try:
+                san = json.loads(san_path.read_text())
+                if isinstance(san, dict):
+                    s["sanity_status"] = san.get("status", "") or ""
+            except (json.JSONDecodeError, OSError, TypeError):
+                pass
+
+        # critique.json — accept/reject of the constructor's first attempt.
+        crit_path = run_dir / "critique.json"
+        if crit_path.exists():
+            try:
+                crit = json.loads(crit_path.read_text())
+                if isinstance(crit, dict):
+                    s["critic_accept"] = crit.get("accept")
+            except (json.JSONDecodeError, OSError, TypeError):
                 pass
 
         # next_run.json — meta-scheduler's cadence call.

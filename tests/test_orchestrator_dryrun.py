@@ -30,7 +30,9 @@ from lib import state
 V2_DRY_RUN_ARTIFACTS = {
     "signals.json",
     "view.json",
+    "chain_lookups.json",
     "portfolio.json",
+    "critique.json",
     "sanity.json",
     "next_run.json",
 }
@@ -56,11 +58,15 @@ def test_dry_run_writes_all_artifacts(tmp_state):
 def test_dry_run_emits_decision_log(tmp_state):
     orchestrator.run_pipeline(dry_run=True)
     lines = state.DECISIONS_LOG.read_text().strip().splitlines()
-    # v2 dry-run logs 4 decisions: signals + strategist + construct + execute
-    # (market_gate doesn't fire in dry-run; sanity doesn't go through _run_stage).
-    assert len(lines) == 4
+    # v2 dry-run logs 6 decisions: signals + strategist + chain_lookup
+    # + construct + critic + execute (market_gate doesn't fire in
+    # dry-run; sanity doesn't go through _run_stage).
+    assert len(lines) == 6
     stages = [json.loads(line)["stage"] for line in lines]
-    assert stages == ["signals", "strategist", "construct", "execute"]
+    assert stages == [
+        "signals", "strategist", "chain_lookup",
+        "construct", "critic", "execute",
+    ]
     for line in lines:
         row = json.loads(line)
         assert row["status"] == "ok"
@@ -87,8 +93,11 @@ def test_dry_run_writes_sanity_json_with_known_status(tmp_state):
         f"status={sanity_doc['status']!r}; offenders: {sanity_doc['rules']}"
     )
     state.validate(sanity_doc, "sanity.schema.json")
-    # Rule list mirrors lib/sanity.RULES — pin the count.
-    assert len(sanity_doc["rules"]) == 6
+    # Rule list mirrors lib/sanity.RULES — pin the count. v2 base had 6;
+    # the winrate-improvements PR added position_within_adaptive_cap,
+    # position_size_matches_confidence, position_notional_above_floor,
+    # position_adv_liquidity → 10 total.
+    assert len(sanity_doc["rules"]) == 10
 
 
 def test_sanity_pass_path_writes_summary_into_next_run(tmp_state, monkeypatch):
@@ -168,6 +177,12 @@ def test_live_mode_writes_current_portfolio_with_mocked_llm(tmp_state, monkeypat
             payload = fixtures["view"]
         elif call.stage == "construct":
             payload = fixtures["portfolio"]
+        elif call.stage == "critic":
+            payload = {
+                "accept": True,
+                "critique": "mock critic auto-accepts",
+                "suggested_changes": [],
+            }
         else:
             payload = {}
         return StructuredCallResult(
@@ -239,3 +254,160 @@ def test_market_gate_closed_short_circuits_pipeline(tmp_state, monkeypatch):
     row = json.loads(lines[0])
     assert row["stage"] == "market_gate"
     assert row["status"] == "skipped_market_closed"
+
+
+# ---- v2 winrate features: cycle dedup, critic, state awareness ----
+
+
+def test_cycle_dedup_skips_when_signals_and_positions_unchanged(tmp_state, monkeypatch):
+    """After one successful cycle, a second dry-run with identical
+    signals + positions should reuse the prior portfolio (dedup).
+
+    Dry-run normally skips the dedup branch (it's gated on
+    `not dry_run`). To exercise it we make dry_run produce a non-
+    dry-run path via a stubbed pipeline: easier path is to manually
+    write last_cycle_hash.json + current_portfolio.json and confirm
+    the dedup helpers find them.
+    """
+    # Bootstrap state: write last_cycle_hash matching what the helper
+    # would compute, plus a current_portfolio.json.
+    signals_out = {"tickers": [
+        {"symbol": "TQQQ", "last_close": 72.0, "momentum_30d_pct": 8.0,
+         "momentum_60d_pct": 12.0, "hv_30d_annualised": 0.4,
+         "hv_90d_annualised": 0.35, "dist_from_50d_ma_pct": 4.0,
+         "dist_from_200d_ma_pct": 15.0},
+    ]}
+    positions = [{"symbol": "TQQQ", "qty": 4.0}]
+    state.write_json(state.LAST_CYCLE_HASH, {
+        "signals_fingerprint": orchestrator._signals_fingerprint(signals_out),
+        "positions_fingerprint": orchestrator._positions_fingerprint(positions),
+        "updated_at": state.utcnow_iso(),
+    })
+    state.write_json(state.CURRENT_PORTFOLIO, {
+        "run_id": "prior", "positions": [], "all_cash": True,
+    })
+    result = orchestrator._check_cycle_dedup(signals_out, positions)
+    assert result is not None
+    assert "portfolio" in result
+
+
+def test_cycle_dedup_does_not_skip_when_signals_change(tmp_state):
+    """Different signals fingerprint → dedup must NOT fire."""
+    state.write_json(state.LAST_CYCLE_HASH, {
+        "signals_fingerprint": "stale-hash",
+        "positions_fingerprint": "stale-hash",
+        "updated_at": state.utcnow_iso(),
+    })
+    state.write_json(state.CURRENT_PORTFOLIO, {"positions": []})
+    result = orchestrator._check_cycle_dedup(
+        {"tickers": [{"symbol": "TQQQ", "last_close": 72.0}]},
+        [],
+    )
+    assert result is None
+
+
+def test_cycle_dedup_first_cycle_no_hash_file(tmp_state):
+    """No last_cycle_hash.json → dedup returns None (don't skip)."""
+    result = orchestrator._check_cycle_dedup({"tickers": []}, [])
+    assert result is None
+
+
+def test_signals_fingerprint_stable_across_identical_inputs(tmp_state):
+    """Same numeric content → same fingerprint regardless of generated_at."""
+    a = {"tickers": [{"symbol": "TQQQ", "last_close": 72.45,
+                       "momentum_30d_pct": 8.4, "momentum_60d_pct": 12.1,
+                       "hv_30d_annualised": 0.42, "hv_90d_annualised": 0.38,
+                       "dist_from_50d_ma_pct": 4.2,
+                       "dist_from_200d_ma_pct": 15.7}]}
+    b = dict(a)
+    assert orchestrator._signals_fingerprint(a) == orchestrator._signals_fingerprint(b)
+
+
+def test_signals_fingerprint_differs_when_momentum_moves(tmp_state):
+    a = {"tickers": [{"symbol": "TQQQ", "momentum_30d_pct": 8.4}]}
+    b = {"tickers": [{"symbol": "TQQQ", "momentum_30d_pct": 9.1}]}
+    assert orchestrator._signals_fingerprint(a) != orchestrator._signals_fingerprint(b)
+
+
+def test_signals_fingerprint_changes_when_new_macro_event_enters_window(tmp_state):
+    """Codex P1 regression: an FOMC/CPI/NFP/PCE moving into the 7-day
+    window MUST invalidate the dedup. Otherwise the agent skips the
+    cycle exactly when new event risk appears — the opposite of what
+    the event-aware signals were added for.
+
+    Before the fix, the fingerprint only hashed numeric features and
+    these two signals payloads (identical numerics, different events)
+    would produce the same hash.
+    """
+    quiet = {"tickers": [{
+        "symbol": "SPY", "last_close": 540.0,
+        "momentum_30d_pct": 2.1, "momentum_60d_pct": 3.1,
+        "hv_30d_annualised": 0.11, "hv_90d_annualised": 0.10,
+        "dist_from_50d_ma_pct": 1.0, "dist_from_200d_ma_pct": 4.1,
+        "upcoming_macro_events_7d": [],
+    }]}
+    with_fomc = {"tickers": [{
+        "symbol": "SPY", "last_close": 540.0,
+        "momentum_30d_pct": 2.1, "momentum_60d_pct": 3.1,
+        "hv_30d_annualised": 0.11, "hv_90d_annualised": 0.10,
+        "dist_from_50d_ma_pct": 1.0, "dist_from_200d_ma_pct": 4.1,
+        "upcoming_macro_events_7d": [
+            {"date": "2026-05-15", "type": "FOMC", "description": "FOMC"},
+        ],
+    }]}
+    assert orchestrator._signals_fingerprint(quiet) != orchestrator._signals_fingerprint(with_fomc), (
+        "dedup hash must invalidate when a new macro event enters the 7-day "
+        "window — otherwise the agent skips strategist/construct exactly when "
+        "event risk appears."
+    )
+
+
+def test_signals_fingerprint_stable_when_events_reordered(tmp_state):
+    """Two events on different dates returned in different order
+    produce the same hash — the events list is canonically sorted by
+    (date, type) before hashing."""
+    a = {"tickers": [{
+        "symbol": "SPY", "upcoming_macro_events_7d": [
+            {"date": "2026-05-15", "type": "FOMC"},
+            {"date": "2026-05-14", "type": "CPI"},
+        ],
+    }]}
+    b = {"tickers": [{
+        "symbol": "SPY", "upcoming_macro_events_7d": [
+            {"date": "2026-05-14", "type": "CPI"},
+            {"date": "2026-05-15", "type": "FOMC"},
+        ],
+    }]}
+    assert orchestrator._signals_fingerprint(a) == orchestrator._signals_fingerprint(b)
+
+
+def test_positions_fingerprint_changes_when_qty_changes(tmp_state):
+    a = [{"symbol": "TQQQ", "qty": 4.0}]
+    b = [{"symbol": "TQQQ", "qty": 5.0}]
+    assert orchestrator._positions_fingerprint(a) != orchestrator._positions_fingerprint(b)
+
+
+def test_recent_pnl_history_empty_when_no_runs(tmp_state):
+    """No nav_history rows → empty list."""
+    assert orchestrator._recent_pnl_history() == []
+
+
+def test_recent_pnl_history_returns_chronological_with_realized(tmp_state):
+    """Two nav rows → one PnL row (curr/prev change)."""
+    state.append_nav({"run_id": "r1", "at": "2026-05-13T14:00:00Z",
+                      "nav_usd": 2500.0, "positions_count": 0, "all_cash": True,
+                      "gross_pnl_usd": 0.0, "modelled_costs_usd": 0.0, "net_pnl_usd": 0.0})
+    state.append_nav({"run_id": "r2", "at": "2026-05-13T18:00:00Z",
+                      "nav_usd": 2550.0, "positions_count": 2, "all_cash": False,
+                      "gross_pnl_usd": 50.0, "modelled_costs_usd": 0.0, "net_pnl_usd": 50.0})
+    rows = orchestrator._recent_pnl_history(limit=5)
+    assert len(rows) == 1
+    assert rows[0]["realized_pnl_pct"] == 2.0  # (2550/2500 - 1) × 100
+
+
+def test_peak_nav_30d_returns_max_observed(tmp_state):
+    for nav in (2500.0, 2700.0, 2400.0):
+        state.append_nav({"run_id": "r", "at": "2026-05-13T14:00:00Z",
+                          "nav_usd": nav, "positions_count": 0, "all_cash": True,
+                          "gross_pnl_usd": 0.0, "modelled_costs_usd": 0.0, "net_pnl_usd": 0.0})
+    assert orchestrator._peak_nav_30d() == 2700.0

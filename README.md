@@ -18,12 +18,15 @@ The canonical build spec is [CLAUDE.md](./CLAUDE.md). This README is the operato
 
 ```
 systemd timer (Linux) / Task Scheduler (Windows) ──▶ orchestrator.py
-                                                      ├─ Stage 0: market_gate (Alpaca clock, $0)
-                                                      ├─ Stage 1: signals     (deterministic Python, $0)
-                                                      ├─ Stage 2: strategist  (Sonnet 4.6, ~$0.05)
-                                                      ├─ Stage 3: construct   (Opus 4.7, ~$0.20, 1–12 or all-cash)
-                                                      ├─ Stage 4: sanity      (deterministic Python, $0)
-                                                      └─ Stage 5: execute     (Alpaca paper) + write next_run.json
+                                                      ├─ Stage 0: market_gate   (Alpaca clock, $0)
+                                                      ├─ Stage 1: signals       (deterministic Python, $0)
+                                                      ├─       state context     (broker positions + PnL history)
+                                                      ├─ Stage 2: strategist    (Sonnet 4.6, ~$0.05)
+                                                      ├─ Stage 2.5: chain_lookup (Alpaca options, $0)
+                                                      ├─ Stage 3: construct     (Opus 4.7, ~$0.20, 1–12 or all-cash)
+                                                      ├─ Stage 3.5: critic      (Sonnet 4.6 low, ~$0.03, +1 retry on reject)
+                                                      ├─ Stage 4: sanity        (deterministic Python, $0, 10 rules)
+                                                      └─ Stage 5: execute       (Alpaca paper) + write next_run.json
                                                             │
                                                             ▼
                                                    state/ (JSON, append-only)
@@ -38,13 +41,13 @@ systemd timer (Linux) / Task Scheduler (Windows) ──▶ orchestrator.py
 
 The v1 pipeline had 5 LLM-bearing stages (screen, bull/bear research × 8 candidates, scenarios, construct, meta) costing ~$1.50–2.50/cycle. The bull/bear/scenarios stages produced qualitative text that ultimately compressed to a few numbers anyway — and they were the heaviest, least reliable parts of the system (Sonnet+adaptive-thinking empty-output failures, cost-cap overruns, recurring TLT straddles).
 
-v2 collapses screen + bull/bear + scenarios into a single **deterministic signals stage** (zero LLM cost, just yfinance features per ticker) plus a **single strategist LLM call** that produces a regime + ranked candidate list. The construct stage still owns position selection on Opus 4.7 because that IS the soft-judgement call.
+v2 collapses screen + bull/bear + scenarios into a single **deterministic signals stage** (zero LLM cost, just yfinance features per ticker) plus a **single strategist LLM call** that produces a regime + ranked candidate list. The construct stage still owns position selection on Opus 4.7 because that IS the soft-judgement call. The v2-winrate add-on (PR after #67) layered a critic agent, chain-lookups, PnL feedback, cycle dedup, and a drawdown-adaptive cap on top.
 
-- LLM calls per cycle: **20 → 2** (~95% reduction)
-- Typical per-cycle cost: **~$0.25** (was ~$1.50–2.50)
-- At 2 cycles/weekday: **~$10/month** (was ~$300/month)
+- LLM calls per cycle: **20 → 2–3** (~85% reduction, +1 for the critic on rejection retry)
+- Typical per-cycle cost: **~$0.28** (was ~$1.50–2.50; critic adds ~$0.03)
+- At 2 cycles/weekday: **~$12/month** (was ~$300/month)
 
-The market_gate stage is the cheapest reliability win: skip the entire pipeline cleanly when markets are closed instead of producing a portfolio that can't trade.
+The market_gate stage is the cheapest reliability win: skip the entire pipeline cleanly when markets are closed instead of producing a portfolio that can't trade. Cycle-dedup further skips strategist + construct + execute when the signals fingerprint and broker positions are both unchanged from the prior cycle.
 
 ### Model tiering rationale
 
@@ -110,7 +113,7 @@ The v1 33-ticker universe produced the same TLT-straddle outcome cycle after cyc
 
 ## How the agents work
 
-Each cycle, six stages run in sequence with **schema-validated JSON outputs**. Two of them are LLM calls; the other four are deterministic. The two LLM agents read role-specific system prompts under [`prompts/`](./prompts/). Anthropic prompt caching keeps the static system block cheap across calls.
+Each cycle runs as a sequence of **schema-validated stages**. Three are LLM calls (strategist, construct, critic); the rest are deterministic Python. The LLM agents read role-specific system prompts under [`prompts/`](./prompts/). Anthropic prompt caching keeps the static system block cheap across calls.
 
 ### 0. Market gate — Alpaca clock, $0
 Queries `/v2/clock`. If markets are closed (weekend, holiday, after-hours), writes `market_gate.json` + a closed-market `next_run.json` pointing at the broker-reported next open, and exits. No LLM calls billed on a closed-market cycle.
@@ -142,12 +145,32 @@ Builds the portfolio with sizing math:
 - Hard 15% per-position NAV cap, sum of `position_pct` ≤ 100 (residual = cash buffer)
 - Explicit kill conditions per leg (max_loss_pct + at least one of price/time stop)
 
-Bias: take a position if the strategist surfaces a candidate with confidence ≥ 0.6. **Abstaining cycle after cycle is not the goal** — the v1 system collapsed to that pattern and the v2 prompt explicitly counters it. Output: `portfolio.json`.
+Bias: take a position if the strategist surfaces a candidate with confidence ≥ 0.6. **Abstaining cycle after cycle is not the goal** — the v1 system collapsed to that pattern and the v2 prompt explicitly counters it. The constructor receives:
+- Signals + view (from the upstream stages)
+- `chain_lookups.json` — real Alpaca OSI symbols + DTE for each option candidate (avoids inventing untradable strikes)
+- Current broker positions (state awareness — bias to hold winners vs churn)
+- Recent PnL history (last 5 cycles' regime + realized 4h PnL — self-correct drift)
+- Adaptive per-position cap (lower in drawdown via `risk.adaptive_position_cap_pct`)
+
+Output: `portfolio.json`.
+
+### 3.5 Critic — Sonnet 4.6 (low effort), ~$0.03
+Adversarial second-pair-of-eyes pass. Reads `view.json` + `portfolio.json`, returns either `{accept: true}` or `{accept: false, critique, suggested_changes}`. On reject, the orchestrator re-runs the constructor ONCE with the critique fed back. Worst case: ~$0.30 extra (one critic + one retry construct); typical case: ~$0.03 (accept on first pass). Output: `critique.json`.
 
 ### 4. Sanity — deterministic Python, $0
 Post-construct rules (see [`lib/sanity.py`](./lib/sanity.py)). Each rule has a fixed severity (`warn` or `fail`); the overall sanity status is the worst per-rule status. Non-blocking by default — `SANITY_BLOCK_ON_FAIL=true` escalates `fail` into a hard skip of `stage_execute`.
 
-Rules: per-underlying concentration ≤ 20%, long-straddle iv_percentile ≤ 40 on every leg, kill_conditions completeness, position backed by strategist (confidence ≥ 0.5 + matching instrument_kind), option-premium ≥ $0.05, construction_rationale ≥ 80 chars.
+Rules (10 total):
+- `construction_rationale_meaningful` — ≥ 80 chars
+- `kill_conditions_complete` — max_loss_pct ∈ (0,100] + at least one price/time stop
+- `position_backed_by_strategist` — every position has confidence ≥ 0.5 + matching instrument_kind in `view.json`
+- `position_within_adaptive_cap` — position_pct ≤ drawdown-adaptive cap (15% at-peak, 7.5% at ≥10% drawdown, linear between)
+- `straddle_requires_low_iv` — call+put on same underlying must have iv_percentile ≤ 40 on every leg
+- `per_underlying_pct_cap_20` — Σ position_pct per underlying ≤ 20%
+- `position_size_matches_confidence` — position_pct ≤ strategist confidence × 15
+- `option_premium_above_floor` — premium ≥ $0.05
+- `position_notional_above_floor` — position notional ≥ $50 (spread + fees dominate below this on a $2,500 account)
+- `position_adv_liquidity` — position notional ≤ 1% of underlying's 30-day dollar ADV
 
 Output: `sanity.json`.
 
