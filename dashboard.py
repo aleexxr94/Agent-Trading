@@ -14,7 +14,7 @@ Layout:
     📜 Decisions — chronological stage decisions with full agent reasoning
     📈 Performance — equity curve, LLM-cost-over-time, trading-fees-over-time, monthly cost breakdown
     💱 Trades — per-trade PnL (gross − fees − attributed LLM cost), closed + open lots, totals
-    🤖 Agent Logs — latest artifacts (research/scenarios/portfolio), next-run plan
+    🤖 Agent Logs — latest artifacts (research/scenarios/portfolio/sanity), next-run plan
     ⚙️ Settings — halt flag toggle, cost totals, README link
 """
 from __future__ import annotations
@@ -972,10 +972,58 @@ with tabs[5]:
             unsafe_allow_html=True,
         )
         run_dir = state.RUNS_DIR / latest_rid
+
+        # Sanity report — surface as a structured panel above the JSON
+        # dumps so the operator sees rule status at a glance, not buried
+        # inside a "click to expand" envelope. Deterministic post-construct
+        # rules; no LLM cost. See lib/sanity.py for rule list. The panel
+        # only renders when sanity.json exists (runs predating PR γ won't
+        # have one).
+        sanity_path = run_dir / "sanity.json"
+        if sanity_path.exists():
+            try:
+                sanity_doc = json.loads(sanity_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                sanity_doc = None
+            if sanity_doc:
+                overall = sanity_doc.get("status", "pass")
+                summary = sanity_doc.get("summary", {})
+                badge_color = {
+                    "pass": "var(--green)",
+                    "warn": "var(--amber)",
+                    "fail": "var(--red)",
+                }.get(overall, "var(--text-1)")
+                st.markdown(
+                    f'<div class="at-section-label">🛡️  Sanity '
+                    f'<span style="color:{badge_color}; font-weight:700;">'
+                    f'{overall.upper()}</span> · '
+                    f'pass={summary.get("pass", 0)} '
+                    f'warn={summary.get("warn", 0)} '
+                    f'fail={summary.get("fail", 0)} '
+                    f'skip={summary.get("skip", 0)}</div>',
+                    unsafe_allow_html=True,
+                )
+                rules = sanity_doc.get("rules", [])
+                if rules:
+                    rule_rows = []
+                    for r in rules:
+                        rule_rows.append({
+                            "Rule": r.get("name", ""),
+                            "Severity": r.get("severity", ""),
+                            "Status": r.get("status", ""),
+                            "Detail": r.get("detail", "") or "—",
+                        })
+                    st.dataframe(
+                        pd.DataFrame(rule_rows),
+                        width="stretch",
+                        hide_index=True,
+                    )
+
         artifact_icons = {
             "research.json":  "⚖️",
             "scenarios.json": "🎲",
             "portfolio.json": "🧩",
+            "sanity.json":    "🛡️",
             "next_run.json":  "🕒",
         }
         for name, icon in artifact_icons.items():

@@ -141,6 +141,7 @@ If every candidate is negative-EV, outputs **all-cash** with rationale. **A sing
 - **`monitor.py`** (every 15 min during US market hours): re-evaluates kill conditions on every open position. Flattens via the broker. **Cannot open new positions** — it's a stop-loss daemon, not a trader.
 - **Halt flag (`state/halt.flag`)**: presence stops both orchestrator and monitor *before any API call*. Toggled from the dashboard, or `sudo -u agent touch /opt/agent-trading/state/halt.flag`.
 - **Cost caps**: per-run **$2**, daily **$10**. Cleanly aborts between stages if hit.
+- **Post-construct sanity rules** (`lib/sanity.py`, runs after every cycle, zero LLM cost): deterministic checks against the just-built portfolio + scenarios — per-underlying concentration ≤ 20%, long-straddle iv_percentile ≤ 40, kill_conditions completeness, positive-EV per position, option-premium liquidity floor, construction_rationale meaningfulness. Writes `state/runs/{rid}/sanity.json`; surfaces in the dashboard Agent Logs tab. **Non-blocking by default** — set `SANITY_BLOCK_ON_FAIL=true` to hard-skip `stage_execute` on `fail` status (the run still writes `portfolio.json` + `sanity.json` so the operator can see what was rejected and why).
 
 ### Strategy in one paragraph
 
