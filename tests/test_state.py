@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from jsonschema import ValidationError
@@ -244,3 +245,181 @@ def test_filter_costs_post_reset_does_not_mutate_input(tmp_state):
     ]
     state.filter_costs_post_reset(rows)
     assert len(rows) == 2  # not mutated
+
+
+# ---------- wipe_run_history (Settings tab "start fresh" button) ----------
+
+
+def test_wipe_run_history_clears_jsonl_logs(tmp_state):
+    """Append to all three JSONL audit logs then wipe — expect every
+    file present-but-empty (truncated, not unlinked)."""
+    state.append_decision({
+        "run_id": "rid1", "stage": "signals", "model": "x",
+        "inputs_hash": "deadbeefcafebabe1234", "output_ref": "signals.json",
+        "prompt_cache_hit_pct": 0.0, "cost_usd": 0.0,
+        "started_at": "2026-05-13T14:00:00Z",
+        "ended_at": "2026-05-13T14:00:01Z",
+        "status": "ok", "risk_warning": "test",
+    })
+    state.append_cost({"run_id": "rid1", "stage": "construct",
+                       "model": "opus", "cost_usd": 0.20,
+                       "at": "2026-05-13T14:01:00Z"})
+    state.append_nav({"run_id": "rid1", "at": "2026-05-13T14:02:00Z",
+                      "nav_usd": 2500.0, "positions_count": 0,
+                      "all_cash": True, "gross_pnl_usd": 0.0,
+                      "modelled_costs_usd": 0.0, "net_pnl_usd": 0.0})
+
+    result = state.wipe_run_history(include_costs=True, backup=False)
+
+    # All three JSONLs truncated (still exist, but empty)
+    assert state.DECISIONS_LOG.exists()
+    assert state.DECISIONS_LOG.read_text() == ""
+    assert state.COSTS_LOG.read_text() == ""
+    assert state.NAV_HISTORY_LOG.read_text() == ""
+
+    # Summary dict reflects what was cleared
+    assert set(result["jsonl_truncated"]) >= {
+        "decisions.jsonl", "costs.jsonl", "nav_history.jsonl",
+    }
+
+
+def test_wipe_run_history_preserves_costs_when_include_costs_false(tmp_state):
+    """include_costs=False keeps the cost audit log intact — caps
+    continue to enforce against historical spend."""
+    state.append_cost({"run_id": "r", "stage": "x", "model": "m",
+                       "cost_usd": 1.50, "at": "2026-05-13T14:00:00Z"})
+    state.wipe_run_history(include_costs=False, backup=False)
+    assert state.COSTS_LOG.exists()
+    assert state.COSTS_LOG.read_text().strip()  # still has the row
+
+
+def test_wipe_run_history_preserves_halt_flag(tmp_state):
+    """The halt flag represents operator stop-intent; this button must
+    not override it."""
+    state.set_halt("test")
+    assert state.HALT_FLAG.exists()
+    state.wipe_run_history(backup=False)
+    assert state.HALT_FLAG.exists(), "halt.flag must survive a history wipe"
+
+
+def test_wipe_run_history_removes_runs_and_snapshots(tmp_state):
+    """state/runs/* + snapshot files (current_portfolio, next_run,
+    last_cycle_hash) all go away."""
+    rid = state.new_run_id()
+    state.run_dir(rid).mkdir(parents=True, exist_ok=True)
+    state.write_json(state.run_dir(rid) / "signals.json", {"tickers": []})
+    state.write_json(state.CURRENT_PORTFOLIO, {"positions": []})
+    state.write_json(state.NEXT_RUN, {"next_run_at": "2026-05-13T18:00:00Z"})
+    state.write_json(state.LAST_CYCLE_HASH, {"signals_fingerprint": "x"})
+
+    result = state.wipe_run_history(backup=False)
+
+    # Run dirs gone
+    assert list(state.RUNS_DIR.iterdir()) == []
+    assert result["runs_dirs_removed"] >= 1
+
+    # Snapshots gone
+    assert not state.CURRENT_PORTFOLIO.exists()
+    assert not state.NEXT_RUN.exists()
+    assert not state.LAST_CYCLE_HASH.exists()
+    assert set(result["snapshots_removed"]) >= {
+        "current_portfolio.json", "next_run.json", "last_cycle_hash.json",
+    }
+
+
+def test_wipe_run_history_writes_backup_when_requested(tmp_state):
+    """backup=True (default) copies state files to a timestamped backup
+    dir before deleting. Operator can restore from there if needed."""
+    state.append_decision({
+        "run_id": "rid", "stage": "signals", "model": "x",
+        "inputs_hash": "deadbeefcafebabe1234", "output_ref": "signals.json",
+        "prompt_cache_hit_pct": 0.0, "cost_usd": 0.0,
+        "started_at": "2026-05-13T14:00:00Z",
+        "ended_at": "2026-05-13T14:00:01Z",
+        "status": "ok", "risk_warning": "t",
+    })
+
+    result = state.wipe_run_history(include_costs=True, backup=True)
+
+    assert result["backup_dir"] is not None
+    backup_dir = Path(result["backup_dir"])
+    assert backup_dir.exists()
+    assert backup_dir.is_dir()
+    assert backup_dir.name.startswith("backup_")
+    # The pre-wipe decisions.jsonl is in the backup
+    bd = backup_dir / "decisions.jsonl"
+    assert bd.exists()
+    assert "signals" in bd.read_text()
+
+
+def test_wipe_run_history_succeeds_when_state_is_already_empty(tmp_state):
+    """Calling wipe on a clean state/ directory must not error.
+    Returns a summary showing 0 of everything."""
+    result = state.wipe_run_history(backup=False)
+    assert result["runs_dirs_removed"] == 0
+    assert result["jsonl_truncated"] == []
+    assert result["snapshots_removed"] == []
+
+
+def test_wipe_run_history_backup_dir_collision_safe(tmp_state, monkeypatch):
+    """Codex P2 on PR #70: when two wipes land in the same microsecond
+    (rapid double-click, automation), the second backup must NOT
+    silently fail and let the wipe proceed without a safety net.
+
+    Simulate by freezing utcnow() so both calls produce the same
+    timestamp. The retry-with-suffix loop should give the second
+    backup dir an alternate name and still succeed.
+    """
+    from datetime import datetime, timezone
+    frozen = datetime(2026, 5, 13, 22, 0, 0, 123456, tzinfo=timezone.utc)
+    monkeypatch.setattr(state, "utcnow", lambda: frozen)
+
+    state.append_decision({
+        "run_id": "r1", "stage": "signals", "model": "x",
+        "inputs_hash": "deadbeefcafebabe1234", "output_ref": "signals.json",
+        "prompt_cache_hit_pct": 0.0, "cost_usd": 0.0,
+        "started_at": "2026-05-13T14:00:00Z",
+        "ended_at": "2026-05-13T14:00:01Z",
+        "status": "ok", "risk_warning": "t",
+    })
+
+    r1 = state.wipe_run_history(backup=True)
+    state.append_decision({
+        "run_id": "r2", "stage": "signals", "model": "x",
+        "inputs_hash": "deadbeefcafebabe1234", "output_ref": "signals.json",
+        "prompt_cache_hit_pct": 0.0, "cost_usd": 0.0,
+        "started_at": "2026-05-13T14:00:00Z",
+        "ended_at": "2026-05-13T14:00:01Z",
+        "status": "ok", "risk_warning": "t",
+    })
+    r2 = state.wipe_run_history(backup=True)
+
+    # Both wipes must have created distinct backup directories.
+    assert r1["backup_dir"] is not None, "first wipe should have backed up"
+    assert r2["backup_dir"] is not None, (
+        "second same-microsecond wipe must NOT silently skip backup"
+    )
+    assert r1["backup_dir"] != r2["backup_dir"], (
+        "collision-safe naming must yield distinct paths"
+    )
+    assert Path(r1["backup_dir"]).exists()
+    assert Path(r2["backup_dir"]).exists()
+
+
+def test_wipe_run_history_idempotent(tmp_state):
+    """Two consecutive wipes must both succeed (second is a no-op)."""
+    state.append_decision({
+        "run_id": "r", "stage": "signals", "model": "x",
+        "inputs_hash": "deadbeefcafebabe1234", "output_ref": "signals.json",
+        "prompt_cache_hit_pct": 0.0, "cost_usd": 0.0,
+        "started_at": "2026-05-13T14:00:00Z",
+        "ended_at": "2026-05-13T14:00:01Z",
+        "status": "ok", "risk_warning": "t",
+    })
+    r1 = state.wipe_run_history(backup=False)
+    r2 = state.wipe_run_history(backup=False)
+    assert len(r1["jsonl_truncated"]) >= 1
+    # Second wipe truncates files that are already empty — still legal
+    # (write_text("") is idempotent) — backup dir count is 0 since we
+    # passed backup=False.
+    assert r2["runs_dirs_removed"] == 0
