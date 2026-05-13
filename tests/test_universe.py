@@ -12,28 +12,29 @@ import pytest
 from lib import universe
 
 
-def test_universe_size_is_15():
-    """v2 universe has exactly 15 tickers (10 ETFs + 2 solo + 3 option
-    underlyings). If you're adding to this list, update the factor-count
+def test_universe_size_is_18():
+    """v2 universe (post gold expansion 2026-05-13) has exactly 18
+    tickers: 12 leveraged ETFs (5 equity bull/bear pairs + UVXY + BITX
+    + NUGT/DUST gold-miners pair) + 4 option underlyings (SPY/QQQ/TLT
+    + GLD). If you're adding to this list, update the factor-count
     floor below; if you're shrinking it, double-check the strategist
     prompt's universe section matches.
     """
-    assert len(universe.UNIVERSE) == 15, (
-        f"universe size {len(universe.UNIVERSE)} != 15. v2 was trimmed from 33; "
-        "the strategist prompt hard-codes 15 in its universe section."
+    assert len(universe.UNIVERSE) == 18, (
+        f"universe size {len(universe.UNIVERSE)} != 18. v2 + gold expansion."
     )
 
 
 def test_universe_covers_multiple_uncorrelated_factors():
-    """v2 must span ≥8 distinct factors: nasdaq, sp500, semis, small-caps,
-    financials-broad (5 bull/bear pairs) + vol + crypto-btc + rates
-    (option underlying). Bull/bear pairs of the same index share a
-    factor (TQQQ + SQQQ both = "nasdaq")."""
+    """v2+gold must span ≥10 distinct factors: nasdaq, sp500, semis,
+    small-caps, financials-broad (5 bull/bear equity pairs) +
+    gold-miners (NUGT/DUST) + vol + crypto-btc + rates (option) +
+    gold-spot (GLD option). Bull/bear pairs share a factor."""
     factors = {e.factor for e in universe.UNIVERSE}
-    assert len(factors) >= 8, (
+    assert len(factors) >= 10, (
         f"universe spans only {len(factors)} factors: {sorted(factors)}. "
-        "v2 floor is 8 — adding factors is encouraged, but pruning below "
-        "this floor weakens diversification options for the strategist."
+        "v2+gold floor is 10 — adding factors is encouraged, but pruning "
+        "below this floor weakens diversification options."
     )
 
 
@@ -48,7 +49,7 @@ def test_every_entry_has_non_empty_factor():
 
 
 def test_bull_bear_pairs_share_factor():
-    """v2 bull/bear pairs (5 of them) must share a factor so the
+    """v2+gold bull/bear pairs (6 of them) must share a factor so the
     constructor's correlation check doesn't double-count them."""
     pairs = [
         ("TQQQ", "SQQQ"),
@@ -56,6 +57,7 @@ def test_bull_bear_pairs_share_factor():
         ("TNA",  "TZA"),
         ("SOXL", "SOXS"),
         ("FAS",  "FAZ"),
+        ("NUGT", "DUST"),
     ]
     for bull_sym, bear_sym in pairs:
         bull = universe.by_symbol(bull_sym)
@@ -94,12 +96,12 @@ def test_every_entry_has_required_fields():
 
 
 def test_option_underlyings_are_unleveraged_and_liquid():
-    """v2 trimmed option underlyings from 5 to 3 — dropped IWM (covered
-    via TNA/TZA leveraged ETFs already in the universe) and DIA
-    (~99% correlated with SPY). Kept SPY + QQQ for liquidity, TLT for
-    rates exposure (no leveraged bond ETF in the universe)."""
+    """v2+gold option underlyings: SPY + QQQ for broad-equity options,
+    TLT for rates exposure, GLD for spot-gold (added 2026-05-13
+    alongside NUGT/DUST leveraged miners).
+    """
     underlyings = [e for e in universe.UNIVERSE if e.kind == "option_underlying"]
-    assert {e.symbol for e in underlyings} == {"SPY", "QQQ", "TLT"}
+    assert {e.symbol for e in underlyings} == {"SPY", "QQQ", "TLT", "GLD"}
     for e in underlyings:
         assert e.leverage_factor == 1.0
 
@@ -155,7 +157,8 @@ def test_factor_pair_returns_bull_and_bear_for_paired_factors():
     "FAS",  "FAZ",   # Financials (broad)
     "UVXY",          # Vol
     "BITX",          # Crypto
-    "SPY", "QQQ", "TLT",  # Option underlyings
+    "NUGT", "DUST",  # Gold miners (added 2026-05-13)
+    "SPY", "QQQ", "TLT", "GLD",  # Option underlyings (GLD added 2026-05-13)
 ])
 def test_v2_universe_symbols_present(expected):
     assert universe.by_symbol(expected) is not None, (
@@ -170,10 +173,12 @@ def test_v2_universe_symbols_present(expected):
     "CURE",          # Healthcare
     "YINN", "YANG",  # China
     "ERX",  "ERY",   # Energy
-    "NUGT", "DUST",  # Gold miners
     "BOIL",          # NatGas
     "BITU", "SBIT", "ETHU",  # Crypto alts
     "IWM", "DIA",    # Option underlyings dropped (factor-covered or correlated)
+    # NUGT/DUST were on this list in v2 base; added back in the
+    # gold-expansion 2026-05-13. If they reappear here, gold's been
+    # removed again — make that an explicit decision.
 ])
 def test_v1_dropped_symbols_absent(dropped):
     """Lock the v2 trim: symbols intentionally cut from the v1 universe

@@ -67,9 +67,9 @@ Per-run cap defaults to $3; daily cap defaults to $12.
 
 ## What we scan & trade
 
-**Universe: 15 instruments** (trimmed from 33 in v2) across 8 factor groups. Curated; entries that fail liquidity filters at signals time still appear in the table with their numeric features, but the strategist learns to ignore low-ADV rows.
+**Universe: 18 instruments** (trimmed from 33 in v2, expanded with gold on 2026-05-13) across 10 factor groups. Curated; entries that fail liquidity filters at signals time still appear in the table with their numeric features, but the strategist learns to ignore low-ADV rows.
 
-### Leveraged ETFs (12)
+### Leveraged ETFs (14)
 
 Direct positions in 1.5x / 2x / 3x daily-rebalancing ETFs. Subject to per-position **15% NAV cap** and **25% loss kill condition**.
 
@@ -80,10 +80,11 @@ Direct positions in 1.5x / 2x / 3x daily-rebalancing ETFs. Subject to per-positi
 | Russell 2000 (3x) | TNA | TZA |
 | Semiconductors (3x) | SOXL | SOXS |
 | Financials, broad (3x) | FAS | FAZ |
+| Gold miners (2x) | NUGT | DUST |
 | VIX front-month (1.5x) | UVXY | — |
 | Bitcoin futures (2x) | BITX | — |
 
-### Option underlyings (3)
+### Option underlyings (4)
 
 The agent doesn't hold these as positions — only **listed calls / puts on them**. Long options only (no writes, no spreads). Subject to **100% premium kill condition**.
 
@@ -92,6 +93,7 @@ The agent doesn't hold these as positions — only **listed calls / puts on them
 | SPY | Most liquid options chain in the world; broad-market exposure |
 | QQQ | Tech-heavy options chain, very liquid |
 | TLT | 20+ Year Treasury — rates exposure, anti-correlated to equity-long (no leveraged bond ETF in v2) |
+| GLD | SPDR Gold Shares — spot-gold tracker, distinct from NUGT/DUST (which carry equity beta + operational leverage on top of gold) |
 
 ### What we explicitly don't trade
 
@@ -119,7 +121,7 @@ Each cycle runs as a sequence of **schema-validated stages**. Three are LLM call
 Queries `/v2/clock`. If markets are closed (weekend, holiday, after-hours), writes `market_gate.json` + a closed-market `next_run.json` pointing at the broker-reported next open, and exits. No LLM calls billed on a closed-market cycle.
 
 ### 1. Signals — deterministic Python, $0
-For each of the 15 universe tickers, computes from yfinance daily history:
+For each of the 18 universe tickers, computes from yfinance daily history:
 - `last_close`, `adv_30d` (liquidity)
 - `momentum_30d_pct` / `momentum_60d_pct` (trailing returns)
 - `hv_30d_annualised` / `hv_90d_annualised` (close-to-close vol)
