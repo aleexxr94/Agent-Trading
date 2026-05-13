@@ -40,9 +40,12 @@ RISK_WARNING_TEXT = (
 )
 
 # Per-run + per-day cost caps come from .env so the meters reflect what
-# orchestrator.py will actually enforce. Defaults match .env.example.
-PER_RUN_CAP_USD = float(os.environ.get("PER_RUN_COST_CAP_USD", "2.00"))
-DAILY_CAP_USD = float(os.environ.get("DAILY_COST_CAP_USD", "10.00"))
+# orchestrator.py will actually enforce. Defaults match lib.llm._per_run_cap
+# / _daily_cap and .env.example — bumped to $3 / $12 on 2026-05-13 (Codex
+# P2 on PR #62: dashboard fallback was reporting stricter thresholds than
+# the orchestrator actually enforced when the env vars were unset).
+PER_RUN_CAP_USD = float(os.environ.get("PER_RUN_COST_CAP_USD", "3.00"))
+DAILY_CAP_USD = float(os.environ.get("DAILY_COST_CAP_USD", "12.00"))
 
 
 # ---------- page setup ----------
