@@ -52,14 +52,55 @@ def test_constructor_max_tokens_within_provider_caps():
 
     Two-sided guard:
       - Floor 24k so future "trim tokens" edits can't regress us below
-        the level where Opus 4.6's adaptive thinking + the verbose
-        portfolio payload reliably fits.
-      - Ceiling 32k because that's Opus 4.6's default max_tokens cap
-        (without the interleaved-thinking beta header).
+        the level where adaptive thinking + the verbose portfolio
+        payload reliably fits.
+      - Ceiling 32k. Originally chosen because that's Opus 4.6's
+        default max_tokens cap (without the interleaved-thinking beta
+        header). 32k stays well inside Sonnet 4.6's 64k provider cap
+        after PR β (2026-05-13) downgraded the default model. If
+        MODEL_CONSTRUCTOR is overridden back to Opus the 32k ceiling
+        still applies cleanly.
     """
     cfg = stages.constructor()
     assert 24_000 <= cfg.max_tokens <= 32_000, (
         f"constructor max_tokens={cfg.max_tokens} is outside the safe range "
         f"[24000, 32000]. Below 24k risks truncation; above 32k exceeds "
-        f"Opus 4.6's default max_tokens cap."
+        f"Opus 4.6's default max_tokens cap (Sonnet 4.6's 64k cap also "
+        f"comfortably above 32k)."
     )
+
+
+def test_constructor_default_model_is_sonnet():
+    """Lock the PR-β downgrade: constructor default is Sonnet 4.6.
+
+    Lifted from chat conversation 2026-05-13: original spec said "sonnet
+    for orchestrator, haiku for screening, sonnet for adversarial
+    research" — i.e. Sonnet was always the default tier and Opus was an
+    interim choice for the highest-stakes call. After observing typical
+    runs cost $0.80-2.20 with Opus at construct + meta, the team
+    downgraded both to Sonnet to keep cycles comfortably inside the
+    $3/run cap (PR α bumped from $2). Override is preserved via
+    MODEL_CONSTRUCTOR env var.
+    """
+    import os
+    # Ensure no test-env override is shadowing the default we're pinning.
+    prev = os.environ.pop("MODEL_CONSTRUCTOR", None)
+    try:
+        assert stages.constructor().model == "claude-sonnet-4-6"
+    finally:
+        if prev is not None:
+            os.environ["MODEL_CONSTRUCTOR"] = prev
+
+
+def test_orchestrator_meta_default_model_is_sonnet():
+    """Lock the PR-β downgrade for the meta scheduling call. Same
+    rationale as constructor — small payload, no schema, Sonnet
+    sufficient. Override preserved via MODEL_ORCHESTRATOR env var.
+    """
+    import os
+    prev = os.environ.pop("MODEL_ORCHESTRATOR", None)
+    try:
+        assert stages.orchestrator_meta().model == "claude-sonnet-4-6"
+    finally:
+        if prev is not None:
+            os.environ["MODEL_ORCHESTRATOR"] = prev
