@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-trading.local/schemas/critique.schema.json",
+  "title": "Critique",
+  "description": "Output of v2 pipeline stage 3.5 (critic). Adversarial review of the constructor's portfolio. Either accepts the construction or proposes specific changes that the constructor gets one retry to address.",
+  "type": "object",
+  "properties": {
+    "run_id": {"type": "string"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "accept": {"type": "boolean"},
+    "critique": {"type": "string", "minLength": 1},
+    "suggested_changes": {
+      "type": "array",
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "properties": {
+          "action": {"enum": ["drop_position", "resize", "swap_kind", "tighten_kill", "loosen_kill", "add_position"]},
+          "symbol": {"type": "string"},
+          "reason": {"type": "string", "minLength": 1}
+        },
+        "required": ["action", "symbol", "reason"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["accept", "critique", "suggested_changes"],
+  "additionalProperties": false
+}

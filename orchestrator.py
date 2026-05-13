@@ -39,7 +39,7 @@ except ImportError:
     pass
 from typing import Callable
 
-from lib import llm, market_gate, risk, sanity, signals, stages, state
+from lib import llm, market_gate, options_chain, risk, sanity, signals, stages, state
 from lib.broker import Broker
 
 ROOT = Path(__file__).resolve().parent
@@ -133,27 +133,47 @@ def stage_signals(ctx: StageContext) -> dict:
     return signals.compute_signals(run_id=ctx.run_id)
 
 
-def stage_strategist(ctx: StageContext, signals_out: dict) -> dict:
-    """One LLM call — Sonnet 4.6, ~$0.05. Reads signals.json, emits
-    view.json with regime classification + 0-6 ranked candidates."""
+def stage_strategist(
+    ctx: StageContext,
+    signals_out: dict,
+    current_positions: list[dict] | None = None,
+    pnl_history: list[dict] | None = None,
+) -> dict:
+    """One LLM call — Sonnet 4.6, ~$0.05. Reads signals + current
+    portfolio + recent PnL feedback; emits view.json with regime
+    classification + 0-6 ranked candidates.
+
+    current_positions: broker-reported holdings (passed through from
+    orchestrator). Lets the strategist bias toward "keep this winner"
+    vs churning to fresh ideas.
+
+    pnl_history: last 5 cycles' {regime, positions_summary,
+    realized_4h_pnl_pct} so the strategist can self-correct drift.
+    """
     if ctx.dry_run:
         out = _load_fixture("view.json")
         out["run_id"] = ctx.run_id
         return out
     cfg = stages.strategist()
+    current_positions = current_positions or []
+    pnl_history = pnl_history or []
+    content = (
+        f"Signals: {json.dumps(signals_out, sort_keys=True)}\n"
+        f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
+        f"Recent PnL history (last cycles, oldest first): "
+        f"{json.dumps(pnl_history, sort_keys=True)}\n"
+        f"Run id: {ctx.run_id}\n"
+        "Return JSON conforming to view.schema.json. When current "
+        "positions already align with your regime call, prefer keeping "
+        "them (no churn). When recent PnL on a regime has been "
+        "consistently negative, weight your new regime call lower."
+    )
     res = llm.structured_call(llm.StageCall(
         run_id=ctx.run_id,
         stage=cfg.stage,
         model=cfg.model,
         system_blocks=_system_blocks(cfg),
-        user_messages=[{
-            "role": "user",
-            "content": (
-                f"Signals: {json.dumps(signals_out, sort_keys=True)}\n"
-                f"Run id: {ctx.run_id}\n"
-                "Return JSON conforming to view.schema.json."
-            ),
-        }],
+        user_messages=[{"role": "user", "content": content}],
         schema_filename=cfg.schema_filename,
         max_tokens=cfg.max_tokens,
         thinking=cfg.thinking,
@@ -162,30 +182,104 @@ def stage_strategist(ctx: StageContext, signals_out: dict) -> dict:
     return res.payload
 
 
-def stage_construct(ctx: StageContext, signals_out: dict, view: dict) -> dict:
-    """One LLM call — Opus 4.7, ~$0.20. Reads signals + view; emits the
-    final portfolio.json with positions, sizing, kill conditions."""
+def stage_chain_lookup(ctx: StageContext, signals_out: dict, view: dict) -> dict:
+    """Resolve option candidates → real tradable contracts. $0 cost.
+
+    The strategist names option candidates like ``{symbol: "SPY",
+    instrument_kind: "option_call"}``. Without this stage the
+    constructor invents OSI symbols (strike+expiry combos) from thin
+    air, and orders.py rejects them at submission time when Alpaca
+    paper doesn't list those exact contracts.
+
+    For each option candidate, query Alpaca's option-contracts
+    endpoint for the nearest-OTM contract at target DTE 37 (±14d).
+    Output ``chain_lookups.json`` keyed by candidate, so the
+    constructor can read the real strike + expiry per option position.
+    """
+    return options_chain.lookup_for_view(view, signals_out, broker=ctx.broker)
+
+
+def stage_construct(
+    ctx: StageContext,
+    signals_out: dict,
+    view: dict,
+    chain_lookups: dict | None = None,
+    current_positions: list[dict] | None = None,
+    pnl_history: list[dict] | None = None,
+    adaptive_cap_pct: float = 15.0,
+) -> dict:
+    """One LLM call — Opus 4.7, ~$0.20. Reads signals + view + chain
+    lookups + current positions + recent PnL feedback; emits the final
+    portfolio.json with positions, sizing, kill conditions."""
     if ctx.dry_run:
         out = _load_fixture("portfolio.json")
         out["run_id"] = ctx.run_id
         return out
     cfg = stages.constructor()
     nav = _account_nav(ctx)
+    chain_lookups = chain_lookups or {"lookups": []}
+    current_positions = current_positions or []
+    pnl_history = pnl_history or []
+    content = (
+        f"Signals: {json.dumps(signals_out, sort_keys=True)}\n"
+        f"Strategist view: {json.dumps(view, sort_keys=True)}\n"
+        f"Chain lookups (real Alpaca contracts for option candidates): "
+        f"{json.dumps(chain_lookups, sort_keys=True)}\n"
+        f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
+        f"Recent PnL history (last cycles): {json.dumps(pnl_history, sort_keys=True)}\n"
+        f"NAV (USD): {nav:.2f}\n"
+        f"Adaptive per-position cap %: {adaptive_cap_pct:.2f} "
+        f"(reduced from 15.0% when NAV is in drawdown)\n"
+        f"Run id: {ctx.run_id}\n"
+        "Return JSON conforming to portfolio.schema.json. Use the OSI "
+        "symbols + strikes from chain_lookups for option positions; do "
+        "NOT invent strikes. Prefer keeping current positions when the "
+        "strategist's view is consistent with them."
+    )
     res = llm.structured_call(llm.StageCall(
         run_id=ctx.run_id,
         stage=cfg.stage,
         model=cfg.model,
         system_blocks=_system_blocks(cfg),
-        user_messages=[{
-            "role": "user",
-            "content": (
-                f"Signals: {json.dumps(signals_out, sort_keys=True)}\n"
-                f"Strategist view: {json.dumps(view, sort_keys=True)}\n"
-                f"NAV (USD): {nav:.2f}\n"
-                f"Run id: {ctx.run_id}\n"
-                "Return JSON conforming to portfolio.schema.json."
-            ),
-        }],
+        user_messages=[{"role": "user", "content": content}],
+        schema_filename=cfg.schema_filename,
+        max_tokens=cfg.max_tokens,
+        thinking=cfg.thinking,
+        output_config=_output_config(cfg),
+    ))
+    return res.payload
+
+
+def stage_critic(
+    ctx: StageContext,
+    view: dict,
+    portfolio: dict,
+) -> dict:
+    """One LLM call — Sonnet 4.6 low effort, ~$0.03. Reads view +
+    portfolio; returns {accept, critique, suggested_changes}.
+
+    Dry-run returns a default-accept fixture so the pipeline doesn't
+    require an LLM call in tests.
+    """
+    if ctx.dry_run:
+        return {
+            "accept": True,
+            "critique": "dry-run: critic auto-accepts",
+            "suggested_changes": [],
+        }
+    cfg = stages.critic()
+    content = (
+        f"View: {json.dumps(view, sort_keys=True)}\n"
+        f"Portfolio: {json.dumps(portfolio, sort_keys=True)}\n"
+        f"Run id: {ctx.run_id}\n"
+        "Return JSON conforming to critique.schema.json."
+    )
+    res = llm.structured_call(llm.StageCall(
+        run_id=ctx.run_id,
+        stage=cfg.stage,
+        model=cfg.model,
+        system_blocks=_system_blocks(cfg),
+        user_messages=[{"role": "user", "content": content}],
         schema_filename=cfg.schema_filename,
         max_tokens=cfg.max_tokens,
         thinking=cfg.thinking,
@@ -209,6 +303,206 @@ def _account_nav(ctx: StageContext) -> float:
         except Exception:
             pass
     return 2500.0  # $2.5k paper baseline
+
+
+def _current_positions_summary(ctx: StageContext) -> list[dict]:
+    """Compact broker-position summary, fed to strategist + constructor
+    so they can reason about current state vs target.
+
+    Each row: {symbol, qty, avg_cost, market_value, unrealized_pl_usd,
+    asset_class}. Returns empty list on dry-run or broker error.
+    """
+    if ctx.broker is None or ctx.dry_run:
+        return []
+    try:
+        positions = ctx.broker.get_positions()
+    except Exception:
+        return []
+    rows = []
+    for p in positions:
+        rows.append({
+            "symbol": p.symbol,
+            "qty": p.qty,
+            "avg_cost": p.avg_cost,
+            "market_value": p.market_value,
+            "unrealized_pl_usd": p.unrealized_pl_usd,
+            "asset_class": p.asset_class,
+        })
+    return rows
+
+
+def _recent_pnl_history(*, limit: int = 5) -> list[dict]:
+    """Last N cycles' regime + portfolio + realized 4h PnL.
+
+    Reads state/nav_history.jsonl in pairs to compute realized
+    cycle-over-cycle NAV % change. Joins with the matching view.json
+    in the run dir to get the regime classification per cycle.
+
+    Returns oldest-first so the LLM reads a chronological tape.
+    """
+    rows = state.read_nav_history(limit=limit + 1)
+    if len(rows) < 2:
+        return []
+    out: list[dict] = []
+    for prev, curr in zip(rows, rows[1:]):
+        prev_nav = prev.get("nav_usd") or 0.0
+        curr_nav = curr.get("nav_usd") or 0.0
+        if prev_nav <= 0:
+            realized_pct = None
+        else:
+            realized_pct = round((curr_nav / prev_nav - 1.0) * 100.0, 4)
+        rid = curr.get("run_id", "")
+        regime = None
+        view_path = state.RUNS_DIR / rid / "view.json"
+        if view_path.exists():
+            try:
+                regime = json.loads(view_path.read_text()).get("regime")
+            except Exception:
+                regime = None
+        out.append({
+            "run_id": rid,
+            "at": curr.get("at"),
+            "regime": regime,
+            "positions_count": curr.get("positions_count", 0),
+            "all_cash": curr.get("all_cash", False),
+            "realized_pnl_pct": realized_pct,
+        })
+    return out[-limit:]
+
+
+def _signals_fingerprint(signals_out: dict) -> str:
+    """Hash of the per-ticker feature payload used for cycle dedup.
+
+    Fingerprints (a) numeric price/vol/MA features rounded to 4dp so
+    yfinance recompute noise doesn't make every cycle look unique,
+    AND (b) the set of upcoming macro events per ticker — Codex P1
+    on PR #68 caught that fingerprinting only the numerics meant a
+    new FOMC/CPI/NFP/PCE moving into the 7-day window wouldn't bump
+    the hash, so dedup would skip strategist + construct *exactly*
+    when new event risk appeared. Now any change in the event set
+    (new event added, event date changed, event count shifted)
+    invalidates the dedup and forces a fresh cycle.
+
+    Excludes generated_at + run_id so the same data on two different
+    cycles produces the same hash.
+    """
+    rows = []
+    for t in signals_out.get("tickers", []):
+        # Compact-but-stable representation of the macro event list:
+        # sort by date so reordering doesn't spuriously change the hash.
+        events_summary = sorted(
+            ((e.get("date"), e.get("type")) for e in (t.get("upcoming_macro_events_7d") or [])),
+            key=lambda p: (p[0] or "", p[1] or ""),
+        )
+        rows.append({
+            "sym": t.get("symbol"),
+            "last_close": round(t.get("last_close") or 0.0, 4),
+            "mom30": round(t.get("momentum_30d_pct") or 0.0, 2),
+            "mom60": round(t.get("momentum_60d_pct") or 0.0, 2),
+            "hv30": round(t.get("hv_30d_annualised") or 0.0, 4),
+            "hv90": round(t.get("hv_90d_annualised") or 0.0, 4),
+            "d50": round(t.get("dist_from_50d_ma_pct") or 0.0, 2),
+            "d200": round(t.get("dist_from_200d_ma_pct") or 0.0, 2),
+            "events": events_summary,
+        })
+    rows.sort(key=lambda r: r["sym"] or "")
+    return _hash_inputs(json.dumps(rows, sort_keys=True))
+
+
+def _positions_fingerprint(positions: list[dict]) -> str:
+    """Stable hash of the current-positions set, used as the secondary
+    dedup key. If positions changed (manual close, kill_condition
+    flatten, prior fill), the dedup must NOT skip — the agent should
+    re-evaluate."""
+    rows = sorted(
+        ({"sym": p.get("symbol"), "qty": p.get("qty")} for p in positions),
+        key=lambda r: r["sym"] or "",
+    )
+    return _hash_inputs(json.dumps(rows, sort_keys=True))
+
+
+def _check_cycle_dedup(signals_out: dict, current_positions: list[dict]) -> dict | None:
+    """Return the cached portfolio dict if dedup applies; None otherwise.
+
+    Dedup applies when:
+      - state/last_cycle_hash.json exists
+      - signals_fingerprint matches the prior cycle's
+      - positions_fingerprint matches the prior cycle's
+      - state/current_portfolio.json exists (the cached portfolio
+        to reuse)
+    """
+    if not state.LAST_CYCLE_HASH.exists() or not state.CURRENT_PORTFOLIO.exists():
+        return None
+    try:
+        last = json.loads(state.LAST_CYCLE_HASH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    signals_fp = _signals_fingerprint(signals_out)
+    positions_fp = _positions_fingerprint(current_positions)
+    if (
+        last.get("signals_fingerprint") != signals_fp
+        or last.get("positions_fingerprint") != positions_fp
+    ):
+        return None
+    try:
+        portfolio = json.loads(state.CURRENT_PORTFOLIO.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    return {"portfolio": portfolio}
+
+
+def _write_dedup_next_run(rid: str, *, portfolio: dict) -> dict:
+    """Build + persist a minimal next_run.json on a dedup-skipped cycle."""
+    next_at = _default_next_run_at(portfolio)
+    next_run = {
+        "run_id": rid,
+        "next_run_at": next_at,
+        "rationale": (
+            "cycle dedup: signals fingerprint and broker positions both "
+            "unchanged from prior cycle. Skipped strategist + "
+            "construct + execute; cached portfolio retained."
+        ),
+        "dedup_skipped": True,
+    }
+    state.write_json(state.run_dir(rid) / "next_run.json", next_run)
+    state.write_json(state.NEXT_RUN, next_run)
+    # Log a decision row so the dashboard timeline shows the skip.
+    state.append_decision({
+        "run_id": rid,
+        "stage": "signals",
+        "model": "local-deterministic",
+        "inputs_hash": _hash_inputs(rid),
+        "output_ref": "signals.json",
+        "prompt_cache_hit_pct": 0.0,
+        "cost_usd": 0.0,
+        "started_at": state.utcnow_iso(),
+        "ended_at": state.utcnow_iso(),
+        "status": "skipped",
+        "risk_warning": RISK_WARNING,
+    })
+    return next_run
+
+
+def _update_cycle_dedup_hash(signals_out: dict, current_positions: list[dict]) -> None:
+    """Called at the END of a successful cycle to record the fingerprints
+    for the NEXT cycle's dedup check. Failures here are non-fatal."""
+    try:
+        state.write_json(state.LAST_CYCLE_HASH, {
+            "signals_fingerprint": _signals_fingerprint(signals_out),
+            "positions_fingerprint": _positions_fingerprint(current_positions),
+            "updated_at": state.utcnow_iso(),
+        })
+    except Exception:
+        pass
+
+
+def _peak_nav_30d() -> float:
+    """Highest NAV observed in the last 30 days from state.read_nav_history.
+    Used by risk.adaptive_position_cap_pct to dial size down in drawdown."""
+    rows = state.read_nav_history(limit=180)  # ~30d at 6 cycles/day
+    if not rows:
+        return 0.0
+    return max((r.get("nav_usd") or 0.0) for r in rows)
 
 
 def _default_next_run_at(portfolio: dict) -> str:
@@ -491,32 +785,152 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
         model="local-deterministic",
     )
 
+    # Current broker positions — passed to strategist + constructor as
+    # state context so they can bias toward holding existing winners
+    # vs churning the portfolio. Live only; dry-run uses empty list.
+    current_positions = _current_positions_summary(ctx)
+
+    # ----- Cycle dedup -----
+    # If the signals fingerprint matches the prior cycle AND the broker
+    # position set is unchanged, skip strategist + construct + execute
+    # and reuse the last portfolio. Saves ~$0.25 on a quiet 4h window
+    # where the market hasn't moved meaningfully.
+    if not dry_run:
+        dedup = _check_cycle_dedup(signals_out, current_positions)
+        if dedup is not None:
+            next_run = _write_dedup_next_run(rid, portfolio=dedup["portfolio"])
+            return {
+                "run_id": rid,
+                "signals": signals_out,
+                "dedup_skipped": True,
+                "next_run": next_run,
+            }
+
+    # Recent PnL feedback — last 5 cycles' regime + realized 4h PnL
+    # so the strategist can self-correct drift across cycles.
+    pnl_history = _recent_pnl_history(limit=5)
+
     # ----- Stage 2: strategist (1 LLM call) -----
     view = _run_stage(
         ctx=ctx, stage_id="strategist", schema="view.schema.json",
         output_filename="view.json",
-        runner=lambda: stage_strategist(ctx, signals_out),
+        runner=lambda: stage_strategist(
+            ctx, signals_out,
+            current_positions=current_positions,
+            pnl_history=pnl_history,
+        ),
         inputs_hash_parts=(rid, json.dumps(signals_out, sort_keys=True)),
         model=strat_model,
+    )
+
+    # ----- Stage 2.5: chain lookup (deterministic, $0) -----
+    # Resolve every option candidate to a real tradable Alpaca contract
+    # so the constructor doesn't invent OSI symbols.
+    chain_lookups = _run_stage(
+        ctx=ctx, stage_id="chain_lookup", schema="chain_lookups.schema.json",
+        output_filename="chain_lookups.json",
+        runner=lambda: stage_chain_lookup(ctx, signals_out, view),
+        inputs_hash_parts=(rid, json.dumps(view, sort_keys=True)),
+        model="local-deterministic",
+    )
+
+    # Adaptive position-pct cap from current drawdown — feeds the
+    # constructor prompt as a soft ceiling. Real enforcement is in
+    # sanity (rule: position_within_adaptive_cap).
+    adaptive_cap = risk.adaptive_position_cap_pct(
+        current_nav=_account_nav(ctx),
+        peak_nav_30d=_peak_nav_30d(),
     )
 
     # ----- Stage 3: construct (1 LLM call) -----
     portfolio = _run_stage(
         ctx=ctx, stage_id="construct", schema="portfolio.schema.json",
         output_filename="portfolio.json",
-        runner=lambda: stage_construct(ctx, signals_out, view),
+        runner=lambda: stage_construct(
+            ctx, signals_out, view,
+            chain_lookups=chain_lookups,
+            current_positions=current_positions,
+            pnl_history=pnl_history,
+            adaptive_cap_pct=adaptive_cap,
+        ),
         inputs_hash_parts=(
             rid,
             json.dumps(signals_out, sort_keys=True),
             json.dumps(view, sort_keys=True),
+            json.dumps(chain_lookups, sort_keys=True),
         ),
         model=cons_model,
     )
     if not risk.position_band_ok(len(portfolio["positions"]), portfolio["all_cash"]):
         raise RuntimeError("portfolio violates 1–12 band / all-cash invariant")
 
+    # ----- Stage 3.5: critic (1 LLM call, ~$0.03) -----
+    # Adversarial review of the constructor's portfolio. If accept=true
+    # proceed to sanity. If accept=false, retry the constructor ONCE
+    # with the critique fed back; the retry's portfolio is then used.
+    critique = _run_stage(
+        ctx=ctx, stage_id="critic", schema="critique.schema.json",
+        output_filename="critique.json",
+        runner=lambda: stage_critic(ctx, view, portfolio),
+        inputs_hash_parts=(
+            rid,
+            json.dumps(view, sort_keys=True),
+            json.dumps(portfolio, sort_keys=True),
+        ),
+        model="fixture" if dry_run else stages.critic().model,
+    )
+    if not critique.get("accept", True) and not dry_run:
+        # Retry constructor with the critique appended as user context.
+        def _retry_with_critique() -> dict:
+            cfg = stages.constructor()
+            content = (
+                f"Signals: {json.dumps(signals_out, sort_keys=True)}\n"
+                f"Strategist view: {json.dumps(view, sort_keys=True)}\n"
+                f"Chain lookups: {json.dumps(chain_lookups, sort_keys=True)}\n"
+                f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
+                f"Recent PnL history: {json.dumps(pnl_history, sort_keys=True)}\n"
+                f"NAV (USD): {_account_nav(ctx):.2f}\n"
+                f"Adaptive per-position cap %: {adaptive_cap:.2f}\n"
+                f"Run id: {ctx.run_id}\n"
+                f"Critic rejected your first attempt: {critique.get('critique')}. "
+                f"Suggested changes: {json.dumps(critique.get('suggested_changes', []))}. "
+                "Address the critique and return a revised portfolio. "
+                "JSON only, portfolio.schema.json."
+            )
+            res = llm.structured_call(llm.StageCall(
+                run_id=ctx.run_id,
+                stage=cfg.stage,
+                model=cfg.model,
+                system_blocks=_system_blocks(cfg),
+                user_messages=[{"role": "user", "content": content}],
+                schema_filename=cfg.schema_filename,
+                max_tokens=cfg.max_tokens,
+                thinking=cfg.thinking,
+                output_config=_output_config(cfg),
+            ))
+            return res.payload
+
+        portfolio = _run_stage(
+            ctx=ctx, stage_id="construct", schema="portfolio.schema.json",
+            output_filename="portfolio.json",
+            runner=_retry_with_critique,
+            inputs_hash_parts=(
+                rid,
+                json.dumps(view, sort_keys=True),
+                json.dumps(critique, sort_keys=True),
+            ),
+            model=cons_model,
+        )
+        if not risk.position_band_ok(len(portfolio["positions"]), portfolio["all_cash"]):
+            raise RuntimeError("retry-portfolio violates 1–12 band / all-cash invariant")
+
     # ----- Stage 4: sanity (deterministic) -----
-    sanity_report = sanity.run_sanity_checks(portfolio, view)
+    sanity_report = sanity.run_sanity_checks(
+        portfolio, view,
+        signals=signals_out,
+        nav_usd=_account_nav(ctx),
+        adaptive_cap_pct=adaptive_cap,
+    )
     sanity_report["run_id"] = rid
     sanity_report["generated_at"] = state.utcnow_iso()
     state.write_json(
@@ -564,6 +978,9 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
 
     if not dry_run:
         state.write_json(state.CURRENT_PORTFOLIO, portfolio)
+        # Update the cycle-dedup fingerprints so the next cycle can
+        # short-circuit cleanly if nothing material changed.
+        _update_cycle_dedup_hash(signals_out, current_positions)
 
     return {
         "run_id": rid,

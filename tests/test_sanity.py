@@ -412,3 +412,116 @@ def test_block_on_fail_truthy_values_enable(monkeypatch, val):
 def test_block_on_fail_falsy_values_disable(monkeypatch, val):
     monkeypatch.setenv("SANITY_BLOCK_ON_FAIL", val)
     assert sanity.block_on_fail_enabled() is False
+
+
+# ---- v2 winrate rules: confidence-weighted sizing ----
+
+
+def test_size_matches_confidence_warns_when_oversized_for_confidence():
+    """Position sized larger than confidence × 15."""
+    p = _portfolio([_etf("TQQQ", position_pct=12.0)])
+    v = _view_for({"TQQQ": 0.6})  # ceiling = 9%, actual = 12%
+    r = sanity._r_position_size_matches_confidence(p, v)
+    assert r.status == "warn"
+    assert r.meta["offenders"][0]["symbol"] == "TQQQ"
+
+
+def test_size_matches_confidence_passes_when_sized_under_ceiling():
+    p = _portfolio([_etf("TQQQ", position_pct=8.0)])
+    v = _view_for({"TQQQ": 0.6})
+    r = sanity._r_position_size_matches_confidence(p, v)
+    assert r.status == "pass"
+
+
+# ---- v2 winrate rules: adaptive cap ----
+
+
+def test_adaptive_cap_skips_when_no_drawdown():
+    p = _portfolio([_etf("TQQQ", position_pct=14.0)])
+    p["_adaptive_cap_pct"] = 15.0
+    r = sanity._r_position_within_adaptive_cap(p, None)
+    assert r.status == "skip"
+
+
+def test_adaptive_cap_fails_when_position_exceeds_dd_cap():
+    """In drawdown the cap is 7.5%; a 12% position should fail."""
+    p = _portfolio([_etf("TQQQ", position_pct=12.0)])
+    p["_adaptive_cap_pct"] = 7.5
+    r = sanity._r_position_within_adaptive_cap(p, None)
+    assert r.status == "fail"
+
+
+def test_adaptive_cap_passes_when_position_within_dd_cap():
+    p = _portfolio([_etf("TQQQ", position_pct=7.0)])
+    p["_adaptive_cap_pct"] = 7.5
+    r = sanity._r_position_within_adaptive_cap(p, None)
+    assert r.status == "pass"
+
+
+# ---- v2 winrate rules: notional floor ----
+
+
+def test_notional_floor_warns_when_below_50_usd():
+    """1% NAV × $2500 = $25 → below $50 floor."""
+    p = _portfolio([_etf("TQQQ", position_pct=1.0)])
+    p["_nav_usd"] = 2500.0
+    r = sanity._r_position_notional_above_floor(p, None)
+    assert r.status == "warn"
+    assert r.meta["offenders"][0]["notional_usd"] < 50.0
+
+
+def test_notional_floor_passes_when_above_50_usd():
+    p = _portfolio([_etf("TQQQ", position_pct=5.0)])
+    p["_nav_usd"] = 2500.0
+    r = sanity._r_position_notional_above_floor(p, None)
+    assert r.status == "pass"
+
+
+# ---- v2 winrate rules: ADV liquidity ----
+
+
+def test_adv_liquidity_warns_when_notional_exceeds_1pct_of_adv():
+    """Position notional > 1% of underlying's dollar ADV."""
+    p = _portfolio([_etf("TQQQ", position_pct=10.0)])
+    p["_nav_usd"] = 2500.0  # → $250 notional
+    p["_signals_adv"] = {"TQQQ": 20000.0}  # 1% = $200, notional = $250 → fires
+    r = sanity._r_position_adv_liquidity(p, None)
+    assert r.status == "warn"
+
+
+def test_adv_liquidity_passes_when_notional_within_1pct_of_adv():
+    p = _portfolio([_etf("TQQQ", position_pct=10.0)])
+    p["_nav_usd"] = 2500.0  # → $250 notional
+    p["_signals_adv"] = {"TQQQ": 100_000.0}  # 1% = $1000 — plenty
+    r = sanity._r_position_adv_liquidity(p, None)
+    assert r.status == "pass"
+
+
+def test_adv_liquidity_skips_when_no_signals():
+    p = _portfolio([_etf("TQQQ", position_pct=10.0)])
+    p["_nav_usd"] = 2500.0
+    # _signals_adv NOT set
+    r = sanity._r_position_adv_liquidity(p, None)
+    assert r.status == "skip"
+
+
+# ---- run_sanity_checks injection of extra context ----
+
+
+def test_run_sanity_checks_injects_extra_context_into_rules():
+    """nav_usd + adaptive_cap_pct + signals → flow through to the rules
+    that consume them."""
+    p = _portfolio([_etf("TQQQ", position_pct=12.0)])
+    v = _view_for({"TQQQ": 0.7})
+    signals = {"tickers": [{"symbol": "TQQQ", "adv_30d": 1_000_000, "last_close": 70.0}]}
+    report = sanity.run_sanity_checks(
+        p, v,
+        signals=signals,
+        nav_usd=2500.0,
+        adaptive_cap_pct=7.5,
+    )
+    # adaptive_cap rule should fail (12% > 7.5%); notional rule should
+    # pass (12% × $2500 = $300 > $50).
+    rules_by_name = {r["name"]: r for r in report["rules"]}
+    assert rules_by_name["position_within_adaptive_cap"]["status"] == "fail"
+    assert rules_by_name["position_notional_above_floor"]["status"] == "pass"

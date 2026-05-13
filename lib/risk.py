@@ -120,3 +120,32 @@ def position_band_ok(count: int, all_cash: bool) -> bool:
 
 def total_position_pct(positions: list[dict]) -> float:
     return sum(p.get("position_pct", 0.0) for p in positions)
+
+
+# Drawdown-adaptive sizing — when the account has bled materially from
+# its recent peak, halve the per-position cap so a string of losses
+# doesn't compound. Linear interpolation between the two anchor points
+# below; clipped at both ends.
+ADAPTIVE_CAP_BASE_PCT = 15.0      # at-peak NAV → spec-mandated 15%
+ADAPTIVE_CAP_FLOOR_PCT = 7.5      # ≥10% drawdown → halved
+ADAPTIVE_DRAWDOWN_TRIGGER = 0.10  # 10% off peak = full reduction
+
+
+def adaptive_position_cap_pct(*, current_nav: float, peak_nav_30d: float) -> float:
+    """Per-position % cap adjusted for current drawdown.
+
+    Returns 15.0 when current NAV ≥ peak NAV.
+    Returns 7.5 when current NAV is ≥10% below peak.
+    Linear between those endpoints.
+
+    Both args expect raw USD NAV. If peak is unknown / non-positive
+    (cold-start path), returns the base cap.
+    """
+    if peak_nav_30d <= 0 or current_nav >= peak_nav_30d:
+        return ADAPTIVE_CAP_BASE_PCT
+    drawdown_frac = max(0.0, (peak_nav_30d - current_nav) / peak_nav_30d)
+    if drawdown_frac >= ADAPTIVE_DRAWDOWN_TRIGGER:
+        return ADAPTIVE_CAP_FLOOR_PCT
+    # Linear interpolation between (0%, BASE) and (TRIGGER, FLOOR).
+    fraction = drawdown_frac / ADAPTIVE_DRAWDOWN_TRIGGER
+    return ADAPTIVE_CAP_BASE_PCT - fraction * (ADAPTIVE_CAP_BASE_PCT - ADAPTIVE_CAP_FLOOR_PCT)

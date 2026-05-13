@@ -49,6 +49,12 @@ TRADES_LOG = STATE_DIR / "trades.jsonl"
 CURRENT_PORTFOLIO = STATE_DIR / "current_portfolio.json"
 NEXT_RUN = STATE_DIR / "next_run.json"
 NAV_HISTORY_LOG = STATE_DIR / "nav_history.jsonl"
+# Cycle-dedup: signals-hash + portfolio-pointer from last completed
+# cycle. If the next cycle's signals hash matches AND the broker
+# positions are unchanged, the orchestrator skips strategist +
+# constructor + execute and just re-writes next_run.json. Saves ~$0.25
+# on quiet markets.
+LAST_CYCLE_HASH = STATE_DIR / "last_cycle_hash.json"
 
 
 # --------- run_id ---------
