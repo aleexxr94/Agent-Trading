@@ -1,9 +1,9 @@
 """Anthropic client wrapper — prompt caching, schema-validated outputs, cost caps.
 
 Spec invariants:
-  - Per-run hard cap: $2.00 USD. Mid-run breach → finish current call, abort
+  - Per-run hard cap: $3.00 USD. Mid-run breach → finish current call, abort
     cleanly between stages, log.
-  - Daily hard cap: $10.00 USD. Beyond this, orchestrator refuses to run
+  - Daily hard cap: $12.00 USD. Beyond this, orchestrator refuses to run
     until next UTC day (caller checks before invoking).
   - Schema-failed agent outputs retry once with the validation error fed
     back; second failure aborts the run.
@@ -328,11 +328,11 @@ def estimate_cost_usd(model: str, usage: CallUsage) -> float:
 
 
 def _per_run_cap() -> float:
-    return float(os.environ.get("PER_RUN_COST_CAP_USD", "2.00"))
+    return float(os.environ.get("PER_RUN_COST_CAP_USD", "3.00"))
 
 
 def _daily_cap() -> float:
-    return float(os.environ.get("DAILY_COST_CAP_USD", "10.00"))
+    return float(os.environ.get("DAILY_COST_CAP_USD", "12.00"))
 
 
 def check_caps_or_raise(run_id: str) -> None:
