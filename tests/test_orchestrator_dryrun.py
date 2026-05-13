@@ -499,6 +499,15 @@ def test_sanity_block_on_fail_skips_execute_and_writes_block_reason(tmp_state, m
     rejected). The fixture's kill_conditions incompleteness is the
     "failing rule" trigger here — no need to construct a synthetic
     portfolio.
+
+    Codex P1 on PR #64: the sanity-block path MUST still populate
+    next_run_at with a sensible future timestamp. The root-level
+    run_scheduler.sh reads `.next_run_at // empty` and skips its tick
+    when empty — without this, enabling sanity-blocking would silently
+    drop the orchestrator from 1-24h cadence to the ~24h daily
+    fallback timer. Reuse the existing _default_next_run_at heuristic
+    so a sanity-fail skips ONE cycle's execute but cadence is
+    preserved.
     """
     monkeypatch.setenv("SANITY_BLOCK_ON_FAIL", "true")
     result = orchestrator.run_pipeline(dry_run=True)
@@ -515,7 +524,19 @@ def test_sanity_block_on_fail_skips_execute_and_writes_block_reason(tmp_state, m
     assert "sanity_block" in next_run
     assert next_run["sanity_block"]["status"] == "fail"
     assert len(next_run["sanity_block"]["failed_rules"]) >= 1
-    assert next_run["next_run_at"] is None  # meta scheduler skipped
+
+    # Cadence preserved — scheduler keeps firing.
+    assert isinstance(next_run["next_run_at"], str)
+    from datetime import datetime, timezone
+    parsed = datetime.strptime(next_run["next_run_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    # _default_next_run_at returns 4h (positions held) or 6h (all-cash)
+    # ahead. Be generous on both ends to absorb test timing.
+    delta_hours = (parsed - datetime.now(timezone.utc)).total_seconds() / 3600.0
+    assert 0.5 <= delta_hours <= 8.0, (
+        f"next_run_at delta {delta_hours:.2f}h outside 0.5h-8h expected band; "
+        f"sanity-block path must use the same heuristic as the meta-scheduler "
+        f"fallback so deploy/run_scheduler.sh keeps firing."
+    )
 
 
 def test_sanity_pass_path_writes_summary_into_next_run(tmp_state, monkeypatch):

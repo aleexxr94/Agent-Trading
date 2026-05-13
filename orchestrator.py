@@ -831,13 +831,25 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
         # Skip stage_execute entirely. Write a minimal next_run.json so
         # the dashboard's Agent Logs tab + meta scheduler still have a
         # row to show; flag the block reason so it's not silently lost.
+        #
+        # Codex P1 on PR #64: an earlier version wrote next_run_at=None
+        # here. The root-level run_scheduler.sh (deploy/run_scheduler.sh)
+        # reads `.next_run_at // empty` from next_run.json and skips its
+        # tick when empty — so a single sanity-fail would silently drop
+        # the orchestrator from its normal 1-24h cadence to the coarse
+        # daily fallback timer (~24h gap). Sanity blocking is supposed
+        # to skip ONE cycle's order submission, not stall cadence
+        # entirely. Use the existing _default_next_run_at heuristic
+        # (4h if positions exist, 6h all-cash) so the scheduler keeps
+        # firing and the agent re-evaluates after the failed cycle.
         next_run = {
             "run_id": rid,
-            "next_run_at": None,
+            "next_run_at": _default_next_run_at(portfolio),
             "rationale": (
                 "stage_execute skipped: SANITY_BLOCK_ON_FAIL=true and sanity "
                 f"report status=fail ({sanity_report['summary']['fail']} rule "
-                "failure(s)). See sanity.json for offender details."
+                "failure(s)). Cadence preserved via heuristic so the scheduler "
+                "keeps firing; see sanity.json for offender details."
             ),
             "sanity_block": {
                 "status": sanity_report["status"],
