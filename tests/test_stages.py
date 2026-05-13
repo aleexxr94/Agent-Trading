@@ -70,32 +70,40 @@ def test_constructor_max_tokens_within_provider_caps():
     )
 
 
-def test_constructor_default_model_is_sonnet():
-    """Lock the PR-β downgrade: constructor default is Sonnet 4.6.
+def test_constructor_default_model_is_opus_4_7():
+    """Lock the PR-δ promotion: constructor default is Opus 4.7.
 
-    Lifted from chat conversation 2026-05-13: original spec said "sonnet
-    for orchestrator, haiku for screening, sonnet for adversarial
-    research" — i.e. Sonnet was always the default tier and Opus was an
-    interim choice for the highest-stakes call. After observing typical
-    runs cost $0.80-2.20 with Opus at construct + meta, the team
-    downgraded both to Sonnet to keep cycles comfortably inside the
-    $3/run cap (PR α bumped from $2). Override is preserved via
-    MODEL_CONSTRUCTOR env var.
+    Recap of decisions:
+      - Pre-2026-05-13: constructor was claude-opus-4-6 (initial spec
+        bias toward the highest-stakes call's reasoning quality).
+      - PR β (2026-05-13): downgraded to claude-sonnet-4-6 to land
+        with the cost-caps bump; rationale was that structured output
+        enforces shape so Sonnet is sufficient.
+      - PR δ (2026-05-13, hours later): promoted back to Opus, but
+        to 4.7 specifically (same price as 4.6, newer model, supports
+        xhigh effort). Honest re-think: cost delta is ~$60/month at
+        4 cycles/day; PnL impact of better position-picking on a
+        $2,500 account dominates. Construct is where dollars are
+        decided — pay for the best reasoning there.
+
+    Override is preserved via MODEL_CONSTRUCTOR env var (flip back
+    to Sonnet if cost ever dominates).
     """
     import os
-    # Ensure no test-env override is shadowing the default we're pinning.
     prev = os.environ.pop("MODEL_CONSTRUCTOR", None)
     try:
-        assert stages.constructor().model == "claude-sonnet-4-6"
+        assert stages.constructor().model == "claude-opus-4-7"
     finally:
         if prev is not None:
             os.environ["MODEL_CONSTRUCTOR"] = prev
 
 
 def test_orchestrator_meta_default_model_is_sonnet():
-    """Lock the PR-β downgrade for the meta scheduling call. Same
-    rationale as constructor — small payload, no schema, Sonnet
-    sufficient. Override preserved via MODEL_ORCHESTRATOR env var.
+    """Lock the PR-β downgrade for the meta scheduling call (kept on
+    Sonnet through PR δ — meta has a deterministic 4h/6h fallback
+    that covers any LLM output failure, so Opus is overkill for a
+    2k-token scheduling decision). Override preserved via
+    MODEL_ORCHESTRATOR env var.
     """
     import os
     prev = os.environ.pop("MODEL_ORCHESTRATOR", None)

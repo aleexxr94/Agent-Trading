@@ -105,25 +105,33 @@ def scenarios() -> StageConfig:
 def constructor() -> StageConfig:
     return StageConfig(
         stage="construct",
-        model=_model("MODEL_CONSTRUCTOR", "claude-sonnet-4-6"),
+        model=_model("MODEL_CONSTRUCTOR", "claude-opus-4-7"),
         system_prompt=_load("constructor.md"),
         schema_filename="portfolio.schema.json",
         # 32000: constructor consumes a 14-row scenarios payload (8 ETFs +
         # up to 6 option-direction rows per PRs #39-41) and emits a 1–12
         # position portfolio.json with sizing math + kill conditions per
         # row. The cap was originally tuned for Opus 4.6 (interleaved-
-        # thinking-free ceiling). Sonnet 4.6's max_tokens cap is 64k, so
-        # 32k is comfortably inside the SDK limit on Sonnet too and
-        # leaves room for adaptive thinking + structured-output JSON
-        # without truncation.
+        # thinking-free ceiling). Opus 4.7 has the same default cap, so
+        # 32k is safe; if we ever bump to Sonnet (via env override) the
+        # 32k value sits comfortably inside Sonnet 4.6's 64k cap too.
         #
-        # Model: claude-sonnet-4-6 (was claude-opus-4-6 pre-PR-β,
-        # 2026-05-13). Constructor is the highest-stakes call but it's
-        # also the heaviest per-token: dropping to Sonnet saves ~40%/run
-        # vs. Opus on this stage alone, and the structured output schema
-        # already constrains what the model can emit. Override with
-        # MODEL_CONSTRUCTOR=claude-opus-4-6 if a quality regression shows
-        # up in paper running.
+        # Model: claude-opus-4-7. The construct stage is where actual
+        # trade decisions are made on a $2,500 leveraged-ETF+options
+        # account — multi-position sizing under correlation, kill-
+        # condition tailoring, EV thresholding. Reasoning quality has
+        # direct PnL impact and the cost difference vs Sonnet
+        # (~$0.50/run on construct alone) is meaningful but well
+        # within the $3/run cap. Opus 4.7 specifically (not 4.6):
+        # same price, newer model, supports "xhigh" effort which 4.6
+        # doesn't. The PR β downgrade to Sonnet (2026-05-13) was
+        # reverted on 2026-05-13 after honestly re-thinking the
+        # asymmetry: cost delta is ~$60/month at 4 cycles/day; a 5%
+        # PnL improvement from better position-picking is ~$50/month
+        # on $2,500 NAV, but the downside of a single bad construct
+        # decision (4h of bad positions before re-evaluation) is
+        # disproportionately large vs the saved cents. Override with
+        # MODEL_CONSTRUCTOR=claude-sonnet-4-6 if cost dominates.
         max_tokens=32_000,
         thinking={"type": "adaptive"},
         output_config_extras={"effort": "high"},
@@ -133,12 +141,13 @@ def constructor() -> StageConfig:
 def orchestrator_meta() -> StageConfig:
     """Used for the next-run scheduling / meta-decision call.
 
-    Downgraded from Opus 4.6 → Sonnet 4.6 on 2026-05-13 (PR β to the
-    cost-reduction trio). This call is small (2k output, schema-free
-    free-form text) and the fallback heuristic kicks in cleanly if the
-    LLM output is unusable — Sonnet is plenty for choosing a 1–24h
-    next-run window. Override with MODEL_ORCHESTRATOR=claude-opus-4-6 if
-    needed.
+    Sonnet 4.6 (downgraded from Opus 4.6 on 2026-05-13 PR β; kept on
+    Sonnet when constructor was promoted back to Opus 4.7 on the same
+    day). This call is small (2k output, schema-free free-form text)
+    and the deterministic 4h/6h fallback heuristic kicks in cleanly
+    if the LLM output is unusable — Sonnet is plenty for choosing a
+    1–24h next-run window. Override with MODEL_ORCHESTRATOR=claude-opus-4-7
+    if a quality regression on scheduling decisions ever shows up.
     """
     return StageConfig(
         stage="meta",
