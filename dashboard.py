@@ -1077,14 +1077,6 @@ with tabs[3]:
         broker_costs=broker_costs or {},
         held_keys=broker_view.held_keys if broker_view.available else None,
     )
-    # Modelled trading costs are kept as a separate sanity-floor
-    # estimate — they're NOT in the synthetic balance formula
-    # (real Alpaca fees from trades.jsonl are used instead).
-    _modelled = pnl_lib.compute_portfolio_pnl(
-        portfolio=portfolio,
-        marks=broker_marks or None,
-        costs=broker_costs or None,
-    )
 
     st.markdown('<div class="at-section-label">Synthetic balance breakdown</div>',
                 unsafe_allow_html=True)
@@ -1137,7 +1129,10 @@ with tabs[3]:
         _stat_card(
             "Trading fees",
             f"${_synth.trading_fees_total_usd:,.2f}",
-            sub="real broker fees, never reset",
+            sub=(
+                f"${_synth.real_trading_fees_usd:,.2f} real (closed) "
+                f"+ ${_synth.modelled_open_fees_usd:,.2f} modelled (open)"
+            ),
         ),
         unsafe_allow_html=True,
     )
@@ -1151,27 +1146,6 @@ with tabs[3]:
         unsafe_allow_html=True,
     )
 
-    # Smaller, separate sanity-floor card. Explicitly labelled as
-    # modelled (not used by the headline balance) so the operator
-    # doesn't conflate it with the real-fees number above.
-    st.markdown(
-        '<div class="at-section-label" style="margin-top:0.6rem;">'
-        'Modelled trading costs (sanity floor)</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        _stat_card(
-            "Modelled round-trip cost",
-            f"${_modelled.modelled_costs_usd:,.2f}",
-            sub=(
-                "IBKR-Pro-retail estimate for currently-open positions. "
-                "NOT used in the synthetic balance — real Alpaca fees "
-                "from trades.jsonl are deducted instead."
-            ),
-        ),
-        unsafe_allow_html=True,
-    )
-
     marks_status = (
         f"Live marks from Alpaca paper ({len(broker_marks)} positions matched)."
         if broker_marks else
@@ -1180,32 +1154,49 @@ with tabs[3]:
     st.caption(
         marks_status + " LLM cost is reset-aware (the Settings tab "
         "'Reset ALL LLM costs' button bumps the synthetic balance upward "
-        "by the historical attribution). Trading fees are real and never "
-        "reset — they reduce the balance permanently."
+        "by the historical attribution). Trading fees combine real "
+        "broker fees on closed trades (from `state/trades.jsonl`; \$0 "
+        "on Alpaca paper ETFs) with the IBKR-Pro round-trip estimate "
+        "on currently-open positions — same source the positions "
+        "table's per-row Fees column uses. Real fees never reset; "
+        "modelled fees taper as positions close."
     )
 
-    st.markdown('<div class="at-section-label">Realized balance curve</div>',
+    st.markdown('<div class="at-section-label">Synthetic balance over time</div>',
                 unsafe_allow_html=True)
-    # Time series of the realized synthetic balance — reconstructed
-    # deterministically from trades.jsonl + costs.jsonl (no marks
-    # history needed). Each step in the line is a real close or a
-    # real cost row landing; open-position mark drift lives in the
-    # hero card, not here.
+    # Two-trace chart:
+    #
+    # 1. **Historical realized line** — reconstructed deterministically
+    #    from trades.jsonl + costs.jsonl, plus all-time real trading
+    #    fees. Stable; doesn't move with intraday marks. Math:
+    #    $2,500 + closed_gross(t) − LLM(t) − real_fees(t).
+    #
+    # 2. **Live tip** — a single marker at utcnow() with the current
+    #    hero value (open P&L + modelled open fees included). Dashed
+    #    grey segment connects the last historical point to it so the
+    #    operator sees explicitly that the chart's TIP reflects the
+    #    hero card. Tooltip labels it as "Live".
     series = dd.realized_balance_series()
-    if series:
-        nav_df = pd.DataFrame(series)
+    live_tip = dd.live_balance_tip(synthetic_balance=_synth)
+    if series or live_tip["synthetic_balance_usd"] != _synth.starting_balance_usd or _synth.open_gross_pnl_usd:
+        # Window filter + DataFrame for the historical trace.
+        nav_df = pd.DataFrame(series) if series else pd.DataFrame(columns=[
+            "at", "synthetic_realized_balance_usd",
+            "closed_gross_pnl_usd", "llm_cost_total_usd",
+            "trading_fees_total_usd",
+        ])
         window_choice = st.radio(
             "Window",
             ["1D", "1W", "1M", "1Y", "All"],
             index=4,
             horizontal=True,
             label_visibility="collapsed",
-            help="Filter the curve to the trailing window. Affects "
-                 "this chart only; underlying trades/costs logs are "
-                 "untouched.",
+            help="Filter the historical line to the trailing window. "
+                 "Affects this chart only; underlying trades/costs logs "
+                 "are untouched. The live tip is always shown.",
         )
         window_days = {"1D": 1, "1W": 7, "1M": 30, "1Y": 365}.get(window_choice)
-        if window_days is not None and "at" in nav_df.columns:
+        if window_days is not None and "at" in nav_df.columns and not nav_df.empty:
             from datetime import datetime, timezone, timedelta
             cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
             nav_df = nav_df.copy()
@@ -1215,26 +1206,22 @@ with tabs[3]:
                 errors="coerce",
             )
             nav_df = nav_df[nav_df["_at_dt"] >= cutoff]
-        if nav_df.empty:
-            st.info(
-                f"No realized events in the trailing {window_choice} window. "
-                "Try a wider window — closes and LLM costs only land "
-                "intermittently."
-            )
-        else:
-            fig_nav = go.Figure()
+
+        fig_nav = go.Figure()
+        # Trace 1: historical realized line.
+        if not nav_df.empty:
             fig_nav.add_trace(go.Scatter(
                 x=nav_df["at"],
                 y=nav_df["synthetic_realized_balance_usd"],
                 mode="lines+markers",
-                name="Realized synthetic balance (USD)",
+                name="Realized synthetic balance",
                 line=dict(width=2.5, color="#059669"),
                 marker=dict(size=5, color="#059669"),
                 hovertemplate=(
                     "%{x}<br>Balance: $%{y:,.2f}"
                     "<br>Closed gross: $%{customdata[0]:,.2f}"
                     "<br>LLM: −$%{customdata[1]:,.2f}"
-                    "<br>Fees: −$%{customdata[2]:,.2f}"
+                    "<br>Real fees: −$%{customdata[2]:,.2f}"
                     "<extra></extra>"
                 ),
                 customdata=nav_df[[
@@ -1243,33 +1230,68 @@ with tabs[3]:
                     "trading_fees_total_usd",
                 ]].values,
             ))
-            fig_nav.update_layout(
-                template="plotly_white",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                height=360, yaxis_title="Synthetic balance (USD)",
-                yaxis=dict(gridcolor="#e2e8f0", color="#059669"),
-                xaxis=dict(gridcolor="#e2e8f0"),
-                margin=dict(l=10, r=10, t=20, b=10),
-                legend=dict(orientation="h", y=1.1, font=dict(size=12)),
-            )
-            st.plotly_chart(fig_nav, width="stretch")
-            if len(nav_df) == 1:
-                st.caption(
-                    "Single realized event in this window — the curve "
-                    "renders as one marker rather than a line. Subsequent "
-                    "closes or cost rows will extend it."
-                )
-            st.caption(
-                "Reconstructed from `state/trades.jsonl` + `state/costs.jsonl`. "
-                "Open-position mark drift is NOT plotted here — it lives "
-                "on the hero card so this curve stays stable. LLM-cost "
-                "resets visibly redraw the curve upward."
-            )
+            # Dashed connector from last historical point to live tip.
+            last_at = nav_df["at"].iloc[-1]
+            last_y = nav_df["synthetic_realized_balance_usd"].iloc[-1]
+            fig_nav.add_trace(go.Scatter(
+                x=[last_at, live_tip["at"]],
+                y=[last_y, live_tip["synthetic_balance_usd"]],
+                mode="lines",
+                line=dict(width=1.5, color="#94a3b8", dash="dash"),
+                name="(open P&L + modelled fees)",
+                hoverinfo="skip",
+            ))
+        # Trace 2: live tip marker — always rendered so the operator
+        # sees the current hero value on the chart even when no
+        # realized events exist yet.
+        fig_nav.add_trace(go.Scatter(
+            x=[live_tip["at"]],
+            y=[live_tip["synthetic_balance_usd"]],
+            mode="markers",
+            name="Live (includes open P&L)",
+            marker=dict(
+                size=12, color="#d97706", symbol="diamond",
+                line=dict(width=1.5, color="#0f172a"),
+            ),
+            hovertemplate=(
+                "Live: $%{y:,.2f}"
+                "<br>Closed gross: $%{customdata[0]:,.2f}"
+                "<br>Open gross: $%{customdata[1]:,.2f}"
+                "<br>LLM: −$%{customdata[2]:,.4f}"
+                "<br>Fees (real + modelled): −$%{customdata[3]:,.2f}"
+                "<extra></extra>"
+            ),
+            customdata=[[
+                live_tip["closed_gross_pnl_usd"],
+                live_tip["open_gross_pnl_usd"],
+                live_tip["llm_cost_total_usd"],
+                live_tip["trading_fees_total_usd"],
+            ]],
+        ))
+        fig_nav.update_layout(
+            template="plotly_white",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            height=360, yaxis_title="Synthetic balance (USD)",
+            yaxis=dict(gridcolor="#e2e8f0", color="#059669"),
+            xaxis=dict(gridcolor="#e2e8f0"),
+            margin=dict(l=10, r=10, t=20, b=10),
+            legend=dict(orientation="h", y=1.1, font=dict(size=12)),
+        )
+        st.plotly_chart(fig_nav, width="stretch")
+        st.caption(
+            "Green line = historical realized balance reconstructed from "
+            "`state/trades.jsonl` + `state/costs.jsonl` (closed gross + "
+            "real fees + LLM, exact). Diamond marker = live snapshot, "
+            "matches the hero card exactly (adds open P&L + modelled "
+            "open fees). The dashed segment is the gap the open positions "
+            "represent at this moment."
+        )
     else:
         st.info(
-            "No realized events yet — the curve populates with the first "
-            "closed trade or LLM cost row."
+            "No realized events and no open positions yet — the curve "
+            "populates with the first closed trade, LLM cost row, or "
+            "open position with marks."
         )
 
     st.markdown('<div class="at-section-label">LLM cost over time</div>', unsafe_allow_html=True)

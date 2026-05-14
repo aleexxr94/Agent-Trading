@@ -773,7 +773,19 @@ def test_synthetic_balance_open_gross_from_broker_positions(tmp_state):
         held_keys=frozenset({"TQQQ"}),
     )
     assert sb.open_gross_pnl_usd == pytest.approx(20.0)
-    assert sb.synthetic_balance_usd == pytest.approx(2520.0)
+    # Hybrid fees: real (closed) = $0 (no closed trades),
+    # modelled (open) > $0 from compute_position_pnl on the open
+    # TQQQ position. The synthetic balance subtracts the hybrid
+    # total, so it sits BELOW the raw $2,520 by the modelled-fee
+    # amount. Math: $2,500 + $20 open − modelled_open_fees.
+    assert sb.modelled_open_fees_usd > 0, (
+        "open ETF position should pick up a modelled round-trip cost"
+    )
+    assert sb.real_trading_fees_usd == pytest.approx(0.0)
+    assert sb.trading_fees_total_usd == sb.modelled_open_fees_usd
+    assert sb.synthetic_balance_usd == pytest.approx(
+        2520.0 - sb.modelled_open_fees_usd
+    )
 
 
 def test_synthetic_balance_open_gross_filters_stale_portfolio_rows(tmp_state):
@@ -869,6 +881,138 @@ def test_synthetic_balance_partial_unmatched_sell(tmp_state):
     # Leftover 1 unit on the sell side surfaces as unmatched.
     assert sb.unmatched_sell_count == 1
     assert sb.is_integrity_warning is True
+
+
+# ---------- Hybrid trading fees ----------
+
+
+def test_synthetic_balance_hybrid_fees_paper_etf_no_real(tmp_state):
+    """On Alpaca paper ETFs, real fees are \$0. The hybrid fees model
+    surfaces the modelled IBKR-Pro round-trip estimate as the
+    headline fees so the synthetic balance reflects what the
+    per-position table already shows. Without this fix the operator
+    sees "$0.00 fees" in the breakdown despite per-row Fees showing
+    a multi-dollar drag."""
+    portfolio = {"positions": [{
+        "kind": "etf", "symbol": "TQQQ", "shares": 2,
+        "avg_cost": 80.0, "leverage_factor": 3.0,
+        "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25},
+        "position_pct": 8.0,
+    }]}
+    sb = dd.compute_synthetic_balance(
+        marks={"TQQQ": 90.0},
+        portfolio=portfolio,
+        broker_costs={"TQQQ": 80.0},
+        held_keys=frozenset({"TQQQ"}),
+    )
+    assert sb.real_trading_fees_usd == pytest.approx(0.0), (
+        "no closed trades + paper ETF → real fees stay at zero"
+    )
+    assert sb.modelled_open_fees_usd > 0, (
+        "open ETF position should carry a modelled round-trip estimate "
+        "matching the positions table's per-row Fees column"
+    )
+    assert sb.trading_fees_total_usd == pytest.approx(
+        sb.real_trading_fees_usd + sb.modelled_open_fees_usd
+    )
+
+
+def test_synthetic_balance_hybrid_fees_real_plus_modelled(tmp_state):
+    """A closed round-trip with real fees AND an open position with a
+    modelled estimate: both contribute to trading_fees_total. Codex
+    should read this and understand the formula at a glance."""
+    # Closed round-trip with real fees $0.50 total.
+    state.append_trade({
+        "activity_id": "a1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 80.0,
+        "fees_usd": 0.25, "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    state.append_trade({
+        "activity_id": "a2", "alpaca_order_id": "o2", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 1, "fill_price": 100.0,
+        "fees_usd": 0.25, "filled_at": "2026-05-11T13:00:00Z", "run_id": None,
+    })
+    # Plus a currently-open SQQQ position with a modelled estimate.
+    portfolio = {"positions": [{
+        "kind": "etf", "symbol": "SQQQ", "shares": 1,
+        "avg_cost": 12.0, "leverage_factor": -3.0,
+        "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25},
+        "position_pct": 5.0,
+    }]}
+    sb = dd.compute_synthetic_balance(
+        marks={"SQQQ": 13.0},
+        portfolio=portfolio,
+        broker_costs={"SQQQ": 12.0},
+        held_keys=frozenset({"SQQQ"}),
+    )
+    assert sb.real_trading_fees_usd == pytest.approx(0.50)
+    assert sb.modelled_open_fees_usd > 0
+    assert sb.trading_fees_total_usd == pytest.approx(
+        0.50 + sb.modelled_open_fees_usd
+    )
+
+
+def test_synthetic_balance_hybrid_fees_no_portfolio_skips_modelled(tmp_state):
+    """When callers don't supply a portfolio (e.g. the Realized
+    balance card sources closed-only), the modelled component stays
+    zero — we have no broker-held positions to estimate against.
+    real_trading_fees_usd still populates from trades.jsonl."""
+    state.append_trade({
+        "activity_id": "a1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 80.0,
+        "fees_usd": 0.25, "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    state.append_trade({
+        "activity_id": "a2", "alpaca_order_id": "o2", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 1, "fill_price": 100.0,
+        "fees_usd": 0.25, "filled_at": "2026-05-11T13:00:00Z", "run_id": None,
+    })
+    sb = dd.compute_synthetic_balance()
+    assert sb.real_trading_fees_usd == pytest.approx(0.50)
+    assert sb.modelled_open_fees_usd == pytest.approx(0.0)
+    assert sb.trading_fees_total_usd == pytest.approx(0.50)
+
+
+# ---------- live_balance_tip ----------
+
+
+def test_live_balance_tip_matches_synthetic_balance(tmp_state):
+    """The live tip is the chart's anchor to the hero card — by
+    construction its synthetic_balance_usd value must equal the
+    SyntheticBalance.synthetic_balance_usd exactly."""
+    portfolio = {"positions": [{
+        "kind": "etf", "symbol": "TQQQ", "shares": 2,
+        "avg_cost": 80.0, "leverage_factor": 3.0,
+        "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25},
+        "position_pct": 8.0,
+    }]}
+    sb = dd.compute_synthetic_balance(
+        marks={"TQQQ": 90.0},
+        portfolio=portfolio,
+        broker_costs={"TQQQ": 80.0},
+        held_keys=frozenset({"TQQQ"}),
+    )
+    tip = dd.live_balance_tip(synthetic_balance=sb)
+    assert tip["synthetic_balance_usd"] == pytest.approx(sb.synthetic_balance_usd)
+    assert tip["closed_gross_pnl_usd"] == pytest.approx(sb.closed_gross_pnl_usd)
+    assert tip["open_gross_pnl_usd"] == pytest.approx(sb.open_gross_pnl_usd)
+    assert tip["llm_cost_total_usd"] == pytest.approx(sb.llm_cost_total_usd)
+    assert tip["trading_fees_total_usd"] == pytest.approx(sb.trading_fees_total_usd)
+    assert tip["kind"] == "live"
+    assert tip["at"]  # ISO timestamp non-empty
+
+
+def test_live_balance_tip_works_with_empty_series(tmp_state):
+    """Even when no realized events exist yet, the helper must
+    return a usable tip so the chart can still render the current
+    snapshot as a single marker."""
+    sb = dd.compute_synthetic_balance()
+    tip = dd.live_balance_tip(synthetic_balance=sb)
+    assert tip["synthetic_balance_usd"] == pytest.approx(sb.starting_balance_usd)
+    assert tip["kind"] == "live"
 
 
 # ---------- realized_balance_series ----------
