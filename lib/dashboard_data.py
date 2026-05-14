@@ -260,26 +260,110 @@ def compute_synthetic_balance(
     *,
     starting_balance_usd: float = 2500.0,
     marks: dict[str, float] | None = None,
+    portfolio: dict | None = None,
+    broker_costs: dict[str, float] | None = None,
+    held_keys: frozenset[str] | set[str] | None = None,
 ) -> SyntheticBalance:
     """Build a SyntheticBalance snapshot at the current moment.
 
-    `marks` is the broker-live per-symbol price map; when provided,
-    open-lot gross P&L is computed against it. When omitted (or empty),
-    open lots have no mark and the resulting balance is the realized-
-    only view (matches the original Settled balance card).
+    Source decomposition (each component reads its authoritative log):
+
+    - ``closed_gross_pnl_usd`` comes from ``trades.jsonl`` via
+      ``trades_pnl_view``. That log is the realized-cash source of
+      truth — every closed round-trip lands there with real prices.
+    - ``open_gross_pnl_usd`` comes from BROKER-HELD POSITIONS, NOT
+      from open lots in trades.jsonl. The trade log can lag behind
+      the broker (after a Wipe-history click, before
+      ``trades_sync.sync_fills_from_alpaca`` runs, or for legacy
+      pre-tracking fills), and using it for open P&L would silently
+      under-report whenever the broker carries positions that aren't
+      yet in the log. The positions table on the Portfolio tab reads
+      the same broker source — sourcing open_gross here from the
+      same place guarantees the two surfaces agree.
+    - ``llm_cost_total_usd`` is the all-time, reset-aware sum from
+      ``costs.jsonl``.
+    - ``trading_fees_total_usd`` is the all-time fees from
+      ``trades.jsonl`` (real broker fees; never reset).
+
+    Args:
+      ``marks``: broker-live per-symbol price map. Open lots without a
+        mark contribute zero and bump ``unmarked_open_lots``.
+      ``portfolio``: agent's last portfolio snapshot. When provided,
+        open_gross is computed from broker-held subset of these
+        positions via ``compute_portfolio_pnl``.
+      ``broker_costs``: broker-reported cost basis per symbol (Alpaca's
+        avg_cost). Preferred over the agent's intended ``avg_cost``
+        for option positions where the agent's premium estimates can
+        be 5-10× off the actual fill.
+      ``held_keys``: broker's currently-held position keys (from
+        ``BrokerView.held_keys``). Used to filter stale portfolio.json
+        rows the broker no longer carries.
+
+    When ``portfolio`` is None (e.g. tests, the Realized-balance card
+    explicitly sourcing closed-only), open_gross falls back to the
+    trades.jsonl open-lots path so the function stays callable
+    without broker context.
     """
     marks = marks or {}
     view = trades_pnl_view(marks=marks)
     closed_gross = view["totals"]["realised_gross_usd"]
-    open_lots = view["open"]
+
     open_gross = 0.0
     unmarked = 0
-    for lot in open_lots:
-        g = lot.get("gross_pnl_usd")
-        if g is None:
-            unmarked += 1
-        else:
-            open_gross += float(g)
+    if portfolio is not None:
+        open_subset, _ = split_positions_by_broker_holdings(
+            portfolio, held_keys=held_keys,
+        )
+        for p in open_subset:
+            key = mark_key_for_position(p)
+            mark = marks.get(key)
+            if mark is None and p["kind"] == "option":
+                # Option marks may be keyed by OSI in some BrokerView
+                # constructions — fall back to that resolution so a
+                # rename doesn't silently zero out the position.
+                try:
+                    osi = osi_symbol(
+                        underlying=p["underlying"], expiry=p["expiry"],
+                        type=p["type"], strike=p["strike"],
+                    )
+                    mark = marks.get(osi)
+                except (ValueError, KeyError):
+                    osi = None
+            if mark is None:
+                unmarked += 1
+                continue
+            broker_cost_for_pos = (broker_costs or {}).get(key)
+            if (
+                broker_cost_for_pos is None
+                and p["kind"] == "option"
+                and (broker_costs or {})
+            ):
+                try:
+                    osi = osi_symbol(
+                        underlying=p["underlying"], expiry=p["expiry"],
+                        type=p["type"], strike=p["strike"],
+                    )
+                    broker_cost_for_pos = broker_costs.get(osi)
+                except (ValueError, KeyError):
+                    pass
+            breakdown = pnl_lib.compute_position_pnl(
+                position=p,
+                current_mark_usd=mark,
+                actual_cost_per_unit=broker_cost_for_pos,
+            )
+            open_gross += breakdown.gross_pnl_usd
+    else:
+        # Legacy fallback: derive open_gross from trades.jsonl open
+        # lots. Used by tests that exercise compute_synthetic_balance
+        # without a portfolio dict, and by the Realized-balance card
+        # which passes marks={} so this branch contributes 0 anyway.
+        for lot in view["open"]:
+            g = lot.get("gross_pnl_usd")
+            if g is None:
+                unmarked += 1
+            else:
+                open_gross += float(g)
+
     return SyntheticBalance(
         starting_balance_usd=float(starting_balance_usd),
         closed_gross_pnl_usd=float(closed_gross),
