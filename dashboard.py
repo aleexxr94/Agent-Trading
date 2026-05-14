@@ -284,17 +284,35 @@ def _pills_html() -> str:
     return '<div class="at-pills">' + "".join(pills) + "</div>"
 
 
+# Hero NAV: prefer the broker's live equity figure when available, fall
+# back to the agent's last portfolio.json snapshot. Broker NAV reflects
+# fills between cycles (mid-cycle gains/losses on open positions) where
+# the snapshot is only as-fresh as the last orchestrator run.
+hero_nav_usd = (
+    broker_view.nav_usd
+    if (broker_view.available and broker_view.nav_usd is not None)
+    else portfolio.get("nav_usd", 0.0)
+)
+hero_nav_source = (
+    f"broker live (as of {_fmt_ts(broker_view.captured_at)})"
+    if (broker_view.available and broker_view.nav_usd is not None)
+    else f"portfolio.json snapshot (cycle {_fmt_ts(last_run_at)})"
+)
+
 st.markdown(
     f"""
     <div class="at-hero">
       <div class="at-hero-row">
         <div>
           <div class="at-hero-label">Net Asset Value (USD)</div>
-          <div class="at-hero-nav">${portfolio['nav_usd']:,.2f}</div>
+          <div class="at-hero-nav">${hero_nav_usd:,.2f}</div>
           <div class="at-hero-sub">
             Last cycle: <strong>{_fmt_ts(last_run_at)}</strong>
             &nbsp;•&nbsp; Next: <strong>{_fmt_ts(next_run_at)}</strong>
             &nbsp;•&nbsp; Source: <strong>{source}</strong>
+          </div>
+          <div class="at-hero-sub" style="opacity:0.75; font-size:0.85rem;">
+            NAV source: {hero_nav_source}
           </div>
         </div>
         <div style="text-align:right">
@@ -438,6 +456,58 @@ with tabs[0]:
         st.markdown('<div class="at-section-label">Positions</div>', unsafe_allow_html=True)
 
         df_pos = pd.DataFrame(rows)
+
+        # Aggregate totals across the open-positions table. Surfaces the
+        # whole-portfolio P&L at a glance, separate from the per-row
+        # breakdown below. None values (rows without a live mark) are
+        # skipped — sum operates on populated cells only.
+        def _sum_or_none(col_name: str) -> float | None:
+            if col_name not in df_pos.columns:
+                return None
+            vals = [v for v in df_pos[col_name] if isinstance(v, (int, float)) and v == v]
+            return sum(vals) if vals else None
+
+        total_gross = _sum_or_none("Gross P&L")
+        total_net = _sum_or_none("Net P&L")
+        total_notional = _sum_or_none("Notional")
+
+        tot = st.columns(4)
+        tot[0].markdown(
+            _stat_card(
+                "Positions open",
+                str(len(df_pos)),
+                sub="across the universe",
+            ),
+            unsafe_allow_html=True,
+        )
+        tot[1].markdown(
+            _stat_card(
+                "Total notional",
+                f"${total_notional:,.0f}" if total_notional is not None else "—",
+                sub="sum of position USD value",
+            ),
+            unsafe_allow_html=True,
+        )
+        tot[2].markdown(
+            _stat_card(
+                "Aggregate Gross P&L",
+                f"${total_gross:+,.2f}" if total_gross is not None else "—",
+                sub="pre-fees, pre-LLM",
+                tone=("pos" if total_gross and total_gross > 0 else
+                      "neg" if total_gross and total_gross < 0 else ""),
+            ),
+            unsafe_allow_html=True,
+        )
+        tot[3].markdown(
+            _stat_card(
+                "Aggregate Net P&L",
+                f"${total_net:+,.2f}" if total_net is not None else "—",
+                sub="net of modelled costs",
+                tone=("pos" if total_net and total_net > 0 else
+                      "neg" if total_net and total_net < 0 else ""),
+            ),
+            unsafe_allow_html=True,
+        )
 
         # Color-code Gross/Net P&L: green positive, red negative, neutral when blank.
         def _color_pnl(v):
@@ -694,34 +764,70 @@ with tabs[3]:
     nav_history = dd.load_nav_history()
     if nav_history:
         nav_df = pd.DataFrame(nav_history)
-        fig_nav = go.Figure()
-        fig_nav.add_trace(go.Scatter(
-            x=nav_df["at"], y=nav_df["nav_usd"], mode="lines+markers",
-            name="NAV (USD)",
-            line=dict(width=2.5, color="#059669"),
-            marker=dict(size=5, color="#059669"),
-        ))
-        if "net_pnl_usd" in nav_df.columns:
-            fig_nav.add_trace(go.Scatter(
-                x=nav_df["at"], y=nav_df["net_pnl_usd"], mode="lines",
-                name="Cumulative Net P&L (USD)",
-                yaxis="y2", line=dict(dash="dot", color="#7c3aed", width=2),
-            ))
-            fig_nav.update_layout(
-                yaxis2=dict(title="Net P&L (USD)", overlaying="y", side="right",
-                            showgrid=False, color="#7c3aed"),
-            )
-        fig_nav.update_layout(
-            template="plotly_white",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            height=360, yaxis_title="NAV (USD)",
-            yaxis=dict(gridcolor="#e2e8f0", color="#059669"),
-            xaxis=dict(gridcolor="#e2e8f0"),
-            margin=dict(l=10, r=10, t=20, b=10),
-            legend=dict(orientation="h", y=1.1, font=dict(size=12)),
+        # Window filter: 1D / 1W / 1M / 1Y / All. Defaults to All so a
+        # fresh-start account renders something useful immediately.
+        # st.radio with horizontal=True is portable back to Streamlit
+        # 1.6 (segmented_control needs ≥1.40 — not all VPSes update
+        # promptly).
+        window_choice = st.radio(
+            "Window",
+            ["1D", "1W", "1M", "1Y", "All"],
+            index=4,
+            horizontal=True,
+            label_visibility="collapsed",
+            help="Filter the equity curve to the trailing window. "
+                 "Affects this chart only; underlying nav_history.jsonl "
+                 "is unchanged.",
         )
-        st.plotly_chart(fig_nav, width="stretch")
+        window_days = {"1D": 1, "1W": 7, "1M": 30, "1Y": 365}.get(window_choice)
+        if window_days is not None and "at" in nav_df.columns:
+            from datetime import datetime, timezone, timedelta
+            cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+            # Parse 'at' column to UTC-aware datetimes. Tolerant of both
+            # Z-suffixed and +00:00 ISO strings (state.utcnow_iso emits Z,
+            # but defensive against future format changes).
+            nav_df = nav_df.copy()
+            nav_df["_at_dt"] = pd.to_datetime(
+                nav_df["at"].str.replace("Z", "+00:00", regex=False),
+                utc=True,
+                errors="coerce",
+            )
+            nav_df = nav_df[nav_df["_at_dt"] >= cutoff]
+        if nav_df.empty:
+            st.info(
+                f"No NAV rows in the trailing {window_choice} window. "
+                "Either the window is too narrow or there's a gap in "
+                "nav_history.jsonl."
+            )
+        else:
+            fig_nav = go.Figure()
+            fig_nav.add_trace(go.Scatter(
+                x=nav_df["at"], y=nav_df["nav_usd"], mode="lines+markers",
+                name="NAV (USD)",
+                line=dict(width=2.5, color="#059669"),
+                marker=dict(size=5, color="#059669"),
+            ))
+            if "net_pnl_usd" in nav_df.columns:
+                fig_nav.add_trace(go.Scatter(
+                    x=nav_df["at"], y=nav_df["net_pnl_usd"], mode="lines",
+                    name="Cumulative Net P&L (USD)",
+                    yaxis="y2", line=dict(dash="dot", color="#7c3aed", width=2),
+                ))
+                fig_nav.update_layout(
+                    yaxis2=dict(title="Net P&L (USD)", overlaying="y", side="right",
+                                showgrid=False, color="#7c3aed"),
+                )
+            fig_nav.update_layout(
+                template="plotly_white",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                height=360, yaxis_title="NAV (USD)",
+                yaxis=dict(gridcolor="#e2e8f0", color="#059669"),
+                xaxis=dict(gridcolor="#e2e8f0"),
+                margin=dict(l=10, r=10, t=20, b=10),
+                legend=dict(orientation="h", y=1.1, font=dict(size=12)),
+            )
+            st.plotly_chart(fig_nav, width="stretch")
     else:
         st.info("No NAV history yet — the equity curve populates once orchestrator runs accumulate.")
 
@@ -1231,6 +1337,34 @@ with tabs[6]:
         if st.button("🛑 Emergency stop (write halt.flag)"):
             state.set_halt("dashboard")
             st.rerun()
+
+    st.markdown('<div class="at-section-label">Auto-refresh</div>', unsafe_allow_html=True)
+    st.caption(
+        "Streamlit dashboards don't refresh on their own — the hero NAV, "
+        "positions table, and equity curve only update when you reload the "
+        "page (or hit the manual button below). Toggle this on to insert "
+        "a `meta http-equiv=\"refresh\"` tag into the page so the browser "
+        "reloads every N seconds. Off by default to avoid surprise re-runs "
+        "interrupting your reading."
+    )
+    auto_refresh_on = st.checkbox(
+        "Auto-refresh enabled", value=False,
+        help="Reload the whole page every N seconds. Live broker NAV / "
+             "positions / fills will tick forward without a manual refresh.",
+    )
+    refresh_seconds = st.slider(
+        "Refresh interval (seconds)",
+        min_value=15, max_value=300, value=60, step=15,
+        disabled=not auto_refresh_on,
+        help="60s matches the scheduler's poll cadence; 30s is fine if you "
+             "want tighter live-mark updates during a position you're watching.",
+    )
+    if auto_refresh_on:
+        st.markdown(
+            f'<meta http-equiv="refresh" content="{refresh_seconds}">',
+            unsafe_allow_html=True,
+        )
+        st.success(f"Page will reload every {refresh_seconds}s.")
 
     st.markdown('<div class="at-section-label">Manual actions</div>', unsafe_allow_html=True)
     if st.button("🔄 Refresh data"):

@@ -124,9 +124,25 @@ def test_broker_view_dataclass_shape():
         costs={"TQQQ": 75.0, "SPY|540.0|2026-06-19|call": 8.10},
         held_keys=frozenset({"TQQQ", "SPY|540.0|2026-06-19|call"}),
         available=True,
+        nav_usd=2575.5,
+        captured_at="2026-05-14T13:35:00Z",
     )
     assert set(view.costs) == set(view.held_keys)
     assert view.available is True
+    assert view.nav_usd == 2575.5
+    assert view.captured_at == "2026-05-14T13:35:00Z"
+
+
+def test_broker_view_defaults_nav_to_none_and_captured_at_to_empty():
+    """Backwards-compat: existing call sites that didn't pass the new
+    nav_usd / captured_at fields should still construct cleanly.
+    Hero falls back to portfolio.json snapshot when nav_usd is None.
+    """
+    view = dd.BrokerView(
+        marks={}, costs={}, held_keys=frozenset(), available=True,
+    )
+    assert view.nav_usd is None
+    assert view.captured_at == ""
 
 
 def test_try_load_broker_view_sets_available_false_when_get_positions_raises(

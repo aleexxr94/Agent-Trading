@@ -373,11 +373,24 @@ class BrokerView:
     ``held_keys`` is exactly ``set(costs)`` precomputed; ``cost_basis_from_broker``
     already filters qty == 0 so it's the truth about what's still open
     on the broker.
+
+    ``nav_usd`` is the broker's live equity figure (account.equity_usd)
+    captured at the moment ``try_load_broker_view`` was called — used
+    by the dashboard hero so the headline number reflects realtime
+    fills rather than the agent's last portfolio.json snapshot. Falls
+    back to None when the account fetch fails (the hero then renders
+    the portfolio.json nav_usd snapshot).
+
+    ``captured_at`` is the wall-clock UTC ISO timestamp the snapshot
+    was taken — surfaced on the hero so the operator can see at a
+    glance how stale the displayed numbers are.
     """
     marks: dict[str, float]
     costs: dict[str, float]
     held_keys: frozenset[str]
     available: bool
+    nav_usd: float | None = None
+    captured_at: str = ""
 
 
 def try_load_broker_view() -> BrokerView:
@@ -412,11 +425,21 @@ def try_load_broker_view() -> BrokerView:
         )
     marks = marks_from_positions(positions)
     costs = cost_basis_from_positions(positions)
+    # Live broker NAV — best-effort; if get_account fails we still have
+    # the positions data, just fall back to portfolio.json snapshot at
+    # render time.
+    nav_usd: float | None = None
+    try:
+        nav_usd = float(broker.get_account().equity_usd)
+    except Exception:
+        nav_usd = None
     return BrokerView(
         marks=marks,
         costs=costs,
         held_keys=frozenset(costs),
         available=True,
+        nav_usd=nav_usd,
+        captured_at=state.utcnow_iso(),
     )
 
 
