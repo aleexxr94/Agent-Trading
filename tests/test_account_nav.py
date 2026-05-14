@@ -76,3 +76,30 @@ def test_account_nav_override_used_when_broker_raises(monkeypatch):
 
     broker = _BrokenBroker(equity_usd=0)
     assert orchestrator._account_nav(_ctx(broker)) == 2500.0
+
+
+def test_parsed_virtual_nav_override_returns_none_when_unset(monkeypatch):
+    monkeypatch.delenv("VIRTUAL_NAV_USD", raising=False)
+    assert orchestrator._parsed_virtual_nav_override() is None
+
+
+def test_parsed_virtual_nav_override_returns_none_when_garbage(monkeypatch):
+    """Codex P1 on PR #76: misconfigured env var ('not-a-number',
+    empty string after parsing) must return None so the orchestrator
+    stamps nav_source='broker' on the row rather than mis-flagging
+    a broker-units row as virtual."""
+    monkeypatch.setenv("VIRTUAL_NAV_USD", "not-a-number")
+    assert orchestrator._parsed_virtual_nav_override() is None
+
+
+def test_parsed_virtual_nav_override_returns_float_when_valid(monkeypatch):
+    monkeypatch.setenv("VIRTUAL_NAV_USD", "2500.0")
+    assert orchestrator._parsed_virtual_nav_override() == 2500.0
+
+
+def test_parsed_virtual_nav_override_handles_whitespace_negative(monkeypatch):
+    """Edge cases: leading/trailing whitespace parses fine, negative
+    numbers also parse (operator might want to stress-test a negative
+    NAV scenario). The helper just reports parseability."""
+    monkeypatch.setenv("VIRTUAL_NAV_USD", "  -500  ")
+    assert orchestrator._parsed_virtual_nav_override() == -500.0
