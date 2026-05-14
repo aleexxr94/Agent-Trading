@@ -116,6 +116,54 @@ def realised_llm_cost_attributed_to_trades_usd(
     return closed_sum + open_sum
 
 
+def apply_nav_offset_to_history(
+    rows: list[dict],
+    *,
+    nav_offset_usd: float,
+    virtual_baseline_usd: float = 2500.0,
+) -> list[dict]:
+    """Subtract `nav_offset_usd` from each row's `nav_usd` field, but
+    only when the row is in raw-broker units. Rows with
+    `nav_source == "virtual"` are left untouched — they were written
+    under VIRTUAL_NAV_USD and are already in display units.
+
+    For legacy rows with no `nav_source` stamp, a value-based heuristic
+    is used: if 0 < nav_usd < virtual_baseline × 10 the row looks like
+    virtual; anything larger is treated as broker.
+
+    Returns a new list of shallow-copied rows (the original list and
+    its rows are not mutated). When `nav_offset_usd == 0` the input is
+    returned as-is.
+
+    Fixes the Y-axis = -$95k bug the operator hit when an anchor was
+    set (offset $97,527) but the orchestrator was already writing
+    rows in virtual units ($2,500), so subtracting again landed the
+    chart at -$95,027.
+    """
+    if not nav_offset_usd:
+        return rows
+    out: list[dict] = []
+    threshold = virtual_baseline_usd * 10
+    for row in rows:
+        src = row.get("nav_source")
+        nav = row.get("nav_usd")
+        if not isinstance(nav, (int, float)):
+            out.append(dict(row))
+            continue
+        if src == "virtual":
+            is_virtual = True
+        elif src == "broker":
+            is_virtual = False
+        else:
+            # Legacy row, no stamp — guess by magnitude.
+            is_virtual = 0 < nav < threshold
+        new_row = dict(row)
+        if not is_virtual:
+            new_row["nav_usd"] = nav - nav_offset_usd
+        out.append(new_row)
+    return out
+
+
 def settled_balance_usd(
     *,
     virtual_baseline_usd: float = 2500.0,

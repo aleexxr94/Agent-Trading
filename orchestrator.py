@@ -288,15 +288,29 @@ def stage_critic(
     return res.payload
 
 
+def _parsed_virtual_nav_override() -> float | None:
+    """Return VIRTUAL_NAV_USD as a float if the env var exists AND
+    parses cleanly. Returns None if the var is absent OR malformed —
+    callers use that to decide whether the resulting NAV is in
+    virtual or broker units (Codex P1 on PR #76: stamping
+    nav_source from env presence alone misclassified rows whenever
+    the var was set but unparseable).
+    """
+    override = os.environ.get("VIRTUAL_NAV_USD")
+    if not override:
+        return None
+    try:
+        return float(override)
+    except ValueError:
+        return None
+
+
 def _account_nav(ctx: StageContext) -> float:
     """$2.5k notional override unless VIRTUAL_NAV_USD set or broker
     reports a different equity figure. Same as v1."""
-    override = os.environ.get("VIRTUAL_NAV_USD")
-    if override:
-        try:
-            return float(override)
-        except ValueError:
-            pass
+    parsed = _parsed_virtual_nav_override()
+    if parsed is not None:
+        return parsed
     if ctx.broker is not None:
         try:
             return ctx.broker.get_account().equity_usd
@@ -707,12 +721,25 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
         # Marks aren't wired here — gross/net P&L includes the modelled-
         # cost entry-leg estimate only. Real marks come through the
         # broker-position path in lib/marks.py.
+        #
+        # `nav_source` records whether nav_usd is in raw broker units
+        # or virtual (VIRTUAL_NAV_USD-overridden) units. The dashboard's
+        # NAV anchor offset only applies to broker-unit rows; without
+        # this tag a row written under VIRTUAL_NAV_USD=2500 would get
+        # the broker offset subtracted again and land at ~-$95k.
+        #
+        # Derive the tag from the SAME parsing logic _account_nav uses
+        # (Codex P1 on PR #76): a malformed env var like
+        # VIRTUAL_NAV_USD="not-a-number" falls through to broker
+        # equity, so the row is broker-units despite the var existing.
         from lib import pnl as pnl_lib
         breakdown = pnl_lib.compute_portfolio_pnl(portfolio=portfolio, marks=None)
+        nav_source = "virtual" if _parsed_virtual_nav_override() is not None else "broker"
         state.append_nav({
             "run_id": ctx.run_id,
             "at": state.utcnow_iso(),
             "nav_usd": portfolio.get("nav_usd", 0.0),
+            "nav_source": nav_source,
             "cash_usd": portfolio.get("cash_usd", 0.0),
             "positions_count": len(portfolio.get("positions", [])),
             "all_cash": portfolio.get("all_cash", False),

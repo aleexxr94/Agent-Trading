@@ -1026,16 +1026,24 @@ with tabs[3]:
     st.markdown('<div class="at-section-label">Equity curve</div>', unsafe_allow_html=True)
     nav_history = dd.load_nav_history()
     if nav_history:
-        nav_df = pd.DataFrame(nav_history)
-        # Apply the NAV display anchor to the equity curve so historical
-        # NAV rows align with the hero card. The offset is a constant
-        # subtraction — relative swings within the window stay 1:1, the
-        # absolute floor just shifts down. When no anchor is set,
-        # nav_offset_usd() returns 0.0 and this is a no-op.
-        _nav_offset = state.nav_offset_usd()
-        if _nav_offset and "nav_usd" in nav_df.columns:
-            nav_df = nav_df.copy()
-            nav_df["nav_usd"] = nav_df["nav_usd"] - _nav_offset
+        # Apply the NAV display anchor to historical rows BEFORE
+        # building the DataFrame so the offset-skip logic can branch on
+        # each row's `nav_source` stamp. Rows written under
+        # VIRTUAL_NAV_USD are tagged "virtual" and are already in
+        # display units; broker-unit rows get the offset subtracted.
+        # Legacy rows lacking the stamp fall back to a value-based
+        # heuristic in apply_nav_offset_to_history.
+        _anchor_cfg = state.read_nav_offset()
+        _virtual_target = (
+            _anchor_cfg["virtual_baseline_usd"]
+            if _anchor_cfg else 2500.0
+        )
+        nav_history_adj = dd.apply_nav_offset_to_history(
+            nav_history,
+            nav_offset_usd=state.nav_offset_usd(),
+            virtual_baseline_usd=_virtual_target,
+        )
+        nav_df = pd.DataFrame(nav_history_adj)
         # Window filter: 1D / 1W / 1M / 1Y / All. Defaults to All so a
         # fresh-start account renders something useful immediately.
         # st.radio with horizontal=True is portable back to Streamlit
@@ -1113,6 +1121,12 @@ with tabs[3]:
                 legend=dict(orientation="h", y=1.1, font=dict(size=12)),
             )
             st.plotly_chart(fig_nav, width="stretch")
+            if len(nav_df) == 1:
+                st.caption(
+                    "Single NAV row in this window — the curve renders as "
+                    "one marker rather than a line. The line draws itself "
+                    "once a second cycle writes another row."
+                )
     else:
         st.info("No NAV history yet — the equity curve populates once orchestrator runs accumulate.")
 

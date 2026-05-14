@@ -1170,6 +1170,66 @@ def test_try_load_broker_marks_no_keys_returns_empty(tmp_state, monkeypatch):
     assert dd.try_load_broker_marks() == {}
 
 
+def test_apply_nav_offset_noop_when_offset_zero(tmp_state):
+    rows = [
+        {"nav_usd": 100020.0, "nav_source": "broker"},
+        {"nav_usd": 2500.0, "nav_source": "virtual"},
+    ]
+    out = dd.apply_nav_offset_to_history(rows, nav_offset_usd=0.0)
+    assert out is rows or out == rows
+
+
+def test_apply_nav_offset_subtracts_from_broker_rows_only(tmp_state):
+    """Operator's real-world scenario: anchor offset is $97,527, the
+    orchestrator wrote a broker-unit row at $100,020 AND later a
+    virtual-unit row at $2,500. Subtracting the offset from the
+    virtual row would land it at -$95,027 (the exact bug from the
+    deployed dashboard). Helper must skip the virtual row."""
+    rows = [
+        {"nav_usd": 100020.0, "nav_source": "broker"},
+        {"nav_usd": 2500.0, "nav_source": "virtual"},
+    ]
+    out = dd.apply_nav_offset_to_history(
+        rows, nav_offset_usd=97527.0, virtual_baseline_usd=2500.0,
+    )
+    assert out[0]["nav_usd"] == pytest.approx(2493.0)
+    assert out[1]["nav_usd"] == pytest.approx(2500.0)
+    # And the original list is not mutated.
+    assert rows[0]["nav_usd"] == 100020.0
+    assert rows[1]["nav_usd"] == 2500.0
+
+
+def test_apply_nav_offset_legacy_row_heuristic(tmp_state):
+    """Rows without nav_source stamp fall back to value-based detection.
+    Anything within 10× of the virtual baseline is treated as virtual;
+    larger values look like raw broker."""
+    rows = [
+        {"nav_usd": 100020.0},  # no stamp → broker-units by magnitude
+        {"nav_usd": 2500.0},    # no stamp → virtual by magnitude
+        {"nav_usd": 12000.0},   # below 10× virtual ($25k) → virtual
+        {"nav_usd": 50000.0},   # above 10× virtual → broker
+    ]
+    out = dd.apply_nav_offset_to_history(
+        rows, nav_offset_usd=97527.0, virtual_baseline_usd=2500.0,
+    )
+    assert out[0]["nav_usd"] == pytest.approx(2493.0)   # broker → subtract
+    assert out[1]["nav_usd"] == pytest.approx(2500.0)   # virtual → keep
+    assert out[2]["nav_usd"] == pytest.approx(12000.0)  # below threshold → virtual
+    assert out[3]["nav_usd"] == pytest.approx(-47527.0) # above threshold → broker (subtract; goes negative — by design, operator should re-anchor)
+
+
+def test_apply_nav_offset_skips_non_numeric_nav(tmp_state):
+    """Defensive: a malformed row with non-numeric nav_usd shouldn't
+    crash the chart."""
+    rows = [{"nav_usd": None}, {"nav_usd": "oops"}, {"nav_usd": 100020.0, "nav_source": "broker"}]
+    out = dd.apply_nav_offset_to_history(
+        rows, nav_offset_usd=97527.0, virtual_baseline_usd=2500.0,
+    )
+    assert out[0]["nav_usd"] is None
+    assert out[1]["nav_usd"] == "oops"
+    assert out[2]["nav_usd"] == pytest.approx(2493.0)
+
+
 def test_load_nav_history_round_trip(tmp_state):
     assert dd.load_nav_history() == []
     state.append_nav({"run_id": "r1", "at": state.utcnow_iso(), "nav_usd": 2500.0})
