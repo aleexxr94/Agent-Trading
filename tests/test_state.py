@@ -265,6 +265,48 @@ def test_nav_offset_default_virtual_baseline_is_2500(tmp_state):
     assert data["virtual_baseline_usd"] == pytest.approx(2500.0)
 
 
+def test_manual_nav_baseline_unset_returns_none(tmp_state):
+    """Fresh installs have no remembered manual baseline — the helper
+    must be a no-op so dashboard inputs fall back to their hardcoded
+    default."""
+    assert state.read_manual_nav_baseline_usd() is None
+
+
+def test_manual_nav_baseline_round_trip(tmp_state):
+    """Set / read / clear cycle for the remembered manual baseline.
+    Operator-flow: they enter $99,938.95 once, the dashboard remembers
+    it across re-anchors and clears."""
+    at = state.set_manual_nav_baseline_usd(99938.95)
+    assert state.read_manual_nav_baseline_usd() == pytest.approx(99938.95)
+    # File on disk carries the stamp too — useful when the operator
+    # needs to audit when the manual baseline was set.
+    import json
+    data = json.loads(state.NAV_MANUAL_BASELINE_FLAG.read_text())
+    assert data["set_at"] == at
+
+    state.clear_manual_nav_baseline()
+    assert state.read_manual_nav_baseline_usd() is None
+
+
+def test_manual_nav_baseline_corrupt_file_returns_none(tmp_state):
+    """Malformed file → fall back to None rather than crashing the
+    Settings tab."""
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.NAV_MANUAL_BASELINE_FLAG.write_text("{not json", encoding="utf-8")
+    assert state.read_manual_nav_baseline_usd() is None
+
+
+def test_manual_nav_baseline_survives_anchor_changes(tmp_state):
+    """The whole point of the remembered baseline: re-anchor /
+    clear-anchor flows don't wipe it. Verifies the two state files
+    are decoupled."""
+    state.set_manual_nav_baseline_usd(99938.95)
+    state.set_nav_offset(broker_baseline_usd=100020.0)  # auto-anchor
+    assert state.read_manual_nav_baseline_usd() == pytest.approx(99938.95)
+    state.clear_nav_offset()
+    assert state.read_manual_nav_baseline_usd() == pytest.approx(99938.95)
+
+
 def test_filter_costs_post_reset_passthrough_when_no_marker(tmp_state):
     """No reset marker → filter is identity."""
     rows = [

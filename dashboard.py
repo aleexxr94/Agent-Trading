@@ -674,8 +674,17 @@ with tabs[0]:
         # columns — apply the same color formatter so a move-since-entry
         # of -8% reads red at a glance.
         color_subset = [c for c in ("Gross P&L", "Net P&L", "Δ%") if c in df_pos_with_total.columns]
+        # na_rep="—" turns every NaN / pd.NA cell into an em-dash
+        # (matches the existing "no data" sentinel used in row builds).
+        # Without this, Pandas Styler renders pd.NA as the literal
+        # string "None" — which is what shows up on ETF rows for DTE /
+        # Days held and on every cell of the TOTAL row for columns we
+        # don't sum (Qty, Entry, Mark, etc.). `precision=None` keeps
+        # column_config's per-column NumberColumn(format=...) rules
+        # in charge of numeric rendering for the non-NA cells.
         styled = (
             df_pos_with_total.style
+            .format(na_rep="—", precision=None)
             .map(_color_pnl, subset=color_subset)
             .apply(_bold_total, axis=1)
         )
@@ -1653,34 +1662,47 @@ with tabs[6]:
             unsafe_allow_html=True,
         )
         manual_cols = st.columns([2, 3])
-        # Bind the widget keys to the anchor's set_at timestamp.
-        # st.number_input persists across reruns when keyed, so the
-        # first-edited value would stick even after a re-anchor with a
-        # different broker_baseline_usd (Codex P2). Including set_at in
-        # the key means each new anchor wipes the session-state slot
-        # and the widget re-renders from the current `value=`.
-        _anchor_session_token = _anchor.get("set_at", "") or "no-set-at"
+        # The manual baseline input defaults to the operator's last
+        # remembered value (stored in state/nav_manual_baseline.json),
+        # so a re-anchor or clear doesn't wipe their known pre-trades
+        # equity figure. Falls back to the current anchor's
+        # broker_baseline_usd, then to a sensible default.
+        _remembered_manual = state.read_manual_nav_baseline_usd()
+        _manual_default = (
+            float(_remembered_manual)
+            if _remembered_manual is not None
+            else float(_anchor["broker_baseline_usd"])
+        )
+        # Bind the widget keys to the remembered value's identity so
+        # the input re-reads from `value=` whenever the remembered
+        # value changes (after a Set click).
+        _manual_session_token = (
+            f"{_remembered_manual or 'unset'}"
+        )
         with manual_cols[0]:
             manual_baseline_set = st.number_input(
                 "Broker baseline ($)",
-                value=float(_anchor["broker_baseline_usd"]),
+                value=_manual_default,
                 min_value=0.0,
                 step=0.01,
                 format="%.2f",
-                key=f"manual_baseline_anchored::{_anchor_session_token}",
+                key=f"manual_baseline_anchored::{_manual_session_token}",
                 help="The broker's equity AT the moment you consider the "
                      "trading account to have started — typically the "
-                     "pre-trades cash balance. Offset = this − virtual.",
+                     "pre-trades cash balance. Offset = this − virtual. "
+                     "Saved across re-anchors so you don't need to "
+                     "re-enter it each time.",
             )
         with manual_cols[1]:
             st.markdown("&nbsp;", unsafe_allow_html=True)
             if st.button(
                 "📐 Set anchor to specific broker baseline",
-                key=f"manual_anchor_btn_anchored::{_anchor_session_token}",
-                help="Stamps the entered broker_baseline directly, no "
-                     "pre-bake estimation. Displayed NAV = "
-                     "broker_now − (manual_baseline − virtual).",
+                key=f"manual_anchor_btn_anchored::{_manual_session_token}",
+                help="Stamps the entered broker_baseline directly AND "
+                     "remembers it for future re-anchors. Displayed NAV "
+                     "= broker_now − (manual_baseline − virtual).",
             ):
+                state.set_manual_nav_baseline_usd(float(manual_baseline_set))
                 state.set_nav_offset(
                     broker_baseline_usd=float(manual_baseline_set),
                     virtual_baseline_usd=_anchor["virtual_baseline_usd"],
@@ -1755,25 +1777,37 @@ with tabs[6]:
             unsafe_allow_html=True,
         )
         manual_unset_cols = st.columns([2, 3])
+        # Default to the remembered manual baseline so the operator
+        # doesn't lose their pre-trades figure across wipes / anchor
+        # clears. Falls back to 99938.95 (the operator's known value
+        # from the deploy on May 14) as a sensible starter.
+        _remembered_unset = state.read_manual_nav_baseline_usd()
+        _manual_unset_default = (
+            float(_remembered_unset) if _remembered_unset is not None else 99938.95
+        )
+        _manual_unset_token = f"{_remembered_unset or 'unset'}"
         with manual_unset_cols[0]:
             manual_baseline_init = st.number_input(
                 "Broker baseline ($)",
-                value=99938.95,
+                value=_manual_unset_default,
                 min_value=0.0,
                 step=0.01,
                 format="%.2f",
-                key="manual_baseline_unanchored",
+                key=f"manual_baseline_unanchored::{_manual_unset_token}",
                 help="The broker's equity AT the moment you consider the "
-                     "trading account to have started.",
+                     "trading account to have started. Saved across "
+                     "re-anchors and dashboard reloads.",
             )
         with manual_unset_cols[1]:
             st.markdown("&nbsp;", unsafe_allow_html=True)
             if st.button(
                 "📐 Set anchor to specific broker baseline",
-                key="manual_anchor_btn_unanchored",
-                help="Stamps the entered broker_baseline directly. "
-                     "Displayed NAV = broker_now − (manual_baseline − virtual).",
+                key=f"manual_anchor_btn_unanchored::{_manual_unset_token}",
+                help="Stamps the entered broker_baseline directly AND "
+                     "remembers it for future re-anchors. Displayed NAV "
+                     "= broker_now − (manual_baseline − virtual).",
             ):
+                state.set_manual_nav_baseline_usd(float(manual_baseline_init))
                 state.set_nav_offset(
                     broker_baseline_usd=float(manual_baseline_init),
                     virtual_baseline_usd=float(virt_target),

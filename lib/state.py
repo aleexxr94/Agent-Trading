@@ -78,6 +78,16 @@ LAST_CYCLE_HASH = STATE_DIR / "last_cycle_hash.json"
 # VIRTUAL_NAV_USD from the environment as a separate setting.
 NAV_OFFSET_FLAG = STATE_DIR / "nav_offset.json"
 
+# Remembered manual broker baseline — separate from the active anchor.
+# The Settings tab's "manual broker baseline" input defaults to this
+# value so an operator can re-anchor without re-typing the exact
+# pre-trades equity each time. Survives re-anchor / clear-anchor;
+# only changes when the operator explicitly enters a new value in the
+# manual input and clicks Set.
+#
+# Schema: {"broker_baseline_usd": <float>, "set_at": <ISO-UTC>}
+NAV_MANUAL_BASELINE_FLAG = STATE_DIR / "nav_manual_baseline.json"
+
 
 # --------- run_id ---------
 
@@ -368,6 +378,47 @@ def clear_nav_offset() -> None:
     """Remove the anchor. Dashboard reverts to raw broker equity."""
     if NAV_OFFSET_FLAG.exists():
         NAV_OFFSET_FLAG.unlink()
+
+
+def read_manual_nav_baseline_usd() -> float | None:
+    """Return the operator's last-entered manual broker baseline, or
+    None when unset. The dashboard's manual-baseline input defaults to
+    this value so re-anchor / clear-anchor flows don't wipe the
+    operator's known pre-trades equity figure."""
+    if not NAV_MANUAL_BASELINE_FLAG.exists():
+        return None
+    try:
+        data = json.loads(NAV_MANUAL_BASELINE_FLAG.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        return float(data["broker_baseline_usd"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def set_manual_nav_baseline_usd(broker_baseline_usd: float) -> str:
+    """Stamp a new remembered manual baseline. Returns the ISO-UTC
+    timestamp written into the file."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    at = utcnow_iso()
+    NAV_MANUAL_BASELINE_FLAG.write_text(
+        json.dumps({
+            "broker_baseline_usd": float(broker_baseline_usd),
+            "set_at": at,
+        }, sort_keys=True),
+        encoding="utf-8",
+    )
+    return at
+
+
+def clear_manual_nav_baseline() -> None:
+    """Drop the remembered manual baseline. Input falls back to its
+    hardcoded default."""
+    if NAV_MANUAL_BASELINE_FLAG.exists():
+        NAV_MANUAL_BASELINE_FLAG.unlink()
 
 
 def read_costs_today() -> list[dict]:
