@@ -184,6 +184,18 @@ st.markdown(
 
       /* dataframe */
       [data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+      /* Bump dataframe cell font-size from Streamlit's default (~0.875rem)
+         to a more readable 1rem for operator readability. Targets both the
+         <th> header row and <td> body rows. Scoped to dataframes only —
+         doesn't touch the rest of the page chrome. */
+      [data-testid="stDataFrame"] th,
+      [data-testid="stDataFrame"] td {
+        font-size: 1rem !important;
+        padding: 0.5rem 0.75rem !important;
+      }
+      [data-testid="stDataFrame"] th {
+        font-weight: 700 !important;
+      }
 
       /* subtle subheaders */
       h1, h2, h3 { color: var(--text-0); font-weight: 700; letter-spacing: -0.01em; }
@@ -520,7 +532,42 @@ with tabs[0]:
                 if v < 0: return "color: #dc2626; font-weight: 700"
             return ""
 
-        styled = df_pos.style.map(_color_pnl, subset=["Gross P&L", "Net P&L"])
+        # Append a TOTAL row at the bottom of the dataframe — readers
+        # asked for column sums alongside the per-row breakdown. The
+        # symbol column gets the literal string "TOTAL" so the row is
+        # visually obvious; the leftover non-numeric columns get blanks
+        # to avoid bogus "averages." Pandas Styler bolds the row via a
+        # row-level apply.
+        def _sum_col(col: str) -> float | None:
+            if col not in df_pos.columns:
+                return None
+            vals = [v for v in df_pos[col] if isinstance(v, (int, float)) and v == v]
+            return sum(vals) if vals else None
+
+        total_row: dict = {}
+        for col in df_pos.columns:
+            if col in ("Notional", "% NAV", "Gross P&L", "Net P&L"):
+                total_row[col] = _sum_col(col)
+            elif col == "Symbol":
+                total_row[col] = "TOTAL"
+            else:
+                total_row[col] = ""
+        df_pos_with_total = pd.concat(
+            [df_pos, pd.DataFrame([total_row])],
+            ignore_index=True,
+        )
+        total_row_idx = len(df_pos_with_total) - 1
+
+        def _bold_total(row):
+            if row.name == total_row_idx:
+                return ["font-weight: 800; border-top: 2px solid var(--border)"] * len(row)
+            return [""] * len(row)
+
+        styled = (
+            df_pos_with_total.style
+            .map(_color_pnl, subset=["Gross P&L", "Net P&L"])
+            .apply(_bold_total, axis=1)
+        )
         st.dataframe(
             styled,
             width="stretch",
