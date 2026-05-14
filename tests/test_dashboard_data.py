@@ -526,6 +526,137 @@ def test_kill_column_includes_underlying_price_and_time_stop(tmp_state):
     assert "by 2026-06-12" in kill
 
 
+def test_split_positions_excludes_stale_for_prebake_pnl(tmp_state):
+    """Codex P1 on PR #75: when portfolio.json carries stale rows the
+    broker no longer holds (manual close, expiry, sync lag), the
+    pre-bake path must NOT include them in compute_portfolio_pnl —
+    each stale row with no live mark returns net_pnl = -entry_leg_cost,
+    which would bake phantom losses into the NAV offset.
+
+    Verifies the upstream contract that the anchor logic relies on:
+    split_positions_by_broker_holdings keeps only broker-held rows.
+    """
+    portfolio = {"positions": [
+        {
+            "kind": "etf", "symbol": "TQQQ", "shares": 1, "avg_cost": 80.0,
+            "leverage_factor": 3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+        },
+        {
+            "kind": "etf", "symbol": "SQQQ", "shares": 1, "avg_cost": 12.0,
+            "leverage_factor": -3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+        },
+    ]}
+    # Broker only holds TQQQ — SQQQ is stale (e.g. manually closed).
+    held = frozenset({"TQQQ"})
+    open_subset, closed_subset = dd.split_positions_by_broker_holdings(
+        portfolio, held_keys=held,
+    )
+    assert [p["symbol"] for p in open_subset] == ["TQQQ"]
+    assert [p["symbol"] for p in closed_subset] == ["SQQQ"]
+
+    # And the pre-bake P&L computation against the filtered subset
+    # must not pick up SQQQ's phantom entry-leg cost.
+    from lib import pnl as pnl_lib
+    pnl_all = pnl_lib.compute_portfolio_pnl(
+        portfolio=portfolio, marks={"TQQQ": 88.0},
+    )
+    pnl_filtered = pnl_lib.compute_portfolio_pnl(
+        portfolio={"positions": open_subset}, marks={"TQQQ": 88.0},
+    )
+    # The filtered net P&L should be strictly greater (less negative,
+    # or more positive) than the unfiltered version — the stale row
+    # contributes a non-zero entry-leg modelled cost on top.
+    assert pnl_filtered.net_pnl_usd > pnl_all.net_pnl_usd, (
+        "filtering out stale rows must improve the pre-bake P&L "
+        "estimate — they contribute fictitious entry-leg losses"
+    )
+
+
+def test_settled_balance_no_trades_returns_virtual_baseline(tmp_state):
+    """Fresh account, no closed trades → settled balance = virtual
+    baseline exactly. No mark drift can move this number; only real
+    closed-trade fills do."""
+    assert dd.settled_balance_usd(virtual_baseline_usd=2500.0) == pytest.approx(2500.0)
+
+
+def test_settled_balance_adds_realised_net_pnl(tmp_state):
+    """One round-trip trade closes at +$20 net → settled balance moves
+    to virtual + $20. The hero NAV may show $2,500 + intra-day mark
+    swing, but this card only counts closed-trade fills."""
+    # Buy then sell same symbol — realised gain on the round trip.
+    state.append_trade({
+        "activity_id": "a1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 80.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    state.append_trade({
+        "activity_id": "a2", "alpaca_order_id": "o2", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 1, "fill_price": 100.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-11T13:00:00Z", "run_id": None,
+    })
+    settled = dd.settled_balance_usd(virtual_baseline_usd=2500.0)
+    assert settled == pytest.approx(2520.0), (
+        "ETF closed +$20 (1 share × $20 gain, $0 fees) → "
+        "$2,500 baseline + $20 realised = $2,520"
+    )
+
+
+def test_closed_trade_chips_empty_when_no_closes(tmp_state):
+    assert dd.closed_trade_chips() == []
+
+
+def test_closed_trade_chips_returns_newest_first(tmp_state):
+    """Chips strip is newest-first so a fresh close lands at the left
+    of the row. Earlier closes drift right."""
+    # Two round-trips on different days.
+    for i, (sym, buy_at, sell_at, buy_p, sell_p) in enumerate([
+        ("TQQQ", "2026-05-09T13:00:00Z", "2026-05-10T13:00:00Z", 80.0, 90.0),
+        ("SQQQ", "2026-05-11T13:00:00Z", "2026-05-12T13:00:00Z", 12.0, 10.0),
+    ]):
+        state.append_trade({
+            "activity_id": f"a{i}b", "alpaca_order_id": f"o{i}b",
+            "symbol": sym, "kind": "etf", "side": "buy",
+            "qty": 1, "fill_price": buy_p, "fees_usd": 0.0,
+            "filled_at": buy_at, "run_id": None,
+        })
+        state.append_trade({
+            "activity_id": f"a{i}s", "alpaca_order_id": f"o{i}s",
+            "symbol": sym, "kind": "etf", "side": "sell",
+            "qty": 1, "fill_price": sell_p, "fees_usd": 0.0,
+            "filled_at": sell_at, "run_id": None,
+        })
+    chips = dd.closed_trade_chips()
+    assert len(chips) == 2
+    # SQQQ closed later → first in the chips list
+    assert chips[0]["symbol"] == "SQQQ"
+    assert chips[1]["symbol"] == "TQQQ"
+    # SQQQ lost $2; TQQQ gained $10.
+    assert chips[0]["net_pnl_usd"] == pytest.approx(-2.0)
+    assert chips[1]["net_pnl_usd"] == pytest.approx(10.0)
+
+
+def test_closed_trade_chips_respects_limit(tmp_state):
+    """The strip caps at `limit` so a long trade history doesn't
+    overflow the hero row."""
+    for i in range(8):
+        state.append_trade({
+            "activity_id": f"b{i}", "alpaca_order_id": f"ob{i}",
+            "symbol": "TQQQ", "kind": "etf", "side": "buy",
+            "qty": 1, "fill_price": 80.0, "fees_usd": 0.0,
+            "filled_at": f"2026-05-{10+i:02d}T13:00:00Z", "run_id": None,
+        })
+        state.append_trade({
+            "activity_id": f"s{i}", "alpaca_order_id": f"os{i}",
+            "symbol": "TQQQ", "kind": "etf", "side": "sell",
+            "qty": 1, "fill_price": 81.0, "fees_usd": 0.0,
+            "filled_at": f"2026-05-{10+i:02d}T14:00:00Z", "run_id": None,
+        })
+    chips = dd.closed_trade_chips(limit=3)
+    assert len(chips) == 3
+
+
 def test_fees_column_populates_modelled_round_trip_cost(tmp_state):
     """The Fees column surfaces the modelled round-trip broker cost
     from compute_position_pnl — same definition as the Performance
