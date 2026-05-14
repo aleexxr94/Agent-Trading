@@ -147,6 +147,31 @@ st.markdown(
       .at-chip.neg { background: var(--red-soft);   color: var(--red-text);   border-color: #fecaca; }
       .at-chip strong { font-weight: 700; }
 
+      /* Pinned TOTAL footer beneath the positions dataframe. Visually
+         tied to the table above via a border-top that mirrors the
+         dataframe's row separator, but rendered as a separate element
+         so the dataframe's column sort can't reorder it. */
+      .at-total-footer {
+        display: flex; flex-wrap: wrap;
+        align-items: center; gap: 0.8rem;
+        padding: 0.55rem 0.85rem;
+        margin-top: -0.25rem;  /* tighten the gap to the dataframe */
+        border-top: 2px solid var(--border);
+        background: var(--bg-2);
+        font-size: 0.95rem;
+        font-weight: 500;
+      }
+      .at-total-footer .at-total-label {
+        font-weight: 800; letter-spacing: 0.04em;
+        color: var(--text-0);
+        padding: 0.1rem 0.5rem;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        background: var(--bg-1);
+        font-size: 0.85rem;
+      }
+      .at-total-footer .at-total-cells strong { font-weight: 700; }
+
       @keyframes at-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 
       /* slim risk strip — replaces the chunky old banner */
@@ -685,63 +710,33 @@ with tabs[0]:
             vals = [v for v in df_pos[col] if isinstance(v, (int, float)) and v == v]
             return sum(vals) if vals else None
 
-        # Any column pandas inferred as numeric must use pd.NA for the
-        # blank TOTAL cell — "" demotes the whole column back to object
-        # and pyarrow refuses to serialise it for Streamlit. Text
-        # columns ("Symbol"/"Kind"/"Bias"/"Greeks"/"Kill"/"Leverage")
-        # take "" cleanly.
-        _numeric_dtypes = {"int64", "Int64", "float64", "Float64"}
-        _is_numeric = {
-            col: str(df_pos[col].dtype) in _numeric_dtypes
-            for col in df_pos.columns
-        }
-
-        total_row: dict = {}
-        for col in df_pos.columns:
-            if col in ("Notional", "Fees", "Gross P&L", "Net P&L"):
-                total_row[col] = _sum_col(col)
-            elif col == "% NAV":
-                # % NAV sums to the portfolio's invested share (cash is
-                # the remainder). Show the sum, not a fictitious average.
-                total_row[col] = _sum_col(col)
-            elif col == "Symbol":
-                total_row[col] = "TOTAL"
-            elif _is_numeric.get(col, False):
-                # Numeric columns we don't sum (Qty, Entry, Mark, DTE,
-                # Days held, Δ%): averaging across heterogenous
-                # instruments would mislead, so leave blank — pd.NA
-                # preserves the column dtype.
-                total_row[col] = pd.NA
-            else:
-                total_row[col] = ""
-        df_pos_with_total = pd.concat(
-            [df_pos, pd.DataFrame([total_row])],
-            ignore_index=True,
-        )
-        total_row_idx = len(df_pos_with_total) - 1
-
-        def _bold_total(row):
-            if row.name == total_row_idx:
-                return ["font-weight: 800; border-top: 2px solid var(--border)"] * len(row)
-            return [""] * len(row)
+        # Aggregate row: pinned to the BELOW the table so operator
+        # sorts on the data rows (ascending / descending) don't move
+        # it. Streamlit's st.dataframe has no frozen-row primitive, so
+        # we keep the TOTAL outside the dataframe entirely — rendered
+        # as a styled footer line whose columns mirror the data
+        # sums the operator wants to see at a glance.
+        def _sum_col(col: str) -> float | None:
+            if col not in df_pos.columns:
+                return None
+            vals = [v for v in df_pos[col] if isinstance(v, (int, float)) and v == v]
+            return sum(vals) if vals else None
 
         # Δ% lives in the same green/red semantic space as the P&L
         # columns — apply the same color formatter so a move-since-entry
         # of -8% reads red at a glance.
-        color_subset = [c for c in ("Gross P&L", "Net P&L", "Δ%") if c in df_pos_with_total.columns]
+        color_subset = [c for c in ("Gross P&L", "Net P&L", "Δ%") if c in df_pos.columns]
         # na_rep="—" turns every NaN / pd.NA cell into an em-dash
         # (matches the existing "no data" sentinel used in row builds).
         # Without this, Pandas Styler renders pd.NA as the literal
         # string "None" — which is what shows up on ETF rows for DTE /
-        # Days held and on every cell of the TOTAL row for columns we
-        # don't sum (Qty, Entry, Mark, etc.). `precision=None` keeps
+        # Days held when marks aren't wired. `precision=None` keeps
         # column_config's per-column NumberColumn(format=...) rules
         # in charge of numeric rendering for the non-NA cells.
         styled = (
-            df_pos_with_total.style
+            df_pos.style
             .format(na_rep="—", precision=None)
             .map(_color_pnl, subset=color_subset)
-            .apply(_bold_total, axis=1)
         )
         st.dataframe(
             styled,
@@ -810,6 +805,67 @@ with tabs[0]:
                 "Net P&L":   st.column_config.NumberColumn("Net P&L",  format="$%+,.2f"),
             },
         )
+
+        # ---------- Pinned TOTAL footer ----------
+        # Anchored below the dataframe so column sorts on the data
+        # rows don't move it. Operator asked for this on May 14:
+        # ascending / descending sorts were dragging the in-table
+        # TOTAL row to the top or bottom, making it look like just
+        # another data point. Streamlit's st.dataframe has no
+        # frozen-row primitive, so we render the totals as a
+        # separate compact line below the table — visually it reads
+        # as a footer pinned to the table's bottom edge.
+        _total_notional = _sum_col("Notional")
+        _total_pct = _sum_col("% NAV")
+        _total_fees = _sum_col("Fees")
+        _total_gross = _sum_col("Gross P&L")
+        _total_net = _sum_col("Net P&L")
+
+        def _fmt_signed_usd(v: float | None) -> str:
+            if v is None:
+                return "—"
+            return f"${v:+,.2f}".replace("$+", "+$").replace("$-", "−$")
+
+        def _tone_color(v: float | None) -> str:
+            if v is None or v == 0:
+                return "var(--text-1)"
+            return "#059669" if v > 0 else "#dc2626"
+
+        total_cells_html = (
+            f'<span style="color: var(--text-2);">Notional</span> '
+            f'<strong>${_total_notional:,.0f}</strong>'
+            if _total_notional is not None else ""
+        )
+        if _total_pct is not None:
+            total_cells_html += (
+                f' &nbsp;·&nbsp; <span style="color: var(--text-2);">% NAV</span> '
+                f'<strong>{_total_pct:.1f}%</strong>'
+            )
+        if _total_fees is not None:
+            total_cells_html += (
+                f' &nbsp;·&nbsp; <span style="color: var(--text-2);">Fees</span> '
+                f'<strong>${_total_fees:,.2f}</strong>'
+            )
+        if _total_gross is not None:
+            total_cells_html += (
+                f' &nbsp;·&nbsp; <span style="color: var(--text-2);">Gross P&L</span> '
+                f'<strong style="color: {_tone_color(_total_gross)};">'
+                f'{_fmt_signed_usd(_total_gross)}</strong>'
+            )
+        if _total_net is not None:
+            total_cells_html += (
+                f' &nbsp;·&nbsp; <span style="color: var(--text-2);">Net P&L</span> '
+                f'<strong style="color: {_tone_color(_total_net)};">'
+                f'{_fmt_signed_usd(_total_net)}</strong>'
+            )
+        st.markdown(
+            f'<div class="at-total-footer">'
+            f'<span class="at-total-label">TOTAL</span>'
+            f'<span class="at-total-cells">{total_cells_html}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
         if not broker_marks:
             st.caption(
                 "Mark / P&L columns stay blank until Alpaca paper keys are "
