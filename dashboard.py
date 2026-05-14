@@ -1347,24 +1347,59 @@ with tabs[6]:
         "reloads every N seconds. Off by default to avoid surprise re-runs "
         "interrupting your reading."
     )
+    # Codex P1 on PR #73: the meta refresh starts a NEW Streamlit
+    # session each tick, which would reset st.checkbox(value=False) to
+    # default and drop the meta tag — so auto-refresh would fire exactly
+    # ONCE then die. Persist the toggle + interval in URL query params
+    # because the meta refresh preserves the URL (no target specified =
+    # reloads current URL including query string). New sessions then
+    # read the params and rebuild the same widget state, keeping the
+    # loop alive across arbitrarily many reloads.
+    params = st.query_params
+    autorefresh_param = params.get("autorefresh", "0") == "1"
+    try:
+        interval_param = int(params.get("interval", "60"))
+    except (TypeError, ValueError):
+        interval_param = 60
+    interval_param = max(15, min(300, interval_param))
+
     auto_refresh_on = st.checkbox(
-        "Auto-refresh enabled", value=False,
+        "Auto-refresh enabled", value=autorefresh_param,
         help="Reload the whole page every N seconds. Live broker NAV / "
-             "positions / fills will tick forward without a manual refresh.",
+             "positions / fills will tick forward without a manual refresh. "
+             "State persists across reloads via URL query params, so a once-"
+             "enabled toggle keeps refreshing until you uncheck it.",
     )
     refresh_seconds = st.slider(
         "Refresh interval (seconds)",
-        min_value=15, max_value=300, value=60, step=15,
+        min_value=15, max_value=300, value=interval_param, step=15,
         disabled=not auto_refresh_on,
         help="60s matches the scheduler's poll cadence; 30s is fine if you "
              "want tighter live-mark updates during a position you're watching.",
     )
+
+    # Sync widget state → URL query params. Only mutates params when
+    # the desired state diverges from the URL to avoid a redundant
+    # rerun loop on every render.
+    desired_autorefresh = "1" if auto_refresh_on else "0"
+    desired_interval = str(refresh_seconds) if auto_refresh_on else None
+    if params.get("autorefresh", "0") != desired_autorefresh:
+        params["autorefresh"] = desired_autorefresh
+    if auto_refresh_on and params.get("interval") != desired_interval:
+        params["interval"] = desired_interval
+    elif not auto_refresh_on and "interval" in params:
+        del params["interval"]
+
     if auto_refresh_on:
         st.markdown(
             f'<meta http-equiv="refresh" content="{refresh_seconds}">',
             unsafe_allow_html=True,
         )
-        st.success(f"Page will reload every {refresh_seconds}s.")
+        st.success(
+            f"Page will reload every {refresh_seconds}s. "
+            "Toggle state lives in the URL (`?autorefresh=1&interval=…`) "
+            "so the loop survives the reload."
+        )
 
     st.markdown('<div class="at-section-label">Manual actions</div>', unsafe_allow_html=True)
     if st.button("🔄 Refresh data"):
