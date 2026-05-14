@@ -707,12 +707,20 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
         # Marks aren't wired here — gross/net P&L includes the modelled-
         # cost entry-leg estimate only. Real marks come through the
         # broker-position path in lib/marks.py.
+        #
+        # `nav_source` records whether nav_usd is in raw broker units
+        # or virtual (VIRTUAL_NAV_USD-overridden) units. The dashboard's
+        # NAV anchor offset only applies to broker-unit rows; without
+        # this tag a row written under VIRTUAL_NAV_USD=2500 would get
+        # the broker offset subtracted again and land at ~-$95k.
         from lib import pnl as pnl_lib
         breakdown = pnl_lib.compute_portfolio_pnl(portfolio=portfolio, marks=None)
+        nav_source = "virtual" if os.environ.get("VIRTUAL_NAV_USD") else "broker"
         state.append_nav({
             "run_id": ctx.run_id,
             "at": state.utcnow_iso(),
             "nav_usd": portfolio.get("nav_usd", 0.0),
+            "nav_source": nav_source,
             "cash_usd": portfolio.get("cash_usd", 0.0),
             "positions_count": len(portfolio.get("positions", [])),
             "all_cash": portfolio.get("all_cash", False),
