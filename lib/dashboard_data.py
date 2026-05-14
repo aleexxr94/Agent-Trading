@@ -498,6 +498,12 @@ def try_load_broker_view() -> BrokerView:
         nav_usd = float(broker.get_account().equity_usd)
     except Exception:
         nav_usd = None
+    # Apply the NAV display anchor when one is set. Default offset is
+    # 0.0 (no anchor) so this is a no-op in fresh installs. The anchor
+    # is a pure display offset — broker order sizing reads
+    # VIRTUAL_NAV_USD from the environment, never this file.
+    if nav_usd is not None:
+        nav_usd = nav_usd - state.nav_offset_usd()
     return BrokerView(
         marks=marks,
         costs=costs,

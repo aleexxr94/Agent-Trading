@@ -193,6 +193,50 @@ def test_try_load_broker_view_distinguishes_unreachable_from_empty(
     assert view.held_keys == frozenset()
 
 
+def test_try_load_broker_view_applies_nav_offset_when_anchor_set(
+    tmp_state, monkeypatch
+):
+    """When the operator has stamped a NAV anchor, BrokerView.nav_usd
+    should report broker_equity − offset so the hero card renders the
+    virtual baseline. Order sizing reads VIRTUAL_NAV_USD from env, not
+    this file — the anchor is display-only."""
+
+    class _StubBroker:
+        def get_positions(self):
+            return []
+
+        def get_account(self):
+            from lib.broker import Account
+            return Account(
+                cash_usd=50020.52,
+                equity_usd=100020.52,
+                buying_power_usd=50000.0,
+                is_paper=True,
+            )
+
+    import lib.alpaca_client as ac_mod
+    monkeypatch.setattr(ac_mod, "AlpacaBroker", lambda *a, **kw: _StubBroker())
+
+    # No anchor → raw broker NAV surfaces.
+    pre = dd.try_load_broker_view()
+    assert pre.available is True
+    assert pre.nav_usd == pytest.approx(100020.52)
+
+    # Anchor → hero shows $2,500.52 (broker $100,020.52 − offset $97,520).
+    state.set_nav_offset(
+        broker_baseline_usd=100020.0,
+        virtual_baseline_usd=2500.0,
+        note="test",
+    )
+    post = dd.try_load_broker_view()
+    assert post.available is True
+    assert post.nav_usd == pytest.approx(2500.52), (
+        "displayed NAV must subtract the (broker_baseline − virtual) offset; "
+        "the 0.52 carries from the broker delta vs anchor, demonstrating "
+        "the curve tracks broker swings 1:1 from the anchor moment"
+    )
+
+
 def test_position_table_rows_etf_and_option_columns(tmp_state):
     portfolio = json.loads(FIXTURE.read_text())
     rows = dd.position_table_rows(portfolio)
