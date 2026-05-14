@@ -1653,6 +1653,13 @@ with tabs[6]:
             unsafe_allow_html=True,
         )
         manual_cols = st.columns([2, 3])
+        # Bind the widget keys to the anchor's set_at timestamp.
+        # st.number_input persists across reruns when keyed, so the
+        # first-edited value would stick even after a re-anchor with a
+        # different broker_baseline_usd (Codex P2). Including set_at in
+        # the key means each new anchor wipes the session-state slot
+        # and the widget re-renders from the current `value=`.
+        _anchor_session_token = _anchor.get("set_at", "") or "no-set-at"
         with manual_cols[0]:
             manual_baseline_set = st.number_input(
                 "Broker baseline ($)",
@@ -1660,7 +1667,7 @@ with tabs[6]:
                 min_value=0.0,
                 step=0.01,
                 format="%.2f",
-                key="manual_baseline_anchored",
+                key=f"manual_baseline_anchored::{_anchor_session_token}",
                 help="The broker's equity AT the moment you consider the "
                      "trading account to have started — typically the "
                      "pre-trades cash balance. Offset = this − virtual.",
@@ -1669,7 +1676,7 @@ with tabs[6]:
             st.markdown("&nbsp;", unsafe_allow_html=True)
             if st.button(
                 "📐 Set anchor to specific broker baseline",
-                key="manual_anchor_btn_anchored",
+                key=f"manual_anchor_btn_anchored::{_anchor_session_token}",
                 help="Stamps the entered broker_baseline directly, no "
                      "pre-bake estimation. Displayed NAV = "
                      "broker_now − (manual_baseline − virtual).",
