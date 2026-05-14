@@ -314,7 +314,12 @@ def _pills_html() -> str:
 # Alpaca's account equity — that's exposed as a separate informational
 # sub-line below. See lib/dashboard_data.py:SyntheticBalance and the
 # refactor rationale at plans/federated-greeting-sphinx.md.
-_synth_live = dd.compute_synthetic_balance(marks=broker_marks or {})
+_synth_live = dd.compute_synthetic_balance(
+    marks=broker_marks or {},
+    portfolio=portfolio,
+    broker_costs=broker_costs or {},
+    held_keys=broker_view.held_keys if broker_view.available else None,
+)
 hero_nav_usd = _synth_live.synthetic_balance_usd
 _starting = _synth_live.starting_balance_usd
 _hero_tone = (
@@ -340,20 +345,28 @@ breakdown_html = (
     f"<span style='color: var(--text-2);'>−</span> "
     f"${_synth_live.trading_fees_total_usd:,.2f} fees"
 )
+# Build the conditional sub-line block as a SINGLE concatenated
+# string. Each line is included only when its data is non-empty.
+# Critical: assemble with str concatenation, not interpolation of
+# three separate variables on separate template lines. The latter
+# leaves blank lines between empty-string interpolations, and
+# Streamlit's markdown parser interprets ≥1 blank line inside an
+# HTML block as end-of-block — every tag that follows then renders
+# as literal text (the "</div>" string you may have seen in a
+# screenshot was exactly this).
+extra_lines_parts: list[str] = []
 # Informational-only Alpaca equity row. Always labelled and rendered
 # in a muted style so it's obviously NOT the source of truth.
-alpaca_line = ""
 if broker_view.available and broker_view.nav_usd is not None:
-    alpaca_line = (
+    extra_lines_parts.append(
         f'<div class="at-hero-sub" style="opacity:0.7; font-size:0.85rem;">'
         f'Alpaca account: <strong>${broker_view.nav_usd:,.2f}</strong> '
         f'<span style="color: var(--text-2);">(informational — not used '
         f'for any dashboard calculation)</span>'
         f'</div>'
     )
-unmarked_line = ""
 if _synth_live.unmarked_open_lots > 0:
-    unmarked_line = (
+    extra_lines_parts.append(
         f'<div class="at-hero-sub" style="opacity:0.7; font-size:0.85rem; color: var(--amber-text);">'
         f'{_synth_live.unmarked_open_lots} open lot(s) without live marks '
         f'— their P&L contribution treated as $0 until marks return.'
@@ -363,9 +376,8 @@ if _synth_live.unmarked_open_lots > 0:
 # the synthetic balance is missing some P&L. Healthy operation never
 # triggers this (Codex P1 on PR #79). Surface loudly rather than let
 # the headline lie about a number the operator trusts.
-integrity_line = ""
 if _synth_live.is_integrity_warning:
-    integrity_line = (
+    extra_lines_parts.append(
         f'<div class="at-hero-sub" style="font-size:0.9rem; '
         f'color: var(--red-text); font-weight: 600; margin-top: 0.4rem; '
         f'padding: 0.4rem 0.6rem; background: var(--red-soft); '
@@ -376,6 +388,7 @@ if _synth_live.is_integrity_warning:
         f'sync, legacy fills, or manual edits).'
         f'</div>'
     )
+extra_lines = "".join(extra_lines_parts)
 
 st.markdown(
     f"""
@@ -391,10 +404,7 @@ st.markdown(
             Last cycle: <strong>{_fmt_ts(last_run_at)}</strong>
             &nbsp;•&nbsp; Next: <strong>{_fmt_ts(next_run_at)}</strong>
             &nbsp;•&nbsp; Source: <strong>{source}</strong>
-          </div>
-          {alpaca_line}
-          {unmarked_line}
-          {integrity_line}
+          </div>{extra_lines}
         </div>
         <div style="text-align:right">
           {_pills_html()}
@@ -1005,7 +1015,12 @@ with tabs[2]:
 with tabs[3]:
     # Drive the entire P&L summary off the same SyntheticBalance the
     # hero card uses — no parallel computation, no risk of divergence.
-    _synth = dd.compute_synthetic_balance(marks=broker_marks or {})
+    _synth = dd.compute_synthetic_balance(
+        marks=broker_marks or {},
+        portfolio=portfolio,
+        broker_costs=broker_costs or {},
+        held_keys=broker_view.held_keys if broker_view.available else None,
+    )
     # Modelled trading costs are kept as a separate sanity-floor
     # estimate — they're NOT in the synthetic balance formula
     # (real Alpaca fees from trades.jsonl are used instead).

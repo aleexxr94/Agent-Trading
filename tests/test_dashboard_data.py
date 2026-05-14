@@ -741,6 +741,113 @@ def test_synthetic_balance_unmatched_sell_not_flagged_when_matched(tmp_state):
     assert sb.is_integrity_warning is False
 
 
+def test_synthetic_balance_open_gross_from_broker_positions(tmp_state):
+    """Per the screenshot bug report from production: the user
+    wiped trades.jsonl, then the agent opened new positions. The
+    Portfolio tab's positions table correctly showed +$34 unrealized
+    gross via broker marks + portfolio.json, but the hero card
+    reported $0 open because compute_synthetic_balance was reading
+    open lots from the (empty) trade log.
+
+    Fix: when callers supply ``portfolio`` + ``broker_costs`` + a
+    broker ``held_keys`` filter, open_gross derives from the
+    broker-held subset of portfolio.json using compute_portfolio_pnl.
+    Same source the positions table uses → two surfaces guaranteed
+    to agree."""
+    portfolio = {"positions": [
+        {
+            "kind": "etf", "symbol": "TQQQ", "shares": 2,
+            "avg_cost": 80.0, "leverage_factor": 3.0,
+            "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25},
+            "position_pct": 8.0,
+        },
+    ]}
+    # trades.jsonl is intentionally empty — the legacy open-lot path
+    # would have returned $0 here. The broker positions path picks
+    # up the +$20 unrealized.
+    sb = dd.compute_synthetic_balance(
+        marks={"TQQQ": 90.0},
+        portfolio=portfolio,
+        broker_costs={"TQQQ": 80.0},
+        held_keys=frozenset({"TQQQ"}),
+    )
+    assert sb.open_gross_pnl_usd == pytest.approx(20.0)
+    assert sb.synthetic_balance_usd == pytest.approx(2520.0)
+
+
+def test_synthetic_balance_open_gross_filters_stale_portfolio_rows(tmp_state):
+    """When portfolio.json carries stale rows the broker no longer
+    holds, they must NOT contribute to open_gross. The held_keys
+    filter (same one the positions table uses) does this."""
+    portfolio = {"positions": [
+        {
+            "kind": "etf", "symbol": "TQQQ", "shares": 2,
+            "avg_cost": 80.0, "leverage_factor": 3.0,
+            "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25},
+            "position_pct": 8.0,
+        },
+        {
+            "kind": "etf", "symbol": "SQQQ", "shares": 1,
+            "avg_cost": 12.0, "leverage_factor": -3.0,
+            "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25},
+            "position_pct": 5.0,
+        },
+    ]}
+    # Broker only carries TQQQ. SQQQ is stale (manually closed,
+    # expired, or sync lag). Must be excluded from open_gross.
+    sb = dd.compute_synthetic_balance(
+        marks={"TQQQ": 90.0, "SQQQ": 10.0},
+        portfolio=portfolio,
+        broker_costs={"TQQQ": 80.0},
+        held_keys=frozenset({"TQQQ"}),
+    )
+    assert sb.open_gross_pnl_usd == pytest.approx(20.0), (
+        "stale SQQQ row must not bleed phantom $-2 P&L into open_gross"
+    )
+
+
+def test_synthetic_balance_open_gross_counts_unmarked_broker_positions(tmp_state):
+    """Broker holds a position but no mark is available — counted as
+    unmarked, contributes $0 to open_gross. Same convention as the
+    legacy trades.jsonl path."""
+    portfolio = {"positions": [{
+        "kind": "etf", "symbol": "TQQQ", "shares": 2,
+        "avg_cost": 80.0, "leverage_factor": 3.0,
+        "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25},
+        "position_pct": 8.0,
+    }]}
+    sb = dd.compute_synthetic_balance(
+        marks={},  # no marks at all
+        portfolio=portfolio,
+        broker_costs={},
+        held_keys=frozenset({"TQQQ"}),
+    )
+    assert sb.unmarked_open_lots == 1
+    assert sb.open_gross_pnl_usd == pytest.approx(0.0)
+
+
+def test_synthetic_balance_open_gross_legacy_path_when_no_portfolio(tmp_state):
+    """When callers don't pass portfolio, compute_synthetic_balance
+    falls back to the trades.jsonl open-lot path. Backward-compat for
+    existing tests + the Realized balance card (which passes
+    marks={} so neither path contributes)."""
+    state.append_trade({
+        "activity_id": "b1", "alpaca_order_id": "ob1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 80.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    sb = dd.compute_synthetic_balance(marks={"TQQQ": 90.0})
+    assert sb.open_gross_pnl_usd == pytest.approx(10.0), (
+        "legacy path: open lot from trades.jsonl still works when "
+        "no portfolio is supplied — tests can exercise it without "
+        "broker plumbing"
+    )
+
+
 def test_synthetic_balance_partial_unmatched_sell(tmp_state):
     """Buy 1, sell 2 → 1 unit of the sell can FIFO-match (closing
     that round trip) and the leftover 1 unit lands in unmatched_sells.
