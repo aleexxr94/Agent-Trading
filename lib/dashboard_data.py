@@ -191,9 +191,10 @@ def settled_balance_usd(
 @dataclass(frozen=True)
 class SyntheticBalance:
     """The dashboard's headline balance, derived entirely from logs we
-    control (state/trades.jsonl + state/costs.jsonl) and NOT from
-    Alpaca account equity. See plans/federated-greeting-sphinx.md for
-    why we made this the single source of truth.
+    control (state/trades.jsonl + state/costs.jsonl + the broker's
+    currently-held positions) and NOT from Alpaca account equity.
+    See plans/federated-greeting-sphinx.md for why we made this the
+    single source of truth.
 
     Formula:
 
@@ -201,31 +202,69 @@ class SyntheticBalance:
           = starting_balance_usd
           + closed_gross_pnl_usd
           + open_gross_pnl_usd      # 0 when no marks
-          − llm_cost_total_usd      # reset-aware via filter_costs_post_reset
-          − trading_fees_total_usd  # real fees, NEVER reset-aware
+          − llm_cost_total_usd      # reset-aware
+          − trading_fees_total_usd  # hybrid: real (closed) + modelled (open)
 
     Field conventions:
-      - `closed_gross_pnl_usd`: sum of `(sell_price − buy_price) × qty
-        × multiplier` across FIFO-matched closes from trades.jsonl.
+      - ``closed_gross_pnl_usd``: sum of ``(sell_price − buy_price) × qty
+        × multiplier`` across FIFO-matched closes from trades.jsonl.
         Trading fees + attributed LLM costs are deducted SEPARATELY via
         the dedicated fields below; this is purely gross.
-      - `open_gross_pnl_usd`: sum of `(mark − buy_price) × qty
-        × multiplier` across currently-open lots that have a live
+      - ``open_gross_pnl_usd``: sum of ``(mark − buy_price) × qty
+        × multiplier`` across currently-open lots that have a live
         mark. Open lots without a mark contribute zero and bump
-        `unmarked_open_lots`.
-      - `llm_cost_total_usd`: ALL LLM API spend recorded in
+        ``unmarked_open_lots``.
+      - ``llm_cost_total_usd``: ALL LLM API spend recorded in
         costs.jsonl, project-wide, reset-aware. Includes runs that
         opened no positions (e.g. all-cash decisions) — those are part
         of the experiment's true cost.
-      - `trading_fees_total_usd`: sum of `fees_usd` across every fill
-        in trades.jsonl (both buy and sell sides). Real money paid;
-        never affected by display resets.
+      - ``trading_fees_total_usd``: HYBRID composition (see
+        ``real_trading_fees_usd`` / ``modelled_open_fees_usd``):
+
+            trading_fees_total_usd
+              = real_trading_fees_usd        # closed-side real broker fees
+              + modelled_open_fees_usd       # IBKR-Pro round-trip estimate
+                                             #   for currently-open positions
+
+        Rationale: Alpaca paper reports \$0 fees on equity fills
+        (``lib/trades_sync.py``), so a real-only definition would leave
+        the headline showing "\$0.00 fees" while the per-position table
+        prominently displays modelled fees that the Aggregate Net P&L
+        already subtracts. Hybrid keeps the headline aligned with what
+        the operator sees in the positions table. On a future live
+        broker, ``real_trading_fees_usd`` populates from trades.jsonl
+        and ``modelled_open_fees_usd`` cleanly tapers as positions
+        close (modelled drops to 0 once a position is fully closed
+        and its real fees land in the realised side).
+
+      - ``real_trading_fees_usd``: sum of ``fees_usd`` across EVERY fill
+        in trades.jsonl. On paper ETFs this is \$0; on options +
+        live trading it populates from OCC/SEC/TAF schedules.
+      - ``modelled_open_fees_usd``: sum of
+        ``compute_position_pnl(...).modelled_costs_usd`` across the
+        broker-held subset of positions (same source the positions
+        table's per-row ``Fees`` column uses). Round-trip estimate —
+        entry leg + projected exit leg.
+
+    Known caveat (paper-only deployment safe): on a live broker the
+    real entry-leg fee on a currently-open position would live in
+    trades.jsonl AND ``modelled_open_fees_usd`` would also include an
+    entry-leg term — slight double-count on the entry side until the
+    position closes. Acceptable for the current paper-ETF deployment
+    where real entry fees are \$0. Follow-up ticket should split
+    ``modelled_costs_usd`` into entry / exit halves so only the exit
+    leg is added here.
     """
     starting_balance_usd: float = 2500.0
     closed_gross_pnl_usd: float = 0.0
     open_gross_pnl_usd: float = 0.0
     llm_cost_total_usd: float = 0.0
+    # Hybrid trading-fees total. See class docstring for the formula.
+    # Two decomposed components exposed so the dashboard / Codex can
+    # see real-vs-modelled at a glance without recomputing.
     trading_fees_total_usd: float = 0.0
+    real_trading_fees_usd: float = 0.0
+    modelled_open_fees_usd: float = 0.0
     unmarked_open_lots: int = 0
     # Sell fills that couldn't FIFO-match against an open buy lot.
     # Healthy operation never produces these (system spec is "no
@@ -282,8 +321,13 @@ def compute_synthetic_balance(
       same place guarantees the two surfaces agree.
     - ``llm_cost_total_usd`` is the all-time, reset-aware sum from
       ``costs.jsonl``.
-    - ``trading_fees_total_usd`` is the all-time fees from
-      ``trades.jsonl`` (real broker fees; never reset).
+    - ``trading_fees_total_usd`` is HYBRID: real broker fees on closed
+      trades (from trades.jsonl) PLUS modelled IBKR-Pro round-trip
+      estimate on currently-open positions (from
+      ``compute_position_pnl``). See ``SyntheticBalance`` docstring
+      for rationale. The two components are surfaced separately on
+      the dataclass as ``real_trading_fees_usd`` /
+      ``modelled_open_fees_usd`` so the operator / Codex can audit.
 
     Args:
       ``marks``: broker-live per-symbol price map. Open lots without a
@@ -309,6 +353,7 @@ def compute_synthetic_balance(
     closed_gross = view["totals"]["realised_gross_usd"]
 
     open_gross = 0.0
+    modelled_open_fees = 0.0  # Σ compute_position_pnl(...).modelled_costs_usd
     unmarked = 0
     if portfolio is not None:
         open_subset, _ = split_positions_by_broker_holdings(
@@ -329,9 +374,6 @@ def compute_synthetic_balance(
                     mark = marks.get(osi)
                 except (ValueError, KeyError):
                     osi = None
-            if mark is None:
-                unmarked += 1
-                continue
             broker_cost_for_pos = (broker_costs or {}).get(key)
             if (
                 broker_cost_for_pos is None
@@ -346,17 +388,40 @@ def compute_synthetic_balance(
                     broker_cost_for_pos = broker_costs.get(osi)
                 except (ValueError, KeyError):
                     pass
+            # Modelled round-trip fee is computed even when no mark is
+            # available (pnl_lib accepts current_mark_usd=None and
+            # returns gross_pnl_usd=0 with modelled_costs_usd still
+            # populated). Unmarked counter only tracks open_gross
+            # contribution, not fees.
             breakdown = pnl_lib.compute_position_pnl(
                 position=p,
                 current_mark_usd=mark,
                 actual_cost_per_unit=broker_cost_for_pos,
             )
-            open_gross += breakdown.gross_pnl_usd
+            if mark is None:
+                unmarked += 1
+            else:
+                open_gross += breakdown.gross_pnl_usd
+            # Codex P1 on PR #82: only accumulate modelled fees when
+            # the broker has confirmed which positions are actually
+            # held. With ``held_keys=None`` (broker unreachable),
+            # ``split_positions_by_broker_holdings`` returns every
+            # portfolio.json row as "open" — including any that the
+            # operator may have already closed manually. Charging
+            # modelled fees against those phantom rows would bias
+            # the synthetic balance downward during an outage. When
+            # we can't verify holdings, skip the modelled-fee
+            # contribution rather than risk a misleading deduction.
+            if held_keys is not None:
+                modelled_open_fees += float(breakdown.modelled_costs_usd)
     else:
         # Legacy fallback: derive open_gross from trades.jsonl open
         # lots. Used by tests that exercise compute_synthetic_balance
         # without a portfolio dict, and by the Realized-balance card
         # which passes marks={} so this branch contributes 0 anyway.
+        # Modelled open fees stay at 0 in this branch — without a
+        # portfolio we can't know which positions are currently open
+        # at the broker.
         for lot in view["open"]:
             g = lot.get("gross_pnl_usd")
             if g is None:
@@ -364,12 +429,15 @@ def compute_synthetic_balance(
             else:
                 open_gross += float(g)
 
+    real_fees = total_trading_fees_usd()
     return SyntheticBalance(
         starting_balance_usd=float(starting_balance_usd),
         closed_gross_pnl_usd=float(closed_gross),
         open_gross_pnl_usd=open_gross,
         llm_cost_total_usd=total_token_cost()["cost_usd"],
-        trading_fees_total_usd=total_trading_fees_usd(),
+        trading_fees_total_usd=real_fees + modelled_open_fees,
+        real_trading_fees_usd=real_fees,
+        modelled_open_fees_usd=modelled_open_fees,
         unmarked_open_lots=unmarked,
         unmatched_sell_count=int(view["totals"].get("unmatched_sell_count", 0)),
     )
@@ -455,6 +523,53 @@ def realized_balance_series(
             "trading_fees_total_usd": fees_total,
         })
     return out
+
+
+def live_balance_tip(
+    *,
+    synthetic_balance: SyntheticBalance,
+    series: list[dict] | None = None,
+) -> dict:
+    """Build a one-row "live tip" extending the realized balance
+    series with the current synthetic balance (including open P&L +
+    modelled open fees).
+
+    The historical series is reconstructed exactly from
+    ``trades.jsonl`` + ``costs.jsonl`` — no historical marks needed,
+    so the curve is stable between cycles. But the operator wants the
+    curve's tip to line up with the hero card, which DOES include
+    open P&L. This helper produces that tip point: a single row at
+    ``utcnow_iso()`` whose ``synthetic_balance_usd`` matches
+    ``synthetic_balance.synthetic_balance_usd`` exactly.
+
+    Returned dict shape mirrors ``realized_balance_series`` rows so
+    the chart can stitch the two together cleanly, with one extra
+    ``kind: "live"`` discriminator field:
+
+        {
+          "at": "<utcnow_iso>",
+          "synthetic_balance_usd": <hero value>,
+          "closed_gross_pnl_usd": <hero closed gross>,
+          "open_gross_pnl_usd":   <hero open gross>,
+          "llm_cost_total_usd":   <hero llm total>,
+          "trading_fees_total_usd": <hero hybrid fees>,
+          "kind": "live",
+        }
+
+    The ``series`` argument is accepted for symmetry with the chart
+    code path that passes both into a renderer; this helper doesn't
+    inspect it (it only needs the SyntheticBalance) but keeping the
+    signature symmetric makes the call site read better.
+    """
+    return {
+        "at": state.utcnow_iso(),
+        "synthetic_balance_usd": synthetic_balance.synthetic_balance_usd,
+        "closed_gross_pnl_usd": synthetic_balance.closed_gross_pnl_usd,
+        "open_gross_pnl_usd": synthetic_balance.open_gross_pnl_usd,
+        "llm_cost_total_usd": synthetic_balance.llm_cost_total_usd,
+        "trading_fees_total_usd": synthetic_balance.trading_fees_total_usd,
+        "kind": "live",
+    }
 
 
 def closed_trade_chips(
