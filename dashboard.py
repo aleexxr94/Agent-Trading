@@ -1597,16 +1597,19 @@ with tabs[6]:
             ):
                 if broker_view.available and broker_view.nav_usd is not None:
                     raw = broker_view.nav_usd + state.nav_offset_usd()
+                    # Filter to broker-held positions only — stale rows
+                    # in portfolio.json (manual close / expiry / sync
+                    # lag) would compute_position_pnl as gross=0 with
+                    # an entry-leg modelled cost, baking phantom losses
+                    # into the offset (Codex P1 on PR #75).
+                    open_subset, _ = dd.split_positions_by_broker_holdings(
+                        portfolio, held_keys=broker_view.held_keys,
+                    )
                     pnl_now = pnl_lib.compute_portfolio_pnl(
-                        portfolio=portfolio,
+                        portfolio={"positions": open_subset},
                         marks=broker_marks or None,
                         costs=broker_costs or None,
                     )
-                    # Pre-bake: subtract current unrealized Net P&L from
-                    # the baseline so the displayed NAV at anchor time
-                    # equals virtual + current Net P&L instead of just
-                    # virtual. Aligns the headline number with the
-                    # per-position Net P&L the operator sees in the table.
                     state.set_nav_offset(
                         broker_baseline_usd=raw - pnl_now.net_pnl_usd,
                         virtual_baseline_usd=_anchor["virtual_baseline_usd"],
@@ -1652,14 +1655,19 @@ with tabs[6]:
                      "the more accurate long-term number.",
             ):
                 if broker_view.available and broker_view.nav_usd is not None:
+                    # Filter to broker-held positions only — stale rows
+                    # in portfolio.json (manual close / expiry / sync
+                    # lag) would compute_position_pnl as gross=0 with
+                    # an entry-leg modelled cost, baking phantom losses
+                    # into the offset (Codex P1 on PR #75).
+                    open_subset, _ = dd.split_positions_by_broker_holdings(
+                        portfolio, held_keys=broker_view.held_keys,
+                    )
                     pnl_now = pnl_lib.compute_portfolio_pnl(
-                        portfolio=portfolio,
+                        portfolio={"positions": open_subset},
                         marks=broker_marks or None,
                         costs=broker_costs or None,
                     )
-                    # Pre-bake unrealized Net P&L into the baseline so the
-                    # hero card immediately reads virtual + Net P&L,
-                    # matching the per-position table totals.
                     state.set_nav_offset(
                         broker_baseline_usd=broker_view.nav_usd - pnl_now.net_pnl_usd,
                         virtual_baseline_usd=float(virt_target),

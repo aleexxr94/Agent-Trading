@@ -526,6 +526,54 @@ def test_kill_column_includes_underlying_price_and_time_stop(tmp_state):
     assert "by 2026-06-12" in kill
 
 
+def test_split_positions_excludes_stale_for_prebake_pnl(tmp_state):
+    """Codex P1 on PR #75: when portfolio.json carries stale rows the
+    broker no longer holds (manual close, expiry, sync lag), the
+    pre-bake path must NOT include them in compute_portfolio_pnl —
+    each stale row with no live mark returns net_pnl = -entry_leg_cost,
+    which would bake phantom losses into the NAV offset.
+
+    Verifies the upstream contract that the anchor logic relies on:
+    split_positions_by_broker_holdings keeps only broker-held rows.
+    """
+    portfolio = {"positions": [
+        {
+            "kind": "etf", "symbol": "TQQQ", "shares": 1, "avg_cost": 80.0,
+            "leverage_factor": 3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+        },
+        {
+            "kind": "etf", "symbol": "SQQQ", "shares": 1, "avg_cost": 12.0,
+            "leverage_factor": -3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+        },
+    ]}
+    # Broker only holds TQQQ — SQQQ is stale (e.g. manually closed).
+    held = frozenset({"TQQQ"})
+    open_subset, closed_subset = dd.split_positions_by_broker_holdings(
+        portfolio, held_keys=held,
+    )
+    assert [p["symbol"] for p in open_subset] == ["TQQQ"]
+    assert [p["symbol"] for p in closed_subset] == ["SQQQ"]
+
+    # And the pre-bake P&L computation against the filtered subset
+    # must not pick up SQQQ's phantom entry-leg cost.
+    from lib import pnl as pnl_lib
+    pnl_all = pnl_lib.compute_portfolio_pnl(
+        portfolio=portfolio, marks={"TQQQ": 88.0},
+    )
+    pnl_filtered = pnl_lib.compute_portfolio_pnl(
+        portfolio={"positions": open_subset}, marks={"TQQQ": 88.0},
+    )
+    # The filtered net P&L should be strictly greater (less negative,
+    # or more positive) than the unfiltered version — the stale row
+    # contributes a non-zero entry-leg modelled cost on top.
+    assert pnl_filtered.net_pnl_usd > pnl_all.net_pnl_usd, (
+        "filtering out stale rows must improve the pre-bake P&L "
+        "estimate — they contribute fictitious entry-leg losses"
+    )
+
+
 def test_settled_balance_no_trades_returns_virtual_baseline(tmp_state):
     """Fresh account, no closed trades → settled balance = virtual
     baseline exactly. No mark drift can move this number; only real
