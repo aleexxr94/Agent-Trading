@@ -135,6 +135,18 @@ st.markdown(
       .at-pill.allcash    { background: var(--amber-soft); color: var(--amber-text); border-color: #fde68a; }
       .at-pill.active     { background: var(--green-soft); color: var(--green-text); border-color: #a7f3d0; }
 
+      /* Closed-trade P&L chips beside the Settled balance card */
+      .at-chip {
+        display: inline-flex; align-items: center; gap: 0.3rem;
+        padding: 0.25rem 0.6rem; border-radius: 999px;
+        font-size: 0.82rem; font-weight: 500;
+        border: 1px solid var(--border);
+        background: var(--bg-2);
+      }
+      .at-chip.pos { background: var(--green-soft); color: var(--green-text); border-color: #a7f3d0; }
+      .at-chip.neg { background: var(--red-soft);   color: var(--red-text);   border-color: #fecaca; }
+      .at-chip strong { font-weight: 700; }
+
       @keyframes at-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 
       /* slim risk strip — replaces the chunky old banner */
@@ -332,6 +344,56 @@ st.markdown(
         </div>
         <div style="text-align:right">
           {_pills_html()}
+        </div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ---------- Settled balance (closed-trade NAV) ----------
+# Slow-moving counterpart to the hero NAV: virtual_baseline plus the
+# sum of net P&L from closed trades only. Hero NAV moves with marks
+# every render; this number only changes when a position actually
+# closes and its realised P&L lands in trades.jsonl. The chips strip
+# beside it surfaces the per-trade contributions so the operator can
+# see exactly which closes built the number up (or down).
+_anchor_for_hero = state.read_nav_offset()
+_virtual_baseline = (
+    _anchor_for_hero["virtual_baseline_usd"]
+    if _anchor_for_hero else 2500.0
+)
+_settled_balance = dd.settled_balance_usd(
+    virtual_baseline_usd=_virtual_baseline,
+    marks=broker_marks or {},
+)
+_chips = dd.closed_trade_chips(marks=broker_marks or {}, limit=12)
+_chips_html = "".join(
+    f'<span class="at-chip {"pos" if c["net_pnl_usd"] >= 0 else "neg"}">'
+    f'{html.escape(c["symbol"])} '
+    f'<strong>{"+" if c["net_pnl_usd"] >= 0 else ""}${c["net_pnl_usd"]:,.2f}</strong>'
+    f'</span>'
+    for c in _chips
+) or '<span style="color: var(--text-2); font-size: 0.9rem;">No closed trades yet — chips appear here as positions close.</span>'
+_settled_tone = (
+    "pos" if _settled_balance > _virtual_baseline
+    else "neg" if _settled_balance < _virtual_baseline
+    else ""
+)
+st.markdown(
+    f"""
+    <div class="at-hero" style="margin-top: 0.8rem; background: var(--card-2, #f8fafc);">
+      <div style="display: flex; align-items: center; gap: 1.25rem; flex-wrap: wrap;">
+        <div style="min-width: 220px;">
+          <div class="at-hero-label">Settled balance (closed trades only)</div>
+          <div class="at-hero-nav {_settled_tone}" style="font-size: 1.85rem;">${_settled_balance:,.2f}</div>
+          <div class="at-hero-sub" style="font-size: 0.8rem;">
+            = ${_virtual_baseline:,.0f} virtual baseline + Σ realised net P&L
+          </div>
+        </div>
+        <div style="flex: 1; min-width: 280px; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center;">
+          {_chips_html}
         </div>
       </div>
     </div>
@@ -1527,18 +1589,28 @@ with tabs[6]:
         anchor_cols = st.columns(2)
         with anchor_cols[0]:
             if st.button(
-                "🔄 Re-anchor (capture current broker equity)",
-                help="Re-stamp using broker equity right now. Future swings "
-                     "track from this new baseline.",
+                "🔄 Re-anchor (pre-bake current unrealized P&L)",
+                help="Re-stamp using broker equity right now MINUS current "
+                     "unrealized P&L. Displayed NAV will read "
+                     "virtual_baseline + unrealized P&L at the anchor "
+                     "moment, then track broker swings 1:1 thereafter.",
             ):
                 if broker_view.available and broker_view.nav_usd is not None:
-                    # broker_view.nav_usd has the OLD offset already subtracted,
-                    # so reconstitute the raw broker equity before re-anchoring.
                     raw = broker_view.nav_usd + state.nav_offset_usd()
+                    pnl_now = pnl_lib.compute_portfolio_pnl(
+                        portfolio=portfolio,
+                        marks=broker_marks or None,
+                        costs=broker_costs or None,
+                    )
+                    # Pre-bake: subtract current unrealized Net P&L from
+                    # the baseline so the displayed NAV at anchor time
+                    # equals virtual + current Net P&L instead of just
+                    # virtual. Aligns the headline number with the
+                    # per-position Net P&L the operator sees in the table.
                     state.set_nav_offset(
-                        broker_baseline_usd=raw,
+                        broker_baseline_usd=raw - pnl_now.net_pnl_usd,
                         virtual_baseline_usd=_anchor["virtual_baseline_usd"],
-                        note="re-anchor",
+                        note="re-anchor (prebake)",
                     )
                     st.rerun()
                 else:
@@ -1571,15 +1643,27 @@ with tabs[6]:
             st.markdown("&nbsp;", unsafe_allow_html=True)  # vertical align
             if st.button(
                 "📌 Anchor NAV display now",
-                help="Stamps the current broker equity as the baseline. "
-                     "Dashboard subtracts (broker_baseline − virtual) "
-                     "from every NAV surface going forward.",
+                help="Stamps (broker equity − current unrealized P&L) as "
+                     "the baseline. Displayed NAV reads "
+                     "virtual_baseline + Net P&L right after anchor, then "
+                     "tracks broker swings 1:1. Drift can creep in if a "
+                     "position closes at a price different from its mark "
+                     "at anchor time — the Settled balance card below is "
+                     "the more accurate long-term number.",
             ):
                 if broker_view.available and broker_view.nav_usd is not None:
+                    pnl_now = pnl_lib.compute_portfolio_pnl(
+                        portfolio=portfolio,
+                        marks=broker_marks or None,
+                        costs=broker_costs or None,
+                    )
+                    # Pre-bake unrealized Net P&L into the baseline so the
+                    # hero card immediately reads virtual + Net P&L,
+                    # matching the per-position table totals.
                     state.set_nav_offset(
-                        broker_baseline_usd=broker_view.nav_usd,
+                        broker_baseline_usd=broker_view.nav_usd - pnl_now.net_pnl_usd,
                         virtual_baseline_usd=float(virt_target),
-                        note="dashboard",
+                        note="dashboard (prebake)",
                     )
                     st.rerun()
                 else:

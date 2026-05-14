@@ -116,6 +116,53 @@ def realised_llm_cost_attributed_to_trades_usd(
     return closed_sum + open_sum
 
 
+def settled_balance_usd(
+    *,
+    virtual_baseline_usd: float = 2500.0,
+    marks: dict[str, float] | None = None,
+) -> float:
+    """Virtual baseline + the sum of net P&L from CLOSED trades only.
+
+    Operator-friendly counterpart to the mark-driven hero NAV: this
+    number doesn't move with intraday marks, only when a position
+    actually closes and its realised P&L lands in trades.jsonl. Slower
+    to update but anchored to real broker fills rather than mid quotes.
+
+    The closed-trade net P&L is reset-aware via trades_pnl_view (which
+    folds in `state.filter_costs_post_reset` for the LLM-cost slice).
+    """
+    view = trades_pnl_view(marks=marks)
+    return float(virtual_baseline_usd) + view["totals"]["realised_net_usd"]
+
+
+def closed_trade_chips(
+    *,
+    marks: dict[str, float] | None = None,
+    limit: int = 12,
+) -> list[dict]:
+    """Most-recent closed trades, shaped for the per-trade chip strip
+    next to the Settled balance card.
+
+    Each chip carries: symbol, kind, net_pnl_usd, closed_at. Sorted
+    newest-first; capped at `limit` so the strip stays scannable when
+    the trade log grows long.
+    """
+    view = trades_pnl_view(marks=marks)
+    closed = view["closed"]
+    closed_sorted = sorted(
+        closed, key=lambda r: r.get("closed_at") or "", reverse=True,
+    )
+    out = []
+    for r in closed_sorted[:limit]:
+        out.append({
+            "symbol": r["symbol"],
+            "kind": r.get("kind", "etf"),
+            "net_pnl_usd": r["net_pnl_usd"],
+            "closed_at": r["closed_at"],
+        })
+    return out
+
+
 def cumulative_llm_cost_by_at() -> list[tuple[str, float]]:
     """Sorted (at_iso, cumulative_cost_usd) pairs across costs.jsonl,
     cost-reset-aware.
