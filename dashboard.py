@@ -184,6 +184,18 @@ st.markdown(
 
       /* dataframe */
       [data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+      /* Bump dataframe cell font-size from Streamlit's default (~0.875rem)
+         to a more readable 1rem for operator readability. Targets both the
+         <th> header row and <td> body rows. Scoped to dataframes only —
+         doesn't touch the rest of the page chrome. */
+      [data-testid="stDataFrame"] th,
+      [data-testid="stDataFrame"] td {
+        font-size: 1rem !important;
+        padding: 0.5rem 0.75rem !important;
+      }
+      [data-testid="stDataFrame"] th {
+        font-weight: 700 !important;
+      }
 
       /* subtle subheaders */
       h1, h2, h3 { color: var(--text-0); font-weight: 700; letter-spacing: -0.01em; }
@@ -284,17 +296,35 @@ def _pills_html() -> str:
     return '<div class="at-pills">' + "".join(pills) + "</div>"
 
 
+# Hero NAV: prefer the broker's live equity figure when available, fall
+# back to the agent's last portfolio.json snapshot. Broker NAV reflects
+# fills between cycles (mid-cycle gains/losses on open positions) where
+# the snapshot is only as-fresh as the last orchestrator run.
+hero_nav_usd = (
+    broker_view.nav_usd
+    if (broker_view.available and broker_view.nav_usd is not None)
+    else portfolio.get("nav_usd", 0.0)
+)
+hero_nav_source = (
+    f"broker live (as of {_fmt_ts(broker_view.captured_at)})"
+    if (broker_view.available and broker_view.nav_usd is not None)
+    else f"portfolio.json snapshot (cycle {_fmt_ts(last_run_at)})"
+)
+
 st.markdown(
     f"""
     <div class="at-hero">
       <div class="at-hero-row">
         <div>
           <div class="at-hero-label">Net Asset Value (USD)</div>
-          <div class="at-hero-nav">${portfolio['nav_usd']:,.2f}</div>
+          <div class="at-hero-nav">${hero_nav_usd:,.2f}</div>
           <div class="at-hero-sub">
             Last cycle: <strong>{_fmt_ts(last_run_at)}</strong>
             &nbsp;•&nbsp; Next: <strong>{_fmt_ts(next_run_at)}</strong>
             &nbsp;•&nbsp; Source: <strong>{source}</strong>
+          </div>
+          <div class="at-hero-sub" style="opacity:0.75; font-size:0.85rem;">
+            NAV source: {hero_nav_source}
           </div>
         </div>
         <div style="text-align:right">
@@ -394,11 +424,16 @@ with tabs[0]:
     # no longer carries (closed manually / expired / killed). When the broker
     # is unreachable we render everything — better than blanking the dashboard.
     filter_keys = broker_view.held_keys if broker_view.available else None
+    # "Days held" is derived from the earliest buy-side fill per symbol in
+    # trades.jsonl — pass that map into the row builder so it can populate
+    # the new column without each row re-reading the file.
+    opened_at_by_symbol = dd._opened_at_map_from_trades(dd.load_trades())
     rows = dd.position_table_rows(
         portfolio,
         marks=broker_marks or None,
         costs=broker_costs or None,
         held_keys=filter_keys,
+        opened_at_by_symbol=opened_at_by_symbol,
     )
 
     open_positions, closed_positions = dd.split_positions_by_broker_holdings(
@@ -439,6 +474,58 @@ with tabs[0]:
 
         df_pos = pd.DataFrame(rows)
 
+        # Aggregate totals across the open-positions table. Surfaces the
+        # whole-portfolio P&L at a glance, separate from the per-row
+        # breakdown below. None values (rows without a live mark) are
+        # skipped — sum operates on populated cells only.
+        def _sum_or_none(col_name: str) -> float | None:
+            if col_name not in df_pos.columns:
+                return None
+            vals = [v for v in df_pos[col_name] if isinstance(v, (int, float)) and v == v]
+            return sum(vals) if vals else None
+
+        total_gross = _sum_or_none("Gross P&L")
+        total_net = _sum_or_none("Net P&L")
+        total_notional = _sum_or_none("Notional")
+
+        tot = st.columns(4)
+        tot[0].markdown(
+            _stat_card(
+                "Positions open",
+                str(len(df_pos)),
+                sub="across the universe",
+            ),
+            unsafe_allow_html=True,
+        )
+        tot[1].markdown(
+            _stat_card(
+                "Total notional",
+                f"${total_notional:,.0f}" if total_notional is not None else "—",
+                sub="sum of position USD value",
+            ),
+            unsafe_allow_html=True,
+        )
+        tot[2].markdown(
+            _stat_card(
+                "Aggregate Gross P&L",
+                f"${total_gross:+,.2f}" if total_gross is not None else "—",
+                sub="pre-fees, pre-LLM",
+                tone=("pos" if total_gross and total_gross > 0 else
+                      "neg" if total_gross and total_gross < 0 else ""),
+            ),
+            unsafe_allow_html=True,
+        )
+        tot[3].markdown(
+            _stat_card(
+                "Aggregate Net P&L",
+                f"${total_net:+,.2f}" if total_net is not None else "—",
+                sub="net of modelled costs",
+                tone=("pos" if total_net and total_net > 0 else
+                      "neg" if total_net and total_net < 0 else ""),
+            ),
+            unsafe_allow_html=True,
+        )
+
         # Color-code Gross/Net P&L: green positive, red negative, neutral when blank.
         def _color_pnl(v):
             # On a light background the brighter Tailwind-emerald-500 / red-500
@@ -450,16 +537,108 @@ with tabs[0]:
                 if v < 0: return "color: #dc2626; font-weight: 700"
             return ""
 
-        styled = df_pos.style.map(_color_pnl, subset=["Gross P&L", "Net P&L"])
+        # Append a TOTAL row at the bottom of the dataframe — readers
+        # asked for column sums alongside the per-row breakdown. The
+        # symbol column gets the literal string "TOTAL" so the row is
+        # visually obvious; the leftover non-numeric columns get blanks
+        # to avoid bogus "averages." Pandas Styler bolds the row via a
+        # row-level apply.
+        def _sum_col(col: str) -> float | None:
+            if col not in df_pos.columns:
+                return None
+            vals = [v for v in df_pos[col] if isinstance(v, (int, float)) and v == v]
+            return sum(vals) if vals else None
+
+        total_row: dict = {}
+        for col in df_pos.columns:
+            if col in ("Notional", "Gross P&L", "Net P&L"):
+                total_row[col] = _sum_col(col)
+            elif col == "% NAV":
+                # % NAV sums to the portfolio's invested share (cash is
+                # the remainder). Show the sum, not a fictitious average.
+                total_row[col] = _sum_col(col)
+            elif col == "Symbol":
+                total_row[col] = "TOTAL"
+            else:
+                # Bias/DTE/Days held/Δ%/Entry/Mark — averaging these
+                # across heterogenous instruments would be misleading, so
+                # blank the TOTAL cell rather than fabricate a number.
+                total_row[col] = ""
+        df_pos_with_total = pd.concat(
+            [df_pos, pd.DataFrame([total_row])],
+            ignore_index=True,
+        )
+        total_row_idx = len(df_pos_with_total) - 1
+
+        def _bold_total(row):
+            if row.name == total_row_idx:
+                return ["font-weight: 800; border-top: 2px solid var(--border)"] * len(row)
+            return [""] * len(row)
+
+        # Δ% lives in the same green/red semantic space as the P&L
+        # columns — apply the same color formatter so a move-since-entry
+        # of -8% reads red at a glance.
+        color_subset = [c for c in ("Gross P&L", "Net P&L", "Δ%") if c in df_pos_with_total.columns]
+        styled = (
+            df_pos_with_total.style
+            .map(_color_pnl, subset=color_subset)
+            .apply(_bold_total, axis=1)
+        )
         st.dataframe(
             styled,
             width="stretch",
             hide_index=True,
             column_config={
-                "Cost":      st.column_config.NumberColumn("Cost",     format="$%.2f"),
-                "Mark":      st.column_config.NumberColumn("Mark",     format="$%.2f"),
+                "Entry":     st.column_config.NumberColumn(
+                    "Entry",
+                    format="$%.2f",
+                    help="Per-unit cost basis at entry — broker-reported "
+                         "avg_cost when available, otherwise the agent's "
+                         "intended fill price from portfolio.json.",
+                ),
+                "Mark":      st.column_config.NumberColumn(
+                    "Mark",
+                    format="$%.2f",
+                    help="Current per-unit price (last trade / mid quote) "
+                         "from the broker. Blank when marks aren't wired.",
+                ),
+                "Δ%":        st.column_config.NumberColumn(
+                    "Δ%",
+                    format="%+.1f%%",
+                    help="Gross percent move since entry, per unit. "
+                         "Independent of position size — complements the "
+                         "$-denominated Gross / Net P&L columns.",
+                ),
                 "Notional":  st.column_config.NumberColumn("Notional", format="$%,.0f"),
-                "% NAV":     st.column_config.NumberColumn("% NAV",    format="%.1f%%"),
+                "% NAV":     st.column_config.NumberColumn(
+                    "% NAV",
+                    format="%.1f%%",
+                    help="Position notional as a share of total NAV. "
+                         "Entry cap is 15%; cap drops to 7.5% in ≥10% "
+                         "drawdown. Drift past the cap after entry is OK.",
+                ),
+                "DTE":       st.column_config.Column(
+                    "DTE",
+                    help="Days to expiry for options. '—' on ETF rows.",
+                ),
+                "Days held": st.column_config.NumberColumn(
+                    "Days held",
+                    format="%d",
+                    help="Whole-days since the earliest buy fill for this "
+                         "symbol per state/trades.jsonl.",
+                ),
+                "Bias":      st.column_config.Column(
+                    "Bias",
+                    help="Direction expressed by the position: Bull (bull "
+                         "ETF or long call), Bear (inverse ETF or long "
+                         "put), Long vol (UVXY), Long crypto (BITX).",
+                ),
+                "Kill":      st.column_config.Column(
+                    "Kill",
+                    help="Trigger conditions monitor.py uses to flatten "
+                         "the position: max-loss %, underlying price "
+                         "thresholds, and time stop (date).",
+                ),
                 "Gross P&L": st.column_config.NumberColumn("Gross P&L", format="$%+,.2f"),
                 "Net P&L":   st.column_config.NumberColumn("Net P&L",  format="$%+,.2f"),
             },
@@ -652,28 +831,56 @@ with tabs[3]:
         costs=broker_costs or None,
     )
     has_gross = broker_marks and pnl_break.gross_pnl_usd != 0
+    # Realised LLM cost attributed to trades, post-reset. Subtracting
+    # this from the Net P&L card means the "Reset ALL LLM costs"
+    # button has a visible, dollar-denominated effect here — not just
+    # on the Costs panel below. The audit log on disk is preserved;
+    # this is purely how the dashboard reports Net.
+    realised_llm = dd.realised_llm_cost_attributed_to_trades_usd(
+        marks=broker_marks or {},
+    )
+    # All-in Net = unrealised net (gross - modelled trading costs)
+    #            - realised LLM cost attributed to trades (post-reset).
+    # Modelled trading costs are unrealised (entry leg + projected
+    # round-trip), so we don't add fees here — they're already in
+    # modelled_costs_usd. Realised fees flow into the Trades tab.
+    net_all_in = pnl_break.net_pnl_usd - realised_llm
 
     st.markdown('<div class="at-section-label">P&L summary</div>', unsafe_allow_html=True)
-    p = st.columns(3)
+    p = st.columns(4)
     gross_tone = "pos" if pnl_break.gross_pnl_usd > 0 else ("neg" if pnl_break.gross_pnl_usd < 0 else "")
-    net_tone = "pos" if pnl_break.net_pnl_usd > 0 else ("neg" if pnl_break.net_pnl_usd < 0 else "")
+    net_tone = "pos" if net_all_in > 0 else ("neg" if net_all_in < 0 else "")
     p[0].markdown(
         _stat_card(
             "Gross P&L",
             f"${pnl_break.gross_pnl_usd:+,.2f}" if has_gross else "—",
             tone=gross_tone if has_gross else "",
+            sub="unrealised, before any costs",
         ),
         unsafe_allow_html=True,
     )
     p[1].markdown(
-        _stat_card("Modelled trading costs", f"${pnl_break.modelled_costs_usd:,.2f}"),
+        _stat_card(
+            "Modelled trading costs",
+            f"${pnl_break.modelled_costs_usd:,.2f}",
+            sub="spreads + commissions + reg fees",
+        ),
         unsafe_allow_html=True,
     )
     p[2].markdown(
         _stat_card(
+            "LLM cost (since reset)",
+            f"${realised_llm:,.4f}",
+            sub="attributed to opening runs",
+        ),
+        unsafe_allow_html=True,
+    )
+    p[3].markdown(
+        _stat_card(
             "Net P&L",
-            f"${pnl_break.net_pnl_usd:+,.2f}" if has_gross else "—",
+            f"${net_all_in:+,.2f}" if has_gross else "—",
             tone=net_tone if has_gross else "",
+            sub="gross − trading costs − LLM",
         ),
         unsafe_allow_html=True,
     )
@@ -687,41 +894,92 @@ with tabs[3]:
         marks_status + " Trading costs are modelled to mirror **IBKR Pro retail** "
         "(USD account): $1 min commission + $0.005/share on ETFs (capped 0.5%), "
         "$0.65/contract + $0.04 OCC on options, ~5 bps / 25 bps half-spread, "
-        "plus SEC + FINRA TAF on sell side."
+        "plus SEC + FINRA TAF on sell side. **LLM cost** is the dashboard's "
+        "view since the last all-time reset — the reset adjusts Net P&L "
+        "above and the equity curve below, not just the cost panel."
     )
 
     st.markdown('<div class="at-section-label">Equity curve</div>', unsafe_allow_html=True)
     nav_history = dd.load_nav_history()
     if nav_history:
         nav_df = pd.DataFrame(nav_history)
-        fig_nav = go.Figure()
-        fig_nav.add_trace(go.Scatter(
-            x=nav_df["at"], y=nav_df["nav_usd"], mode="lines+markers",
-            name="NAV (USD)",
-            line=dict(width=2.5, color="#059669"),
-            marker=dict(size=5, color="#059669"),
-        ))
-        if "net_pnl_usd" in nav_df.columns:
-            fig_nav.add_trace(go.Scatter(
-                x=nav_df["at"], y=nav_df["net_pnl_usd"], mode="lines",
-                name="Cumulative Net P&L (USD)",
-                yaxis="y2", line=dict(dash="dot", color="#7c3aed", width=2),
-            ))
-            fig_nav.update_layout(
-                yaxis2=dict(title="Net P&L (USD)", overlaying="y", side="right",
-                            showgrid=False, color="#7c3aed"),
-            )
-        fig_nav.update_layout(
-            template="plotly_white",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            height=360, yaxis_title="NAV (USD)",
-            yaxis=dict(gridcolor="#e2e8f0", color="#059669"),
-            xaxis=dict(gridcolor="#e2e8f0"),
-            margin=dict(l=10, r=10, t=20, b=10),
-            legend=dict(orientation="h", y=1.1, font=dict(size=12)),
+        # Window filter: 1D / 1W / 1M / 1Y / All. Defaults to All so a
+        # fresh-start account renders something useful immediately.
+        # st.radio with horizontal=True is portable back to Streamlit
+        # 1.6 (segmented_control needs ≥1.40 — not all VPSes update
+        # promptly).
+        window_choice = st.radio(
+            "Window",
+            ["1D", "1W", "1M", "1Y", "All"],
+            index=4,
+            horizontal=True,
+            label_visibility="collapsed",
+            help="Filter the equity curve to the trailing window. "
+                 "Affects this chart only; underlying nav_history.jsonl "
+                 "is unchanged.",
         )
-        st.plotly_chart(fig_nav, width="stretch")
+        window_days = {"1D": 1, "1W": 7, "1M": 30, "1Y": 365}.get(window_choice)
+        if window_days is not None and "at" in nav_df.columns:
+            from datetime import datetime, timezone, timedelta
+            cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+            # Parse 'at' column to UTC-aware datetimes. Tolerant of both
+            # Z-suffixed and +00:00 ISO strings (state.utcnow_iso emits Z,
+            # but defensive against future format changes).
+            nav_df = nav_df.copy()
+            nav_df["_at_dt"] = pd.to_datetime(
+                nav_df["at"].str.replace("Z", "+00:00", regex=False),
+                utc=True,
+                errors="coerce",
+            )
+            nav_df = nav_df[nav_df["_at_dt"] >= cutoff]
+        if nav_df.empty:
+            st.info(
+                f"No NAV rows in the trailing {window_choice} window. "
+                "Either the window is too narrow or there's a gap in "
+                "nav_history.jsonl."
+            )
+        else:
+            fig_nav = go.Figure()
+            fig_nav.add_trace(go.Scatter(
+                x=nav_df["at"], y=nav_df["nav_usd"], mode="lines+markers",
+                name="NAV (USD)",
+                line=dict(width=2.5, color="#059669"),
+                marker=dict(size=5, color="#059669"),
+            ))
+            if "net_pnl_usd" in nav_df.columns:
+                # Subtract cumulative LLM cost as-of each NAV row's
+                # timestamp so the curve reflects the reset marker. The
+                # nav_history.jsonl rows themselves are frozen (gross −
+                # modelled-trading-costs only); LLM cost is folded in
+                # at render time so it can react to operator action.
+                cum_llm = dd.cumulative_llm_cost_at(
+                    nav_df["at"].astype(str).tolist()
+                )
+                cumulative_net_after_llm = [
+                    (n if n is not None else 0.0) - c
+                    for n, c in zip(nav_df["net_pnl_usd"].tolist(), cum_llm)
+                ]
+                fig_nav.add_trace(go.Scatter(
+                    x=nav_df["at"], y=cumulative_net_after_llm, mode="lines",
+                    name="Cumulative Net P&L (after LLM, USD)",
+                    yaxis="y2", line=dict(dash="dot", color="#7c3aed", width=2),
+                    hovertemplate="%{x}<br>Net (after LLM): $%{y:.2f}<extra></extra>",
+                ))
+                fig_nav.update_layout(
+                    yaxis2=dict(title="Net P&L (USD)", overlaying="y", side="right",
+                                showgrid=False, color="#7c3aed"),
+                )
+            fig_nav.update_layout(
+                template="plotly_white",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                height=360, yaxis_title="NAV (USD)",
+                yaxis=dict(gridcolor="#e2e8f0", color="#059669"),
+                xaxis=dict(gridcolor="#e2e8f0"),
+                margin=dict(l=10, r=10, t=20, b=10),
+                legend=dict(orientation="h", y=1.1, font=dict(size=12)),
+            )
+            st.plotly_chart(fig_nav, width="stretch")
     else:
         st.info("No NAV history yet — the equity curve populates once orchestrator runs accumulate.")
 
@@ -1137,10 +1395,13 @@ with tabs[6]:
     all_time_reset_at = state.read_all_time_cost_reset_at()
     if all_time_reset_at:
         st.info(
-            f"All dashboard cost totals are currently filtered — only counting "
-            f"LLM spend after **{_fmt_ts(all_time_reset_at)}**. Underlying "
-            f"`state/costs.jsonl` is intact; cap enforcement still uses the raw "
-            f"log so per-run / per-day safety rails remain in force."
+            f"LLM-cost reset active — every dashboard surface counts only "
+            f"spend after **{_fmt_ts(all_time_reset_at)}**. This bumps the "
+            f"Performance tab Net P&L, the equity-curve cumulative-net line "
+            f"and the Trades tab Realised net + per-row Net columns upward "
+            f"by whatever was previously attributed. Underlying "
+            f"`state/costs.jsonl` is intact; per-run / per-day cap "
+            f"enforcement still uses the raw log."
         )
         at_cols = st.columns(2)
         with at_cols[0]:
@@ -1156,16 +1417,22 @@ with tabs[6]:
                 st.rerun()
     else:
         st.caption(
-            "Dashboard totals (today, this run, monthly, all-time) read from the "
-            "full `state/costs.jsonl` by default. Pressing the button below zeroes "
-            "ALL displayed totals at the current moment — useful after a testing "
-            "burn or model-config change you want to draw a line under. Audit log "
-            "and cap enforcement are unaffected."
+            "Pressing the button below stamps an all-time reset marker. From "
+            "that moment, LLM cost is treated as $0 across **every** dashboard "
+            "surface that subtracts it from P&L — the Performance tab Net P&L "
+            "card, the equity-curve Cumulative Net P&L line, and the Trades "
+            "tab Realised net + per-row Net columns all bump upward by the "
+            "previously-attributed amount. Useful after a testing burn or "
+            "model-config change you want to draw a line under. The underlying "
+            "`state/costs.jsonl` audit log is preserved (never mutated) and "
+            "per-run / per-day cap enforcement continues to use the raw log."
         )
         if st.button(
-            "🧹 Reset ALL LLM costs to $0 (display only)",
-            help="Records an all-time reset marker. costs.jsonl audit log is preserved; "
-                 "per-run and per-day caps continue to use the raw log.",
+            "🧹 Reset ALL LLM costs to $0",
+            help="Records an all-time reset marker. costs.jsonl audit log is "
+                 "preserved; per-run and per-day caps continue to use the raw "
+                 "log. Net P&L surfaces (Performance, Trades, equity curve) "
+                 "all reflect the reset.",
         ):
             state.set_all_time_cost_reset("dashboard")
             st.rerun()
@@ -1231,6 +1498,69 @@ with tabs[6]:
         if st.button("🛑 Emergency stop (write halt.flag)"):
             state.set_halt("dashboard")
             st.rerun()
+
+    st.markdown('<div class="at-section-label">Auto-refresh</div>', unsafe_allow_html=True)
+    st.caption(
+        "Streamlit dashboards don't refresh on their own — the hero NAV, "
+        "positions table, and equity curve only update when you reload the "
+        "page (or hit the manual button below). Toggle this on to insert "
+        "a `meta http-equiv=\"refresh\"` tag into the page so the browser "
+        "reloads every N seconds. Off by default to avoid surprise re-runs "
+        "interrupting your reading."
+    )
+    # Codex P1 on PR #73: the meta refresh starts a NEW Streamlit
+    # session each tick, which would reset st.checkbox(value=False) to
+    # default and drop the meta tag — so auto-refresh would fire exactly
+    # ONCE then die. Persist the toggle + interval in URL query params
+    # because the meta refresh preserves the URL (no target specified =
+    # reloads current URL including query string). New sessions then
+    # read the params and rebuild the same widget state, keeping the
+    # loop alive across arbitrarily many reloads.
+    params = st.query_params
+    autorefresh_param = params.get("autorefresh", "0") == "1"
+    try:
+        interval_param = int(params.get("interval", "60"))
+    except (TypeError, ValueError):
+        interval_param = 60
+    interval_param = max(15, min(300, interval_param))
+
+    auto_refresh_on = st.checkbox(
+        "Auto-refresh enabled", value=autorefresh_param,
+        help="Reload the whole page every N seconds. Live broker NAV / "
+             "positions / fills will tick forward without a manual refresh. "
+             "State persists across reloads via URL query params, so a once-"
+             "enabled toggle keeps refreshing until you uncheck it.",
+    )
+    refresh_seconds = st.slider(
+        "Refresh interval (seconds)",
+        min_value=15, max_value=300, value=interval_param, step=15,
+        disabled=not auto_refresh_on,
+        help="60s matches the scheduler's poll cadence; 30s is fine if you "
+             "want tighter live-mark updates during a position you're watching.",
+    )
+
+    # Sync widget state → URL query params. Only mutates params when
+    # the desired state diverges from the URL to avoid a redundant
+    # rerun loop on every render.
+    desired_autorefresh = "1" if auto_refresh_on else "0"
+    desired_interval = str(refresh_seconds) if auto_refresh_on else None
+    if params.get("autorefresh", "0") != desired_autorefresh:
+        params["autorefresh"] = desired_autorefresh
+    if auto_refresh_on and params.get("interval") != desired_interval:
+        params["interval"] = desired_interval
+    elif not auto_refresh_on and "interval" in params:
+        del params["interval"]
+
+    if auto_refresh_on:
+        st.markdown(
+            f'<meta http-equiv="refresh" content="{refresh_seconds}">',
+            unsafe_allow_html=True,
+        )
+        st.success(
+            f"Page will reload every {refresh_seconds}s. "
+            "Toggle state lives in the URL (`?autorefresh=1&interval=…`) "
+            "so the loop survives the reload."
+        )
 
     st.markdown('<div class="at-section-label">Manual actions</div>', unsafe_allow_html=True)
     if st.button("🔄 Refresh data"):
