@@ -498,6 +498,12 @@ def try_load_broker_view() -> BrokerView:
         nav_usd = float(broker.get_account().equity_usd)
     except Exception:
         nav_usd = None
+    # Apply the NAV display anchor when one is set. Default offset is
+    # 0.0 (no anchor) so this is a no-op in fresh installs. The anchor
+    # is a pure display offset — broker order sizing reads
+    # VIRTUAL_NAV_USD from the environment, never this file.
+    if nav_usd is not None:
+        nav_usd = nav_usd - state.nav_offset_usd()
     return BrokerView(
         marks=marks,
         costs=costs,
@@ -889,6 +895,12 @@ def position_table_rows(
             row["Δ%"] = (mark - cost_per_unit) / cost_per_unit * 100.0
         else:
             row["Δ%"] = None
+        # Modelled trading costs for THIS position — round-trip
+        # estimate (entry leg + projected close): spread + commission
+        # + reg fees. Mirrors what the Performance tab "Modelled
+        # trading costs" aggregate is built from. Makes the per-row
+        # Net P&L breakdown self-explanatory (Gross − Fees = Net).
+        row["Fees"] = breakdown.modelled_costs_usd
         row["Gross P&L"] = breakdown.gross_pnl_usd if mark is not None else None
         row["Net P&L"] = breakdown.net_pnl_usd if mark is not None else None
         out.append(row)

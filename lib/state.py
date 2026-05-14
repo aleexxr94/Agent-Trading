@@ -56,6 +56,28 @@ NAV_HISTORY_LOG = STATE_DIR / "nav_history.jsonl"
 # on quiet markets.
 LAST_CYCLE_HASH = STATE_DIR / "last_cycle_hash.json"
 
+# NAV display anchor (PR following #73). Alpaca paper accounts default
+# to $100,000 USD and can't always be reset to a lower target. The
+# anchor lets the operator pin the displayed NAV to the spec target
+# ($2,500 per CLAUDE.md) while letting it track broker P&L 1:1 from
+# that moment. The file stores both the broker baseline and the
+# virtual baseline so the offset is recoverable and re-anchoring later
+# stays coherent.
+#
+# Schema:
+#   {
+#     "broker_baseline_usd": <float>,
+#     "virtual_baseline_usd": <float>,
+#     "set_at": <ISO-UTC>,
+#     "note": <optional string>
+#   }
+#
+# Offset applied to displayed NAV = broker_baseline_usd - virtual_baseline_usd.
+# Dashboards subtract this from raw broker equity (and from nav_history
+# rows at render time). Constructor sizing is unaffected — it reads
+# VIRTUAL_NAV_USD from the environment as a separate setting.
+NAV_OFFSET_FLAG = STATE_DIR / "nav_offset.json"
+
 
 # --------- run_id ---------
 
@@ -277,6 +299,75 @@ def filter_costs_post_reset(rows: list[dict]) -> list[dict]:
     if not reset_at:
         return rows
     return [r for r in rows if (r.get("at") or "") > reset_at]
+
+
+# --------- NAV display anchor ---------
+
+
+def read_nav_offset() -> dict | None:
+    """Return the anchor dict (broker_baseline_usd, virtual_baseline_usd,
+    set_at, note) or None when no anchor is set.
+
+    Display-only: this does not influence cap enforcement, sizing,
+    sanity rules, or broker orders. Pure rendering offset.
+    """
+    if not NAV_OFFSET_FLAG.exists():
+        return None
+    try:
+        data = json.loads(NAV_OFFSET_FLAG.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if "broker_baseline_usd" not in data or "virtual_baseline_usd" not in data:
+        return None
+    return data
+
+
+def nav_offset_usd() -> float:
+    """Convenience: the dollar offset to subtract from broker equity
+    when displaying NAV. Returns 0.0 when no anchor is set so calls
+    are no-op safe."""
+    data = read_nav_offset()
+    if data is None:
+        return 0.0
+    try:
+        return float(data["broker_baseline_usd"]) - float(data["virtual_baseline_usd"])
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+
+def set_nav_offset(
+    *,
+    broker_baseline_usd: float,
+    virtual_baseline_usd: float = 2500.0,
+    note: str = "",
+) -> str:
+    """Stamp a new anchor. `broker_baseline_usd` is the broker's current
+    equity at anchor time; `virtual_baseline_usd` is what the operator
+    wants the dashboard to show at that moment (defaults to $2,500 per
+    the CLAUDE.md spec).
+
+    Returns the ISO-UTC timestamp written into the file.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    at = utcnow_iso()
+    NAV_OFFSET_FLAG.write_text(
+        json.dumps({
+            "broker_baseline_usd": float(broker_baseline_usd),
+            "virtual_baseline_usd": float(virtual_baseline_usd),
+            "set_at": at,
+            "note": note,
+        }, sort_keys=True),
+        encoding="utf-8",
+    )
+    return at
+
+
+def clear_nav_offset() -> None:
+    """Remove the anchor. Dashboard reverts to raw broker equity."""
+    if NAV_OFFSET_FLAG.exists():
+        NAV_OFFSET_FLAG.unlink()
 
 
 def read_costs_today() -> list[dict]:

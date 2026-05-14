@@ -207,6 +207,64 @@ def test_clear_all_time_cost_reset_also_clears_daily_marker(tmp_state):
     )
 
 
+# ---------- NAV display anchor ----------
+
+
+def test_nav_offset_unset_returns_zero(tmp_state):
+    """Fresh installs have no anchor — offset must be a no-op."""
+    assert state.read_nav_offset() is None
+    assert state.nav_offset_usd() == 0.0
+
+
+def test_nav_offset_round_trip(tmp_state):
+    """Set / read / clear cycle for the NAV anchor."""
+    at = state.set_nav_offset(
+        broker_baseline_usd=100020.52,
+        virtual_baseline_usd=2500.0,
+        note="test",
+    )
+    data = state.read_nav_offset()
+    assert data is not None
+    assert data["broker_baseline_usd"] == pytest.approx(100020.52)
+    assert data["virtual_baseline_usd"] == pytest.approx(2500.0)
+    assert data["set_at"] == at
+    assert data["note"] == "test"
+    # Offset = baseline − virtual = the dollar amount to subtract from
+    # broker equity at render time.
+    assert state.nav_offset_usd() == pytest.approx(97520.52)
+
+    state.clear_nav_offset()
+    assert state.read_nav_offset() is None
+    assert state.nav_offset_usd() == 0.0
+
+
+def test_nav_offset_corrupt_file_returns_none(tmp_state):
+    """A malformed file must not crash the dashboard. Treat it as
+    'no anchor' and let the operator re-anchor."""
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.NAV_OFFSET_FLAG.write_text("{not json", encoding="utf-8")
+    assert state.read_nav_offset() is None
+    assert state.nav_offset_usd() == 0.0
+
+
+def test_nav_offset_missing_keys_returns_none(tmp_state):
+    """File present but missing required fields → treat as no anchor."""
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.NAV_OFFSET_FLAG.write_text(
+        '{"broker_baseline_usd": 100000}',  # missing virtual_baseline_usd
+        encoding="utf-8",
+    )
+    assert state.read_nav_offset() is None
+    assert state.nav_offset_usd() == 0.0
+
+
+def test_nav_offset_default_virtual_baseline_is_2500(tmp_state):
+    """CLAUDE.md spec target is $2,500 — make that the helper default."""
+    state.set_nav_offset(broker_baseline_usd=100000.0)
+    data = state.read_nav_offset()
+    assert data["virtual_baseline_usd"] == pytest.approx(2500.0)
+
+
 def test_filter_costs_post_reset_passthrough_when_no_marker(tmp_state):
     """No reset marker → filter is identity."""
     rows = [
