@@ -308,39 +308,93 @@ def _pills_html() -> str:
     return '<div class="at-pills">' + "".join(pills) + "</div>"
 
 
-# Hero NAV: prefer the broker's live equity figure when available, fall
-# back to the agent's last portfolio.json snapshot. Broker NAV reflects
-# fills between cycles (mid-cycle gains/losses on open positions) where
-# the snapshot is only as-fresh as the last orchestrator run.
+# Synthetic balance is the single source of truth for the dashboard's
+# headline number. It's derived entirely from logs we control
+# (state/trades.jsonl + state/costs.jsonl) and intentionally ignores
+# Alpaca's account equity — that's exposed as a separate informational
+# sub-line below. See lib/dashboard_data.py:SyntheticBalance and the
+# refactor rationale at plans/federated-greeting-sphinx.md.
+_synth_live = dd.compute_synthetic_balance(marks=broker_marks or {})
+hero_nav_usd = _synth_live.synthetic_balance_usd
+_starting = _synth_live.starting_balance_usd
+_hero_tone = (
+    "pos" if hero_nav_usd > _starting
+    else "neg" if hero_nav_usd < _starting
+    else ""
+)
+# Breakdown sub-line: shows the five formula components so any drift
+# between the headline and the per-position table is auditable in one
+# glance. Numbers carry signs (closed/open can be either) and we drop
+# "−$0.00" terms only when ALL costs/fees are genuinely zero.
+def _signed(usd: float) -> str:
+    return f"${usd:+,.2f}".replace("$+", "+$").replace("$-", "−$")
+
+breakdown_html = (
+    f"${_starting:,.0f} "
+    f"<span style='color: var(--text-2);'>+</span> "
+    f"{_signed(_synth_live.closed_gross_pnl_usd)} closed "
+    f"<span style='color: var(--text-2);'>+</span> "
+    f"{_signed(_synth_live.open_gross_pnl_usd)} open "
+    f"<span style='color: var(--text-2);'>−</span> "
+    f"${_synth_live.llm_cost_total_usd:,.2f} LLM "
+    f"<span style='color: var(--text-2);'>−</span> "
+    f"${_synth_live.trading_fees_total_usd:,.2f} fees"
+)
+# Informational-only Alpaca equity row. Always labelled and rendered
+# in a muted style so it's obviously NOT the source of truth.
+alpaca_line = ""
 if broker_view.available and broker_view.nav_usd is not None:
-    # broker_view.nav_usd already had the anchor offset subtracted in
-    # try_load_broker_view.
-    hero_nav_usd = broker_view.nav_usd
-    hero_nav_source = f"broker live (as of {_fmt_ts(broker_view.captured_at)})"
-else:
-    # Fallback path — portfolio.json is the agent's last snapshot of
-    # broker equity, so it ALSO needs the offset applied. Codex P2 on
-    # PR #74 caught the case where a transient get_account() failure
-    # let the hero jump back to ~$100k even with an anchor set.
-    snapshot_nav = portfolio.get("nav_usd", 0.0)
-    hero_nav_usd = snapshot_nav - state.nav_offset_usd()
-    hero_nav_source = f"portfolio.json snapshot (cycle {_fmt_ts(last_run_at)})"
+    alpaca_line = (
+        f'<div class="at-hero-sub" style="opacity:0.7; font-size:0.85rem;">'
+        f'Alpaca account: <strong>${broker_view.nav_usd:,.2f}</strong> '
+        f'<span style="color: var(--text-2);">(informational — not used '
+        f'for any dashboard calculation)</span>'
+        f'</div>'
+    )
+unmarked_line = ""
+if _synth_live.unmarked_open_lots > 0:
+    unmarked_line = (
+        f'<div class="at-hero-sub" style="opacity:0.7; font-size:0.85rem; color: var(--amber-text);">'
+        f'{_synth_live.unmarked_open_lots} open lot(s) without live marks '
+        f'— their P&L contribution treated as $0 until marks return.'
+        f'</div>'
+    )
+# Data-integrity warning: unmatched sell fills in trades.jsonl signal
+# the synthetic balance is missing some P&L. Healthy operation never
+# triggers this (Codex P1 on PR #79). Surface loudly rather than let
+# the headline lie about a number the operator trusts.
+integrity_line = ""
+if _synth_live.is_integrity_warning:
+    integrity_line = (
+        f'<div class="at-hero-sub" style="font-size:0.9rem; '
+        f'color: var(--red-text); font-weight: 600; margin-top: 0.4rem; '
+        f'padding: 0.4rem 0.6rem; background: var(--red-soft); '
+        f'border-radius: 6px;">'
+        f'⚠ {_synth_live.unmatched_sell_count} unmatched sell fill(s) '
+        f'in state/trades.jsonl — synthetic balance may be inaccurate. '
+        f'Inspect the file for sells without matching buys (out-of-order '
+        f'sync, legacy fills, or manual edits).'
+        f'</div>'
+    )
 
 st.markdown(
     f"""
     <div class="at-hero">
       <div class="at-hero-row">
         <div>
-          <div class="at-hero-label">Net Asset Value (USD)</div>
-          <div class="at-hero-nav">${hero_nav_usd:,.2f}</div>
+          <div class="at-hero-label">Synthetic balance (USD)</div>
+          <div class="at-hero-nav {_hero_tone}">${hero_nav_usd:,.2f}</div>
           <div class="at-hero-sub">
+            {breakdown_html}
+          </div>
+          <div class="at-hero-sub" style="opacity:0.75; font-size:0.85rem;">
             Last cycle: <strong>{_fmt_ts(last_run_at)}</strong>
             &nbsp;•&nbsp; Next: <strong>{_fmt_ts(next_run_at)}</strong>
             &nbsp;•&nbsp; Source: <strong>{source}</strong>
           </div>
-          <div class="at-hero-sub" style="opacity:0.75; font-size:0.85rem;">
-            NAV source: {hero_nav_source}
-          </div>
+          {alpaca_line}
+          {unmarked_line}
+          {integrity_line}
         </div>
         <div style="text-align:right">
           {_pills_html()}
@@ -352,22 +406,13 @@ st.markdown(
 )
 
 
-# ---------- Settled balance (closed-trade NAV) ----------
-# Slow-moving counterpart to the hero NAV: virtual_baseline plus the
-# sum of net P&L from closed trades only. Hero NAV moves with marks
-# every render; this number only changes when a position actually
-# closes and its realised P&L lands in trades.jsonl. The chips strip
-# beside it surfaces the per-trade contributions so the operator can
-# see exactly which closes built the number up (or down).
-_anchor_for_hero = state.read_nav_offset()
-_virtual_baseline = (
-    _anchor_for_hero["virtual_baseline_usd"]
-    if _anchor_for_hero else 2500.0
-)
-_settled_balance = dd.settled_balance_usd(
-    virtual_baseline_usd=_virtual_baseline,
-    marks=broker_marks or {},
-)
+# ---------- Realized balance (closed trades only) ----------
+# Complementary view to the hero. Frozen between closes so it doesn't
+# move with intraday marks — only changes when a real fill lands in
+# trades.jsonl or a cost row lands in costs.jsonl. The chips strip
+# beside it shows the per-trade contributions that built it.
+_synth_realized = dd.compute_synthetic_balance(marks={})
+_realized_balance = _synth_realized.synthetic_balance_usd
 _chips = dd.closed_trade_chips(marks=broker_marks or {}, limit=12)
 _chips_html = "".join(
     f'<span class="at-chip {"pos" if c["net_pnl_usd"] >= 0 else "neg"}">'
@@ -376,9 +421,9 @@ _chips_html = "".join(
     f'</span>'
     for c in _chips
 ) or '<span style="color: var(--text-2); font-size: 0.9rem;">No closed trades yet — chips appear here as positions close.</span>'
-_settled_tone = (
-    "pos" if _settled_balance > _virtual_baseline
-    else "neg" if _settled_balance < _virtual_baseline
+_realized_tone = (
+    "pos" if _realized_balance > _synth_realized.starting_balance_usd
+    else "neg" if _realized_balance < _synth_realized.starting_balance_usd
     else ""
 )
 st.markdown(
@@ -386,10 +431,10 @@ st.markdown(
     <div class="at-hero" style="margin-top: 0.8rem; background: var(--card-2, #f8fafc);">
       <div style="display: flex; align-items: center; gap: 1.25rem; flex-wrap: wrap;">
         <div style="min-width: 220px;">
-          <div class="at-hero-label">Settled balance (closed trades only)</div>
-          <div class="at-hero-nav {_settled_tone}" style="font-size: 1.85rem;">${_settled_balance:,.2f}</div>
+          <div class="at-hero-label">Realized balance (closed trades only)</div>
+          <div class="at-hero-nav {_realized_tone}" style="font-size: 1.85rem;">${_realized_balance:,.2f}</div>
           <div class="at-hero-sub" style="font-size: 0.8rem;">
-            = ${_virtual_baseline:,.0f} virtual baseline + Σ realised net P&L
+            Frozen at last close. Live mark P&L is in the hero above.
           </div>
         </div>
         <div style="flex: 1; min-width: 280px; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center;">
@@ -958,62 +1003,100 @@ with tabs[2]:
 
 # ===== Tab 3: Performance =====
 with tabs[3]:
-    pnl_break = pnl_lib.compute_portfolio_pnl(
+    # Drive the entire P&L summary off the same SyntheticBalance the
+    # hero card uses — no parallel computation, no risk of divergence.
+    _synth = dd.compute_synthetic_balance(marks=broker_marks or {})
+    # Modelled trading costs are kept as a separate sanity-floor
+    # estimate — they're NOT in the synthetic balance formula
+    # (real Alpaca fees from trades.jsonl are used instead).
+    _modelled = pnl_lib.compute_portfolio_pnl(
         portfolio=portfolio,
         marks=broker_marks or None,
         costs=broker_costs or None,
     )
-    has_gross = broker_marks and pnl_break.gross_pnl_usd != 0
-    # Realised LLM cost attributed to trades, post-reset. Subtracting
-    # this from the Net P&L card means the "Reset ALL LLM costs"
-    # button has a visible, dollar-denominated effect here — not just
-    # on the Costs panel below. The audit log on disk is preserved;
-    # this is purely how the dashboard reports Net.
-    realised_llm = dd.realised_llm_cost_attributed_to_trades_usd(
-        marks=broker_marks or {},
-    )
-    # All-in Net = unrealised net (gross - modelled trading costs)
-    #            - realised LLM cost attributed to trades (post-reset).
-    # Modelled trading costs are unrealised (entry leg + projected
-    # round-trip), so we don't add fees here — they're already in
-    # modelled_costs_usd. Realised fees flow into the Trades tab.
-    net_all_in = pnl_break.net_pnl_usd - realised_llm
 
-    st.markdown('<div class="at-section-label">P&L summary</div>', unsafe_allow_html=True)
-    p = st.columns(4)
-    gross_tone = "pos" if pnl_break.gross_pnl_usd > 0 else ("neg" if pnl_break.gross_pnl_usd < 0 else "")
-    net_tone = "pos" if net_all_in > 0 else ("neg" if net_all_in < 0 else "")
-    p[0].markdown(
+    st.markdown('<div class="at-section-label">Synthetic balance breakdown</div>',
+                unsafe_allow_html=True)
+
+    def _tone_for(v: float) -> str:
+        return "pos" if v > 0 else "neg" if v < 0 else ""
+
+    row1 = st.columns(3)
+    row1[0].markdown(
         _stat_card(
-            "Gross P&L",
-            f"${pnl_break.gross_pnl_usd:+,.2f}" if has_gross else "—",
-            tone=gross_tone if has_gross else "",
-            sub="unrealised, before any costs",
+            "Starting balance",
+            f"${_synth.starting_balance_usd:,.2f}",
+            sub="virtual baseline (CLAUDE.md spec)",
         ),
         unsafe_allow_html=True,
     )
-    p[1].markdown(
+    row1[1].markdown(
         _stat_card(
-            "Modelled trading costs",
-            f"${pnl_break.modelled_costs_usd:,.2f}",
-            sub="spreads + commissions + reg fees",
+            "Closed gross P&L",
+            f"${_synth.closed_gross_pnl_usd:+,.2f}",
+            tone=_tone_for(_synth.closed_gross_pnl_usd),
+            sub="Σ (sell − buy) × qty across closed trades",
         ),
         unsafe_allow_html=True,
     )
-    p[2].markdown(
+    row1[2].markdown(
+        _stat_card(
+            "Open gross P&L",
+            f"${_synth.open_gross_pnl_usd:+,.2f}",
+            tone=_tone_for(_synth.open_gross_pnl_usd),
+            sub=(
+                f"{_synth.unmarked_open_lots} open lot(s) unmarked"
+                if _synth.unmarked_open_lots else
+                "Σ (mark − buy) × qty across open lots"
+            ),
+        ),
+        unsafe_allow_html=True,
+    )
+
+    row2 = st.columns(3)
+    row2[0].markdown(
         _stat_card(
             "LLM cost (since reset)",
-            f"${realised_llm:,.4f}",
-            sub="attributed to opening runs",
+            f"${_synth.llm_cost_total_usd:,.4f}",
+            sub="all-time Anthropic spend, reset-aware",
         ),
         unsafe_allow_html=True,
     )
-    p[3].markdown(
+    row2[1].markdown(
         _stat_card(
-            "Net P&L",
-            f"${net_all_in:+,.2f}" if has_gross else "—",
-            tone=net_tone if has_gross else "",
-            sub="gross − trading costs − LLM",
+            "Trading fees",
+            f"${_synth.trading_fees_total_usd:,.2f}",
+            sub="real broker fees, never reset",
+        ),
+        unsafe_allow_html=True,
+    )
+    row2[2].markdown(
+        _stat_card(
+            "Synthetic balance",
+            f"${_synth.synthetic_balance_usd:,.2f}",
+            tone=_tone_for(_synth.synthetic_balance_usd - _synth.starting_balance_usd),
+            sub="= start + closed + open − LLM − fees",
+        ),
+        unsafe_allow_html=True,
+    )
+
+    # Smaller, separate sanity-floor card. Explicitly labelled as
+    # modelled (not used by the headline balance) so the operator
+    # doesn't conflate it with the real-fees number above.
+    st.markdown(
+        '<div class="at-section-label" style="margin-top:0.6rem;">'
+        'Modelled trading costs (sanity floor)</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        _stat_card(
+            "Modelled round-trip cost",
+            f"${_modelled.modelled_costs_usd:,.2f}",
+            sub=(
+                "IBKR-Pro-retail estimate for currently-open positions. "
+                "NOT used in the synthetic balance — real Alpaca fees "
+                "from trades.jsonl are deducted instead."
+            ),
         ),
         unsafe_allow_html=True,
     )
@@ -1021,60 +1104,39 @@ with tabs[3]:
     marks_status = (
         f"Live marks from Alpaca paper ({len(broker_marks)} positions matched)."
         if broker_marks else
-        "No live marks yet — connect Alpaca paper keys to populate Gross / Net P&L."
+        "No live marks yet — connect Alpaca paper keys to populate Open gross P&L."
     )
     st.caption(
-        marks_status + " Trading costs are modelled to mirror **IBKR Pro retail** "
-        "(USD account): $1 min commission + $0.005/share on ETFs (capped 0.5%), "
-        "$0.65/contract + $0.04 OCC on options, ~5 bps / 25 bps half-spread, "
-        "plus SEC + FINRA TAF on sell side. **LLM cost** is the dashboard's "
-        "view since the last all-time reset — the reset adjusts Net P&L "
-        "above and the equity curve below, not just the cost panel."
+        marks_status + " LLM cost is reset-aware (the Settings tab "
+        "'Reset ALL LLM costs' button bumps the synthetic balance upward "
+        "by the historical attribution). Trading fees are real and never "
+        "reset — they reduce the balance permanently."
     )
 
-    st.markdown('<div class="at-section-label">Equity curve</div>', unsafe_allow_html=True)
-    nav_history = dd.load_nav_history()
-    if nav_history:
-        # Apply the NAV display anchor to historical rows BEFORE
-        # building the DataFrame so the offset-skip logic can branch on
-        # each row's `nav_source` stamp. Rows written under
-        # VIRTUAL_NAV_USD are tagged "virtual" and are already in
-        # display units; broker-unit rows get the offset subtracted.
-        # Legacy rows lacking the stamp fall back to a value-based
-        # heuristic in apply_nav_offset_to_history.
-        _anchor_cfg = state.read_nav_offset()
-        _virtual_target = (
-            _anchor_cfg["virtual_baseline_usd"]
-            if _anchor_cfg else 2500.0
-        )
-        nav_history_adj = dd.apply_nav_offset_to_history(
-            nav_history,
-            nav_offset_usd=state.nav_offset_usd(),
-            virtual_baseline_usd=_virtual_target,
-        )
-        nav_df = pd.DataFrame(nav_history_adj)
-        # Window filter: 1D / 1W / 1M / 1Y / All. Defaults to All so a
-        # fresh-start account renders something useful immediately.
-        # st.radio with horizontal=True is portable back to Streamlit
-        # 1.6 (segmented_control needs ≥1.40 — not all VPSes update
-        # promptly).
+    st.markdown('<div class="at-section-label">Realized balance curve</div>',
+                unsafe_allow_html=True)
+    # Time series of the realized synthetic balance — reconstructed
+    # deterministically from trades.jsonl + costs.jsonl (no marks
+    # history needed). Each step in the line is a real close or a
+    # real cost row landing; open-position mark drift lives in the
+    # hero card, not here.
+    series = dd.realized_balance_series()
+    if series:
+        nav_df = pd.DataFrame(series)
         window_choice = st.radio(
             "Window",
             ["1D", "1W", "1M", "1Y", "All"],
             index=4,
             horizontal=True,
             label_visibility="collapsed",
-            help="Filter the equity curve to the trailing window. "
-                 "Affects this chart only; underlying nav_history.jsonl "
-                 "is unchanged.",
+            help="Filter the curve to the trailing window. Affects "
+                 "this chart only; underlying trades/costs logs are "
+                 "untouched.",
         )
         window_days = {"1D": 1, "1W": 7, "1M": 30, "1Y": 365}.get(window_choice)
         if window_days is not None and "at" in nav_df.columns:
             from datetime import datetime, timezone, timedelta
             cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
-            # Parse 'at' column to UTC-aware datetimes. Tolerant of both
-            # Z-suffixed and +00:00 ISO strings (state.utcnow_iso emits Z,
-            # but defensive against future format changes).
             nav_df = nav_df.copy()
             nav_df["_at_dt"] = pd.to_datetime(
                 nav_df["at"].str.replace("Z", "+00:00", regex=False),
@@ -1084,46 +1146,37 @@ with tabs[3]:
             nav_df = nav_df[nav_df["_at_dt"] >= cutoff]
         if nav_df.empty:
             st.info(
-                f"No NAV rows in the trailing {window_choice} window. "
-                "Either the window is too narrow or there's a gap in "
-                "nav_history.jsonl."
+                f"No realized events in the trailing {window_choice} window. "
+                "Try a wider window — closes and LLM costs only land "
+                "intermittently."
             )
         else:
             fig_nav = go.Figure()
             fig_nav.add_trace(go.Scatter(
-                x=nav_df["at"], y=nav_df["nav_usd"], mode="lines+markers",
-                name="NAV (USD)",
+                x=nav_df["at"],
+                y=nav_df["synthetic_realized_balance_usd"],
+                mode="lines+markers",
+                name="Realized synthetic balance (USD)",
                 line=dict(width=2.5, color="#059669"),
                 marker=dict(size=5, color="#059669"),
+                hovertemplate=(
+                    "%{x}<br>Balance: $%{y:,.2f}"
+                    "<br>Closed gross: $%{customdata[0]:,.2f}"
+                    "<br>LLM: −$%{customdata[1]:,.2f}"
+                    "<br>Fees: −$%{customdata[2]:,.2f}"
+                    "<extra></extra>"
+                ),
+                customdata=nav_df[[
+                    "closed_gross_pnl_usd",
+                    "llm_cost_total_usd",
+                    "trading_fees_total_usd",
+                ]].values,
             ))
-            if "net_pnl_usd" in nav_df.columns:
-                # Subtract cumulative LLM cost as-of each NAV row's
-                # timestamp so the curve reflects the reset marker. The
-                # nav_history.jsonl rows themselves are frozen (gross −
-                # modelled-trading-costs only); LLM cost is folded in
-                # at render time so it can react to operator action.
-                cum_llm = dd.cumulative_llm_cost_at(
-                    nav_df["at"].astype(str).tolist()
-                )
-                cumulative_net_after_llm = [
-                    (n if n is not None else 0.0) - c
-                    for n, c in zip(nav_df["net_pnl_usd"].tolist(), cum_llm)
-                ]
-                fig_nav.add_trace(go.Scatter(
-                    x=nav_df["at"], y=cumulative_net_after_llm, mode="lines",
-                    name="Cumulative Net P&L (after LLM, USD)",
-                    yaxis="y2", line=dict(dash="dot", color="#7c3aed", width=2),
-                    hovertemplate="%{x}<br>Net (after LLM): $%{y:.2f}<extra></extra>",
-                ))
-                fig_nav.update_layout(
-                    yaxis2=dict(title="Net P&L (USD)", overlaying="y", side="right",
-                                showgrid=False, color="#7c3aed"),
-                )
             fig_nav.update_layout(
                 template="plotly_white",
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
-                height=360, yaxis_title="NAV (USD)",
+                height=360, yaxis_title="Synthetic balance (USD)",
                 yaxis=dict(gridcolor="#e2e8f0", color="#059669"),
                 xaxis=dict(gridcolor="#e2e8f0"),
                 margin=dict(l=10, r=10, t=20, b=10),
@@ -1132,12 +1185,21 @@ with tabs[3]:
             st.plotly_chart(fig_nav, width="stretch")
             if len(nav_df) == 1:
                 st.caption(
-                    "Single NAV row in this window — the curve renders as "
-                    "one marker rather than a line. The line draws itself "
-                    "once a second cycle writes another row."
+                    "Single realized event in this window — the curve "
+                    "renders as one marker rather than a line. Subsequent "
+                    "closes or cost rows will extend it."
                 )
+            st.caption(
+                "Reconstructed from `state/trades.jsonl` + `state/costs.jsonl`. "
+                "Open-position mark drift is NOT plotted here — it lives "
+                "on the hero card so this curve stays stable. LLM-cost "
+                "resets visibly redraw the curve upward."
+            )
     else:
-        st.info("No NAV history yet — the equity curve populates once orchestrator runs accumulate.")
+        st.info(
+            "No realized events yet — the curve populates with the first "
+            "closed trade or LLM cost row."
+        )
 
     st.markdown('<div class="at-section-label">LLM cost over time</div>', unsafe_allow_html=True)
     if costs:
@@ -1593,227 +1655,13 @@ with tabs[6]:
             state.set_all_time_cost_reset("dashboard")
             st.rerun()
 
-    # ---------- NAV display anchor ----------
-    st.markdown(
-        '<div class="at-section-label">NAV display anchor</div>',
-        unsafe_allow_html=True,
-    )
-    _anchor = state.read_nav_offset()
-    if _anchor:
-        st.info(
-            f"Anchored on **{_fmt_ts(_anchor.get('set_at', ''))}** — broker "
-            f"equity of **${_anchor['broker_baseline_usd']:,.2f}** was pinned "
-            f"to a displayed NAV of **${_anchor['virtual_baseline_usd']:,.2f}**. "
-            f"Offset of **${_anchor['broker_baseline_usd'] - _anchor['virtual_baseline_usd']:,.2f}** "
-            f"subtracted from every NAV surface (hero card + equity curve). "
-            f"Broker order sizing reads `VIRTUAL_NAV_USD` from the systemd "
-            f"environment — that's a separate setting."
-        )
-        anchor_cols = st.columns(2)
-        with anchor_cols[0]:
-            if st.button(
-                "🔄 Re-anchor (pre-bake current unrealized P&L)",
-                help="Re-stamp using broker equity right now MINUS current "
-                     "unrealized P&L. Displayed NAV will read "
-                     "virtual_baseline + unrealized P&L at the anchor "
-                     "moment, then track broker swings 1:1 thereafter.",
-            ):
-                if broker_view.available and broker_view.nav_usd is not None:
-                    raw = broker_view.nav_usd + state.nav_offset_usd()
-                    # Filter to broker-held positions only — stale rows
-                    # in portfolio.json (manual close / expiry / sync
-                    # lag) would compute_position_pnl as gross=0 with
-                    # an entry-leg modelled cost, baking phantom losses
-                    # into the offset (Codex P1 on PR #75).
-                    open_subset, _ = dd.split_positions_by_broker_holdings(
-                        portfolio, held_keys=broker_view.held_keys,
-                    )
-                    pnl_now = pnl_lib.compute_portfolio_pnl(
-                        portfolio={"positions": open_subset},
-                        marks=broker_marks or None,
-                        costs=broker_costs or None,
-                    )
-                    state.set_nav_offset(
-                        broker_baseline_usd=raw - pnl_now.net_pnl_usd,
-                        virtual_baseline_usd=_anchor["virtual_baseline_usd"],
-                        note="re-anchor (prebake)",
-                    )
-                    st.rerun()
-                else:
-                    st.error("Broker unreachable — can't re-anchor right now.")
-        with anchor_cols[1]:
-            if st.button("↩ Clear anchor (show raw broker equity)"):
-                state.clear_nav_offset()
-                st.rerun()
-
-        # Manual broker baseline — for when the operator knows the
-        # exact broker equity at the start-of-trading moment (e.g.
-        # $99,938.95 after a prior liquidation, not the textbook
-        # $100,000 default). Pre-bake estimates that off the current
-        # positions; this skips the estimate and pins the offset to a
-        # known number.
-        st.markdown(
-            "<div style='font-size:0.85rem; color: var(--text-2); margin-top:0.6rem;'>"
-            "<strong>Manual broker baseline (advanced)</strong>: pin the "
-            "anchor to a known pre-trades broker equity rather than the "
-            "pre-bake estimate. Useful when the broker's actual starting "
-            "balance isn't the round $100k default."
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        manual_cols = st.columns([2, 3])
-        # The manual baseline input defaults to the operator's last
-        # remembered value (stored in state/nav_manual_baseline.json),
-        # so a re-anchor or clear doesn't wipe their known pre-trades
-        # equity figure. Falls back to the current anchor's
-        # broker_baseline_usd, then to a sensible default.
-        _remembered_manual = state.read_manual_nav_baseline_usd()
-        _manual_default = (
-            float(_remembered_manual)
-            if _remembered_manual is not None
-            else float(_anchor["broker_baseline_usd"])
-        )
-        # Bind the widget keys to the remembered value's identity so
-        # the input re-reads from `value=` whenever the remembered
-        # value changes (after a Set click).
-        _manual_session_token = (
-            f"{_remembered_manual or 'unset'}"
-        )
-        with manual_cols[0]:
-            manual_baseline_set = st.number_input(
-                "Broker baseline ($)",
-                value=_manual_default,
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-                key=f"manual_baseline_anchored::{_manual_session_token}",
-                help="The broker's equity AT the moment you consider the "
-                     "trading account to have started — typically the "
-                     "pre-trades cash balance. Offset = this − virtual. "
-                     "Saved across re-anchors so you don't need to "
-                     "re-enter it each time.",
-            )
-        with manual_cols[1]:
-            st.markdown("&nbsp;", unsafe_allow_html=True)
-            if st.button(
-                "📐 Set anchor to specific broker baseline",
-                key=f"manual_anchor_btn_anchored::{_manual_session_token}",
-                help="Stamps the entered broker_baseline directly AND "
-                     "remembers it for future re-anchors. Displayed NAV "
-                     "= broker_now − (manual_baseline − virtual).",
-            ):
-                state.set_manual_nav_baseline_usd(float(manual_baseline_set))
-                state.set_nav_offset(
-                    broker_baseline_usd=float(manual_baseline_set),
-                    virtual_baseline_usd=_anchor["virtual_baseline_usd"],
-                    note="manual baseline",
-                )
-                st.rerun()
-    else:
-        st.caption(
-            "Pins the displayed NAV to a target (default $2,500 per CLAUDE.md) "
-            "while letting it track broker swings 1:1 from that moment. The "
-            "raw `state/nav_history.jsonl` is untouched — the offset is "
-            "applied at render time. Useful when Alpaca's paper account is "
-            "stuck at its $100k default. **Display-only**: order sizing "
-            "still reads `VIRTUAL_NAV_USD` from the systemd environment."
-        )
-        target_col, btn_col = st.columns([2, 3])
-        with target_col:
-            virt_target = st.number_input(
-                "Anchor displayed NAV to ($)",
-                value=2500.0,
-                min_value=1.0,
-                step=100.0,
-                format="%.2f",
-                help="What the hero NAV should read at anchor time. Future "
-                     "swings move it from there 1:1 with the broker.",
-            )
-        with btn_col:
-            st.markdown("&nbsp;", unsafe_allow_html=True)  # vertical align
-            if st.button(
-                "📌 Anchor NAV display now",
-                help="Stamps (broker equity − current unrealized P&L) as "
-                     "the baseline. Displayed NAV reads "
-                     "virtual_baseline + Net P&L right after anchor, then "
-                     "tracks broker swings 1:1. Drift can creep in if a "
-                     "position closes at a price different from its mark "
-                     "at anchor time — the Settled balance card below is "
-                     "the more accurate long-term number.",
-            ):
-                if broker_view.available and broker_view.nav_usd is not None:
-                    # Filter to broker-held positions only — stale rows
-                    # in portfolio.json (manual close / expiry / sync
-                    # lag) would compute_position_pnl as gross=0 with
-                    # an entry-leg modelled cost, baking phantom losses
-                    # into the offset (Codex P1 on PR #75).
-                    open_subset, _ = dd.split_positions_by_broker_holdings(
-                        portfolio, held_keys=broker_view.held_keys,
-                    )
-                    pnl_now = pnl_lib.compute_portfolio_pnl(
-                        portfolio={"positions": open_subset},
-                        marks=broker_marks or None,
-                        costs=broker_costs or None,
-                    )
-                    state.set_nav_offset(
-                        broker_baseline_usd=broker_view.nav_usd - pnl_now.net_pnl_usd,
-                        virtual_baseline_usd=float(virt_target),
-                        note="dashboard (prebake)",
-                    )
-                    st.rerun()
-                else:
-                    st.error("Broker unreachable — can't anchor right now.")
-
-        # Manual broker baseline alternative — for operators who know
-        # the exact pre-trades broker equity (e.g. $99,938.95 after an
-        # old liquidation moved the textbook $100k starting balance).
-        st.markdown(
-            "<div style='font-size:0.85rem; color: var(--text-2); margin-top:0.8rem;'>"
-            "<strong>Alternative — manual broker baseline (advanced)</strong>: "
-            "skip the pre-bake estimate and pin the anchor to a known "
-            "pre-trades broker equity. Pick this when you know the "
-            "exact dollar amount the broker held before today's trades."
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        manual_unset_cols = st.columns([2, 3])
-        # Default to the remembered manual baseline so the operator
-        # doesn't lose their pre-trades figure across wipes / anchor
-        # clears. Falls back to 99938.95 (the operator's known value
-        # from the deploy on May 14) as a sensible starter.
-        _remembered_unset = state.read_manual_nav_baseline_usd()
-        _manual_unset_default = (
-            float(_remembered_unset) if _remembered_unset is not None else 99938.95
-        )
-        _manual_unset_token = f"{_remembered_unset or 'unset'}"
-        with manual_unset_cols[0]:
-            manual_baseline_init = st.number_input(
-                "Broker baseline ($)",
-                value=_manual_unset_default,
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-                key=f"manual_baseline_unanchored::{_manual_unset_token}",
-                help="The broker's equity AT the moment you consider the "
-                     "trading account to have started. Saved across "
-                     "re-anchors and dashboard reloads.",
-            )
-        with manual_unset_cols[1]:
-            st.markdown("&nbsp;", unsafe_allow_html=True)
-            if st.button(
-                "📐 Set anchor to specific broker baseline",
-                key=f"manual_anchor_btn_unanchored::{_manual_unset_token}",
-                help="Stamps the entered broker_baseline directly AND "
-                     "remembers it for future re-anchors. Displayed NAV "
-                     "= broker_now − (manual_baseline − virtual).",
-            ):
-                state.set_manual_nav_baseline_usd(float(manual_baseline_init))
-                state.set_nav_offset(
-                    broker_baseline_usd=float(manual_baseline_init),
-                    virtual_baseline_usd=float(virt_target),
-                    note="manual baseline",
-                )
-                st.rerun()
+    # NAV anchor + manual baseline UI removed in the synthetic-balance
+    # refactor — the dashboard no longer derives its headline from
+    # Alpaca account equity, so there's nothing to "anchor". See
+    # lib/dashboard_data.SyntheticBalance for the new source of truth.
+    # Stale state files (state/nav_offset.json,
+    # state/nav_manual_baseline.json) are harmlessly left on disk and
+    # wiped by the "Wipe history" button below.
 
     st.markdown('<div class="at-section-label">Wipe history (start fresh)</div>', unsafe_allow_html=True)
     st.caption(

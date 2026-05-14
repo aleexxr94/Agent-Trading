@@ -92,9 +92,29 @@ class OpenTradePnl:
 
 
 @dataclass(frozen=True)
+class UnmatchedSell:
+    """A sell fill that couldn't be FIFO-matched against any open buy
+    lot when compute_trades_pnl walked the trade log. The system spec
+    is "no broker shorts", so this should never happen in healthy
+    operation. When it does, it signals data loss / out-of-order
+    activities sync / a legacy fill predating our trade-sync window /
+    a manual edit to trades.jsonl. Surfaced via TradesPnl so the
+    dashboard can warn the operator instead of silently misrepresenting
+    the synthetic balance.
+    """
+    symbol: str
+    kind: Literal["etf", "option"]
+    qty: float
+    fill_price: float
+    filled_at: str
+    activity_id: str
+
+
+@dataclass(frozen=True)
 class TradesPnl:
     closed: list[ClosedTrade]
     open: list[OpenTradePnl]
+    unmatched_sells: list[UnmatchedSell] = field(default_factory=list)
 
     @property
     def total_realised_gross_usd(self) -> float:
@@ -193,6 +213,11 @@ def compute_trades_pnl(
     # FIFO queues per symbol of open buy lots (with remaining qty + remaining fees).
     open_lots: dict[str, deque[dict]] = defaultdict(deque)
     closed: list[ClosedTrade] = []
+    # Sells that couldn't FIFO-match against an open buy lot. Should
+    # be empty in healthy operation (spec is "no broker shorts").
+    # Codex P1 on PR #79: surfaced so the dashboard can warn the
+    # operator instead of silently corrupting the synthetic balance.
+    unmatched_sells: list[UnmatchedSell] = []
 
     for t in trades:
         symbol = t["symbol"]
@@ -271,12 +296,26 @@ def compute_trades_pnl(
             remaining_sell_qty -= matched
             if lot["remaining_qty"] <= 1e-9:
                 open_lots[symbol].popleft()
-        # If remaining_sell_qty > 0 here, the operator is short-selling
-        # without an open buy lot. Paper trading allows it; we log a
-        # synthetic "open short" lot. Until short selling is in scope we
-        # silently drop the unmatched sell — the dashboard's totals will
-        # be off only for that edge case and the operator can grep
-        # trades.jsonl to debug.
+        # If remaining_sell_qty > 0 here, the sell fill couldn't be
+        # FIFO-matched against any open buy lot. System spec is "no
+        # broker shorts", so this should never happen in healthy
+        # operation. When it does, it signals: out-of-order activities
+        # sync, a legacy fill predating our trade-sync window, manual
+        # editing of trades.jsonl, or actual data loss.
+        #
+        # Pre-PR #79 we silently dropped these and let the dashboard
+        # silently misrepresent totals. Now we record them on TradesPnl
+        # so SyntheticBalance can surface a warning to the operator
+        # rather than corrupt the headline balance invisibly.
+        if remaining_sell_qty > 1e-9:
+            unmatched_sells.append(UnmatchedSell(
+                symbol=symbol,
+                kind=kind,
+                qty=remaining_sell_qty,
+                fill_price=price,
+                filled_at=filled_at,
+                activity_id=activity_id,
+            ))
 
     # Flatten remaining open lots into OpenTradePnl rows.
     open_rows: list[OpenTradePnl] = []
@@ -312,4 +351,6 @@ def compute_trades_pnl(
                 net_pnl_usd=net,
             ))
 
-    return TradesPnl(closed=closed, open=open_rows)
+    return TradesPnl(
+        closed=closed, open=open_rows, unmatched_sells=unmatched_sells,
+    )

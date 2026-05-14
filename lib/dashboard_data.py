@@ -169,18 +169,208 @@ def settled_balance_usd(
     virtual_baseline_usd: float = 2500.0,
     marks: dict[str, float] | None = None,
 ) -> float:
-    """Virtual baseline + the sum of net P&L from CLOSED trades only.
+    """Backward-compat wrapper around the new synthetic-balance helper.
 
-    Operator-friendly counterpart to the mark-driven hero NAV: this
-    number doesn't move with intraday marks, only when a position
-    actually closes and its realised P&L lands in trades.jsonl. Slower
-    to update but anchored to real broker fills rather than mid quotes.
+    Returns the synthetic balance computed with empty marks — i.e. the
+    "realized only" view: $2,500 + closed gross P&L − LLM cost
+    − trading fees, with open-position gross P&L excluded. This matches
+    the original definition of the Settled balance card (closed trades
+    only, frozen between closes).
 
-    The closed-trade net P&L is reset-aware via trades_pnl_view (which
-    folds in `state.filter_costs_post_reset` for the LLM-cost slice).
+    For the live mark-aware balance used in the hero card, callers
+    should reach for `compute_synthetic_balance(marks=broker_marks)`
+    directly. This wrapper exists so the existing chips strip and
+    several unit tests written against `settled_balance_usd` keep
+    working unchanged.
     """
+    return compute_synthetic_balance(
+        starting_balance_usd=virtual_baseline_usd, marks={},
+    ).synthetic_balance_usd
+
+
+@dataclass(frozen=True)
+class SyntheticBalance:
+    """The dashboard's headline balance, derived entirely from logs we
+    control (state/trades.jsonl + state/costs.jsonl) and NOT from
+    Alpaca account equity. See plans/federated-greeting-sphinx.md for
+    why we made this the single source of truth.
+
+    Formula:
+
+        synthetic_balance_usd
+          = starting_balance_usd
+          + closed_gross_pnl_usd
+          + open_gross_pnl_usd      # 0 when no marks
+          − llm_cost_total_usd      # reset-aware via filter_costs_post_reset
+          − trading_fees_total_usd  # real fees, NEVER reset-aware
+
+    Field conventions:
+      - `closed_gross_pnl_usd`: sum of `(sell_price − buy_price) × qty
+        × multiplier` across FIFO-matched closes from trades.jsonl.
+        Trading fees + attributed LLM costs are deducted SEPARATELY via
+        the dedicated fields below; this is purely gross.
+      - `open_gross_pnl_usd`: sum of `(mark − buy_price) × qty
+        × multiplier` across currently-open lots that have a live
+        mark. Open lots without a mark contribute zero and bump
+        `unmarked_open_lots`.
+      - `llm_cost_total_usd`: ALL LLM API spend recorded in
+        costs.jsonl, project-wide, reset-aware. Includes runs that
+        opened no positions (e.g. all-cash decisions) — those are part
+        of the experiment's true cost.
+      - `trading_fees_total_usd`: sum of `fees_usd` across every fill
+        in trades.jsonl (both buy and sell sides). Real money paid;
+        never affected by display resets.
+    """
+    starting_balance_usd: float = 2500.0
+    closed_gross_pnl_usd: float = 0.0
+    open_gross_pnl_usd: float = 0.0
+    llm_cost_total_usd: float = 0.0
+    trading_fees_total_usd: float = 0.0
+    unmarked_open_lots: int = 0
+    # Sell fills that couldn't FIFO-match against an open buy lot.
+    # Healthy operation never produces these (system spec is "no
+    # broker shorts"). Nonzero is a data-integrity signal — the
+    # synthetic balance can't account for those sells' P&L because
+    # the corresponding buys are missing or out of order. Surfaced
+    # for a dashboard warning rather than silently corrupting the
+    # headline. Codex P1 on PR #79.
+    unmatched_sell_count: int = 0
+
+    @property
+    def synthetic_balance_usd(self) -> float:
+        return (
+            self.starting_balance_usd
+            + self.closed_gross_pnl_usd
+            + self.open_gross_pnl_usd
+            - self.llm_cost_total_usd
+            - self.trading_fees_total_usd
+        )
+
+    @property
+    def is_integrity_warning(self) -> bool:
+        """True when the synthetic balance may not be trustworthy
+        because the upstream trade log carries unmatched sells. The
+        dashboard surfaces this as a yellow warning band so the
+        operator doesn't read the headline as authoritative without
+        first investigating the data anomaly."""
+        return self.unmatched_sell_count > 0
+
+
+def compute_synthetic_balance(
+    *,
+    starting_balance_usd: float = 2500.0,
+    marks: dict[str, float] | None = None,
+) -> SyntheticBalance:
+    """Build a SyntheticBalance snapshot at the current moment.
+
+    `marks` is the broker-live per-symbol price map; when provided,
+    open-lot gross P&L is computed against it. When omitted (or empty),
+    open lots have no mark and the resulting balance is the realized-
+    only view (matches the original Settled balance card).
+    """
+    marks = marks or {}
     view = trades_pnl_view(marks=marks)
-    return float(virtual_baseline_usd) + view["totals"]["realised_net_usd"]
+    closed_gross = view["totals"]["realised_gross_usd"]
+    open_lots = view["open"]
+    open_gross = 0.0
+    unmarked = 0
+    for lot in open_lots:
+        g = lot.get("gross_pnl_usd")
+        if g is None:
+            unmarked += 1
+        else:
+            open_gross += float(g)
+    return SyntheticBalance(
+        starting_balance_usd=float(starting_balance_usd),
+        closed_gross_pnl_usd=float(closed_gross),
+        open_gross_pnl_usd=open_gross,
+        llm_cost_total_usd=total_token_cost()["cost_usd"],
+        trading_fees_total_usd=total_trading_fees_usd(),
+        unmarked_open_lots=unmarked,
+        unmatched_sell_count=int(view["totals"].get("unmatched_sell_count", 0)),
+    )
+
+
+def realized_balance_series(
+    *, starting_balance_usd: float = 2500.0,
+) -> list[dict]:
+    """Time series of the realized synthetic balance for the equity curve.
+
+    At each timestamp `t` where a close, an LLM cost, or a trading-fee
+    fill landed, emit:
+
+        synthetic_realized_balance_usd(t)
+          = starting_balance_usd
+          + closed_gross_pnl_usd(t)
+          − llm_cost_total_usd(t)        # reset-aware
+          − trading_fees_total_usd(t)
+
+    Open-lot P&L is intentionally NOT included — the curve is
+    reconstructable exactly from logs, with no need to know historical
+    marks (we don't have them). The hero card is where open P&L lives.
+
+    Each emitted point carries the component fields too, so the chart
+    can expose them in hover-text for the curious operator.
+
+    Empty when there are no closes / no LLM rows / no fees yet.
+    """
+    # Build per-event impact rows: (at, closed_gross_delta, llm_delta, fees_delta).
+    # Closes contribute their per-trade gross + per-trade fees (both
+    # sides pro-rated by compute_trades_pnl). LLM events from
+    # costs.jsonl contribute as standalone cost deltas. Trade-row
+    # events from trades.jsonl contribute their fees_usd at fill time.
+    events: list[dict] = []
+    # Closed-trade gross P&L by closed_at.
+    view = trades_pnl_view(marks=None)
+    for c in view["closed"]:
+        events.append({
+            "at": c.get("closed_at") or "",
+            "closed_gross_delta": float(c.get("gross_pnl_usd") or 0.0),
+            "llm_delta": 0.0,
+            "fees_delta": 0.0,
+        })
+    # LLM cost events (reset-aware via load_costs).
+    for row in load_costs(limit=10**9):
+        events.append({
+            "at": row.get("at") or "",
+            "closed_gross_delta": 0.0,
+            "llm_delta": float(row.get("cost_usd") or 0.0),
+            "fees_delta": 0.0,
+        })
+    # Trading-fee events — each fill (buy or sell) lands its fee at
+    # filled_at. NOT reset-aware (real money).
+    for t in load_trades():
+        fee = float(t.get("fees_usd") or 0.0)
+        if fee <= 0:
+            continue
+        events.append({
+            "at": t.get("filled_at") or "",
+            "closed_gross_delta": 0.0,
+            "llm_delta": 0.0,
+            "fees_delta": fee,
+        })
+    if not events:
+        return []
+    # Sort chronologically; emit running totals at each tick.
+    events.sort(key=lambda r: r["at"])
+    out: list[dict] = []
+    closed_gross = 0.0
+    llm_total = 0.0
+    fees_total = 0.0
+    for e in events:
+        closed_gross += e["closed_gross_delta"]
+        llm_total += e["llm_delta"]
+        fees_total += e["fees_delta"]
+        out.append({
+            "at": e["at"],
+            "synthetic_realized_balance_usd": (
+                starting_balance_usd + closed_gross - llm_total - fees_total
+            ),
+            "closed_gross_pnl_usd": closed_gross,
+            "llm_cost_total_usd": llm_total,
+            "trading_fees_total_usd": fees_total,
+        })
+    return out
 
 
 def closed_trade_chips(
@@ -448,7 +638,20 @@ def trades_pnl_view(marks: dict[str, float] | None = None) -> dict:
             "realised_net_usd": pnl.total_realised_net_usd,
             "closed_count": len(pnl.closed),
             "open_count": len(pnl.open),
+            "unmatched_sell_count": len(pnl.unmatched_sells),
         },
+        # Surfaced for dashboard warnings — sells in trades.jsonl
+        # that couldn't FIFO-match against an open buy lot. Healthy
+        # operation never produces these; nonzero means data loss /
+        # out-of-order sync / manual edit.
+        "unmatched_sells": [
+            {
+                "symbol": u.symbol, "kind": u.kind, "qty": u.qty,
+                "fill_price": u.fill_price, "filled_at": u.filled_at,
+                "activity_id": u.activity_id,
+            }
+            for u in pnl.unmatched_sells
+        ],
     }
 
 
@@ -585,20 +788,15 @@ def try_load_broker_view() -> BrokerView:
         )
     marks = marks_from_positions(positions)
     costs = cost_basis_from_positions(positions)
-    # Live broker NAV — best-effort; if get_account fails we still have
-    # the positions data, just fall back to portfolio.json snapshot at
-    # render time.
+    # Live broker NAV — best-effort; if get_account fails we still
+    # have the positions data. Returned as the raw broker equity for
+    # the dashboard's informational sub-line. The headline balance
+    # comes from compute_synthetic_balance, NOT this number.
     nav_usd: float | None = None
     try:
         nav_usd = float(broker.get_account().equity_usd)
     except Exception:
         nav_usd = None
-    # Apply the NAV display anchor when one is set. Default offset is
-    # 0.0 (no anchor) so this is a no-op in fresh installs. The anchor
-    # is a pure display offset — broker order sizing reads
-    # VIRTUAL_NAV_USD from the environment, never this file.
-    if nav_usd is not None:
-        nav_usd = nav_usd - state.nav_offset_usd()
     return BrokerView(
         marks=marks,
         costs=costs,

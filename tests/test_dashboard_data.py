@@ -196,12 +196,11 @@ def test_try_load_broker_view_distinguishes_unreachable_from_empty(
 def test_try_load_broker_view_returns_none_nav_when_get_account_fails(
     tmp_state, monkeypatch
 ):
-    """Codex P2 on PR #74: when get_account() raises (transient Alpaca
-    error) but get_positions() succeeds, the hero falls back to
-    portfolio.json. The caller (dashboard.py) is responsible for
-    re-applying the offset on the fallback path — this test pins the
-    contract that try_load_broker_view returns nav_usd=None in that
-    case, signaling 'use fallback'."""
+    """When get_account() raises (transient Alpaca error) but
+    get_positions() succeeds, BrokerView.nav_usd is None. The dashboard
+    uses this only for the informational 'Alpaca account' sub-line, so
+    None just means we hide that line — the synthetic balance hero is
+    unaffected (it doesn't read broker equity at all)."""
 
     class _PartialBroker:
         def get_positions(self):
@@ -213,27 +212,20 @@ def test_try_load_broker_view_returns_none_nav_when_get_account_fails(
     import lib.alpaca_client as ac_mod
     monkeypatch.setattr(ac_mod, "AlpacaBroker", lambda *a, **kw: _PartialBroker())
 
-    state.set_nav_offset(
-        broker_baseline_usd=100020.0,
-        virtual_baseline_usd=2500.0,
-        note="test",
-    )
     view = dd.try_load_broker_view()
     assert view.available is True, "positions reachable → still available"
-    assert view.nav_usd is None, (
-        "get_account failure must surface as nav_usd=None so the "
-        "caller's fallback path (portfolio.json) kicks in — and that "
-        "fallback applies the offset itself (dashboard.py)"
-    )
+    assert view.nav_usd is None
 
 
-def test_try_load_broker_view_applies_nav_offset_when_anchor_set(
+def test_try_load_broker_view_returns_raw_broker_equity(
     tmp_state, monkeypatch
 ):
-    """When the operator has stamped a NAV anchor, BrokerView.nav_usd
-    should report broker_equity − offset so the hero card renders the
-    virtual baseline. Order sizing reads VIRTUAL_NAV_USD from env, not
-    this file — the anchor is display-only."""
+    """Post-synthetic-balance refactor: BrokerView.nav_usd returns the
+    broker's raw equity figure (no offset application). It's only used
+    by the dashboard's informational sub-line — the headline hero
+    derives from compute_synthetic_balance instead. Even when a
+    legacy state/nav_offset.json sits on disk, the broker view path
+    must NOT subtract from it."""
 
     class _StubBroker:
         def get_positions(self):
@@ -251,23 +243,24 @@ def test_try_load_broker_view_applies_nav_offset_when_anchor_set(
     import lib.alpaca_client as ac_mod
     monkeypatch.setattr(ac_mod, "AlpacaBroker", lambda *a, **kw: _StubBroker())
 
-    # No anchor → raw broker NAV surfaces.
+    # No anchor on disk → broker_view.nav_usd is raw broker equity.
     pre = dd.try_load_broker_view()
     assert pre.available is True
     assert pre.nav_usd == pytest.approx(100020.52)
 
-    # Anchor → hero shows $2,500.52 (broker $100,020.52 − offset $97,520).
+    # Legacy anchor on disk → should be IGNORED (refactor removed the
+    # offset application). Same raw broker equity surfaces.
     state.set_nav_offset(
         broker_baseline_usd=100020.0,
         virtual_baseline_usd=2500.0,
-        note="test",
+        note="legacy anchor — should be ignored",
     )
     post = dd.try_load_broker_view()
     assert post.available is True
-    assert post.nav_usd == pytest.approx(2500.52), (
-        "displayed NAV must subtract the (broker_baseline − virtual) offset; "
-        "the 0.52 carries from the broker delta vs anchor, demonstrating "
-        "the curve tracks broker swings 1:1 from the anchor moment"
+    assert post.nav_usd == pytest.approx(100020.52), (
+        "raw broker equity must surface regardless of legacy "
+        "state/nav_offset.json contents — the anchor file is "
+        "vestigial after the synthetic-balance refactor"
     )
 
 
@@ -574,10 +567,304 @@ def test_split_positions_excludes_stale_for_prebake_pnl(tmp_state):
     )
 
 
+# ---------- SyntheticBalance ----------
+
+
+def test_synthetic_balance_empty_state_equals_starting_balance(tmp_state):
+    """No trades, no costs → balance = $2,500 baseline. unmarked_open_lots
+    is 0 because there are no open lots at all."""
+    sb = dd.compute_synthetic_balance()
+    assert sb.starting_balance_usd == pytest.approx(2500.0)
+    assert sb.closed_gross_pnl_usd == pytest.approx(0.0)
+    assert sb.open_gross_pnl_usd == pytest.approx(0.0)
+    assert sb.llm_cost_total_usd == pytest.approx(0.0)
+    assert sb.trading_fees_total_usd == pytest.approx(0.0)
+    assert sb.unmarked_open_lots == 0
+    assert sb.synthetic_balance_usd == pytest.approx(2500.0)
+
+
+def test_synthetic_balance_closed_trade_adds_gross_subtracts_fees(tmp_state):
+    """One closed round-trip: +$20 gross, $0.50 in buy+sell fees. The
+    balance picks up the gross via closed_gross_pnl AND subtracts the
+    fees via trading_fees_total (real money paid)."""
+    state.append_trade({
+        "activity_id": "a1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 80.0,
+        "fees_usd": 0.25, "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    state.append_trade({
+        "activity_id": "a2", "alpaca_order_id": "o2", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 1, "fill_price": 100.0,
+        "fees_usd": 0.25, "filled_at": "2026-05-11T13:00:00Z", "run_id": None,
+    })
+    sb = dd.compute_synthetic_balance()
+    assert sb.closed_gross_pnl_usd == pytest.approx(20.0)
+    assert sb.trading_fees_total_usd == pytest.approx(0.50)
+    # $2,500 + $20 closed gross − $0 LLM − $0.50 fees = $2,519.50
+    assert sb.synthetic_balance_usd == pytest.approx(2519.50)
+
+
+def test_synthetic_balance_open_lot_with_mark_adds_open_gross(tmp_state):
+    """Open lot with a live mark contributes (mark − fill) × qty to
+    open_gross_pnl. The fee paid on the buy is in trading_fees_total
+    independently — open_gross reflects price movement only."""
+    state.append_trade({
+        "activity_id": "b1", "alpaca_order_id": "ob1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 80.0,
+        "fees_usd": 0.30, "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    sb = dd.compute_synthetic_balance(marks={"TQQQ": 90.0})
+    assert sb.closed_gross_pnl_usd == pytest.approx(0.0)
+    assert sb.open_gross_pnl_usd == pytest.approx(10.0)
+    assert sb.unmarked_open_lots == 0
+    assert sb.trading_fees_total_usd == pytest.approx(0.30)
+    # $2,500 + $0 closed + $10 open − $0 LLM − $0.30 fees = $2,509.70
+    assert sb.synthetic_balance_usd == pytest.approx(2509.70)
+
+
+def test_synthetic_balance_open_lot_without_mark_flags_unmarked(tmp_state):
+    """When marks are not available for a symbol, open_gross_pnl
+    contribution is 0 (not arbitrary) and `unmarked_open_lots`
+    increments so the dashboard can surface the gap to the operator."""
+    state.append_trade({
+        "activity_id": "c1", "alpaca_order_id": "oc1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 80.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    sb = dd.compute_synthetic_balance(marks={})  # no marks at all
+    assert sb.open_gross_pnl_usd == pytest.approx(0.0)
+    assert sb.unmarked_open_lots == 1
+    assert sb.synthetic_balance_usd == pytest.approx(2500.0)
+
+
+def test_synthetic_balance_subtracts_llm_cost(tmp_state):
+    """LLM spend in costs.jsonl is subtracted in full (ALL spend,
+    including runs that opened no positions). This is the truthful
+    framing — every Anthropic call cost money even if it produced
+    no trade."""
+    state.append_cost({
+        "run_id": "r1", "stage": "construct", "model": "m",
+        "cost_usd": 0.35, "at": "2026-05-10T12:00:00Z",
+    })
+    state.append_cost({
+        "run_id": "r2-all-cash", "stage": "strategist", "model": "m",
+        "cost_usd": 0.05, "at": "2026-05-10T16:00:00Z",  # no trade for this run
+    })
+    sb = dd.compute_synthetic_balance()
+    assert sb.llm_cost_total_usd == pytest.approx(0.40), (
+        "ALL LLM cost rows count — including the all-cash run that "
+        "produced no positions; the experiment still paid for the API call"
+    )
+    assert sb.synthetic_balance_usd == pytest.approx(2499.60)
+
+
+def test_synthetic_balance_llm_reset_bumps_balance_upward(tmp_state):
+    """state.set_all_time_cost_reset zeros the displayed LLM cost
+    going forward. The synthetic balance bumps upward by exactly the
+    pre-reset attribution. This is the wiring that makes 'Reset ALL
+    LLM costs' a meaningful balance adjustment, not just a display
+    fiddle."""
+    state.append_cost({
+        "run_id": "old", "stage": "x", "model": "m",
+        "cost_usd": 0.40, "at": "2026-05-10T12:00:00Z",
+    })
+    pre = dd.compute_synthetic_balance()
+    assert pre.llm_cost_total_usd == pytest.approx(0.40)
+    pre_balance = pre.synthetic_balance_usd
+
+    state.set_all_time_cost_reset("test")
+    post = dd.compute_synthetic_balance()
+    assert post.llm_cost_total_usd == pytest.approx(0.0)
+    assert post.synthetic_balance_usd == pre_balance + 0.40, (
+        "reset must visibly raise the balance by the historical LLM total"
+    )
+
+
+def test_synthetic_balance_trading_fees_never_reset(tmp_state):
+    """Trading fees are real broker fees — actual money paid to
+    Alpaca. The cost reset only affects LLM display; trading fees
+    keep reducing the balance permanently."""
+    state.append_trade({
+        "activity_id": "f1", "alpaca_order_id": "of1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 80.0,
+        "fees_usd": 1.50, "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    pre = dd.compute_synthetic_balance()
+    assert pre.trading_fees_total_usd == pytest.approx(1.50)
+    state.set_all_time_cost_reset("test")
+    post = dd.compute_synthetic_balance()
+    assert post.trading_fees_total_usd == pytest.approx(1.50), (
+        "trading fees must NOT be affected by the LLM cost reset"
+    )
+
+
+def test_synthetic_balance_custom_starting_balance(tmp_state):
+    """starting_balance_usd is configurable so tests / future
+    operators can override the CLAUDE.md $2,500 default cleanly."""
+    sb = dd.compute_synthetic_balance(starting_balance_usd=5000.0)
+    assert sb.starting_balance_usd == pytest.approx(5000.0)
+    assert sb.synthetic_balance_usd == pytest.approx(5000.0)
+
+
+def test_synthetic_balance_flags_unmatched_sells(tmp_state):
+    """Codex P1 on PR #79: when trades.jsonl carries sells that
+    don't FIFO-match against a buy (out-of-order sync, manual edit,
+    or genuinely missing buy data), the upstream compute_trades_pnl
+    silently drops them. The synthetic balance can't account for
+    that P&L, so it must surface a warning to the operator rather
+    than silently misrepresent the headline."""
+    state.append_trade({
+        "activity_id": "s1", "alpaca_order_id": "os1", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 2, "fill_price": 100.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-11T13:00:00Z", "run_id": None,
+    })
+    sb = dd.compute_synthetic_balance()
+    assert sb.unmatched_sell_count == 1
+    assert sb.is_integrity_warning is True
+
+
+def test_synthetic_balance_unmatched_sell_not_flagged_when_matched(tmp_state):
+    """A normal buy → sell round trip leaves no unmatched residue.
+    is_integrity_warning is False so the dashboard renders cleanly."""
+    state.append_trade({
+        "activity_id": "b1", "alpaca_order_id": "ob1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 2, "fill_price": 80.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    state.append_trade({
+        "activity_id": "s1", "alpaca_order_id": "os1", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 2, "fill_price": 100.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-11T13:00:00Z", "run_id": None,
+    })
+    sb = dd.compute_synthetic_balance()
+    assert sb.unmatched_sell_count == 0
+    assert sb.is_integrity_warning is False
+
+
+def test_synthetic_balance_partial_unmatched_sell(tmp_state):
+    """Buy 1, sell 2 → 1 unit of the sell can FIFO-match (closing
+    that round trip) and the leftover 1 unit lands in unmatched_sells.
+    The closed trade reflects the 1-unit match; the leftover bumps
+    the integrity counter."""
+    state.append_trade({
+        "activity_id": "b1", "alpaca_order_id": "ob1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 80.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    state.append_trade({
+        "activity_id": "s1", "alpaca_order_id": "os1", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 2, "fill_price": 100.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-11T13:00:00Z", "run_id": None,
+    })
+    sb = dd.compute_synthetic_balance()
+    # The 1-unit match still records a +$20 close.
+    assert sb.closed_gross_pnl_usd == pytest.approx(20.0)
+    # Leftover 1 unit on the sell side surfaces as unmatched.
+    assert sb.unmatched_sell_count == 1
+    assert sb.is_integrity_warning is True
+
+
+# ---------- realized_balance_series ----------
+
+
+def test_realized_balance_series_empty_state(tmp_state):
+    assert dd.realized_balance_series() == []
+
+
+def test_realized_balance_series_records_close_event(tmp_state):
+    """A single closed round-trip emits one point at the close
+    timestamp with synthetic_realized_balance = $2,500 + gross − fees."""
+    state.append_trade({
+        "activity_id": "a1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 80.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    state.append_trade({
+        "activity_id": "a2", "alpaca_order_id": "o2", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 1, "fill_price": 100.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-11T13:00:00Z", "run_id": None,
+    })
+    series = dd.realized_balance_series()
+    # Two events from trades.jsonl: a buy (fee=0 so skipped from
+    # fees deltas) and a sell whose closed_at lands the +$20 gross.
+    # Buy and sell both have fees_usd=0 so no fee events. Only the
+    # close event contributes here.
+    closes = [r for r in series if r["closed_gross_pnl_usd"] > 0]
+    assert closes
+    assert closes[-1]["synthetic_realized_balance_usd"] == pytest.approx(2520.0)
+
+
+def test_realized_balance_series_interleaves_costs_and_closes(tmp_state):
+    """The series walks all event types in chronological order.
+    Intermediate points reflect the running totals at each step."""
+    # Day 1: LLM cost lands.
+    state.append_cost({
+        "run_id": "r1", "stage": "construct", "model": "m",
+        "cost_usd": 0.20, "at": "2026-05-10T08:00:00Z",
+    })
+    # Day 2: round-trip closes at +$30.
+    state.append_trade({
+        "activity_id": "a1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 70.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-10T13:00:00Z", "run_id": "r1",
+    })
+    state.append_trade({
+        "activity_id": "a2", "alpaca_order_id": "o2", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 1, "fill_price": 100.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-11T13:00:00Z", "run_id": "r1",
+    })
+
+    series = dd.realized_balance_series()
+    # The last point should reflect the full state: +$30 closed, −$0.20 LLM.
+    last = series[-1]
+    assert last["synthetic_realized_balance_usd"] == pytest.approx(2529.80)
+    assert last["closed_gross_pnl_usd"] == pytest.approx(30.0)
+    assert last["llm_cost_total_usd"] == pytest.approx(0.20)
+    # The cost-only point earlier in the series should sit below $2,500.
+    cost_only = next(
+        r for r in series
+        if r["llm_cost_total_usd"] > 0 and r["closed_gross_pnl_usd"] == 0
+    )
+    assert cost_only["synthetic_realized_balance_usd"] == pytest.approx(2499.80)
+
+
+def test_realized_balance_series_honors_llm_cost_reset(tmp_state):
+    """After a reset, the LLM cost component of the series drops to 0
+    going forward — exactly what the operator expects when clicking
+    'Reset ALL LLM costs'."""
+    # Pre-reset cost should disappear from the series.
+    state.append_cost({
+        "run_id": "old", "stage": "x", "model": "m",
+        "cost_usd": 0.50, "at": "2026-05-10T12:00:00Z",
+    })
+    # Plant a reset marker strictly between the two cost rows so the
+    # post-reset cost survives filter_costs_post_reset (which drops
+    # rows with at <= reset_at).
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.ALL_TIME_COST_RESET_FLAG.write_text(
+        '{"at": "2026-05-11T00:00:00Z", "reason": "test"}',
+        encoding="utf-8",
+    )
+    state.append_cost({
+        "run_id": "new", "stage": "y", "model": "m",
+        "cost_usd": 0.10, "at": "2026-05-12T08:00:00Z",
+    })
+    series = dd.realized_balance_series()
+    # The reset filter drops the pre-reset row; only the post-reset
+    # cost of $0.10 appears.
+    assert len(series) == 1
+    last = series[-1]
+    assert last["llm_cost_total_usd"] == pytest.approx(0.10)
+    assert last["synthetic_realized_balance_usd"] == pytest.approx(2499.90)
+
+
+# ---------- back-compat: settled_balance_usd is now a thin wrapper ----------
+
+
 def test_settled_balance_no_trades_returns_virtual_baseline(tmp_state):
     """Fresh account, no closed trades → settled balance = virtual
-    baseline exactly. No mark drift can move this number; only real
-    closed-trade fills do."""
+    baseline exactly. Backward-compat wrapper around the synthetic
+    balance with empty marks."""
     assert dd.settled_balance_usd(virtual_baseline_usd=2500.0) == pytest.approx(2500.0)
 
 

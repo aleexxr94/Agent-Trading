@@ -311,7 +311,18 @@ def filter_costs_post_reset(rows: list[dict]) -> list[dict]:
     return [r for r in rows if (r.get("at") or "") > reset_at]
 
 
-# --------- NAV display anchor ---------
+# --------- NAV display anchor (DEPRECATED) ---------
+#
+# The synthetic-balance refactor (see lib/dashboard_data.SyntheticBalance)
+# made these helpers unused: the dashboard no longer derives its
+# headline from Alpaca account equity, so there's no offset to apply.
+# The functions below are kept for one release cycle so that:
+#   - If any external tooling or snapshot reader still references them,
+#     they don't ImportError on upgrade.
+#   - State files on disk (state/nav_offset.json,
+#     state/nav_manual_baseline.json) can still be read for forensic
+#     debugging if needed.
+# They'll be removed in a follow-up cleanup PR.
 
 
 def read_nav_offset() -> dict | None:
@@ -647,10 +658,16 @@ def wipe_run_history(*, include_costs: bool = True, backup: bool = True) -> dict
                 pass
 
     # Remove snapshot files entirely (orchestrator regenerates them).
+    # Includes deprecated NAV anchor files (NAV_OFFSET_FLAG,
+    # NAV_MANUAL_BASELINE_FLAG) so a fresh-start wipe truly is fresh
+    # — the synthetic-balance refactor doesn't read them, but stale
+    # files lingering on disk are noise the operator probably doesn't
+    # want carried into the next experiment.
     snapshots = [
         CURRENT_PORTFOLIO, NEXT_RUN, LAST_CYCLE_HASH,
         STATE_DIR / "scheduler_last_fired.txt",
         COST_RESET_FLAG, ALL_TIME_COST_RESET_FLAG,
+        NAV_OFFSET_FLAG, NAV_MANUAL_BASELINE_FLAG,
     ]
     for f in snapshots:
         if f.exists():
