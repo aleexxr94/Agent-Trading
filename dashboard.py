@@ -424,11 +424,16 @@ with tabs[0]:
     # no longer carries (closed manually / expired / killed). When the broker
     # is unreachable we render everything — better than blanking the dashboard.
     filter_keys = broker_view.held_keys if broker_view.available else None
+    # "Days held" is derived from the earliest buy-side fill per symbol in
+    # trades.jsonl — pass that map into the row builder so it can populate
+    # the new column without each row re-reading the file.
+    opened_at_by_symbol = dd._opened_at_map_from_trades(dd.load_trades())
     rows = dd.position_table_rows(
         portfolio,
         marks=broker_marks or None,
         costs=broker_costs or None,
         held_keys=filter_keys,
+        opened_at_by_symbol=opened_at_by_symbol,
     )
 
     open_positions, closed_positions = dd.split_positions_by_broker_holdings(
@@ -546,11 +551,18 @@ with tabs[0]:
 
         total_row: dict = {}
         for col in df_pos.columns:
-            if col in ("Notional", "% NAV", "Gross P&L", "Net P&L"):
+            if col in ("Notional", "Gross P&L", "Net P&L"):
+                total_row[col] = _sum_col(col)
+            elif col == "% NAV":
+                # % NAV sums to the portfolio's invested share (cash is
+                # the remainder). Show the sum, not a fictitious average.
                 total_row[col] = _sum_col(col)
             elif col == "Symbol":
                 total_row[col] = "TOTAL"
             else:
+                # Bias/DTE/Days held/Δ%/Entry/Mark — averaging these
+                # across heterogenous instruments would be misleading, so
+                # blank the TOTAL cell rather than fabricate a number.
                 total_row[col] = ""
         df_pos_with_total = pd.concat(
             [df_pos, pd.DataFrame([total_row])],
@@ -563,9 +575,13 @@ with tabs[0]:
                 return ["font-weight: 800; border-top: 2px solid var(--border)"] * len(row)
             return [""] * len(row)
 
+        # Δ% lives in the same green/red semantic space as the P&L
+        # columns — apply the same color formatter so a move-since-entry
+        # of -8% reads red at a glance.
+        color_subset = [c for c in ("Gross P&L", "Net P&L", "Δ%") if c in df_pos_with_total.columns]
         styled = (
             df_pos_with_total.style
-            .map(_color_pnl, subset=["Gross P&L", "Net P&L"])
+            .map(_color_pnl, subset=color_subset)
             .apply(_bold_total, axis=1)
         )
         st.dataframe(
@@ -573,10 +589,56 @@ with tabs[0]:
             width="stretch",
             hide_index=True,
             column_config={
-                "Cost":      st.column_config.NumberColumn("Cost",     format="$%.2f"),
-                "Mark":      st.column_config.NumberColumn("Mark",     format="$%.2f"),
+                "Entry":     st.column_config.NumberColumn(
+                    "Entry",
+                    format="$%.2f",
+                    help="Per-unit cost basis at entry — broker-reported "
+                         "avg_cost when available, otherwise the agent's "
+                         "intended fill price from portfolio.json.",
+                ),
+                "Mark":      st.column_config.NumberColumn(
+                    "Mark",
+                    format="$%.2f",
+                    help="Current per-unit price (last trade / mid quote) "
+                         "from the broker. Blank when marks aren't wired.",
+                ),
+                "Δ%":        st.column_config.NumberColumn(
+                    "Δ%",
+                    format="%+.1f%%",
+                    help="Gross percent move since entry, per unit. "
+                         "Independent of position size — complements the "
+                         "$-denominated Gross / Net P&L columns.",
+                ),
                 "Notional":  st.column_config.NumberColumn("Notional", format="$%,.0f"),
-                "% NAV":     st.column_config.NumberColumn("% NAV",    format="%.1f%%"),
+                "% NAV":     st.column_config.NumberColumn(
+                    "% NAV",
+                    format="%.1f%%",
+                    help="Position notional as a share of total NAV. "
+                         "Entry cap is 15%; cap drops to 7.5% in ≥10% "
+                         "drawdown. Drift past the cap after entry is OK.",
+                ),
+                "DTE":       st.column_config.Column(
+                    "DTE",
+                    help="Days to expiry for options. '—' on ETF rows.",
+                ),
+                "Days held": st.column_config.NumberColumn(
+                    "Days held",
+                    format="%d",
+                    help="Whole-days since the earliest buy fill for this "
+                         "symbol per state/trades.jsonl.",
+                ),
+                "Bias":      st.column_config.Column(
+                    "Bias",
+                    help="Direction expressed by the position: Bull (bull "
+                         "ETF or long call), Bear (inverse ETF or long "
+                         "put), Long vol (UVXY), Long crypto (BITX).",
+                ),
+                "Kill":      st.column_config.Column(
+                    "Kill",
+                    help="Trigger conditions monitor.py uses to flatten "
+                         "the position: max-loss %, underlying price "
+                         "thresholds, and time stop (date).",
+                ),
                 "Gross P&L": st.column_config.NumberColumn("Gross P&L", format="$%+,.2f"),
                 "Net P&L":   st.column_config.NumberColumn("Net P&L",  format="$%+,.2f"),
             },
@@ -769,28 +831,56 @@ with tabs[3]:
         costs=broker_costs or None,
     )
     has_gross = broker_marks and pnl_break.gross_pnl_usd != 0
+    # Realised LLM cost attributed to trades, post-reset. Subtracting
+    # this from the Net P&L card means the "Reset ALL LLM costs"
+    # button has a visible, dollar-denominated effect here — not just
+    # on the Costs panel below. The audit log on disk is preserved;
+    # this is purely how the dashboard reports Net.
+    realised_llm = dd.realised_llm_cost_attributed_to_trades_usd(
+        marks=broker_marks or {},
+    )
+    # All-in Net = unrealised net (gross - modelled trading costs)
+    #            - realised LLM cost attributed to trades (post-reset).
+    # Modelled trading costs are unrealised (entry leg + projected
+    # round-trip), so we don't add fees here — they're already in
+    # modelled_costs_usd. Realised fees flow into the Trades tab.
+    net_all_in = pnl_break.net_pnl_usd - realised_llm
 
     st.markdown('<div class="at-section-label">P&L summary</div>', unsafe_allow_html=True)
-    p = st.columns(3)
+    p = st.columns(4)
     gross_tone = "pos" if pnl_break.gross_pnl_usd > 0 else ("neg" if pnl_break.gross_pnl_usd < 0 else "")
-    net_tone = "pos" if pnl_break.net_pnl_usd > 0 else ("neg" if pnl_break.net_pnl_usd < 0 else "")
+    net_tone = "pos" if net_all_in > 0 else ("neg" if net_all_in < 0 else "")
     p[0].markdown(
         _stat_card(
             "Gross P&L",
             f"${pnl_break.gross_pnl_usd:+,.2f}" if has_gross else "—",
             tone=gross_tone if has_gross else "",
+            sub="unrealised, before any costs",
         ),
         unsafe_allow_html=True,
     )
     p[1].markdown(
-        _stat_card("Modelled trading costs", f"${pnl_break.modelled_costs_usd:,.2f}"),
+        _stat_card(
+            "Modelled trading costs",
+            f"${pnl_break.modelled_costs_usd:,.2f}",
+            sub="spreads + commissions + reg fees",
+        ),
         unsafe_allow_html=True,
     )
     p[2].markdown(
         _stat_card(
+            "LLM cost (since reset)",
+            f"${realised_llm:,.4f}",
+            sub="attributed to opening runs",
+        ),
+        unsafe_allow_html=True,
+    )
+    p[3].markdown(
+        _stat_card(
             "Net P&L",
-            f"${pnl_break.net_pnl_usd:+,.2f}" if has_gross else "—",
+            f"${net_all_in:+,.2f}" if has_gross else "—",
             tone=net_tone if has_gross else "",
+            sub="gross − trading costs − LLM",
         ),
         unsafe_allow_html=True,
     )
@@ -804,7 +894,9 @@ with tabs[3]:
         marks_status + " Trading costs are modelled to mirror **IBKR Pro retail** "
         "(USD account): $1 min commission + $0.005/share on ETFs (capped 0.5%), "
         "$0.65/contract + $0.04 OCC on options, ~5 bps / 25 bps half-spread, "
-        "plus SEC + FINRA TAF on sell side."
+        "plus SEC + FINRA TAF on sell side. **LLM cost** is the dashboard's "
+        "view since the last all-time reset — the reset adjusts Net P&L "
+        "above and the equity curve below, not just the cost panel."
     )
 
     st.markdown('<div class="at-section-label">Equity curve</div>', unsafe_allow_html=True)
@@ -855,10 +947,23 @@ with tabs[3]:
                 marker=dict(size=5, color="#059669"),
             ))
             if "net_pnl_usd" in nav_df.columns:
+                # Subtract cumulative LLM cost as-of each NAV row's
+                # timestamp so the curve reflects the reset marker. The
+                # nav_history.jsonl rows themselves are frozen (gross −
+                # modelled-trading-costs only); LLM cost is folded in
+                # at render time so it can react to operator action.
+                cum_llm = dd.cumulative_llm_cost_at(
+                    nav_df["at"].astype(str).tolist()
+                )
+                cumulative_net_after_llm = [
+                    (n if n is not None else 0.0) - c
+                    for n, c in zip(nav_df["net_pnl_usd"].tolist(), cum_llm)
+                ]
                 fig_nav.add_trace(go.Scatter(
-                    x=nav_df["at"], y=nav_df["net_pnl_usd"], mode="lines",
-                    name="Cumulative Net P&L (USD)",
+                    x=nav_df["at"], y=cumulative_net_after_llm, mode="lines",
+                    name="Cumulative Net P&L (after LLM, USD)",
                     yaxis="y2", line=dict(dash="dot", color="#7c3aed", width=2),
+                    hovertemplate="%{x}<br>Net (after LLM): $%{y:.2f}<extra></extra>",
                 ))
                 fig_nav.update_layout(
                     yaxis2=dict(title="Net P&L (USD)", overlaying="y", side="right",
@@ -1290,10 +1395,13 @@ with tabs[6]:
     all_time_reset_at = state.read_all_time_cost_reset_at()
     if all_time_reset_at:
         st.info(
-            f"All dashboard cost totals are currently filtered — only counting "
-            f"LLM spend after **{_fmt_ts(all_time_reset_at)}**. Underlying "
-            f"`state/costs.jsonl` is intact; cap enforcement still uses the raw "
-            f"log so per-run / per-day safety rails remain in force."
+            f"LLM-cost reset active — every dashboard surface counts only "
+            f"spend after **{_fmt_ts(all_time_reset_at)}**. This bumps the "
+            f"Performance tab Net P&L, the equity-curve cumulative-net line "
+            f"and the Trades tab Realised net + per-row Net columns upward "
+            f"by whatever was previously attributed. Underlying "
+            f"`state/costs.jsonl` is intact; per-run / per-day cap "
+            f"enforcement still uses the raw log."
         )
         at_cols = st.columns(2)
         with at_cols[0]:
@@ -1309,16 +1417,22 @@ with tabs[6]:
                 st.rerun()
     else:
         st.caption(
-            "Dashboard totals (today, this run, monthly, all-time) read from the "
-            "full `state/costs.jsonl` by default. Pressing the button below zeroes "
-            "ALL displayed totals at the current moment — useful after a testing "
-            "burn or model-config change you want to draw a line under. Audit log "
-            "and cap enforcement are unaffected."
+            "Pressing the button below stamps an all-time reset marker. From "
+            "that moment, LLM cost is treated as $0 across **every** dashboard "
+            "surface that subtracts it from P&L — the Performance tab Net P&L "
+            "card, the equity-curve Cumulative Net P&L line, and the Trades "
+            "tab Realised net + per-row Net columns all bump upward by the "
+            "previously-attributed amount. Useful after a testing burn or "
+            "model-config change you want to draw a line under. The underlying "
+            "`state/costs.jsonl` audit log is preserved (never mutated) and "
+            "per-run / per-day cap enforcement continues to use the raw log."
         )
         if st.button(
-            "🧹 Reset ALL LLM costs to $0 (display only)",
-            help="Records an all-time reset marker. costs.jsonl audit log is preserved; "
-                 "per-run and per-day caps continue to use the raw log.",
+            "🧹 Reset ALL LLM costs to $0",
+            help="Records an all-time reset marker. costs.jsonl audit log is "
+                 "preserved; per-run and per-day caps continue to use the raw "
+                 "log. Net P&L surfaces (Performance, Trades, equity curve) "
+                 "all reflect the reset.",
         ):
             state.set_all_time_cost_reset("dashboard")
             st.rerun()

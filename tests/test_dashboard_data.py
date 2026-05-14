@@ -200,7 +200,10 @@ def test_position_table_rows_etf_and_option_columns(tmp_state):
     assert kinds == {"ETF", "OPT"}
     opt_row = next(r for r in rows if r["Kind"] == "OPT")
     assert "Δ" in opt_row["Greeks"]
-    assert opt_row["Kill"] == "≤100%"
+    # Kill cell now folds in any underlying price / time stops alongside
+    # the max-loss %; assert on the prefix rather than full string so
+    # fixture tweaks to those guards don't ripple into the test.
+    assert opt_row["Kill"].startswith("≤100% loss")
 
 
 def test_position_table_rows_without_marks_leaves_pnl_blank(tmp_state):
@@ -292,7 +295,7 @@ def test_position_pnl_uses_broker_cost_basis_when_provided(tmp_state):
     )
     r = rows[0]
     # Cost column shows broker's actual fill, not the agent's premium_paid
-    assert r["Cost"] == pytest.approx(0.61)
+    assert r["Entry"] == pytest.approx(0.61)
     # Notional reflects truth: 1 contract × 100 × $0.61 = $61
     assert r["Notional"] == pytest.approx(61.0)
     # Gross P&L: ($0.59 - $0.61) × 1 × 100 = -$2  (NOT the -$590 we'd see
@@ -310,7 +313,7 @@ def test_position_pnl_falls_back_to_portfolio_premium_when_no_broker_costs(tmp_s
         costs=None,  # broker unavailable
     )
     r = rows[0]
-    assert r["Cost"] == pytest.approx(6.50)
+    assert r["Entry"] == pytest.approx(6.50)
     # ($8.00 - $6.50) × 1 × 100 = $150
     assert r["Gross P&L"] == pytest.approx(150.0)
 
@@ -331,10 +334,177 @@ def test_position_pnl_etf_uses_broker_cost_basis_when_provided(tmp_state):
         costs={"TQQQ": 75.0},  # agent thought $70, actually filled at $75
     )
     r = rows[0]
-    assert r["Cost"] == pytest.approx(75.0)
+    assert r["Entry"] == pytest.approx(75.0)
     assert r["Notional"] == pytest.approx(300.0)  # 4 × $75
     # ($80 - $75) × 4 = $20 (not $40 against the agent's $70 intent)
     assert r["Gross P&L"] == pytest.approx(20.0)
+
+
+def test_bias_column_etf_bull(tmp_state):
+    """Bull leveraged ETFs (positive leverage_factor, e.g. TQQQ at +3x)
+    surface as 'Bull' in the new Bias column."""
+    portfolio = {
+        "positions": [{
+            "kind": "etf", "symbol": "TQQQ", "shares": 1, "avg_cost": 80.0,
+            "leverage_factor": 3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+        }],
+    }
+    rows = dd.position_table_rows(portfolio)
+    assert rows[0]["Bias"] == "Bull"
+
+
+def test_bias_column_etf_bear(tmp_state):
+    """Inverse leveraged ETFs (negative leverage_factor, e.g. SQQQ at
+    -3x) surface as 'Bear'. The system is long-only — a bear thesis is
+    expressed by being long the inverse ETF — so the column shows the
+    directional exposure, not the position side."""
+    portfolio = {
+        "positions": [{
+            "kind": "etf", "symbol": "SQQQ", "shares": 1, "avg_cost": 12.0,
+            "leverage_factor": -3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+        }],
+    }
+    rows = dd.position_table_rows(portfolio)
+    assert rows[0]["Bias"] == "Bear"
+
+
+def test_bias_column_option_put_is_bear(tmp_state):
+    """Long puts express a bearish view on the underlying."""
+    pos = _option_pos()
+    pos["type"] = "put"
+    rows = dd.position_table_rows({"positions": [pos]})
+    assert rows[0]["Bias"] == "Bear"
+
+
+def test_bias_column_option_call_is_bull(tmp_state):
+    rows = dd.position_table_rows({"positions": [_option_pos()]})
+    assert rows[0]["Bias"] == "Bull"
+
+
+def test_bias_column_uvxy_is_long_vol(tmp_state):
+    """UVXY has positive leverage but it's a vol instrument, not an
+    equity-bull bet — labelling it 'Bull' would mislead the reader."""
+    portfolio = {
+        "positions": [{
+            "kind": "etf", "symbol": "UVXY", "shares": 1, "avg_cost": 20.0,
+            "leverage_factor": 1.5, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+        }],
+    }
+    rows = dd.position_table_rows(portfolio)
+    assert rows[0]["Bias"] == "Long vol"
+
+
+def test_delta_pct_column_computes_from_entry_and_mark(tmp_state):
+    """Δ% is (mark - entry) / entry × 100, computed off per-unit prices
+    so it's identical for an ETF share or an option contract premium."""
+    portfolio = {
+        "positions": [{
+            "kind": "etf", "symbol": "TQQQ", "shares": 1, "avg_cost": 80.0,
+            "leverage_factor": 3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+        }],
+    }
+    rows = dd.position_table_rows(portfolio, marks={"TQQQ": 88.0})
+    # (88 - 80) / 80 = +10%
+    assert rows[0]["Δ%"] == pytest.approx(10.0)
+
+
+def test_delta_pct_column_blank_without_mark(tmp_state):
+    """No mark → no Δ%. Same convention as Gross / Net columns."""
+    portfolio = {
+        "positions": [{
+            "kind": "etf", "symbol": "TQQQ", "shares": 1, "avg_cost": 80.0,
+            "leverage_factor": 3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+        }],
+    }
+    rows = dd.position_table_rows(portfolio)
+    assert rows[0]["Δ%"] is None
+
+
+def test_kill_column_includes_underlying_price_and_time_stop(tmp_state):
+    """Kill cell folds underlying-price and time-stop guards alongside
+    the max-loss %. Each guard becomes a ` · `-joined segment so the
+    reader sees every trigger in one place."""
+    portfolio = {
+        "positions": [{
+            "kind": "etf", "symbol": "TQQQ", "shares": 1, "avg_cost": 80.0,
+            "leverage_factor": 3.0, "entry_thesis": "x",
+            "kill_conditions": {
+                "max_loss_pct": 25,
+                "underlying_price_below": 75.5,
+                "time_stop_utc": "2026-06-12T20:00:00Z",
+            },
+            "position_pct": 5.0,
+        }],
+    }
+    rows = dd.position_table_rows(portfolio)
+    kill = rows[0]["Kill"]
+    assert "≤25% loss" in kill
+    assert "≤$75.5" in kill
+    assert "by 2026-06-12" in kill
+
+
+def test_dte_column_present_for_options_dash_for_etfs(tmp_state):
+    """DTE comes straight from position.schema 'dte'; ETF rows show
+    '—' since they have no expiry."""
+    etf = {
+        "kind": "etf", "symbol": "TQQQ", "shares": 1, "avg_cost": 80.0,
+        "leverage_factor": 3.0, "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+    }
+    rows = dd.position_table_rows({"positions": [etf, _option_pos()]})
+    etf_row = next(r for r in rows if r["Kind"] == "ETF")
+    opt_row = next(r for r in rows if r["Kind"] == "OPT")
+    assert etf_row["DTE"] == "—"
+    assert opt_row["DTE"] == 40
+
+
+def test_days_held_from_opened_at_map_for_etf(tmp_state):
+    """`opened_at_by_symbol` is keyed by broker symbol (ETF ticker / OSI
+    for options). Days-held is whole-days since that timestamp."""
+    from datetime import datetime, timezone, timedelta
+    six_days_ago = (datetime.now(timezone.utc) - timedelta(days=6)).isoformat().replace("+00:00", "Z")
+    portfolio = {
+        "positions": [{
+            "kind": "etf", "symbol": "TQQQ", "shares": 1, "avg_cost": 80.0,
+            "leverage_factor": 3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+        }],
+    }
+    rows = dd.position_table_rows(
+        portfolio, opened_at_by_symbol={"TQQQ": six_days_ago},
+    )
+    assert rows[0]["Days held"] == 6
+
+
+def test_days_held_none_when_no_opened_at(tmp_state):
+    """Without trade history the row renders blank rather than fabricating zero."""
+    portfolio = {
+        "positions": [{
+            "kind": "etf", "symbol": "TQQQ", "shares": 1, "avg_cost": 80.0,
+            "leverage_factor": 3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+        }],
+    }
+    rows = dd.position_table_rows(portfolio)
+    assert rows[0]["Days held"] is None
+
+
+def test_opened_at_map_picks_earliest_buy_per_symbol(tmp_state):
+    """When multiple buy fills exist for the same symbol (averaging-in),
+    Days held should anchor on the FIRST one — that's when the position
+    was opened, not when it was added to."""
+    trades = [
+        {"symbol": "TQQQ", "side": "buy",  "filled_at": "2026-04-10T15:00:00Z"},
+        {"symbol": "TQQQ", "side": "buy",  "filled_at": "2026-05-01T15:00:00Z"},
+        {"symbol": "TQQQ", "side": "sell", "filled_at": "2026-04-15T15:00:00Z"},  # noise
+    ]
+    out = dd._opened_at_map_from_trades(trades)
+    assert out["TQQQ"] == "2026-04-10T15:00:00Z"
 
 
 def test_load_decisions_empty_log(tmp_state):
@@ -622,6 +792,83 @@ def test_total_token_cost_filters_post_all_time_reset(tmp_state):
     assert state.COSTS_LOG.exists()
     raw_lines = state.COSTS_LOG.read_text(encoding="utf-8").strip().splitlines()
     assert len(raw_lines) == 2
+
+
+def test_cumulative_llm_cost_at_returns_running_sum_by_timestamp(tmp_state):
+    """For each `at` queried, returns the sum of cost_usd across rows
+    with `at` <= the query. Reset-aware via load_costs."""
+    for at, c in [
+        ("2026-05-10T12:00:00Z", 0.50),
+        ("2026-05-11T12:00:00Z", 0.30),
+        ("2026-05-12T12:00:00Z", 0.20),
+    ]:
+        state.append_cost({
+            "run_id": "r", "stage": "s", "model": "m",
+            "cost_usd": c, "at": at,
+        })
+    # Query a timestamp BEFORE all rows, BETWEEN rows, and AFTER all.
+    out = dd.cumulative_llm_cost_at([
+        "2026-05-10T00:00:00Z",  # before first row → 0
+        "2026-05-11T13:00:00Z",  # after first two → 0.80
+        "2026-05-15T00:00:00Z",  # after all three → 1.00
+    ])
+    assert out == [pytest.approx(0.0), pytest.approx(0.80), pytest.approx(1.00)]
+
+
+def test_cumulative_llm_cost_at_honours_all_time_reset(tmp_state):
+    """A reset marker zeros out pre-reset costs from the cumulative
+    series so the equity-curve cumulative-net line bumps upward when
+    the operator hits Reset."""
+    state.append_cost({
+        "run_id": "old", "stage": "s", "model": "m",
+        "cost_usd": 0.50, "at": "2026-05-10T12:00:00Z",
+    })
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.ALL_TIME_COST_RESET_FLAG.write_text(
+        '{"at": "2026-05-11T00:00:00Z", "reason": "test"}',
+        encoding="utf-8",
+    )
+    state.append_cost({
+        "run_id": "new", "stage": "s", "model": "m",
+        "cost_usd": 0.10, "at": "2026-05-12T08:00:00Z",
+    })
+    # Before reset: old row would have counted; with reset active, it's
+    # excluded. The query timestamp here is after both rows.
+    out = dd.cumulative_llm_cost_at(["2026-05-13T00:00:00Z"])
+    assert out == [pytest.approx(0.10)]
+
+
+def test_realised_llm_cost_attributed_to_trades_zero_when_no_trades(tmp_state):
+    """No trades → no attribution. Helper returns 0.0 cleanly."""
+    assert dd.realised_llm_cost_attributed_to_trades_usd() == pytest.approx(0.0)
+
+
+def test_realised_llm_cost_drops_to_zero_after_all_time_reset(tmp_state):
+    """Reset wiping costs.jsonl from the dashboard's view means trades
+    get $0 attributed LLM cost — Net P&L surfaces that subtract this
+    bump upward by exactly the reset amount. This is the core wiring
+    that makes 'reset all costs' a meaningful net-P&L adjustment."""
+    # One LLM cost row + one closed trade (buy then sell same symbol).
+    state.append_cost({
+        "run_id": "r1", "stage": "construct", "model": "m",
+        "cost_usd": 0.40, "at": "2026-05-10T12:00:00Z",
+    })
+    state.append_trade({
+        "activity_id": "a1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 80.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-10T13:00:00Z", "run_id": "r1",
+    })
+    state.append_trade({
+        "activity_id": "a2", "alpaca_order_id": "o2", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 1, "fill_price": 82.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-11T13:00:00Z", "run_id": "r1",
+    })
+    pre = dd.realised_llm_cost_attributed_to_trades_usd()
+    assert pre == pytest.approx(0.40), "trade should carry its run's LLM cost"
+
+    state.set_all_time_cost_reset("test")
+    post = dd.realised_llm_cost_attributed_to_trades_usd()
+    assert post == pytest.approx(0.0), "reset zeroes the attributed cost"
 
 
 def test_runs_count_filters_post_all_time_reset(tmp_state):

@@ -12,6 +12,7 @@ from typing import Any
 
 from . import pnl as pnl_lib
 from . import state
+from . import universe as universe_lib
 from .orders import osi_symbol
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -88,6 +89,70 @@ def load_costs(limit: int = 1000) -> list[dict]:
             continue
     rows = state.filter_costs_post_reset(rows)
     return rows[-limit:]
+
+
+def realised_llm_cost_attributed_to_trades_usd(
+    marks: dict[str, float] | None = None,
+) -> float:
+    """LLM cost attributed to closed AND open trades, post-reset.
+
+    The reset marker zeroes this value (via filter_costs_post_reset
+    inside trades_pnl_view) — so subtracting this from a "Net P&L"
+    display surface gives the operator a visible delta when they
+    click 'Reset all LLM costs'.
+
+    Closed + open lots are both summed because the equal-split
+    methodology attributes the run's LLM spend at *open* time, not
+    close — open positions already carry their share even before they
+    realise P&L.
+    """
+    view = trades_pnl_view(marks=marks)
+    closed_sum = sum(
+        r.get("llm_cost_usd", 0.0) or 0.0 for r in view["closed"]
+    )
+    open_sum = sum(
+        r.get("llm_cost_usd", 0.0) or 0.0 for r in view["open"]
+    )
+    return closed_sum + open_sum
+
+
+def cumulative_llm_cost_by_at() -> list[tuple[str, float]]:
+    """Sorted (at_iso, cumulative_cost_usd) pairs across costs.jsonl,
+    cost-reset-aware.
+
+    Used to subtract cumulative LLM spend up to each NAV-history row's
+    timestamp from the equity-curve Cumulative Net P&L line, so a
+    reset visibly redraws the curve upward.
+    """
+    rows = sorted(
+        ({"at": r.get("at") or "", "cost_usd": float(r.get("cost_usd", 0.0) or 0.0)}
+         for r in load_costs(limit=10**9)),
+        key=lambda r: r["at"],
+    )
+    out: list[tuple[str, float]] = []
+    running = 0.0
+    for r in rows:
+        running += r["cost_usd"]
+        out.append((r["at"], running))
+    return out
+
+
+def cumulative_llm_cost_at(timestamps: list[str]) -> list[float]:
+    """For each timestamp, return the cumulative LLM cost as of that
+    moment (post-reset). Streaming binary search via a precomputed
+    sorted list of cumulative pairs — O((N+M) log N).
+    """
+    pairs = cumulative_llm_cost_by_at()
+    if not pairs:
+        return [0.0] * len(timestamps)
+    ats = [p[0] for p in pairs]
+    cums = [p[1] for p in pairs]
+    import bisect
+    out: list[float] = []
+    for ts in timestamps:
+        idx = bisect.bisect_right(ats, ts) - 1
+        out.append(cums[idx] if idx >= 0 else 0.0)
+    return out
 
 
 def cost_today_usd() -> float:
@@ -613,11 +678,103 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
     return summaries
 
 
+def _bias_for_position(pos: dict) -> str:
+    """Bull / Bear / — classification for the positions-table Bias column.
+
+    The system is long-only, but a bear thesis is expressed via either a
+    long inverse-leveraged ETF (SQQQ, SPXU, TZA, SOXS, FAZ, DUST) or a
+    long put. Surfacing the direction at a glance saves the reader from
+    decoding the leverage_factor sign and the option type by hand.
+
+    Returns 'Bull' / 'Bear' / '—' (the dash for cases we can't classify
+    cleanly, e.g. UVXY/BITX which are bullish on vol or crypto but don't
+    map cleanly onto an equity bull/bear axis).
+    """
+    if pos["kind"] == "etf":
+        entry = universe_lib.by_symbol(pos["symbol"])
+        if entry is None:
+            return "—"
+        # UVXY (vol) and BITX (crypto) carry positive leverage but are not
+        # equity-bull instruments — show their own labels so the reader
+        # isn't misled into thinking UVXY long = bullish equities.
+        if pos["symbol"] == "UVXY":
+            return "Long vol"
+        if pos["symbol"] == "BITX":
+            return "Long crypto"
+        if entry.leverage_factor > 0:
+            return "Bull"
+        if entry.leverage_factor < 0:
+            return "Bear"
+        return "—"
+    # Options: call = bullish on the underlying, put = bearish.
+    return "Bull" if pos["type"] == "call" else "Bear"
+
+
+def _opened_at_map_from_trades(trade_rows: list[dict]) -> dict[str, str]:
+    """Earliest buy-side `filled_at` per symbol, keyed as the broker stores it.
+
+    Used to derive "Days held" on the positions table. Trades.jsonl stores
+    `symbol` as the broker symbol (ETF ticker, OSI for options), which is
+    the same convention the positions table uses for its `costs`/`marks`
+    lookups — so the caller passes the same `osi_symbol` resolution when
+    reading from this map.
+    """
+    out: dict[str, str] = {}
+    for t in trade_rows:
+        if t.get("side") != "buy":
+            continue
+        sym = t.get("symbol")
+        filled_at = t.get("filled_at") or ""
+        if not sym or not filled_at:
+            continue
+        prev = out.get(sym)
+        if prev is None or filled_at < prev:
+            out[sym] = filled_at
+    return out
+
+
+def _days_held(opened_at: str | None) -> int | None:
+    """Whole-days elapsed since `opened_at` (UTC). None when missing/bad."""
+    if not opened_at:
+        return None
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(opened_at.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - dt
+        return max(0, int(delta.total_seconds() // 86400))
+    except (ValueError, TypeError):
+        return None
+
+
+def _kill_summary(kill: dict) -> str:
+    """Compact one-cell summary of kill_conditions for the positions table.
+
+    Folds the underlying-price guard and the time stop into a single
+    string alongside the max-loss percentage. Empty fields are dropped so
+    a position with only `max_loss_pct` set still renders cleanly.
+    """
+    parts: list[str] = [f"≤{kill.get('max_loss_pct', 0):g}% loss"]
+    below = kill.get("underlying_price_below")
+    above = kill.get("underlying_price_above")
+    if below is not None:
+        parts.append(f"≤${below:g}")
+    if above is not None:
+        parts.append(f"≥${above:g}")
+    time_stop = kill.get("time_stop_utc")
+    if time_stop:
+        # Strip the time portion — the date alone is enough for a glance.
+        parts.append(f"by {time_stop[:10]}")
+    return " · ".join(parts)
+
+
 def position_table_rows(
     portfolio: dict,
     marks: dict[str, float] | None = None,
     costs: dict[str, float] | None = None,
     held_keys: frozenset[str] | set[str] | None = None,
+    opened_at_by_symbol: dict[str, str] | None = None,
 ) -> list[dict]:
     """Flatten ETF + option rows into uniform columns for st.dataframe.
 
@@ -640,6 +797,7 @@ def position_table_rows(
     """
     marks = marks or {}
     costs = costs or {}
+    opened_at_by_symbol = opened_at_by_symbol or {}
     out: list[dict] = []
     for p in portfolio.get("positions", []):
         # Stale-position filter: when the broker is reachable and reports
@@ -649,22 +807,28 @@ def position_table_rows(
         # render everything in that case rather than blank the dashboard.
         if held_keys is not None and mark_key_for_position(p) not in held_keys:
             continue
+        bias = _bias_for_position(p)
+        kill_cell = _kill_summary(p["kill_conditions"])
         if p["kind"] == "etf":
             key = p["symbol"]
             mark = marks.get(key)
             broker_cost = costs.get(key)
             cost_per_unit = broker_cost if broker_cost is not None else p["avg_cost"]
             shares = p["shares"]
+            opened_at = opened_at_by_symbol.get(key)
             row = {
                 "Symbol": p["symbol"],
                 "Kind": "ETF",
+                "Bias": bias,
                 "Leverage": f"{p.get('leverage_factor', 1):g}x",
+                "DTE": "—",
                 "Qty": shares,
-                "Cost": cost_per_unit,
+                "Entry": cost_per_unit,
                 "Notional": shares * cost_per_unit,
                 "% NAV": p["position_pct"],
+                "Days held": _days_held(opened_at),
                 "Greeks": "—",
-                "Kill": f"≤{p['kill_conditions']['max_loss_pct']}%",
+                "Kill": kill_cell,
             }
         else:
             contracts = p["contracts"]
@@ -674,33 +838,40 @@ def position_table_rows(
             synth_key = f"{p['underlying']}|{p['strike']}|{p['expiry']}|{p['type']}"
             mark = marks.get(synth_key)
             broker_cost = costs.get(synth_key)
-            if mark is None or broker_cost is None:
-                try:
-                    osi = osi_symbol(
-                        underlying=p["underlying"], expiry=p["expiry"],
-                        type=p["type"], strike=p["strike"],
-                    )
-                    if mark is None:
-                        mark = marks.get(osi)
-                    if broker_cost is None:
-                        broker_cost = costs.get(osi)
-                except (ValueError, KeyError):
-                    pass
+            opened_at = None
+            try:
+                osi = osi_symbol(
+                    underlying=p["underlying"], expiry=p["expiry"],
+                    type=p["type"], strike=p["strike"],
+                )
+            except (ValueError, KeyError):
+                osi = None
+            if mark is None and osi is not None:
+                mark = marks.get(osi)
+            if broker_cost is None and osi is not None:
+                broker_cost = costs.get(osi)
+            # Trade history stores option symbols as OSI; that's our only
+            # lookup key for the opened-at map.
+            if osi is not None:
+                opened_at = opened_at_by_symbol.get(osi)
             cost_per_unit = broker_cost if broker_cost is not None else p["premium_paid"]
             premium_usd = cost_per_unit * 100 * contracts
             row = {
                 "Symbol": f"{p['underlying']} {p['type'].upper()} {p['strike']} {p['expiry']}",
                 "Kind": "OPT",
+                "Bias": bias,
                 "Leverage": "—",
+                "DTE": p.get("dte", "—"),
                 "Qty": contracts,
-                "Cost": cost_per_unit,
+                "Entry": cost_per_unit,
                 "Notional": premium_usd,
                 "% NAV": p["position_pct"],
+                "Days held": _days_held(opened_at),
                 "Greeks": (
                     f"Δ{g['delta']:.2f} Θ{g['theta']:.2f} "
                     f"IV {g['iv']*100:.0f}% (p{int(g['iv_percentile'])})"
                 ),
-                "Kill": f"≤{p['kill_conditions']['max_loss_pct']}%",
+                "Kill": kill_cell,
             }
         # Pass the broker-truth cost basis into the P&L helper so option
         # P&L reflects actual fill, not the agent's premium estimate.
@@ -710,6 +881,14 @@ def position_table_rows(
             actual_cost_per_unit=cost_per_unit,
         )
         row["Mark"] = mark if mark is not None else None
+        # Δ% (move since entry, gross) — surfaces the percent move
+        # independent of position size, complementing the dollar P&L
+        # columns. Computed off the per-unit prices so it works for both
+        # ETF shares and option per-contract premiums.
+        if mark is not None and cost_per_unit:
+            row["Δ%"] = (mark - cost_per_unit) / cost_per_unit * 100.0
+        else:
+            row["Δ%"] = None
         row["Gross P&L"] = breakdown.gross_pnl_usd if mark is not None else None
         row["Net P&L"] = breakdown.net_pnl_usd if mark is not None else None
         out.append(row)
