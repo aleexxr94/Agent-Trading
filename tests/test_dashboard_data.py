@@ -193,6 +193,40 @@ def test_try_load_broker_view_distinguishes_unreachable_from_empty(
     assert view.held_keys == frozenset()
 
 
+def test_try_load_broker_view_returns_none_nav_when_get_account_fails(
+    tmp_state, monkeypatch
+):
+    """Codex P2 on PR #74: when get_account() raises (transient Alpaca
+    error) but get_positions() succeeds, the hero falls back to
+    portfolio.json. The caller (dashboard.py) is responsible for
+    re-applying the offset on the fallback path — this test pins the
+    contract that try_load_broker_view returns nav_usd=None in that
+    case, signaling 'use fallback'."""
+
+    class _PartialBroker:
+        def get_positions(self):
+            return []
+
+        def get_account(self):
+            raise RuntimeError("simulated transient 500")
+
+    import lib.alpaca_client as ac_mod
+    monkeypatch.setattr(ac_mod, "AlpacaBroker", lambda *a, **kw: _PartialBroker())
+
+    state.set_nav_offset(
+        broker_baseline_usd=100020.0,
+        virtual_baseline_usd=2500.0,
+        note="test",
+    )
+    view = dd.try_load_broker_view()
+    assert view.available is True, "positions reachable → still available"
+    assert view.nav_usd is None, (
+        "get_account failure must surface as nav_usd=None so the "
+        "caller's fallback path (portfolio.json) kicks in — and that "
+        "fallback applies the offset itself (dashboard.py)"
+    )
+
+
 def test_try_load_broker_view_applies_nav_offset_when_anchor_set(
     tmp_state, monkeypatch
 ):
@@ -490,6 +524,27 @@ def test_kill_column_includes_underlying_price_and_time_stop(tmp_state):
     assert "≤25% loss" in kill
     assert "≤$75.5" in kill
     assert "by 2026-06-12" in kill
+
+
+def test_fees_column_populates_modelled_round_trip_cost(tmp_state):
+    """The Fees column surfaces the modelled round-trip broker cost
+    from compute_position_pnl — same definition as the Performance
+    tab's 'Modelled trading costs' aggregate. Must be > 0 for any
+    real position so Net P&L = Gross − Fees is visibly correct."""
+    portfolio = {
+        "positions": [{
+            "kind": "etf", "symbol": "TQQQ", "shares": 4, "avg_cost": 80.0,
+            "leverage_factor": 3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+        }],
+    }
+    rows = dd.position_table_rows(portfolio, marks={"TQQQ": 88.0})
+    r = rows[0]
+    assert "Fees" in r
+    assert isinstance(r["Fees"], (int, float))
+    assert r["Fees"] > 0, "real ETF position should carry non-zero modelled fees"
+    # Sanity: Gross − Fees should equal Net (within rounding).
+    assert r["Gross P&L"] - r["Fees"] == pytest.approx(r["Net P&L"])
 
 
 def test_dte_column_present_for_options_dash_for_etfs(tmp_state):

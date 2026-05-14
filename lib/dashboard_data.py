@@ -895,6 +895,12 @@ def position_table_rows(
             row["Δ%"] = (mark - cost_per_unit) / cost_per_unit * 100.0
         else:
             row["Δ%"] = None
+        # Modelled trading costs for THIS position — round-trip
+        # estimate (entry leg + projected close): spread + commission
+        # + reg fees. Mirrors what the Performance tab "Modelled
+        # trading costs" aggregate is built from. Makes the per-row
+        # Net P&L breakdown self-explanatory (Gross − Fees = Net).
+        row["Fees"] = breakdown.modelled_costs_usd
         row["Gross P&L"] = breakdown.gross_pnl_usd if mark is not None else None
         row["Net P&L"] = breakdown.net_pnl_usd if mark is not None else None
         out.append(row)

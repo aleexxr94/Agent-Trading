@@ -300,16 +300,19 @@ def _pills_html() -> str:
 # back to the agent's last portfolio.json snapshot. Broker NAV reflects
 # fills between cycles (mid-cycle gains/losses on open positions) where
 # the snapshot is only as-fresh as the last orchestrator run.
-hero_nav_usd = (
-    broker_view.nav_usd
-    if (broker_view.available and broker_view.nav_usd is not None)
-    else portfolio.get("nav_usd", 0.0)
-)
-hero_nav_source = (
-    f"broker live (as of {_fmt_ts(broker_view.captured_at)})"
-    if (broker_view.available and broker_view.nav_usd is not None)
-    else f"portfolio.json snapshot (cycle {_fmt_ts(last_run_at)})"
-)
+if broker_view.available and broker_view.nav_usd is not None:
+    # broker_view.nav_usd already had the anchor offset subtracted in
+    # try_load_broker_view.
+    hero_nav_usd = broker_view.nav_usd
+    hero_nav_source = f"broker live (as of {_fmt_ts(broker_view.captured_at)})"
+else:
+    # Fallback path — portfolio.json is the agent's last snapshot of
+    # broker equity, so it ALSO needs the offset applied. Codex P2 on
+    # PR #74 caught the case where a transient get_account() failure
+    # let the hero jump back to ~$100k even with an anchor set.
+    snapshot_nav = portfolio.get("nav_usd", 0.0)
+    hero_nav_usd = snapshot_nav - state.nav_offset_usd()
+    hero_nav_source = f"portfolio.json snapshot (cycle {_fmt_ts(last_run_at)})"
 
 st.markdown(
     f"""
@@ -578,7 +581,7 @@ with tabs[0]:
 
         total_row: dict = {}
         for col in df_pos.columns:
-            if col in ("Notional", "Gross P&L", "Net P&L"):
+            if col in ("Notional", "Fees", "Gross P&L", "Net P&L"):
                 total_row[col] = _sum_col(col)
             elif col == "% NAV":
                 # % NAV sums to the portfolio's invested share (cash is
@@ -669,6 +672,14 @@ with tabs[0]:
                          "the position: max-loss %, underlying price "
                          "thresholds, and time stop (date).",
                 ),
+                "Fees":      st.column_config.NumberColumn(
+                    "Fees",
+                    format="$%,.2f",
+                    help="Modelled round-trip broker costs for this "
+                         "position (IBKR Pro retail): entry-leg spread + "
+                         "commission already paid, plus projected close. "
+                         "Net P&L = Gross P&L − Fees.",
+                ),
                 "Gross P&L": st.column_config.NumberColumn("Gross P&L", format="$%+,.2f"),
                 "Net P&L":   st.column_config.NumberColumn("Net P&L",  format="$%+,.2f"),
             },
@@ -703,12 +714,32 @@ with tabs[0]:
             bar_rows = [r for r in rows if r.get("Net P&L") is not None]
             if bar_rows:
                 bar_rows = sorted(bar_rows, key=lambda r: r["Net P&L"])
-                fig_bar = go.Figure(go.Bar(
+                # Two-trace bar: per-position bars (green/red by sign) plus
+                # an aggregate TOTAL bar on the far right in gold so it's
+                # visually distinct from the individual positions. The
+                # operator asked for the combined number alongside the
+                # per-position breakdown.
+                total_net = sum(r["Net P&L"] for r in bar_rows)
+                fig_bar = go.Figure()
+                fig_bar.add_trace(go.Bar(
                     x=[r["Symbol"] for r in bar_rows],
                     y=[r["Net P&L"] for r in bar_rows],
                     marker_color=[
-                        "#059669" if r["Net P&L"] >= 0 else "#dc2626" for r in bar_rows
+                        "#059669" if r["Net P&L"] >= 0 else "#dc2626"
+                        for r in bar_rows
                     ],
+                    name="Per position",
+                    hovertemplate="%{x}<br>Net: $%{y:+,.2f}<extra></extra>",
+                ))
+                fig_bar.add_trace(go.Bar(
+                    x=["TOTAL"],
+                    y=[total_net],
+                    marker_color=["#d97706"],
+                    marker_line=dict(color="#0f172a", width=1.5),
+                    name="Total",
+                    text=[f"${total_net:+,.2f}"],
+                    textposition="outside",
+                    hovertemplate="All positions combined<br>Net: $%{y:+,.2f}<extra></extra>",
                 ))
                 fig_bar.update_layout(
                     template="plotly_white",
@@ -716,10 +747,11 @@ with tabs[0]:
                     plot_bgcolor="rgba(0,0,0,0)",
                     height=360,
                     margin=dict(l=10, r=10, t=40, b=10),
-                    title=dict(text="Net P&L per position (USD)",
+                    title=dict(text="Net P&L per position + combined (USD)",
                                font=dict(size=15, color="#0f172a")),
                     yaxis=dict(title="USD", gridcolor="#e2e8f0"),
                     xaxis=dict(tickfont=dict(size=11)),
+                    showlegend=False,
                 )
                 st.plotly_chart(fig_bar, width="stretch")
             else:
