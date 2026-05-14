@@ -1636,6 +1636,57 @@ with tabs[6]:
             if st.button("↩ Clear anchor (show raw broker equity)"):
                 state.clear_nav_offset()
                 st.rerun()
+
+        # Manual broker baseline — for when the operator knows the
+        # exact broker equity at the start-of-trading moment (e.g.
+        # $99,938.95 after a prior liquidation, not the textbook
+        # $100,000 default). Pre-bake estimates that off the current
+        # positions; this skips the estimate and pins the offset to a
+        # known number.
+        st.markdown(
+            "<div style='font-size:0.85rem; color: var(--text-2); margin-top:0.6rem;'>"
+            "<strong>Manual broker baseline (advanced)</strong>: pin the "
+            "anchor to a known pre-trades broker equity rather than the "
+            "pre-bake estimate. Useful when the broker's actual starting "
+            "balance isn't the round $100k default."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        manual_cols = st.columns([2, 3])
+        # Bind the widget keys to the anchor's set_at timestamp.
+        # st.number_input persists across reruns when keyed, so the
+        # first-edited value would stick even after a re-anchor with a
+        # different broker_baseline_usd (Codex P2). Including set_at in
+        # the key means each new anchor wipes the session-state slot
+        # and the widget re-renders from the current `value=`.
+        _anchor_session_token = _anchor.get("set_at", "") or "no-set-at"
+        with manual_cols[0]:
+            manual_baseline_set = st.number_input(
+                "Broker baseline ($)",
+                value=float(_anchor["broker_baseline_usd"]),
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+                key=f"manual_baseline_anchored::{_anchor_session_token}",
+                help="The broker's equity AT the moment you consider the "
+                     "trading account to have started — typically the "
+                     "pre-trades cash balance. Offset = this − virtual.",
+            )
+        with manual_cols[1]:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            if st.button(
+                "📐 Set anchor to specific broker baseline",
+                key=f"manual_anchor_btn_anchored::{_anchor_session_token}",
+                help="Stamps the entered broker_baseline directly, no "
+                     "pre-bake estimation. Displayed NAV = "
+                     "broker_now − (manual_baseline − virtual).",
+            ):
+                state.set_nav_offset(
+                    broker_baseline_usd=float(manual_baseline_set),
+                    virtual_baseline_usd=_anchor["virtual_baseline_usd"],
+                    note="manual baseline",
+                )
+                st.rerun()
     else:
         st.caption(
             "Pins the displayed NAV to a target (default $2,500 per CLAUDE.md) "
@@ -1690,6 +1741,45 @@ with tabs[6]:
                     st.rerun()
                 else:
                     st.error("Broker unreachable — can't anchor right now.")
+
+        # Manual broker baseline alternative — for operators who know
+        # the exact pre-trades broker equity (e.g. $99,938.95 after an
+        # old liquidation moved the textbook $100k starting balance).
+        st.markdown(
+            "<div style='font-size:0.85rem; color: var(--text-2); margin-top:0.8rem;'>"
+            "<strong>Alternative — manual broker baseline (advanced)</strong>: "
+            "skip the pre-bake estimate and pin the anchor to a known "
+            "pre-trades broker equity. Pick this when you know the "
+            "exact dollar amount the broker held before today's trades."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        manual_unset_cols = st.columns([2, 3])
+        with manual_unset_cols[0]:
+            manual_baseline_init = st.number_input(
+                "Broker baseline ($)",
+                value=99938.95,
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+                key="manual_baseline_unanchored",
+                help="The broker's equity AT the moment you consider the "
+                     "trading account to have started.",
+            )
+        with manual_unset_cols[1]:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            if st.button(
+                "📐 Set anchor to specific broker baseline",
+                key="manual_anchor_btn_unanchored",
+                help="Stamps the entered broker_baseline directly. "
+                     "Displayed NAV = broker_now − (manual_baseline − virtual).",
+            ):
+                state.set_nav_offset(
+                    broker_baseline_usd=float(manual_baseline_init),
+                    virtual_baseline_usd=float(virt_target),
+                    note="manual baseline",
+                )
+                st.rerun()
 
     st.markdown('<div class="at-section-label">Wipe history (start fresh)</div>', unsafe_allow_html=True)
     st.caption(
