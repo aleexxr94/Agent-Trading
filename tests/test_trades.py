@@ -323,3 +323,51 @@ def test_totals_sum_across_closed_trades():
     assert res.total_realised_gross_usd == pytest.approx(5.0 + (-2.0))
     assert res.total_realised_llm_cost_usd == pytest.approx(1.0)
     assert res.total_realised_net_usd == pytest.approx(3.0 - 1.0)
+
+
+# ---------- Unmatched sells (Codex P1 on PR #79) ----------
+
+
+def test_unmatched_sells_empty_when_all_sells_fifo_match():
+    """Round-trip buy/sell leaves no unmatched residue."""
+    rows = [
+        _trade(activity_id="b1", symbol="A", side="buy", qty=2,
+               fill_price=10.0, fees_usd=0.0, run_id="r1"),
+        _trade(activity_id="s1", symbol="A", side="sell", qty=2,
+               fill_price=12.0, fees_usd=0.0, run_id="r2"),
+    ]
+    res = trades.compute_trades_pnl(rows)
+    assert res.unmatched_sells == []
+
+
+def test_unmatched_sells_records_sell_without_prior_buy():
+    """A sell fill with no open buy lot lands in unmatched_sells —
+    pre-PR-#79 these were silently dropped."""
+    rows = [
+        _trade(activity_id="s1", symbol="A", side="sell", qty=3,
+               fill_price=12.0, fees_usd=0.0, run_id="r1"),
+    ]
+    res = trades.compute_trades_pnl(rows)
+    assert len(res.unmatched_sells) == 1
+    u = res.unmatched_sells[0]
+    assert u.symbol == "A"
+    assert u.qty == pytest.approx(3.0)
+    assert u.fill_price == pytest.approx(12.0)
+    assert u.activity_id == "s1"
+
+
+def test_unmatched_sells_records_leftover_after_partial_match():
+    """Buy 1, sell 3 → 1 unit closes cleanly, 2 units land as
+    unmatched_sells. The closed-trade list captures the 1-unit
+    match, the unmatched_sells list captures the leftover."""
+    rows = [
+        _trade(activity_id="b1", symbol="A", side="buy", qty=1,
+               fill_price=10.0, fees_usd=0.0, run_id="r1"),
+        _trade(activity_id="s1", symbol="A", side="sell", qty=3,
+               fill_price=12.0, fees_usd=0.0, run_id="r2"),
+    ]
+    res = trades.compute_trades_pnl(rows)
+    assert len(res.closed) == 1
+    assert res.closed[0].qty == pytest.approx(1.0)
+    assert len(res.unmatched_sells) == 1
+    assert res.unmatched_sells[0].qty == pytest.approx(2.0)

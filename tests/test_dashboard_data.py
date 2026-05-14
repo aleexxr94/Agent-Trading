@@ -706,6 +706,64 @@ def test_synthetic_balance_custom_starting_balance(tmp_state):
     assert sb.synthetic_balance_usd == pytest.approx(5000.0)
 
 
+def test_synthetic_balance_flags_unmatched_sells(tmp_state):
+    """Codex P1 on PR #79: when trades.jsonl carries sells that
+    don't FIFO-match against a buy (out-of-order sync, manual edit,
+    or genuinely missing buy data), the upstream compute_trades_pnl
+    silently drops them. The synthetic balance can't account for
+    that P&L, so it must surface a warning to the operator rather
+    than silently misrepresent the headline."""
+    state.append_trade({
+        "activity_id": "s1", "alpaca_order_id": "os1", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 2, "fill_price": 100.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-11T13:00:00Z", "run_id": None,
+    })
+    sb = dd.compute_synthetic_balance()
+    assert sb.unmatched_sell_count == 1
+    assert sb.is_integrity_warning is True
+
+
+def test_synthetic_balance_unmatched_sell_not_flagged_when_matched(tmp_state):
+    """A normal buy → sell round trip leaves no unmatched residue.
+    is_integrity_warning is False so the dashboard renders cleanly."""
+    state.append_trade({
+        "activity_id": "b1", "alpaca_order_id": "ob1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 2, "fill_price": 80.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    state.append_trade({
+        "activity_id": "s1", "alpaca_order_id": "os1", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 2, "fill_price": 100.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-11T13:00:00Z", "run_id": None,
+    })
+    sb = dd.compute_synthetic_balance()
+    assert sb.unmatched_sell_count == 0
+    assert sb.is_integrity_warning is False
+
+
+def test_synthetic_balance_partial_unmatched_sell(tmp_state):
+    """Buy 1, sell 2 → 1 unit of the sell can FIFO-match (closing
+    that round trip) and the leftover 1 unit lands in unmatched_sells.
+    The closed trade reflects the 1-unit match; the leftover bumps
+    the integrity counter."""
+    state.append_trade({
+        "activity_id": "b1", "alpaca_order_id": "ob1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 80.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    state.append_trade({
+        "activity_id": "s1", "alpaca_order_id": "os1", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 2, "fill_price": 100.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-11T13:00:00Z", "run_id": None,
+    })
+    sb = dd.compute_synthetic_balance()
+    # The 1-unit match still records a +$20 close.
+    assert sb.closed_gross_pnl_usd == pytest.approx(20.0)
+    # Leftover 1 unit on the sell side surfaces as unmatched.
+    assert sb.unmatched_sell_count == 1
+    assert sb.is_integrity_warning is True
+
+
 # ---------- realized_balance_series ----------
 
 

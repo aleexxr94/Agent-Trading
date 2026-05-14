@@ -359,6 +359,23 @@ if _synth_live.unmarked_open_lots > 0:
         f'— their P&L contribution treated as $0 until marks return.'
         f'</div>'
     )
+# Data-integrity warning: unmatched sell fills in trades.jsonl signal
+# the synthetic balance is missing some P&L. Healthy operation never
+# triggers this (Codex P1 on PR #79). Surface loudly rather than let
+# the headline lie about a number the operator trusts.
+integrity_line = ""
+if _synth_live.is_integrity_warning:
+    integrity_line = (
+        f'<div class="at-hero-sub" style="font-size:0.9rem; '
+        f'color: var(--red-text); font-weight: 600; margin-top: 0.4rem; '
+        f'padding: 0.4rem 0.6rem; background: var(--red-soft); '
+        f'border-radius: 6px;">'
+        f'⚠ {_synth_live.unmatched_sell_count} unmatched sell fill(s) '
+        f'in state/trades.jsonl — synthetic balance may be inaccurate. '
+        f'Inspect the file for sells without matching buys (out-of-order '
+        f'sync, legacy fills, or manual edits).'
+        f'</div>'
+    )
 
 st.markdown(
     f"""
@@ -377,6 +394,7 @@ st.markdown(
           </div>
           {alpaca_line}
           {unmarked_line}
+          {integrity_line}
         </div>
         <div style="text-align:right">
           {_pills_html()}

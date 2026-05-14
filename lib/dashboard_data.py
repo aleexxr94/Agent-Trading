@@ -227,6 +227,14 @@ class SyntheticBalance:
     llm_cost_total_usd: float = 0.0
     trading_fees_total_usd: float = 0.0
     unmarked_open_lots: int = 0
+    # Sell fills that couldn't FIFO-match against an open buy lot.
+    # Healthy operation never produces these (system spec is "no
+    # broker shorts"). Nonzero is a data-integrity signal — the
+    # synthetic balance can't account for those sells' P&L because
+    # the corresponding buys are missing or out of order. Surfaced
+    # for a dashboard warning rather than silently corrupting the
+    # headline. Codex P1 on PR #79.
+    unmatched_sell_count: int = 0
 
     @property
     def synthetic_balance_usd(self) -> float:
@@ -237,6 +245,15 @@ class SyntheticBalance:
             - self.llm_cost_total_usd
             - self.trading_fees_total_usd
         )
+
+    @property
+    def is_integrity_warning(self) -> bool:
+        """True when the synthetic balance may not be trustworthy
+        because the upstream trade log carries unmatched sells. The
+        dashboard surfaces this as a yellow warning band so the
+        operator doesn't read the headline as authoritative without
+        first investigating the data anomaly."""
+        return self.unmatched_sell_count > 0
 
 
 def compute_synthetic_balance(
@@ -270,6 +287,7 @@ def compute_synthetic_balance(
         llm_cost_total_usd=total_token_cost()["cost_usd"],
         trading_fees_total_usd=total_trading_fees_usd(),
         unmarked_open_lots=unmarked,
+        unmatched_sell_count=int(view["totals"].get("unmatched_sell_count", 0)),
     )
 
 
@@ -620,7 +638,20 @@ def trades_pnl_view(marks: dict[str, float] | None = None) -> dict:
             "realised_net_usd": pnl.total_realised_net_usd,
             "closed_count": len(pnl.closed),
             "open_count": len(pnl.open),
+            "unmatched_sell_count": len(pnl.unmatched_sells),
         },
+        # Surfaced for dashboard warnings — sells in trades.jsonl
+        # that couldn't FIFO-match against an open buy lot. Healthy
+        # operation never produces these; nonzero means data loss /
+        # out-of-order sync / manual edit.
+        "unmatched_sells": [
+            {
+                "symbol": u.symbol, "kind": u.kind, "qty": u.qty,
+                "fill_price": u.fill_price, "filled_at": u.filled_at,
+                "activity_id": u.activity_id,
+            }
+            for u in pnl.unmatched_sells
+        ],
     }
 
 
