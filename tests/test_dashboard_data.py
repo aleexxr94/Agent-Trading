@@ -954,6 +954,40 @@ def test_synthetic_balance_hybrid_fees_real_plus_modelled(tmp_state):
     )
 
 
+def test_synthetic_balance_hybrid_fees_skips_modelled_when_broker_unreachable(tmp_state):
+    """Codex P1 on PR #82: when the broker is unreachable
+    (``held_keys=None``), split_positions_by_broker_holdings returns
+    every portfolio.json row as "open" — including positions that
+    may have already closed manually. Charging modelled fees against
+    those would bias the synthetic balance downward by phantom costs
+    during an outage. Require broker holdings confirmation before
+    accumulating modelled fees."""
+    portfolio = {"positions": [{
+        "kind": "etf", "symbol": "TQQQ", "shares": 2,
+        "avg_cost": 80.0, "leverage_factor": 3.0,
+        "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25},
+        "position_pct": 8.0,
+    }]}
+    # held_keys=None simulates a broker outage: try_load_broker_view
+    # couldn't reach Alpaca, so we have a stale portfolio.json but
+    # no way to verify what's actually held.
+    sb = dd.compute_synthetic_balance(
+        marks={"TQQQ": 90.0},
+        portfolio=portfolio,
+        broker_costs={"TQQQ": 80.0},
+        held_keys=None,
+    )
+    assert sb.modelled_open_fees_usd == pytest.approx(0.0), (
+        "broker outage → modelled fees must NOT be accumulated; "
+        "stale portfolio.json rows could include closed positions"
+    )
+    # open_gross still reflects (mark - cost) * qty — the operator
+    # can still see unrealized P&L from cached marks, just not
+    # modelled fee drag.
+    assert sb.open_gross_pnl_usd == pytest.approx(20.0)
+
+
 def test_synthetic_balance_hybrid_fees_no_portfolio_skips_modelled(tmp_state):
     """When callers don't supply a portfolio (e.g. the Realized
     balance card sources closed-only), the modelled component stays

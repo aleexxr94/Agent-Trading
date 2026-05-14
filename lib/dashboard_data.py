@@ -402,7 +402,18 @@ def compute_synthetic_balance(
                 unmarked += 1
             else:
                 open_gross += breakdown.gross_pnl_usd
-            modelled_open_fees += float(breakdown.modelled_costs_usd)
+            # Codex P1 on PR #82: only accumulate modelled fees when
+            # the broker has confirmed which positions are actually
+            # held. With ``held_keys=None`` (broker unreachable),
+            # ``split_positions_by_broker_holdings`` returns every
+            # portfolio.json row as "open" — including any that the
+            # operator may have already closed manually. Charging
+            # modelled fees against those phantom rows would bias
+            # the synthetic balance downward during an outage. When
+            # we can't verify holdings, skip the modelled-fee
+            # contribution rather than risk a misleading deduction.
+            if held_keys is not None:
+                modelled_open_fees += float(breakdown.modelled_costs_usd)
     else:
         # Legacy fallback: derive open_gross from trades.jsonl open
         # lots. Used by tests that exercise compute_synthetic_balance
