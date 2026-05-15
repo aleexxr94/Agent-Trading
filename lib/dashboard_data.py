@@ -1098,9 +1098,17 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
     summaries: list[dict] = []
     for run_dir in run_dirs:
         rid = run_dir.name
+        # Fall back to the run_id timestamp prefix when no artifact
+        # gives us a generated_at — review cycles don't write
+        # portfolio.json (where trade cycles store this), so without
+        # this fallback the Cycles tab renders "in flight" for a
+        # successfully completed review. Format: YYYYMMDDTHHMMSSZ-xxxxxx.
+        rid_ts = ""
+        if len(rid) >= 16 and rid[8] == "T" and rid[15] == "Z":
+            rid_ts = f"{rid[0:4]}-{rid[4:6]}-{rid[6:8]}T{rid[9:11]}:{rid[11:13]}:{rid[13:15]}Z"
         s: dict = {
             "run_id": rid,
-            "generated_at": "",
+            "generated_at": rid_ts,
             "all_cash": None,
             "positions_count": 0,
             "signals_count": 0,
@@ -1125,7 +1133,13 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
             try:
                 p = json.loads(portfolio_path.read_text())
                 if isinstance(p, dict):
-                    s["generated_at"] = p.get("generated_at", "") or ""
+                    # Only override the rid_ts fallback when the
+                    # portfolio's own generated_at is a real value —
+                    # otherwise a missing/null field would wipe our
+                    # fallback and re-trigger the "in flight" render.
+                    portfolio_ts = p.get("generated_at") or ""
+                    if portfolio_ts:
+                        s["generated_at"] = portfolio_ts
                     s["all_cash"] = p.get("all_cash")
                     positions = p.get("positions")
                     s["positions_count"] = len(positions) if isinstance(positions, list) else 0
