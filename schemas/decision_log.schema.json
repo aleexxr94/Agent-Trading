@@ -9,7 +9,8 @@
     "stage": {
       "enum": [
         "market_gate", "signals", "strategist", "chain_lookup",
-        "construct", "critic", "execute", "monitor"
+        "construct", "critic", "execute", "monitor",
+        "review_complete"
       ]
     },
     "model": {"type": "string", "minLength": 1},
@@ -20,9 +21,13 @@
     "cost_usd": {"type": "number", "minimum": 0},
     "started_at": {"type": "string", "format": "date-time"},
     "ended_at": {"type": "string", "format": "date-time"},
-    "status": {"enum": ["ok", "schema_retry", "aborted", "skipped", "skipped_market_closed"]},
+    "status": {"enum": ["ok", "schema_retry", "aborted", "skipped", "skipped_market_closed", "skipped_review_cap"]},
     "risk_warning": {"type": "string", "minLength": 1,
-                      "description": "Mandatory warning string injected by lib/llm.py per spec."}
+                      "description": "Mandatory warning string injected by lib/llm.py per spec."},
+    "cycle_intent": {"enum": ["trade", "review"],
+                      "description": "Which pipeline branch ran. trade = full pipeline (default for legacy rows); review = after-hours reflection (signals + strategist + meta only, no orders)."},
+    "intent_source": {"enum": ["cli", "env", "file", "default"],
+                       "description": "Where the cycle_intent was loaded from. file = persisted via prior cycle's next_run.json; cli/env = manual operator override; default = no signal anywhere."}
   },
   "required": ["run_id", "stage", "model", "inputs_hash", "output_ref",
                 "prompt_cache_hit_pct", "cost_usd",

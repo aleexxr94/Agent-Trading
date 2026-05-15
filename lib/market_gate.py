@@ -126,5 +126,9 @@ def write_closed_artifacts(run_id: str, ms: MarketState) -> dict:
             "No LLM calls billed; no orders submitted."
         ),
         "market_closed": True,
+        # Next cycle defaults to trade — when markets re-open the agent
+        # should pick up with the full pipeline. Review picks come from
+        # the meta-scheduler, not from market-closed bypasses.
+        "cycle_intent": "trade",
     }
     return next_run

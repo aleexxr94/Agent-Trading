@@ -953,9 +953,14 @@ with tabs[1]:
             unsafe_allow_html=True,
         )
         for s in summaries:
-            # Status pill (matches the hero-row pills): orange for all-cash,
-            # green for positions, neutral for in-flight runs missing data.
-            if s["all_cash"] is True:
+            # Status pill (matches the hero-row pills). Review cycles get
+            # their own pill since they're a fundamentally different kind
+            # of cycle — no positions, no orders, just strategist
+            # reflection. Showing "all-cash" or "no portfolio" would be
+            # misleading.
+            if s.get("cycle_intent") == "review":
+                status_html = '<span class="at-pill orders-off">📋 review</span>'
+            elif s["all_cash"] is True:
                 status_html = '<span class="at-pill allcash">💰 all-cash</span>'
             elif s["all_cash"] is False and s["positions_count"] > 0:
                 status_html = f'<span class="at-pill active">▶ {s["positions_count"]} positions</span>'

@@ -1446,6 +1446,45 @@ def test_load_run_summaries_tolerates_top_level_non_dict(tmp_state):
     assert out[0]["signals_count"] == 0
 
 
+def test_load_run_summaries_defaults_cycle_intent_to_trade(tmp_state):
+    """Legacy runs (decision rows lack cycle_intent) default to 'trade'
+    in the summary so the Cycles tab doesn't render '📋 review' for
+    pre-feature history."""
+    rid = "20260510T120000Z-legacy"
+    (state.RUNS_DIR / rid).mkdir(parents=True)
+    out = dd.load_run_summaries()
+    assert len(out) == 1
+    assert out[0]["cycle_intent"] == "trade"
+
+
+def test_load_run_summaries_surfaces_review_intent(tmp_state):
+    """Review cycles tag every decision row with cycle_intent='review';
+    the summary reads the first matching row to pick the run's intent."""
+    rid = "20260512T210000Z-review"
+    rdir = state.RUNS_DIR / rid
+    rdir.mkdir(parents=True)
+    # Review cycles write review.json (not view.json).
+    state.write_json(rdir / "signals.json", {"tickers": []})
+    state.write_json(rdir / "review.json", {
+        "regime": "neutral", "candidates": [],
+    })
+    state.append_decision({
+        "run_id": rid, "stage": "review_complete",
+        "model": "local-deterministic",
+        "inputs_hash": "a" * 32, "output_ref": "review.json",
+        "prompt_cache_hit_pct": 0.0, "cost_usd": 0.0,
+        "started_at": "2026-05-12T21:00:00Z",
+        "ended_at": "2026-05-12T21:00:01Z",
+        "status": "ok", "risk_warning": "test",
+        "cycle_intent": "review", "intent_source": "file",
+    })
+    out = dd.load_run_summaries()
+    assert len(out) == 1
+    assert out[0]["cycle_intent"] == "review"
+    # And the review.json fallback populated the regime field.
+    assert out[0]["regime"] == "neutral"
+
+
 def test_load_run_summaries_tolerates_missing_artifacts(tmp_state):
     """A run dir that crashed mid-stage may be missing some artifacts. The
     summary should still come back populated for whatever was written."""
