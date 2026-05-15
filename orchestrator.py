@@ -180,6 +180,11 @@ def _count_autonomous_reviews_today() -> int:
     driven and don't burn the cap. We look at the synthetic
     ``review_complete`` decision row (one per review cycle) so each
     cycle is counted exactly once.
+
+    Cap-skip rows (status="skipped_review_cap") are excluded so a
+    blocked attempt doesn't itself burn budget — otherwise raising
+    MAX_REVIEW_CYCLES_PER_DAY mid-day would still find the meter
+    inflated by the failed attempts (Codex P2 on PR #83).
     """
     if not state.DECISIONS_LOG.exists():
         return 0
@@ -193,6 +198,8 @@ def _count_autonomous_reviews_today() -> int:
         except json.JSONDecodeError:
             continue
         if row.get("stage") != "review_complete":
+            continue
+        if row.get("status") != "ok":
             continue
         if row.get("cycle_intent") != "review":
             continue
@@ -421,6 +428,40 @@ def _account_nav(ctx: StageContext) -> float:
         except Exception:
             pass
     return 2500.0  # $2.5k paper baseline
+
+
+def _broker_portfolio_summary_for_meta(ctx: StageContext) -> dict:
+    """Compact account summary fed to the meta-scheduler when the cycle
+    didn't produce a constructed portfolio (review path).
+
+    Reads real broker holdings + equity + cash so the cadence + intent
+    decision after a review reflects what we actually hold. Passing a
+    flat placeholder ({positions: [], all_cash: True, nav: 0}) would
+    push meta into the "all-cash, calm" 6-12h bucket exactly when an
+    open option or risk-sensitive position actually needs near-term
+    monitoring (Codex P1 on PR #83).
+
+    Returns the shape `_compute_next_run_at` reads:
+      {positions, all_cash, nav_usd, cash_buffer_pct}
+
+    Defensive: broker errors fall back to all-cash + spec NAV. Dry-run
+    is short-circuited upstream so this isn't exercised there.
+    """
+    positions = _current_positions_summary(ctx)
+    nav = _account_nav(ctx)
+    cash_usd = 0.0
+    if ctx.broker is not None and not ctx.dry_run:
+        try:
+            cash_usd = ctx.broker.get_account().cash_usd
+        except Exception:
+            cash_usd = 0.0
+    cash_pct = (cash_usd / nav * 100.0) if nav > 0 else 100.0
+    return {
+        "positions": positions,
+        "all_cash": len(positions) == 0,
+        "nav_usd": nav,
+        "cash_buffer_pct": cash_pct,
+    }
 
 
 def _current_positions_summary(ctx: StageContext) -> list[dict]:
@@ -995,12 +1036,14 @@ def _run_pipeline_review(*, ctx: StageContext, dry_run: bool) -> dict:
     )
 
     # ----- Meta-scheduler: pick next-run window + intent for next cycle.
-    # No portfolio to feed in — pass an empty placeholder. The review
-    # path doesn't construct a portfolio by design.
+    # Feed real broker holdings (not a flat placeholder) so meta's
+    # cadence + intent decision reflects what we actually hold. A
+    # placeholder would push meta into the "all-cash" bucket exactly
+    # when a held option / risk-sensitive position needs near-term
+    # monitoring after the reflection cycle.
     next_at, meta_rationale, next_intent = _compute_next_run_at(
         ctx=ctx,
-        portfolio={"positions": [], "all_cash": True, "nav_usd": 0.0,
-                   "cash_buffer_pct": 100.0},
+        portfolio=_broker_portfolio_summary_for_meta(ctx),
         view=review_payload,
     )
     next_run = {
@@ -1067,10 +1110,16 @@ def run_pipeline(
         cli_intent=cli_intent, ignore_cap=ignore_cap,
     )
 
+    # ignore_cap is an operator-only override. The docstring promises it
+    # only applies to CLI-driven reviews; tighten the gate here so that
+    # `--ignore-cap` without `--intent=review` cannot bypass the cap on
+    # a file-driven (autonomous) review pick (Codex P2 on PR #83).
+    effective_ignore_cap = ignore_cap and intent_source == "cli"
+
     # Frequency cap: if meta-scheduler picked review but the daily cap
     # is hit, skip + advance next_run. Only intent_source="file" rows
     # count (autonomous cycles); operator-driven cli/env intents bypass.
-    if cycle_intent == "review" and intent_source == "file" and not ignore_cap:
+    if cycle_intent == "review" and intent_source == "file" and not effective_ignore_cap:
         cap = _max_review_cycles_per_day()
         today_count = _count_autonomous_reviews_today()
         if today_count >= cap:

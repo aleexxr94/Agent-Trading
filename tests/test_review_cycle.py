@@ -363,6 +363,109 @@ def test_review_cycle_return_shape_discriminated(tmp_state):
     assert "next_run" in result
 
 
+def test_review_meta_sees_real_broker_holdings(tmp_state, monkeypatch):
+    """Codex P1: the review path used to feed meta a flat placeholder
+    portfolio ({positions:[], all_cash:True, nav:0}) regardless of
+    actual holdings, pushing meta into the wrong cadence bucket when
+    real positions were held. Confirm the broker summary is wired in.
+    """
+    monkeypatch.setattr(orchestrator.llm, "structured_call", _fake_strategist_call)
+    fixtures_dir = Path(__file__).parent / "fixtures"
+    monkeypatch.setattr(
+        orchestrator.signals, "compute_signals",
+        lambda *, run_id, symbols=None: json.loads((fixtures_dir / "signals.json").read_text()),
+    )
+
+    captured_portfolio: dict = {}
+
+    def _spy_meta(*, ctx, portfolio, view):
+        captured_portfolio.update(portfolio)
+        return "2026-05-16T13:30:00Z", "stub", "trade"
+
+    monkeypatch.setattr(orchestrator, "_compute_next_run_at", _spy_meta)
+
+    class _Account:
+        cash_usd = 700.0
+        equity_usd = 2800.0
+
+    class _Position:
+        symbol = "TQQQ"
+        qty = 5.0
+        avg_cost = 70.0
+        market_value = 360.0
+        unrealized_pl_usd = 10.0
+        asset_class = "us_equity"
+
+    class _StubBroker:
+        def get_clock(self): return None
+        def get_account(self): return _Account()
+        def get_positions(self): return [_Position()]
+
+    orchestrator.run_pipeline(
+        dry_run=False, broker=_StubBroker(), cli_intent="review",
+    )
+
+    assert captured_portfolio.get("all_cash") is False, (
+        "meta should see all_cash=False when broker reports positions"
+    )
+    assert len(captured_portfolio.get("positions", [])) == 1
+    assert captured_portfolio.get("nav_usd") == 2800.0
+    # cash_buffer_pct = 700/2800 * 100 = 25.0
+    assert captured_portfolio.get("cash_buffer_pct") == pytest.approx(25.0)
+
+
+def test_ignore_cap_without_cli_intent_does_not_bypass(tmp_state, monkeypatch):
+    """Codex P2: ignore_cap=True from somewhere other than CLI
+    (--intent=review) must NOT bypass the daily cap. The intended
+    boundary is operator-attended override only — unattended runs
+    can't escape the safety/cost rail just by passing the flag.
+    """
+    monkeypatch.setenv("MAX_REVIEW_CYCLES_PER_DAY", "0")
+    # Set up a file-driven review intent.
+    state.write_json(state.NEXT_RUN, {
+        "run_id": "prior", "next_run_at": state.utcnow_iso(),
+        "rationale": "seed", "cycle_intent": "review",
+    })
+
+    # ignore_cap=True but cli_intent=None → intent_source resolves to
+    # "file", so the override must NOT apply.
+    result = orchestrator.run_pipeline(
+        dry_run=True, cli_intent=None, ignore_cap=True,
+    )
+    assert result.get("review_cap_skipped") is True, (
+        "ignore_cap should be ignored when intent_source is not 'cli'"
+    )
+
+
+def test_skipped_review_cap_row_does_not_count_toward_budget(tmp_state):
+    """Codex P2: a previous cap-skipped attempt must NOT inflate
+    today's review counter. Otherwise raising MAX_REVIEW_CYCLES_PER_DAY
+    mid-day would still find the meter pinned by failed attempts.
+    """
+    today_iso = state.utcnow_iso()
+    # One successful + one cap-skipped, both file-driven.
+    state.append_decision({
+        "run_id": "ok-1", "stage": "review_complete",
+        "model": "local-deterministic", "inputs_hash": "a" * 32,
+        "output_ref": "review.json",
+        "prompt_cache_hit_pct": 0.0, "cost_usd": 0.05,
+        "started_at": today_iso, "ended_at": today_iso,
+        "status": "ok", "risk_warning": "test",
+        "cycle_intent": "review", "intent_source": "file",
+    })
+    state.append_decision({
+        "run_id": "skip-1", "stage": "review_complete",
+        "model": "local-deterministic", "inputs_hash": "a" * 32,
+        "output_ref": "next_run.json",
+        "prompt_cache_hit_pct": 0.0, "cost_usd": 0.0,
+        "started_at": today_iso, "ended_at": today_iso,
+        "status": "skipped_review_cap", "risk_warning": "test",
+        "cycle_intent": "review", "intent_source": "file",
+    })
+    # Counter should report 1 (the OK row), not 2.
+    assert orchestrator._count_autonomous_reviews_today() == 1
+
+
 def test_trade_cycle_decision_rows_carry_trade_intent(tmp_state):
     """Regression: trade cycles MUST stamp cycle_intent=trade on every
     decision row. If they stamped 'review' or omitted it, audit could
