@@ -369,6 +369,12 @@ def test_review_meta_sees_real_broker_holdings(tmp_state, monkeypatch):
     actual holdings, pushing meta into the wrong cadence bucket when
     real positions were held. Confirm the broker summary is wired in.
     """
+    # Force the broker-NAV code path. _account_nav prefers VIRTUAL_NAV_USD
+    # when set, and the VPS sets that env var to enforce the $2,500 spec
+    # target — without this clear, the env leaks into the test and we'd
+    # assert against the broker stub's equity but read the env override.
+    monkeypatch.delenv("VIRTUAL_NAV_USD", raising=False)
+
     monkeypatch.setattr(orchestrator.llm, "structured_call", _fake_strategist_call)
     fixtures_dir = Path(__file__).parent / "fixtures"
     monkeypatch.setattr(
