@@ -1098,13 +1098,25 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
     summaries: list[dict] = []
     for run_dir in run_dirs:
         rid = run_dir.name
-        # Fall back to the run_id timestamp prefix when no artifact
-        # gives us a generated_at — review cycles don't write
-        # portfolio.json (where trade cycles store this), so without
-        # this fallback the Cycles tab renders "in flight" for a
-        # successfully completed review. Format: YYYYMMDDTHHMMSSZ-xxxxxx.
+        # Fall back to the run_id timestamp prefix when a completed
+        # cycle's own artifact doesn't carry generated_at — review
+        # cycles don't write portfolio.json (where trade cycles store
+        # this), so without this fallback the Cycles tab renders "in
+        # flight" for a successfully completed review.
+        #
+        # Gate on a completion marker (portfolio.json for trade OR
+        # review.json for review). A run dir with neither is
+        # in-flight or aborted — leave generated_at empty so the
+        # Cycles tab still shows "in flight", which is a useful
+        # operational signal (Codex P2 on PR #85).
+        #
+        # Format: YYYYMMDDTHHMMSSZ-xxxxxx.
+        completed = (
+            (run_dir / "portfolio.json").exists()
+            or (run_dir / "review.json").exists()
+        )
         rid_ts = ""
-        if len(rid) >= 16 and rid[8] == "T" and rid[15] == "Z":
+        if completed and len(rid) >= 16 and rid[8] == "T" and rid[15] == "Z":
             rid_ts = f"{rid[0:4]}-{rid[4:6]}-{rid[6:8]}T{rid[9:11]}:{rid[11:13]}:{rid[13:15]}Z"
         s: dict = {
             "run_id": rid,
