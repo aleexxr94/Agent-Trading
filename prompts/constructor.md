@@ -73,6 +73,35 @@ job:
   them disproportionately attractive (e.g. UVXY long with confidence
   0.45 makes sense in a `vol_elevated` regime).
 
+## Harvesting winning positions
+
+Before deciding which strategist candidates to take, look at
+`current_positions` for any position with significant unrealized gain.
+A position is "winning" if its unrealized P&L is **≥ 20% of cost basis**
+(compute from `unrealized_pl_usd / (avg_cost × qty)` for ETFs; same
+shape for options with premium-per-contract).
+
+**Default behaviour for winners: drop them from the target portfolio.**
+The strategist's next-cycle confidence on that name is your tiebreaker
+— if (and only if) the strategist re-endorses this exact
+`(symbol, instrument_kind)` pair this cycle with **confidence ≥ 0.8**,
+you may keep the position; otherwise harvest it (let the execute stage
+sell it for cash). Document the harvest in `construction_rationale`
+(e.g. "harvested SOXL at +28% unrealized; strategist confidence 0.76
+below 0.80 retention floor").
+
+**Why:** profitable positions where strategist conviction has softened
+are exactly the ones to bank. Riding 20%+ gains without re-endorsement
+turns realized profit into round-trip exposure. The 0.8 floor is
+intentionally a high bar — the strategist normally surfaces 0.6–0.75
+candidates; clearing 0.8 means "this thesis is still acutely alive,
+let it run."
+
+**Side effect to expect:** winners can rotate weekly; some round-trip
+slippage in exchange for compounding realised gains. Paired with the
+25% kill-loss cap on the downside, each position is bracketed into a
+roughly [-25%, +20%] band by default.
+
 ## Order direction safety
 
 You only ever output LONG positions. Bearish theses are expressed as:
