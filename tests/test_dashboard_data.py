@@ -1457,6 +1457,69 @@ def test_load_run_summaries_defaults_cycle_intent_to_trade(tmp_state):
     assert out[0]["cycle_intent"] == "trade"
 
 
+def test_load_run_summaries_review_cycle_timestamp_falls_back_to_run_id(tmp_state):
+    """Review cycles don't write portfolio.json, so generated_at would
+    otherwise be empty and the Cycles tab would render 'in flight' for
+    a completed review. Fall back to the run_id timestamp prefix
+    (YYYYMMDDTHHMMSSZ-xxxxxx → 2026-05-15T10:50:12Z)."""
+    rid = "20260515T105012Z-1709c2"
+    rdir = state.RUNS_DIR / rid
+    rdir.mkdir(parents=True)
+    # review.json is the completion marker for review cycles.
+    state.write_json(rdir / "review.json", {"regime": "neutral", "candidates": []})
+    out = dd.load_run_summaries()
+    assert len(out) == 1
+    assert out[0]["generated_at"] == "2026-05-15T10:50:12Z"
+
+
+def test_load_run_summaries_in_flight_run_stays_in_flight(tmp_state):
+    """Codex P2: a run dir with neither portfolio.json nor review.json
+    is in-flight or aborted. generated_at must stay empty so the
+    Cycles tab still renders 'in flight' — that's the operational
+    signal an operator relies on to spot stuck cycles."""
+    rid = "20260515T105012Z-stalled"
+    rdir = state.RUNS_DIR / rid
+    rdir.mkdir(parents=True)
+    # Only signals.json written — cycle never produced a portfolio or
+    # review payload (crashed / aborted / still running).
+    state.write_json(rdir / "signals.json", {"tickers": []})
+    out = dd.load_run_summaries()
+    assert len(out) == 1
+    assert out[0]["generated_at"] == "", (
+        "in-flight/aborted runs must keep generated_at empty so the "
+        "Cycles tab renders 'in flight'"
+    )
+
+
+def test_load_run_summaries_portfolio_generated_at_overrides_rid_fallback(tmp_state):
+    """When portfolio.json carries its own generated_at (trade cycles),
+    that wins over the rid timestamp fallback — it's more precise."""
+    rid = "20260515T105012Z-1709c2"
+    rdir = state.RUNS_DIR / rid
+    rdir.mkdir(parents=True)
+    state.write_json(rdir / "portfolio.json", {
+        "run_id": rid, "generated_at": "2026-05-15T10:50:30Z",
+        "all_cash": False, "positions": [],
+    })
+    out = dd.load_run_summaries()
+    assert out[0]["generated_at"] == "2026-05-15T10:50:30Z"
+
+
+def test_load_run_summaries_portfolio_missing_generated_at_keeps_rid_fallback(tmp_state):
+    """Trade cycle whose portfolio.json lacks generated_at (defensive
+    path for malformed LLM output) must still surface a timestamp on
+    the Cycles tab via the rid fallback."""
+    rid = "20260515T105012Z-1709c2"
+    rdir = state.RUNS_DIR / rid
+    rdir.mkdir(parents=True)
+    state.write_json(rdir / "portfolio.json", {
+        "run_id": rid, "all_cash": False, "positions": [],
+        # no generated_at
+    })
+    out = dd.load_run_summaries()
+    assert out[0]["generated_at"] == "2026-05-15T10:50:12Z"
+
+
 def test_load_run_summaries_surfaces_review_intent(tmp_state):
     """Review cycles tag every decision row with cycle_intent='review';
     the summary reads the first matching row to pick the run's intent."""
