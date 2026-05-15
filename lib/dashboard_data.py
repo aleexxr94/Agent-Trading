@@ -1061,7 +1061,7 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
           critic_accept,
           construction_rationale, all_cash_rationale,
           next_run_at, next_run_rationale,
-          cost_usd
+          cost_usd, cycle_intent
     """
     if not state.RUNS_DIR.exists():
         return []
@@ -1077,6 +1077,23 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
         rid = r.get("run_id")
         if rid:
             cost_by_run[rid] = cost_by_run.get(rid, 0.0) + (r.get("cost_usd") or 0.0)
+
+    # cycle_intent per run, read from decisions.jsonl (one row per stage,
+    # all rows for a run carry the same intent). Default "trade" handles
+    # legacy runs written before the field existed.
+    intent_by_run: dict[str, str] = {}
+    if state.DECISIONS_LOG.exists():
+        for line in state.DECISIONS_LOG.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rid = row.get("run_id")
+            intent = row.get("cycle_intent")
+            if rid and intent and rid not in intent_by_run:
+                intent_by_run[rid] = intent
 
     summaries: list[dict] = []
     for run_dir in run_dirs:
@@ -1096,6 +1113,7 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
             "next_run_at": "",
             "next_run_rationale": "",
             "cost_usd": cost_by_run.get(rid, 0.0),
+            "cycle_intent": intent_by_run.get(rid, "trade"),
         }
 
         # portfolio.json — the headline result + rationales.
@@ -1128,7 +1146,14 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
                 s["signals_count"] = len(tickers) if isinstance(tickers, list) else 0
             except (json.JSONDecodeError, OSError, TypeError):
                 pass
+        # Trade cycles write view.json; review cycles write review.json
+        # (same schema). Either is acceptable for surfacing the regime +
+        # candidate count on the Cycles tab.
         view_path = run_dir / "view.json"
+        if not view_path.exists():
+            review_path = run_dir / "review.json"
+            if review_path.exists():
+                view_path = review_path
         if view_path.exists():
             try:
                 v = json.loads(view_path.read_text())

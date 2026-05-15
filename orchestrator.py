@@ -115,6 +115,117 @@ class StageContext:
     run_id: str
     dry_run: bool
     broker: Broker | None
+    # Which pipeline branch is running. "trade" = full pipeline (default,
+    # back-compat for legacy callers that don't pass this field). "review"
+    # = after-hours reflection: signals + strategist + meta-scheduler
+    # only, no construct / sanity / execute. Defense in depth — the
+    # run_pipeline branch is the primary safety boundary; this field
+    # rides on every decision row so audit can prove what ran.
+    cycle_intent: str = "trade"
+    # Where the cycle_intent was loaded from. Affects the daily review
+    # cap: only `intent_source="file"` rows count toward the cap, so an
+    # operator's `--intent=review` doesn't burn the autonomous-review
+    # budget.
+    intent_source: str = "default"
+
+
+# Daily-review-frequency cap defaults. Operator can override via env.
+DEFAULT_MAX_REVIEW_CYCLES_PER_DAY = 2
+
+
+def _max_review_cycles_per_day() -> int:
+    """Env-driven daily cap on autonomous review cycles. CLI overrides
+    (--ignore-cap) bypass this entirely; only `intent_source="file"`
+    cycles are subject to it."""
+    try:
+        return int(os.environ.get("MAX_REVIEW_CYCLES_PER_DAY", DEFAULT_MAX_REVIEW_CYCLES_PER_DAY))
+    except ValueError:
+        return DEFAULT_MAX_REVIEW_CYCLES_PER_DAY
+
+
+def _load_cycle_intent(
+    *, cli_intent: str | None, ignore_cap: bool,
+) -> tuple[str, str]:
+    """Resolve the cycle intent for THIS run with precedence:
+      CLI > env > prior next_run.json > "trade".
+
+    Returns (intent, source). `source` tells the cap-enforcement path
+    whether the intent was operator-driven (cli/env, exempt from the
+    daily review cap) or autonomous (file/default, subject to the cap).
+
+    Anything we can't parse cleanly falls back to "trade" — review is
+    the cheaper but more opinionated path, so when in doubt run the
+    full pipeline.
+    """
+    if cli_intent in ("trade", "review"):
+        return cli_intent, "cli"
+    env_intent = os.environ.get("CYCLE_INTENT")
+    if env_intent in ("trade", "review"):
+        return env_intent, "env"
+    if state.NEXT_RUN.exists():
+        try:
+            nr = json.loads(state.NEXT_RUN.read_text(encoding="utf-8"))
+            file_intent = nr.get("cycle_intent")
+            if file_intent in ("trade", "review"):
+                return file_intent, "file"
+        except (json.JSONDecodeError, OSError):
+            pass
+    return "trade", "default"
+
+
+def _count_autonomous_reviews_today() -> int:
+    """Count review cycles run today (UTC) whose intent came from
+    next_run.json. Only `intent_source="file"` rows count — manual
+    `--intent=review` and `CYCLE_INTENT=review` cycles are operator-
+    driven and don't burn the cap. We look at the synthetic
+    ``review_complete`` decision row (one per review cycle) so each
+    cycle is counted exactly once.
+
+    Cap-skip rows (status="skipped_review_cap") are excluded so a
+    blocked attempt doesn't itself burn budget — otherwise raising
+    MAX_REVIEW_CYCLES_PER_DAY mid-day would still find the meter
+    inflated by the failed attempts (Codex P2 on PR #83).
+    """
+    if not state.DECISIONS_LOG.exists():
+        return 0
+    today = state.utcnow().date().isoformat()
+    n = 0
+    for line in state.DECISIONS_LOG.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("stage") != "review_complete":
+            continue
+        if row.get("status") != "ok":
+            continue
+        if row.get("cycle_intent") != "review":
+            continue
+        if row.get("intent_source") != "file":
+            continue
+        if not (row.get("started_at") or "").startswith(today):
+            continue
+        n += 1
+    return n
+
+
+def _next_run_at_after_review_cap(broker: Broker | None) -> str:
+    """When the daily review cap blocks an autonomous review pick,
+    advance next_run to the broker-reported next market open if we have
+    it, else 6 hours out — the cheapest fallback that keeps the
+    scheduler firing without burning a slot on another review attempt.
+    """
+    from datetime import timedelta
+    if broker is not None:
+        try:
+            clock = broker.get_clock()
+            if clock is not None and clock.next_open:
+                return clock.next_open
+        except Exception:
+            pass
+    return (state.utcnow() + timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ----- per-stage runners -----
@@ -319,6 +430,40 @@ def _account_nav(ctx: StageContext) -> float:
     return 2500.0  # $2.5k paper baseline
 
 
+def _broker_portfolio_summary_for_meta(ctx: StageContext) -> dict:
+    """Compact account summary fed to the meta-scheduler when the cycle
+    didn't produce a constructed portfolio (review path).
+
+    Reads real broker holdings + equity + cash so the cadence + intent
+    decision after a review reflects what we actually hold. Passing a
+    flat placeholder ({positions: [], all_cash: True, nav: 0}) would
+    push meta into the "all-cash, calm" 6-12h bucket exactly when an
+    open option or risk-sensitive position actually needs near-term
+    monitoring (Codex P1 on PR #83).
+
+    Returns the shape `_compute_next_run_at` reads:
+      {positions, all_cash, nav_usd, cash_buffer_pct}
+
+    Defensive: broker errors fall back to all-cash + spec NAV. Dry-run
+    is short-circuited upstream so this isn't exercised there.
+    """
+    positions = _current_positions_summary(ctx)
+    nav = _account_nav(ctx)
+    cash_usd = 0.0
+    if ctx.broker is not None and not ctx.dry_run:
+        try:
+            cash_usd = ctx.broker.get_account().cash_usd
+        except Exception:
+            cash_usd = 0.0
+    cash_pct = (cash_usd / nav * 100.0) if nav > 0 else 100.0
+    return {
+        "positions": positions,
+        "all_cash": len(positions) == 0,
+        "nav_usd": nav,
+        "cash_buffer_pct": cash_pct,
+    }
+
+
 def _current_positions_summary(ctx: StageContext) -> list[dict]:
     """Compact broker-position summary, fed to strategist + constructor
     so they can reason about current state vs target.
@@ -465,8 +610,12 @@ def _check_cycle_dedup(signals_out: dict, current_positions: list[dict]) -> dict
     return {"portfolio": portfolio}
 
 
-def _write_dedup_next_run(rid: str, *, portfolio: dict) -> dict:
-    """Build + persist a minimal next_run.json on a dedup-skipped cycle."""
+def _write_dedup_next_run(rid: str, *, portfolio: dict, ctx: StageContext) -> dict:
+    """Build + persist a minimal next_run.json on a dedup-skipped cycle.
+
+    Dedup only fires on trade cycles (review path skips dedup entirely),
+    so cycle_intent on the persisted next_run is "trade".
+    """
     next_at = _default_next_run_at(portfolio)
     next_run = {
         "run_id": rid,
@@ -477,6 +626,7 @@ def _write_dedup_next_run(rid: str, *, portfolio: dict) -> dict:
             "construct + execute; cached portfolio retained."
         ),
         "dedup_skipped": True,
+        "cycle_intent": "trade",
     }
     state.write_json(state.run_dir(rid) / "next_run.json", next_run)
     state.write_json(state.NEXT_RUN, next_run)
@@ -493,6 +643,8 @@ def _write_dedup_next_run(rid: str, *, portfolio: dict) -> dict:
         "ended_at": state.utcnow_iso(),
         "status": "skipped",
         "risk_warning": RISK_WARNING,
+        "cycle_intent": ctx.cycle_intent,
+        "intent_source": ctx.intent_source,
     })
     return next_run
 
@@ -576,24 +728,50 @@ META_BOUND_TOLERANCE_SECONDS = 30.0
 
 def _compute_next_run_at(
     *, ctx: StageContext, portfolio: dict, view: dict,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """Ask the orchestrator-meta agent for a regime-adaptive cadence.
 
-    Returns (next_run_at_iso, rationale). On any failure falls back to
-    `_default_next_run_at(portfolio)` with an explanatory rationale.
+    Returns (next_run_at_iso, rationale, cycle_intent_for_next). On any
+    failure falls back to `_default_next_run_at(portfolio)` with an
+    explanatory rationale and `cycle_intent="trade"` so safety defaults
+    to the full pipeline when the meta call can't be trusted.
+
+    `cycle_intent_for_next` ∈ {"trade","review"} tells the NEXT cycle
+    which branch to take. The meta call gets market-clock state +
+    today's review count + per-day cap as context so it can pick
+    "review" only at sensible times (post-close reflection) and only
+    when budget remains.
     """
     if ctx.dry_run:
-        return _default_next_run_at(portfolio), "dry-run: heuristic only"
+        return _default_next_run_at(portfolio), "dry-run: heuristic only", "trade"
 
     from datetime import datetime, timezone
     cfg = stages.orchestrator_meta()
     now = state.utcnow()
     nav_history = state.read_nav_history(limit=3)
 
+    # Market-clock + review-budget context for the meta-scheduler.
+    market_is_open = True
+    next_open = None
+    if ctx.broker is not None:
+        try:
+            clock = ctx.broker.get_clock()
+            if clock is not None:
+                market_is_open = bool(clock.is_open)
+                next_open = clock.next_open or None
+        except Exception:
+            pass
+    reviews_today = _count_autonomous_reviews_today()
+    review_cap = _max_review_cycles_per_day()
+    review_budget_remaining = max(0, review_cap - reviews_today)
+
     user_msg = {
         "role": "user",
         "content": (
             f"Current UTC: {state.utcnow_iso()}\n"
+            f"Market clock: is_open={market_is_open}, next_open={next_open}\n"
+            f"Today's autonomous review cycles: {reviews_today}/{review_cap} "
+            f"(remaining budget: {review_budget_remaining})\n"
             f"Portfolio summary:\n"
             f"  positions: {len(portfolio.get('positions', []))}\n"
             f"  all_cash: {portfolio.get('all_cash', False)}\n"
@@ -602,7 +780,10 @@ def _compute_next_run_at(
             f"Strategist regime: {view.get('regime', 'unknown')}\n"
             f"Recent NAV history (last {len(nav_history)} rows):\n"
             f"  {json.dumps(nav_history, separators=(',', ':'))}\n\n"
-            "Choose the next-run window. Return JSON only."
+            "Choose the next-run window AND the cycle_intent for it. "
+            "review = signals + strategist only, no orders, ~$0.05 cost; "
+            "use for post-close reflection. trade = full pipeline. "
+            "Return JSON only."
         ),
     }
     try:
@@ -619,12 +800,12 @@ def _compute_next_run_at(
         ))
         payload = json.loads(llm.strip_markdown_fences(res.raw_text))
     except Exception as e:
-        return _default_next_run_at(portfolio), f"meta call failed ({type(e).__name__}); using heuristic"
+        return _default_next_run_at(portfolio), f"meta call failed ({type(e).__name__}); using heuristic", "trade"
 
     try:
         at = datetime.strptime(payload["next_run_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except Exception:
-        return _default_next_run_at(portfolio), "meta returned malformed next_run_at; using heuristic"
+        return _default_next_run_at(portfolio), "meta returned malformed next_run_at; using heuristic", "trade"
 
     delta_seconds = (at - now).total_seconds()
     min_seconds = META_MIN_HOURS * 3600 - META_BOUND_TOLERANCE_SECONDS
@@ -634,10 +815,22 @@ def _compute_next_run_at(
             f"meta returned out-of-bounds cadence ({delta_seconds/3600:.2f}h, "
             f"allowed {META_MIN_HOURS}-{META_MAX_HOURS}h ±{META_BOUND_TOLERANCE_SECONDS:g}s); "
             f"using heuristic"
-        )
+        ), "trade"
 
-    rationale = (payload.get("rationale") or "")[:300]
-    return payload["next_run_at"], f"orchestrator-meta: {rationale}"
+    # Pull cycle_intent from the meta output. Defaults to "trade" when
+    # missing or invalid — safer to run the full pipeline than to
+    # accidentally skip orders. If the meta would burn the cap, fall
+    # back to "trade" with an explanatory note in the rationale.
+    next_intent = payload.get("cycle_intent")
+    if next_intent not in ("trade", "review"):
+        next_intent = "trade"
+    if next_intent == "review" and review_budget_remaining <= 0:
+        next_intent = "trade"
+        rationale_suffix = " (meta picked review but daily cap exhausted; downgraded to trade)"
+    else:
+        rationale_suffix = ""
+    rationale = (payload.get("rationale") or "")[:300] + rationale_suffix
+    return payload["next_run_at"], f"orchestrator-meta: {rationale}", next_intent
 
 
 def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) -> dict:
@@ -650,13 +843,14 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
     single sell). Closes are submitted before opens to free up cash.
     """
     view = view or {"candidates": []}
-    next_at, meta_rationale = _compute_next_run_at(
+    next_at, meta_rationale, next_intent = _compute_next_run_at(
         ctx=ctx, portfolio=portfolio, view=view,
     )
     next_run = {
         "run_id": ctx.run_id,
         "next_run_at": next_at,
         "rationale": meta_rationale,
+        "cycle_intent": next_intent,
     }
     from lib import orders
     next_run["orders_enabled"] = orders.is_enabled()
@@ -786,16 +980,195 @@ def _run_stage(
         "ended_at": state.utcnow_iso(),
         "status": "ok",
         "risk_warning": RISK_WARNING,
+        "cycle_intent": ctx.cycle_intent,
+        "intent_source": ctx.intent_source,
     })
     return output
 
 
-def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | None = None) -> dict:
+def _run_pipeline_review(*, ctx: StageContext, dry_run: bool) -> dict:
+    """Review-only pipeline branch: signals + strategist + meta only.
+
+    No market gate (the whole point: review runs after close). No
+    construct, no critic, no sanity, no execute → no orders, ever. The
+    strategist's output goes to ``review.json`` (not view.json) so it
+    doesn't pollute ``_recent_pnl_history``'s trade-cycle drift loop.
+
+    Dedup hash + NAV history + current_portfolio.json are NOT updated
+    on a review cycle — only trade cycles record cycle-over-cycle
+    state. This keeps a review followed by an unchanged-signals trade
+    cycle from dedup-skipping into a stale portfolio.
+
+    Cost: ~$0.05 (strategist + meta).
+    """
+    rid = ctx.run_id
+
+    # ----- Stage 1: signals (deterministic, $0) -----
+    signals_out = _run_stage(
+        ctx=ctx, stage_id="signals", schema="signals.schema.json",
+        output_filename="signals.json",
+        runner=lambda: stage_signals(ctx),
+        inputs_hash_parts=(rid,),
+        model="local-deterministic",
+    )
+
+    # Pull current positions + PnL history so the strategist's regime
+    # commentary is informed by what we currently hold.
+    current_positions = _current_positions_summary(ctx)
+    pnl_history = _recent_pnl_history(limit=5)
+
+    # ----- Stage 2: strategist → review.json (not view.json) -----
+    # Same prompt + schema as trade-cycle strategist; the artifact
+    # filename is what differs. Reading `_recent_pnl_history` walks
+    # view.json only, so writing review.json keeps the trade-cycle
+    # drift-correction loop free of after-hours reflection regimes.
+    strat_model = "fixture" if dry_run else stages.strategist().model
+    review_payload = _run_stage(
+        ctx=ctx, stage_id="strategist", schema="view.schema.json",
+        output_filename="review.json",
+        runner=lambda: stage_strategist(
+            ctx, signals_out,
+            current_positions=current_positions,
+            pnl_history=pnl_history,
+        ),
+        inputs_hash_parts=(rid, json.dumps(signals_out, sort_keys=True)),
+        model=strat_model,
+    )
+
+    # ----- Meta-scheduler: pick next-run window + intent for next cycle.
+    # Feed real broker holdings (not a flat placeholder) so meta's
+    # cadence + intent decision reflects what we actually hold. A
+    # placeholder would push meta into the "all-cash" bucket exactly
+    # when a held option / risk-sensitive position needs near-term
+    # monitoring after the reflection cycle.
+    next_at, meta_rationale, next_intent = _compute_next_run_at(
+        ctx=ctx,
+        portfolio=_broker_portfolio_summary_for_meta(ctx),
+        view=review_payload,
+    )
+    next_run = {
+        "run_id": rid,
+        "next_run_at": next_at,
+        "rationale": meta_rationale,
+        "cycle_intent": next_intent,
+        "review_completed": True,
+    }
+    state.write_json(state.run_dir(rid) / "next_run.json", next_run)
+    if not dry_run:
+        state.write_json(state.NEXT_RUN, next_run)
+
+    # Synthetic ``review_complete`` decision row marks the end of a
+    # review cycle. The frequency-cap counter looks for this stage so
+    # each cycle is counted exactly once regardless of how many sub-
+    # stage rows the review wrote.
+    state.append_decision({
+        "run_id": rid,
+        "stage": "review_complete",
+        "model": "local-deterministic",
+        "inputs_hash": _hash_inputs(rid),
+        "output_ref": "review.json",
+        "prompt_cache_hit_pct": 0.0,
+        "cost_usd": 0.0,
+        "started_at": state.utcnow_iso(),
+        "ended_at": state.utcnow_iso(),
+        "status": "ok",
+        "risk_warning": RISK_WARNING,
+        "cycle_intent": ctx.cycle_intent,
+        "intent_source": ctx.intent_source,
+    })
+
+    return {
+        "run_id": rid,
+        "cycle_intent": "review",
+        "intent_source": ctx.intent_source,
+        "signals": signals_out,
+        "review": review_payload,
+        "next_run": next_run,
+    }
+
+
+def run_pipeline(
+    *,
+    dry_run: bool,
+    run_id: str | None = None,
+    broker: Broker | None = None,
+    cli_intent: str | None = None,
+    ignore_cap: bool = False,
+) -> dict:
+    """Run one orchestrator cycle.
+
+    cli_intent: explicit operator override. None falls back to env
+    (CYCLE_INTENT) → prior next_run.json → "trade".
+    ignore_cap: bypass the daily review-cap check. Only honoured when
+    cli_intent is set (CLI is the only path that can grant this).
+    """
     if state.is_halted():
         raise llm.HaltFlagSet("halt.flag is set; refusing to start orchestrator run")
 
     rid = run_id or state.new_run_id()
-    ctx = StageContext(run_id=rid, dry_run=dry_run, broker=broker)
+    cycle_intent, intent_source = _load_cycle_intent(
+        cli_intent=cli_intent, ignore_cap=ignore_cap,
+    )
+
+    # ignore_cap is an operator-only override. The docstring promises it
+    # only applies to CLI-driven reviews; tighten the gate here so that
+    # `--ignore-cap` without `--intent=review` cannot bypass the cap on
+    # a file-driven (autonomous) review pick (Codex P2 on PR #83).
+    effective_ignore_cap = ignore_cap and intent_source == "cli"
+
+    # Frequency cap: if meta-scheduler picked review but the daily cap
+    # is hit, skip + advance next_run. Only intent_source="file" rows
+    # count (autonomous cycles); operator-driven cli/env intents bypass.
+    if cycle_intent == "review" and intent_source == "file" and not effective_ignore_cap:
+        cap = _max_review_cycles_per_day()
+        today_count = _count_autonomous_reviews_today()
+        if today_count >= cap:
+            next_at = _next_run_at_after_review_cap(broker)
+            next_run = {
+                "run_id": rid,
+                "next_run_at": next_at,
+                "rationale": (
+                    f"review cycle skipped: daily cap reached "
+                    f"({today_count}/{cap}). Next cycle defaults to trade. "
+                    "Operator override: rerun with --intent=review --ignore-cap."
+                ),
+                "cycle_intent": "trade",
+                "review_cap_skipped": True,
+            }
+            state.write_json(state.run_dir(rid) / "next_run.json", next_run)
+            state.write_json(state.NEXT_RUN, next_run)
+            state.append_decision({
+                "run_id": rid,
+                "stage": "review_complete",
+                "model": "local-deterministic",
+                "inputs_hash": _hash_inputs(rid),
+                "output_ref": "next_run.json",
+                "prompt_cache_hit_pct": 0.0,
+                "cost_usd": 0.0,
+                "started_at": state.utcnow_iso(),
+                "ended_at": state.utcnow_iso(),
+                "status": "skipped_review_cap",
+                "risk_warning": RISK_WARNING,
+                "cycle_intent": cycle_intent,
+                "intent_source": intent_source,
+            })
+            return {
+                "run_id": rid,
+                "cycle_intent": "review",
+                "review_cap_skipped": True,
+                "next_run": next_run,
+            }
+
+    ctx = StageContext(
+        run_id=rid,
+        dry_run=dry_run,
+        broker=broker,
+        cycle_intent=cycle_intent,
+        intent_source=intent_source,
+    )
+
+    if cycle_intent == "review":
+        return _run_pipeline_review(ctx=ctx, dry_run=dry_run)
 
     # ----- Stage 0: market gate -----
     # Dry-run skips the gate (no broker); live mode calls Alpaca's clock.
@@ -819,6 +1192,8 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
                 "ended_at": state.utcnow_iso(),
                 "status": "skipped_market_closed",
                 "risk_warning": RISK_WARNING,
+                "cycle_intent": ctx.cycle_intent,
+                "intent_source": ctx.intent_source,
             })
             return {
                 "run_id": rid,
@@ -859,7 +1234,7 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
     if not dry_run:
         dedup = _check_cycle_dedup(signals_out, current_positions)
         if dedup is not None:
-            next_run = _write_dedup_next_run(rid, portfolio=dedup["portfolio"])
+            next_run = _write_dedup_next_run(rid, portfolio=dedup["portfolio"], ctx=ctx)
             return {
                 "run_id": rid,
                 "signals": signals_out,
@@ -1017,6 +1392,7 @@ def run_pipeline(*, dry_run: bool, run_id: str | None = None, broker: Broker | N
                     r["name"] for r in sanity_report["rules"] if r["status"] == "fail"
                 ],
             },
+            "cycle_intent": "trade",
         }
         state.write_json(state.run_dir(rid) / "next_run.json", next_run)
         if not dry_run:
@@ -1075,6 +1451,23 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="v2 paper-trading orchestrator")
     parser.add_argument("--dry-run", action="store_true", help="No orders, no LLM calls — fixture mode")
     parser.add_argument("--run-id", default=None, help="Override generated run_id")
+    parser.add_argument(
+        "--intent", choices=["trade", "review"], default=None,
+        help=(
+            "Force cycle intent. trade = full pipeline (default). "
+            "review = signals + strategist + meta only, no orders. "
+            "Without this flag, intent is read from prior next_run.json "
+            "(which the meta-scheduler set on the previous cycle)."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-cap", action="store_true",
+        help=(
+            "Bypass the daily review-frequency cap. Honoured only when "
+            "--intent=review is also passed; never available to "
+            "autonomous (next_run.json-driven) cycles."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if (
@@ -1087,10 +1480,17 @@ def main(argv: list[str] | None = None) -> int:
     broker = None if args.dry_run else _try_load_broker()
 
     t0 = time.time()
-    result = run_pipeline(dry_run=args.dry_run, run_id=args.run_id, broker=broker)
+    result = run_pipeline(
+        dry_run=args.dry_run,
+        run_id=args.run_id,
+        broker=broker,
+        cli_intent=args.intent,
+        ignore_cap=args.ignore_cap,
+    )
     dt = time.time() - t0
     stage_count = 6 if result.get("market_gate", {}).get("is_open", True) else 1
-    print(f"run_id={result['run_id']} stages={stage_count} elapsed={dt:.2f}s dry_run={args.dry_run}")
+    intent_tag = f" intent={result.get('cycle_intent', 'trade')}" if result.get("cycle_intent") else ""
+    print(f"run_id={result['run_id']} stages={stage_count} elapsed={dt:.2f}s dry_run={args.dry_run}{intent_tag}")
     return 0
 
 
