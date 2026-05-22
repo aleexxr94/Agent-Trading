@@ -1300,8 +1300,14 @@ with tabs[3]:
         # but preserved for promotion-to-live; apply_nav_offset_to_history
         # is a no-op when offset is 0).
         raw_rows = _cached_nav_history(_state_mtimes())
+        # Read the offset once so the history line AND the live broker
+        # tip below use the SAME unit space. Codex P2 (PR #87): the
+        # earlier version offset-corrected the history but used raw
+        # broker equity for the live tip, producing a false vertical
+        # jump equal to the offset whenever a NAV anchor was set.
+        _nav_offset_usd = state.nav_offset_usd()
         nav_rows = dd.apply_nav_offset_to_history(
-            raw_rows, nav_offset_usd=state.nav_offset_usd(),
+            raw_rows, nav_offset_usd=_nav_offset_usd,
         )
         if not nav_rows:
             st.info(
@@ -1313,13 +1319,32 @@ with tabs[3]:
             )
         else:
             nav_df = pd.DataFrame(nav_rows)
+            # Codex P1 (PR #87): state.append_nav only REQUIRES run_id,
+            # at, nav_usd — the other hover columns are optional. Older
+            # or externally-written rows that omit positions_count /
+            # gross_pnl_usd / net_pnl_usd / nav_source would crash the
+            # `nav_df[[...]]` slice with KeyError. Ensure every hover
+            # column exists with a sensible default before the slice.
+            for col, default in [
+                ("run_id", "—"),
+                ("positions_count", 0),
+                ("gross_pnl_usd", 0.0),
+                ("net_pnl_usd", 0.0),
+                ("nav_source", "—"),
+            ]:
+                if col not in nav_df.columns:
+                    nav_df[col] = default
             nav_df = _apply_window(nav_df, time_col="at")
             # Live tip: prefer real broker equity when available; fall
             # back to the synthetic balance (hero card) so the operator
             # always sees a current marker even when the broker is offline.
+            # When nav_offset is configured, broker equity must be
+            # offset-corrected to match the history line's units (Codex
+            # P2). The synthetic fallback is already in virtual units so
+            # no offset applies.
             live_at = state.utcnow_iso()
             if broker_view.available and getattr(broker_view, "nav_usd", None) is not None:
-                live_nav = float(broker_view.nav_usd)
+                live_nav = float(broker_view.nav_usd) - _nav_offset_usd
                 live_label = "Live broker equity"
             else:
                 live_nav = float(_synth.synthetic_balance_usd)
