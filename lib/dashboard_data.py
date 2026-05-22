@@ -1227,6 +1227,162 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
     return summaries
 
 
+def option_funnel(limit: int = 20) -> list[dict]:
+    """Per-cycle option funnel: surfaced → chain_ok → taken → sanity_pass → submitted.
+
+    Diagnoses why options aren't being traded by surfacing where in the
+    pipeline option candidates die. Each row corresponds to one
+    orchestrator cycle (newest first) and reads the run-dir artifacts:
+
+      - view.json / review.json — strategist's candidate list. Count
+        entries with `instrument_kind in ("option_call","option_put")`.
+      - chain_lookups.json — Alpaca's nearest-OTM lookup. Count entries
+        whose `contract` is non-null.
+      - portfolio.json — constructor's final picks. Count positions
+        with `kind == "option"`.
+      - sanity.json — overall status. Treated as "pass" unless the run
+        failed and the failure cites an option position.
+      - next_run.json["order_plan"]["results"] — actual submitted
+        orders. Count results whose `symbol` is an OSI option symbol
+        and status doesn't start with "error" or "skipped".
+
+    Returns a list of dicts (newest first):
+      {run_id, generated_at, surfaced, chain_ok, taken, sanity_pass,
+       submitted, regime, all_cash, took_anything}
+
+    Where `took_anything` is True if the portfolio has any position
+    (ETF or option) — useful for distinguishing "all-cash cycle" from
+    "took ETFs but dropped options".
+
+    Empty list when no runs exist. Returns the most recent `limit`
+    cycles, mirroring load_run_summaries.
+    """
+    if not state.RUNS_DIR.exists():
+        return []
+    run_dirs = sorted(
+        [p for p in state.RUNS_DIR.iterdir() if p.is_dir()],
+        key=lambda p: p.name,
+        reverse=True,
+    )[:limit]
+
+    out: list[dict] = []
+    for run_dir in run_dirs:
+        rid = run_dir.name
+        row: dict = {
+            "run_id": rid,
+            "generated_at": "",
+            "surfaced": 0,
+            "chain_ok": 0,
+            "taken": 0,
+            "sanity_pass": None,
+            "submitted": 0,
+            "regime": "",
+            "all_cash": None,
+            "took_anything": False,
+        }
+        # generated_at from rid prefix as a fallback.
+        if len(rid) >= 16 and rid[8] == "T" and rid[15] == "Z":
+            row["generated_at"] = (
+                f"{rid[0:4]}-{rid[4:6]}-{rid[6:8]}T"
+                f"{rid[9:11]}:{rid[11:13]}:{rid[13:15]}Z"
+            )
+
+        # view.json — option candidates surfaced.
+        view_path = run_dir / "view.json"
+        if not view_path.exists():
+            review_path = run_dir / "review.json"
+            if review_path.exists():
+                view_path = review_path
+        if view_path.exists():
+            try:
+                v = json.loads(view_path.read_text())
+                if isinstance(v, dict):
+                    row["regime"] = v.get("regime", "") or ""
+                    cands = v.get("candidates") or []
+                    row["surfaced"] = sum(
+                        1 for c in cands
+                        if isinstance(c, dict) and c.get("instrument_kind") in (
+                            "option_call", "option_put",
+                        )
+                    )
+            except (json.JSONDecodeError, OSError, TypeError):
+                pass
+
+        # chain_lookups.json — how many candidates Alpaca could resolve
+        # to a real OTM contract.
+        cl_path = run_dir / "chain_lookups.json"
+        if cl_path.exists():
+            try:
+                cl = json.loads(cl_path.read_text())
+                if isinstance(cl, dict):
+                    lookups = cl.get("lookups") or []
+                    row["chain_ok"] = sum(
+                        1 for l in lookups
+                        if isinstance(l, dict) and l.get("contract") is not None
+                    )
+            except (json.JSONDecodeError, OSError, TypeError):
+                pass
+
+        # portfolio.json — option positions the constructor took.
+        port_path = run_dir / "portfolio.json"
+        if port_path.exists():
+            try:
+                p = json.loads(port_path.read_text())
+                if isinstance(p, dict):
+                    row["all_cash"] = p.get("all_cash")
+                    positions = p.get("positions") or []
+                    row["took_anything"] = len(positions) > 0
+                    row["taken"] = sum(
+                        1 for pos in positions
+                        if isinstance(pos, dict) and pos.get("kind") == "option"
+                    )
+            except (json.JSONDecodeError, OSError, TypeError):
+                pass
+
+        # sanity.json — pass/warn/fail. Only meaningful when the
+        # constructor took options.
+        if row["taken"] > 0:
+            san_path = run_dir / "sanity.json"
+            if san_path.exists():
+                try:
+                    san = json.loads(san_path.read_text())
+                    if isinstance(san, dict):
+                        status = (san.get("status") or "").lower()
+                        # pass and warn both let the run continue; only
+                        # fail (with SANITY_BLOCK_ON_FAIL=true) stops it.
+                        row["sanity_pass"] = status in ("pass", "warn", "ok")
+                except (json.JSONDecodeError, OSError, TypeError):
+                    pass
+            else:
+                row["sanity_pass"] = None
+
+        # next_run.json["order_plan"]["results"] — submitted orders.
+        # OSI option symbols match _OSI_RE (6-letter underlying + YYMMDD
+        # + C|P + 8-digit strike). Skip "error..." and "skipped..."
+        # statuses since those didn't actually submit.
+        nr_path = run_dir / "next_run.json"
+        if nr_path.exists():
+            try:
+                nr = json.loads(nr_path.read_text())
+                if isinstance(nr, dict):
+                    plan = nr.get("order_plan") or {}
+                    results = plan.get("results") or []
+                    # Lazy import to avoid pulling lib.orders' side effects.
+                    from . import orders as orders_lib
+                    row["submitted"] = sum(
+                        1 for r in results
+                        if isinstance(r, dict)
+                        and orders_lib.is_osi_symbol(r.get("symbol") or "")
+                        and r.get("side") == "buy"
+                        and not (r.get("status") or "").startswith(("error", "skipped"))
+                    )
+            except (json.JSONDecodeError, OSError, TypeError):
+                pass
+
+        out.append(row)
+    return out
+
+
 def _bias_for_position(pos: dict) -> str:
     """Bull / Bear / — classification for the positions-table Bias column.
 

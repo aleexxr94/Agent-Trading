@@ -186,6 +186,53 @@ class AlpacaBroker(Broker):
             status=str(r.status),
         )
 
+    def get_option_quote(self, osi_symbol: str) -> tuple[float, float] | None:
+        """Return (bid, ask) for an OSI option symbol via Alpaca's options
+        market-data feed. Lazy-constructs OptionHistoricalDataClient on
+        first use and caches it on the instance.
+
+        Alpaca's free paper plan uses the `indicative` feed; paying
+        subscribers get `opra`. The SDK auto-selects, so we don't pass
+        a feed arg. Returns None on any failure — never raises.
+
+        Used by lib/options_chain after picking the nearest-OTM contract,
+        so the constructor can size against a real mid premium instead
+        of estimating from HV. When this returns None the constructor
+        falls back to its HV-based estimate (no regression vs the
+        pre-quote behaviour).
+        """
+        try:
+            from alpaca.data.historical.option import OptionHistoricalDataClient  # noqa: WPS433
+            from alpaca.data.requests import OptionLatestQuoteRequest  # noqa: WPS433
+        except ImportError:
+            return None
+        client = getattr(self, "_options_data_client", None)
+        if client is None:
+            try:
+                client = OptionHistoricalDataClient(self._api_key, self._api_secret)
+            except Exception:
+                return None
+            self._options_data_client = client
+        try:
+            req = OptionLatestQuoteRequest(symbol_or_symbols=osi_symbol)
+            resp = client.get_option_latest_quote(req)
+        except Exception:
+            return None
+        # alpaca-py returns a {symbol: OptionQuote} dict.
+        quote = resp.get(osi_symbol) if hasattr(resp, "get") else None
+        if quote is None:
+            return None
+        try:
+            bid = float(getattr(quote, "bid_price", None) or 0.0)
+            ask = float(getattr(quote, "ask_price", None) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        # Reject zero/negative quotes — happens pre-market or on illiquid
+        # strikes; constructor's HV-based estimate is better than a 0 mid.
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        return bid, ask
+
     def option_contract_tradable(self, symbol: str) -> bool:
         """Query Alpaca for a single option contract by OSI symbol.
 

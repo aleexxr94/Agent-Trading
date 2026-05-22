@@ -46,17 +46,38 @@ goal. The standard is:
   rounded down. Refuse positions where 1 share already exceeds the
   per-position cap.
 - **Options**: integer contracts from
-  `position_pct × NAV / (premium × 100)`, rounded down. Refuse
-  contracts where 1 contract already exceeds the cap.
+  `position_pct × NAV / (premium × 100)`, rounded down. When 1 contract
+  exceeds the per-position cap, **don't immediately refuse — try to
+  downgrade in this order**:
+  1. Pick a deeper-OTM strike at the same expiry (lower delta, lower
+     premium) so 1 contract fits. The `chain_lookups` payload only
+     gives you the nearest-OTM contract by default, but the broker
+     supports any standard strike — you may name a strike further from
+     spot (skip 1–3 standard increments) and the execute stage will
+     validate tradability before submitting.
+  2. Pick a cheaper underlying on the **same factor** (small-caps:
+     IWM instead of forcing a SPY/QQQ call; financials: XLF instead of
+     a SPY-call proxy). The strategist surfaces both leveraged ETFs and
+     option underlyings on shared factors precisely so you have this
+     downgrade path.
+  3. Only after both downgrades fail should you fall back to the
+     leveraged ETF on the same factor, or refuse the position.
+  Document the downgrade decision in `construction_rationale`.
 
 For option strike/expiry selection:
 - DTE 30–45 days (target ~37 DTE)
-- Strike: nearest available OTM (long call: nearest strike > spot;
-  long put: nearest strike < spot)
+- Strike: nearest available OTM by default (long call: nearest strike >
+  spot; long put: nearest strike < spot). Move further OTM when sizing
+  requires it (see downgrade rule above).
 - The execute stage will validate the OCC symbol is tradable at the
   broker before submission — if a strike isn't tradable on Alpaca
   paper, the position will be skipped at order time. Pick the nearest
   standard monthly expiry to maximise tradability.
+- **Use `chain_lookups.contract.premium_estimate` when present** —
+  Alpaca returns a live bid/ask mid for the nearest-OTM contract in
+  most cases. When `premium_estimate` is null, estimate from the
+  underlying's `hv_30d_annualised` (rough rule: ATM premium ≈
+  spot × hv × √(DTE/365) × 0.4).
 
 ## How to read the strategist's view
 

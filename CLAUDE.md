@@ -14,8 +14,8 @@ You are a senior quant systems engineer. Build a complete, **paper-trading-only*
 6. If anything below is ambiguous, bundle all clarifying questions into one message before starting. Do not guess on capital allocation, position counts, kill switches, or broker behaviour.
 
 ## System scope
-- Universe (v2 + gold expansion 2026-05-13, 18 tickers): bull/bear leveraged-ETF pairs (TQQQ/SQQQ, UPRO/SPXU, SOXL/SOXS, TNA/TZA, FAS/FAZ, NUGT/DUST), solo leveraged ETFs (UVXY, BITX), and option underlyings (SPY, QQQ, TLT, GLD). Trimmed from v1's 33 tickers, then NUGT/DUST/GLD added back for gold-factor diversification.
-- **No spot single-name equities. No unleveraged broad-market ETFs as core positions** (SPY/QQQ/TLT only via options).
+- Universe (v2 + gold + option cheapeners 2026-05-22, 21 tickers): bull/bear leveraged-ETF pairs (TQQQ/SQQQ, UPRO/SPXU, SOXL/SOXS, TNA/TZA, FAS/FAZ, NUGT/DUST), solo leveraged ETFs (UVXY, BITX), and option underlyings (SPY, QQQ, TLT, GLD, IWM, XLF, XLE). Trimmed from v1's 33, then NUGT/DUST/GLD added back for gold-factor diversification (2026-05-13), then IWM/XLF/XLE added as option underlyings (2026-05-22) so the $2,500 account's 15% per-position cap = $375 can actually fit a single contract on something other than TLT/GLD.
+- **No spot single-name equities. No unleveraged broad-market ETFs as core positions** (SPY/QQQ/TLT/GLD/IWM/XLF/XLE only via options).
 - **No broker shorts.** Bear theses are expressed as long bear ETFs (SQQQ, SPXU, etc.) or long puts. Cash account only.
 - Portfolio target: **1–12 open positions** at the end of each cycle (or all-cash if conviction is genuinely absent). The 1-position floor lets a single strong-conviction thesis fire even when broader diversification isn't available. Concentration risk is bounded by the per-position 15% NAV cap and kill conditions.
 - Per-position cap at entry: **≤15% of portfolio NAV**.

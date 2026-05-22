@@ -1,9 +1,10 @@
-"""Invariants on the static universe (lib.universe) — v2.
+"""Invariants on the static universe (lib.universe) — v2 + gold + option cheapeners.
 
-v2 universe is 15 tickers (was 33 in v1). The diversification floor
-dropped from 10 factors to 8 — bull/bear pairs share a factor so 5
-pairs = 5 factors, plus vol + crypto-btc + rates from solo entries
-and SPY/QQQ option underlyings reusing sp500/nasdaq factors = 8.
+v2 universe was 15 tickers; +3 gold (2026-05-13) made 18; +3 option
+cheapeners IWM/XLF/XLE (2026-05-22) brings it to 21. The diversification
+floor stays ≥10 — XLE is the only net-new factor (energy), others
+intentionally share factors with leveraged ETFs so the constructor
+picks ETF vs option per sizing math.
 """
 from __future__ import annotations
 
@@ -12,28 +13,30 @@ import pytest
 from lib import universe
 
 
-def test_universe_size_is_18():
-    """v2 universe (post gold expansion 2026-05-13) has exactly 18
-    tickers: 12 leveraged ETFs (5 equity bull/bear pairs + UVXY + BITX
-    + NUGT/DUST gold-miners pair) + 4 option underlyings (SPY/QQQ/TLT
-    + GLD). If you're adding to this list, update the factor-count
-    floor below; if you're shrinking it, double-check the strategist
-    prompt's universe section matches.
+def test_universe_size_is_21():
+    """Universe (post option-cheapener expansion 2026-05-22) has exactly
+    21 tickers: 12 leveraged ETFs (5 equity bull/bear pairs + UVXY + BITX
+    + NUGT/DUST gold-miners pair) + 7 option underlyings (SPY/QQQ/TLT
+    + GLD + IWM + XLF + XLE). If you're adding to this list, update the
+    factor-count floor below; if you're shrinking it, double-check the
+    strategist prompt's universe section matches.
     """
-    assert len(universe.UNIVERSE) == 18, (
-        f"universe size {len(universe.UNIVERSE)} != 18. v2 + gold expansion."
+    assert len(universe.UNIVERSE) == 21, (
+        f"universe size {len(universe.UNIVERSE)} != 21. v2 + gold + option cheapeners."
     )
 
 
 def test_universe_covers_multiple_uncorrelated_factors():
-    """v2+gold must span ≥10 distinct factors: nasdaq, sp500, semis,
+    """Universe must span ≥11 distinct factors: nasdaq, sp500, semis,
     small-caps, financials-broad (5 bull/bear equity pairs) +
     gold-miners (NUGT/DUST) + vol + crypto-btc + rates (option) +
-    gold-spot (GLD option). Bull/bear pairs share a factor."""
+    gold-spot (GLD option) + energy (XLE option, no leveraged pair).
+    Bull/bear pairs share a factor; IWM and XLF reuse small-caps and
+    financials-broad respectively."""
     factors = {e.factor for e in universe.UNIVERSE}
-    assert len(factors) >= 10, (
+    assert len(factors) >= 11, (
         f"universe spans only {len(factors)} factors: {sorted(factors)}. "
-        "v2+gold floor is 10 — adding factors is encouraged, but pruning "
+        "Post-cheapener floor is 11 — adding factors is encouraged, but pruning "
         "below this floor weakens diversification options."
     )
 
@@ -96,14 +99,42 @@ def test_every_entry_has_required_fields():
 
 
 def test_option_underlyings_are_unleveraged_and_liquid():
-    """v2+gold option underlyings: SPY + QQQ for broad-equity options,
-    TLT for rates exposure, GLD for spot-gold (added 2026-05-13
-    alongside NUGT/DUST leveraged miners).
+    """Option underlyings: SPY + QQQ for broad-equity, TLT for rates,
+    GLD for spot-gold (2026-05-13), and IWM + XLF + XLE for cheaper
+    sector-level option expressions (2026-05-22). All unleveraged.
     """
     underlyings = [e for e in universe.UNIVERSE if e.kind == "option_underlying"]
-    assert {e.symbol for e in underlyings} == {"SPY", "QQQ", "TLT", "GLD"}
+    assert {e.symbol for e in underlyings} == {
+        "SPY", "QQQ", "TLT", "GLD", "IWM", "XLF", "XLE",
+    }
     for e in underlyings:
         assert e.leverage_factor == 1.0
+
+
+def test_option_cheapeners_share_factors_with_leveraged_pairs():
+    """IWM/XLF intentionally share factors with TNA/TZA and FAS/FAZ so
+    the constructor's factor-dedup logic decides whether the strategist
+    expresses the directional thesis as ETF or option. XLE is solo on
+    the energy factor (no leveraged pair in the universe)."""
+    iwm = universe.by_symbol("IWM")
+    tna = universe.by_symbol("TNA")
+    assert iwm is not None and tna is not None
+    assert iwm.factor == tna.factor == "small-caps"
+
+    xlf = universe.by_symbol("XLF")
+    fas = universe.by_symbol("FAS")
+    assert xlf is not None and fas is not None
+    assert xlf.factor == fas.factor == "financials-broad"
+
+    xle = universe.by_symbol("XLE")
+    assert xle is not None
+    assert xle.factor == "energy"
+    # XLE is the only entry on the energy factor — no leveraged pair.
+    energy_entries = [e for e in universe.UNIVERSE if e.factor == "energy"]
+    assert energy_entries == [xle], (
+        "XLE should be solo on the energy factor; "
+        f"got {[e.symbol for e in energy_entries]}"
+    )
 
 
 def test_leveraged_etfs_have_leverage_at_least_1_5x():
@@ -159,6 +190,7 @@ def test_factor_pair_returns_bull_and_bear_for_paired_factors():
     "BITX",          # Crypto
     "NUGT", "DUST",  # Gold miners (added 2026-05-13)
     "SPY", "QQQ", "TLT", "GLD",  # Option underlyings (GLD added 2026-05-13)
+    "IWM", "XLF", "XLE",  # Option cheapeners (added 2026-05-22)
 ])
 def test_v2_universe_symbols_present(expected):
     assert universe.by_symbol(expected) is not None, (
@@ -172,13 +204,16 @@ def test_v2_universe_symbols_present(expected):
     "LABU", "LABD",  # Biotech
     "CURE",          # Healthcare
     "YINN", "YANG",  # China
-    "ERX",  "ERY",   # Energy
+    "ERX",  "ERY",   # Energy leveraged ETFs (XLE option underlying is in)
     "BOIL",          # NatGas
     "BITU", "SBIT", "ETHU",  # Crypto alts
-    "IWM", "DIA",    # Option underlyings dropped (factor-covered or correlated)
+    "DIA",           # Option underlying dropped (correlates ~99% with SPY)
     # NUGT/DUST were on this list in v2 base; added back in the
     # gold-expansion 2026-05-13. If they reappear here, gold's been
     # removed again — make that an explicit decision.
+    # IWM was on this list in v2 base; added back as an option underlying
+    # in the 2026-05-22 option-cheapener expansion. If it reappears
+    # here, the option-cheapener expansion has been reverted.
 ])
 def test_v1_dropped_symbols_absent(dropped):
     """Lock the v2 trim: symbols intentionally cut from the v1 universe

@@ -948,6 +948,107 @@ with tabs[1]:
     if not summaries:
         st.info("No runs yet — fire the orchestrator (manually or via the timer) to populate this view.")
     else:
+        # ---- Option funnel diagnostic ----
+        # Shows where in the strategist → chain → constructor → sanity →
+        # broker pipeline option candidates die. Added 2026-05-22 after
+        # six months of paper trading produced zero option positions.
+        # Read-only — reads per-cycle artifacts the orchestrator already
+        # writes; no schema changes.
+        funnel_rows = dd.option_funnel(limit=20)
+        # Aggregate counts across the visible window so the operator can
+        # see the big picture before drilling into per-cycle rows.
+        agg = {
+            "surfaced": sum(r["surfaced"] for r in funnel_rows),
+            "chain_ok": sum(r["chain_ok"] for r in funnel_rows),
+            "taken": sum(r["taken"] for r in funnel_rows),
+            "submitted": sum(r["submitted"] for r in funnel_rows),
+        }
+        cycles_with_options_surfaced = sum(1 for r in funnel_rows if r["surfaced"] > 0)
+        cycles_with_options_taken = sum(1 for r in funnel_rows if r["taken"] > 0)
+
+        st.markdown(
+            '<div class="at-section-label">Option funnel — last 20 cycles</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Where do option candidates die between proposal and submission? "
+            "**surfaced** = strategist named an option_call / option_put. "
+            "**chain_ok** = Alpaca returned a tradable OTM contract. "
+            "**taken** = constructor put it in portfolio.json. "
+            "**submitted** = the execute stage actually sent an order. "
+            "A large surfaced→taken gap usually means sizing failed "
+            "(premium > 15% NAV cap); a large chain_ok→taken gap means "
+            "the constructor preferred ETFs."
+        )
+        fcols = st.columns(4)
+        fcols[0].markdown(
+            _stat_card(
+                "Surfaced",
+                f"{agg['surfaced']}",
+                sub=f"in {cycles_with_options_surfaced} of {len(funnel_rows)} cycles",
+            ),
+            unsafe_allow_html=True,
+        )
+        fcols[1].markdown(
+            _stat_card(
+                "Chain OK",
+                f"{agg['chain_ok']}",
+                sub=(
+                    f"{agg['chain_ok']}/{agg['surfaced']} resolved"
+                    if agg["surfaced"] else "no surfaced"
+                ),
+            ),
+            unsafe_allow_html=True,
+        )
+        fcols[2].markdown(
+            _stat_card(
+                "Taken",
+                f"{agg['taken']}",
+                tone="pos" if agg["taken"] else "neg" if agg["chain_ok"] else "",
+                sub=f"in {cycles_with_options_taken} cycles",
+            ),
+            unsafe_allow_html=True,
+        )
+        fcols[3].markdown(
+            _stat_card(
+                "Submitted",
+                f"{agg['submitted']}",
+                tone="pos" if agg["submitted"] else "neg" if agg["taken"] else "",
+                sub="actual broker orders",
+            ),
+            unsafe_allow_html=True,
+        )
+
+        if funnel_rows and any(r["surfaced"] or r["taken"] for r in funnel_rows):
+            df_funnel = pd.DataFrame([
+                {
+                    "Cycle": _fmt_ts(r["generated_at"]) if r["generated_at"] else "—",
+                    "Regime": r["regime"] or "—",
+                    "Surfaced": r["surfaced"],
+                    "Chain OK": r["chain_ok"],
+                    "Taken": r["taken"],
+                    "Sanity": "—" if r["sanity_pass"] is None else (
+                        "✅" if r["sanity_pass"] else "❌"
+                    ),
+                    "Submitted": r["submitted"],
+                    "Cycle outcome": (
+                        "all-cash" if r["all_cash"] else
+                        "took positions" if r["took_anything"] else
+                        "—"
+                    ),
+                }
+                for r in funnel_rows
+            ])
+            st.dataframe(df_funnel, width="stretch", hide_index=True)
+        else:
+            st.info(
+                "No option activity in the last 20 cycles — strategist "
+                "didn't surface any option candidates. If this persists "
+                "across multiple weeks, the prompt nudges in "
+                "prompts/strategist.md may need stronger framing toward "
+                "the option expression of high-conviction directional theses."
+            )
+
         st.markdown(
             f'<div class="at-section-label">Last {len(summaries)} cycles — newest first, all expanded</div>',
             unsafe_allow_html=True,
