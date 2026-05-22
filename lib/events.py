@@ -121,6 +121,16 @@ _BROAD_MACRO_SYMBOLS: frozenset[str] = frozenset({
     # inflation expectations → gold. The strategist sees the event
     # set on these tickers per cycle.
     "NUGT", "DUST", "GLD",
+    # Option cheapeners (added 2026-05-22) — all three react to the
+    # macro calendar. IWM: FOMC drives small-cap valuations via
+    # discount rate + NFP drives small-cap earnings via consumer
+    # spending. XLF: FOMC moves bank NIMs and yield-curve steepness.
+    # XLE: FOMC moves USD which inversely drives crude; CPI prints
+    # bracket energy inflation. Without these, the strategist would
+    # propose option_calls/option_puts on IWM/XLF/XLE blind to
+    # event timing — which is exactly why we added them to the
+    # universe in the first place.
+    "IWM", "XLF", "XLE",
 })
 
 
