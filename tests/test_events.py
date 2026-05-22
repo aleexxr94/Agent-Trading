@@ -27,10 +27,19 @@ def test_upcoming_events_sorted_ascending():
 
 
 def test_events_for_symbol_returns_macro_for_broad_symbols():
-    """SPY/QQQ/TLT and the bull/bear ETFs all get the full macro calendar."""
-    for sym in ("SPY", "QQQ", "TLT", "TQQQ", "SQQQ", "UVXY"):
+    """SPY/QQQ/TLT and the bull/bear ETFs all get the full macro calendar.
+    Includes the 2026-05-22 option-cheapener additions (IWM/XLF/XLE) —
+    without these, the strategist would surface option candidates on
+    those underlyings with no event-timing context (Codex P2 on PR #88).
+    """
+    for sym in ("SPY", "QQQ", "TLT", "TQQQ", "SQQQ", "UVXY",
+                "IWM", "XLF", "XLE"):
         ev = events.events_for_symbol(sym, within_days=60, from_date=date(2026, 5, 13))
         assert isinstance(ev, list)
+        # The 2026 calendar is non-empty within a 60-day window from
+        # mid-May — assert each tracked symbol actually surfaces events
+        # (frozenset membership alone wouldn't catch a typo'd symbol).
+        assert ev, f"{sym} returned empty event list — confirm it's in _BROAD_MACRO_SYMBOLS"
 
 
 def test_events_for_symbol_returns_empty_for_crypto():

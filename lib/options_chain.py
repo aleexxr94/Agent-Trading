@@ -14,6 +14,14 @@ that fail at order time.
 
 Cost: $0. Alpaca's options endpoints are free.
 
+After picking the nearest-OTM contract, this module fires a follow-up
+``broker.get_option_quote(osi)`` for the live mid premium. With NAV
+$2,500 and a 15% per-position cap = $375 notional, the constructor
+needs an accurate premium to know whether 1 contract clears the cap.
+Pre-2026-05-22 this stage left premium fields None and the constructor
+estimated from HV — which over-estimates often enough that SPY/QQQ
+options were always refused at sizing. The live quote closes that gap.
+
 Failure modes:
   - Alpaca returns no contracts for the underlying/DTE window → the
     candidate is dropped from the chain_lookups payload; the
@@ -21,6 +29,9 @@ Failure modes:
   - Alpaca returns contracts but the spot price is unavailable → ATM
     falls back to the last signals.last_close; if both unavailable,
     drop the candidate.
+  - Quote fetch fails (no entitlement, illiquid, network) → premium
+    fields stay None; constructor falls back to HV-based estimate.
+    Pure-additive: pre-quote behaviour is preserved when the call fails.
   - Any other broker error → log on the per-candidate row; drop the
     candidate. Never raises — one bad lookup mustn't kill the cycle.
 """
@@ -207,6 +218,23 @@ def lookup_nearest_otm(
                 oi = int(getattr(match, "open_interest", 0) or 0)
             except (TypeError, ValueError):
                 oi = None
+        # Fetch the live bid/ask so the constructor sizes against the
+        # actual premium instead of estimating from underlying HV. On a
+        # $2,500 account this is the difference between a $400 premium
+        # estimate (refused at the 15% cap) and a $250 real mid (fits).
+        # get_option_quote returns None on any failure — leaving the
+        # fields None preserves the pre-quote behaviour, so this is a
+        # pure additive improvement.
+        bid: float | None = None
+        ask: float | None = None
+        premium_estimate: float | None = None
+        if broker is not None and hasattr(broker, "get_option_quote"):
+            quote = broker.get_option_quote(osi)
+            if quote is not None:
+                bid_f, ask_f = quote
+                bid = bid_f
+                ask = ask_f
+                premium_estimate = round((bid_f + ask_f) / 2.0, 4)
         return OptionContract(
             osi_symbol=osi,
             underlying=underlying,
@@ -214,9 +242,9 @@ def lookup_nearest_otm(
             strike=otm_strike,
             expiry=exp_iso,
             dte=_dte(exp_iso),
-            premium_estimate=None,  # bid/ask requires market-data API; left None
-            bid=None,
-            ask=None,
+            premium_estimate=premium_estimate,
+            bid=bid,
+            ask=ask,
             open_interest=oi,
         )
     return None

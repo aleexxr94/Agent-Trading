@@ -2086,3 +2086,185 @@ def test_trades_pnl_view_honours_all_time_cost_reset(tmp_state):
     assert c["fees_usd"] == pytest.approx(0.20)
     # Net should now equal gross - fees (no LLM cost).
     assert c["net_pnl_usd"] == pytest.approx(50.0 - 0.20)
+
+
+# --------------------------------------------------------------------------- #
+# Option funnel — diagnostic added 2026-05-22 after six months of paper
+# trading produced zero option positions. Surfaces where in the pipeline
+# option candidates die.
+# --------------------------------------------------------------------------- #
+
+
+def _seed_run(rid: str, *, view=None, chain=None, portfolio=None,
+              sanity=None, next_run=None):
+    """Write a minimal per-cycle run dir under state/runs/<rid>/.
+    Any artifact arg left None is simply not written — mirrors the
+    real orchestrator's behaviour when a stage is skipped or aborted.
+    """
+    run_dir = state.RUNS_DIR / rid
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if view is not None:
+        state.write_json(run_dir / "view.json", view)
+    if chain is not None:
+        state.write_json(run_dir / "chain_lookups.json", chain)
+    if portfolio is not None:
+        state.write_json(run_dir / "portfolio.json", portfolio)
+    if sanity is not None:
+        state.write_json(run_dir / "sanity.json", sanity)
+    if next_run is not None:
+        state.write_json(run_dir / "next_run.json", next_run)
+
+
+def test_option_funnel_empty_when_no_runs(tmp_state):
+    assert dd.option_funnel() == []
+
+
+def test_option_funnel_counts_surfaced_and_chain_ok(tmp_state):
+    """Strategist surfaces 2 option candidates; chain resolves both."""
+    _seed_run(
+        "20260522T120000Z-aaaaaa",
+        view={
+            "regime": "trending_up",
+            "candidates": [
+                {"symbol": "SPY", "instrument_kind": "option_call", "confidence": 0.75,
+                 "thesis": "x"},
+                {"symbol": "QQQ", "instrument_kind": "option_call", "confidence": 0.70,
+                 "thesis": "x"},
+                {"symbol": "TQQQ", "instrument_kind": "etf", "confidence": 0.65,
+                 "thesis": "x"},  # ETF, not counted
+            ],
+        },
+        chain={
+            "lookups": [
+                {"candidate": {"symbol": "SPY", "instrument_kind": "option_call"},
+                 "contract": {"osi_symbol": "SPY...", "strike": 540.0},
+                 "error": None},
+                {"candidate": {"symbol": "QQQ", "instrument_kind": "option_call"},
+                 "contract": {"osi_symbol": "QQQ...", "strike": 500.0},
+                 "error": None},
+            ],
+        },
+        portfolio={"all_cash": False, "positions": [
+            {"kind": "etf", "symbol": "TQQQ", "shares": 5},
+        ]},
+    )
+    rows = dd.option_funnel()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["surfaced"] == 2
+    assert r["chain_ok"] == 2
+    assert r["taken"] == 0  # constructor took the ETF, dropped both options
+    assert r["regime"] == "trending_up"
+    assert r["took_anything"] is True
+
+
+def test_option_funnel_records_drop_when_chain_returns_null_contract(tmp_state):
+    """Strategist surfaces 1 option but Alpaca returns no tradable contract."""
+    _seed_run(
+        "20260522T130000Z-bbbbbb",
+        view={"regime": "neutral", "candidates": [
+            {"symbol": "TLT", "instrument_kind": "option_put", "confidence": 0.65,
+             "thesis": "x"},
+        ]},
+        chain={"lookups": [
+            {"candidate": {"symbol": "TLT", "instrument_kind": "option_put"},
+             "contract": None,
+             "error": "no tradable OTM contract found"},
+        ]},
+        portfolio={"all_cash": True, "positions": []},
+    )
+    r = dd.option_funnel()[0]
+    assert r["surfaced"] == 1
+    assert r["chain_ok"] == 0
+    assert r["taken"] == 0
+    assert r["all_cash"] is True
+
+
+def test_option_funnel_counts_taken_and_submitted(tmp_state):
+    """Full happy path: surfaced → chain → taken → sanity → submitted."""
+    _seed_run(
+        "20260522T140000Z-cccccc",
+        view={"candidates": [
+            {"symbol": "IWM", "instrument_kind": "option_call", "confidence": 0.80,
+             "thesis": "x"},
+        ]},
+        chain={"lookups": [
+            {"candidate": {"symbol": "IWM", "instrument_kind": "option_call"},
+             "contract": {"osi_symbol": "IWM260619C00220000"},
+             "error": None},
+        ]},
+        portfolio={"all_cash": False, "positions": [
+            {"kind": "option", "underlying": "IWM", "type": "call",
+             "strike": 220.0, "expiry": "2026-06-19", "dte": 28, "contracts": 1,
+             "premium_paid": 2.50, "position_pct": 10.0},
+        ]},
+        sanity={"status": "pass", "rules": []},
+        next_run={
+            "order_plan": {
+                "results": [
+                    {"symbol": "IWM260619C00220000", "qty": 1, "side": "buy",
+                     "status": "accepted", "broker_order_id": "ord-x"},
+                ],
+            },
+        },
+    )
+    r = dd.option_funnel()[0]
+    assert r["surfaced"] == 1
+    assert r["chain_ok"] == 1
+    assert r["taken"] == 1
+    assert r["sanity_pass"] is True
+    assert r["submitted"] == 1
+
+
+def test_option_funnel_does_not_count_skipped_orders(tmp_state):
+    """A 'skipped: option contract not tradable at broker' result is in
+    the plan but didn't actually submit — must not bump the submitted
+    count or the dashboard will overstate broker activity."""
+    _seed_run(
+        "20260522T150000Z-dddddd",
+        view={"candidates": [
+            {"symbol": "GLD", "instrument_kind": "option_call", "confidence": 0.7,
+             "thesis": "x"},
+        ]},
+        chain={"lookups": [
+            {"candidate": {"symbol": "GLD", "instrument_kind": "option_call"},
+             "contract": {"osi_symbol": "GLD260619C00250000"},
+             "error": None},
+        ]},
+        portfolio={"all_cash": False, "positions": [
+            {"kind": "option", "underlying": "GLD", "type": "call",
+             "strike": 250.0, "expiry": "2026-06-19", "dte": 28, "contracts": 1,
+             "premium_paid": 1.20, "position_pct": 5.0},
+        ]},
+        sanity={"status": "pass"},
+        next_run={
+            "order_plan": {
+                "results": [
+                    {"symbol": "GLD260619C00250000", "qty": 1, "side": "buy",
+                     "status": "skipped: option contract not tradable at broker",
+                     "broker_order_id": ""},
+                ],
+            },
+        },
+    )
+    r = dd.option_funnel()[0]
+    assert r["taken"] == 1
+    assert r["submitted"] == 0
+
+
+def test_option_funnel_orders_newest_first(tmp_state):
+    """Multiple runs come back newest-first so the dashboard renders them
+    in the order an operator scans (top = most recent)."""
+    _seed_run("20260520T120000Z-old001",
+              view={"candidates": []}, portfolio={"all_cash": True, "positions": []})
+    _seed_run("20260522T120000Z-new002",
+              view={"candidates": [
+                  {"symbol": "SPY", "instrument_kind": "option_call",
+                   "confidence": 0.8, "thesis": "x"},
+              ]}, portfolio={"all_cash": True, "positions": []})
+    rows = dd.option_funnel()
+    assert [r["run_id"] for r in rows] == [
+        "20260522T120000Z-new002", "20260520T120000Z-old001",
+    ]
+    assert rows[0]["surfaced"] == 1
+    assert rows[1]["surfaced"] == 0

@@ -1,30 +1,34 @@
-"""Static universe of tradeable instruments — v2 (15 tickers).
+"""Static universe of tradeable instruments — v2 + gold + option-cheapeners (21 tickers).
 
-Trimmed from the v1 33-instrument universe (PR ε predecessor) after the
-LLM pipeline was simplified to a single deterministic-signals stage + one
-LLM constructor call. Fewer candidates means sharper decisions; the v1
-universe produced the same TLT-straddle outcome cycle after cycle, which
-is the failure mode this trim is designed to fix.
+Trimmed from the v1 33-instrument universe to v2's 15, expanded to 18 on
+2026-05-13 (gold: NUGT/DUST/GLD), expanded to 21 on 2026-05-22 (option
+cheapeners: IWM/XLF/XLE). The constant motive across every expansion is:
+fewer candidates means sharper decisions, but only if the choice space
+still permits the strategy. After six months of paper trading produced
+0 option positions ever, three cheaper option underlyings were added so
+the $2,500 account's 15% per-position cap ($375) can actually clear one
+contract on a non-TLT/GLD option.
 
-Universe composition (15):
-  - 5 bull/bear leveraged-ETF pairs (10): Nasdaq, S&P 500, semis,
-    Russell 2000, financials. Each pair covers one factor in both
-    directions — "short Nasdaq" is expressed as long SQQQ, not as a
-    margin short of TQQQ. No actual broker shorts (synthetic only).
+Universe composition (21):
+  - 6 bull/bear leveraged-ETF pairs (12): Nasdaq, S&P 500, semis,
+    Russell 2000, financials, gold miners. Each pair covers one factor
+    in both directions — "short Nasdaq" is expressed as long SQQQ, not
+    as a margin short of TQQQ. No actual broker shorts (synthetic only).
   - 2 solo leveraged ETFs: UVXY (vol), BITX (crypto bull). Different
     factor space from the equity bull/bear pairs.
-  - 3 option underlyings: SPY, QQQ, TLT. SPY+QQQ for broad-market
-    options (most liquid chains); TLT for rates exposure (no
-    leveraged bond ETF in this universe, so options are the entry).
+  - 7 option underlyings: SPY/QQQ for broad-market (most liquid chains),
+    TLT for rates, GLD for spot gold, IWM for small-caps, XLF for
+    financials, XLE for energy. IWM and XLF intentionally share factors
+    with TNA/TZA and FAS/FAZ — the constructor picks ETF vs option per
+    sizing math. XLE is solo on the energy factor.
 
-Dropped from v1:
+Dropped from v1 (still excluded):
   - Russell 2000 alts (URTY/SRTY) — TNA/TZA already cover the factor
   - Regional banks (DPST) — no bear pair; redundant with FAS/FAZ broad
-  - Biotech (LABU/LABD), healthcare (CURE), China (YINN/YANG), energy
-    (ERX/ERY), gold miners (NUGT/DUST), nat gas (BOIL), Ether (ETHU),
-    bitcoin alts (BITU/SBIT) — lower ADV; factor-redundant or speculative
-  - IWM, DIA as option underlyings — Russell 2000 is covered via
-    TNA/TZA already; DIA correlates ~99% with SPY.
+  - Biotech (LABU/LABD), healthcare (CURE), China (YINN/YANG), nat gas
+    (BOIL), Ether (ETHU), bitcoin alts (BITU/SBIT) — lower ADV;
+    factor-redundant or speculative
+  - DIA as option underlying — correlates ~99% with SPY
 
 `factor` is the short factor identifier, shared across bull/bear pairs
 (e.g. TQQQ + SQQQ both → "nasdaq"). Used by:
@@ -75,6 +79,11 @@ F_RATES        = "rates"
 # both heavily — they ARE correlated, just not identical.
 F_GOLD_MINERS  = "gold-miners"
 F_GOLD_SPOT    = "gold-spot"
+# Energy added 2026-05-22 alongside IWM/XLF option underlyings. No
+# leveraged ETF pair in the universe for this factor — XLE is solo on
+# the option-only path, which is fine: the strategist still has cheap
+# directional exposure via long calls / long puts.
+F_ENERGY       = "energy"
 
 
 def _e(symbol: str, kind: InstrumentKind, lev: float, family: str,
@@ -144,6 +153,27 @@ _OPTION_UNDERLYINGS: tuple[UniverseEntry, ...] = (
        "Pure spot-gold tracker — long calls/puts express directional "
        "gold view without the equity-beta + operational-leverage overlay "
        "that NUGT/DUST carry", F_GOLD_SPOT),
+    # IWM/XLF/XLE added 2026-05-22 to unblock the option path on a
+    # $2,500 account. With NAV * 15% = $375 per-position cap, SPY/QQQ
+    # options ($500-800/contract) refuse at sizing — only TLT/GLD fit.
+    # IWM (~$200/sh) gives small-cap option expressions at $200-400
+    # premium; XLF (~$45/sh) gives financials option expressions at
+    # $50-150; XLE (~$90/sh) adds the energy factor entirely. IWM and
+    # XLF intentionally share factors with TNA/TZA and FAS/FAZ — the
+    # constructor's factor-dedup logic decides whether to take the
+    # leveraged-ETF or the option expression of the same directional
+    # thesis. XLE is solo on the energy factor (no leveraged pair).
+    _e("IWM", "option_underlying", 1.0, "iShares Russell 2000 ETF",
+       "Small-cap options at affordable premium — pairs with TNA/TZA "
+       "for the same factor; constructor picks ETF vs option per "
+       "sizing math", F_SMALL_CAPS),
+    _e("XLF", "option_underlying", 1.0, "Financial Select Sector SPDR",
+       "Financials sector options — the cheapest equity-sector option "
+       "expression in the universe; pairs with FAS/FAZ", F_FIN_BROAD),
+    _e("XLE", "option_underlying", 1.0, "Energy Select Sector SPDR",
+       "Energy sector option expression — oil/gas factor with no "
+       "leveraged ETF in the universe; FOMC + OPEC + crude inventory "
+       "catalysts", F_ENERGY),
 )
 
 

@@ -6,7 +6,7 @@ single-shot market view + ranked candidate list. One LLM call per cycle.
 Capital preservation outweighs upside chasing, but **abstaining cycle after
 cycle is not the goal** — pick candidates when the signals justify it.
 
-## Universe (18 tickers, curated)
+## Universe (21 tickers, curated)
 
 **Bull/bear leveraged-ETF pairs (6 factors × 2 directions):**
 - `TQQQ` / `SQQQ` — Nasdaq 3x long / short
@@ -26,6 +26,12 @@ cycle is not the goal** — pick candidates when the signals justify it.
 - `TLT` — 20+ year Treasuries (rates exposure)
 - `GLD` — SPDR Gold Shares (spot-gold tracker — different from NUGT/DUST
   which carry equity beta + operational leverage on top of gold)
+- `IWM` — Russell 2000 ETF (small-caps; pairs with TNA/TZA — constructor
+  picks ETF vs option per sizing math)
+- `XLF` — Financial Select Sector SPDR (cheapest equity-sector option
+  expression in the universe; pairs with FAS/FAZ)
+- `XLE` — Energy Select Sector SPDR (oil/gas factor; no leveraged ETF
+  pair in the universe — options are the only expression)
 
 There are no actual short positions — bearish theses on Nasdaq are
 expressed as **long SQQQ** or **long puts on SPY/QQQ**, never as a broker
@@ -52,7 +58,7 @@ A table of 18 rows. Per row:
 | `momentum_30d_pct` / `momentum_60d_pct` | Trailing total return |
 | `hv_30d_annualised` / `hv_90d_annualised` | Annualised close-to-close vol |
 | `dist_from_50d_ma_pct` / `dist_from_200d_ma_pct` | Distance from MA (negative = below MA = downtrend) |
-| `is_optionable` | True for SPY/QQQ/TLT/GLD |
+| `is_optionable` | True for SPY/QQQ/TLT/GLD/IWM/XLF/XLE |
 
 Rows with an `error` field are unavailable — skip them silently.
 
@@ -82,12 +88,12 @@ Rules:
     use the bull ETF (TQQQ/UPRO/SOXL/TNA/FAS/NUGT); bear thesis →
     use the bear ETF (SQQQ/SPXU/SOXS/TZA/FAZ/DUST); UVXY for long
     vol; BITX for long crypto.
-  - `option_call` — long call on `symbol` (must be in SPY/QQQ/TLT/GLD).
-    Bullish thesis on the underlying.
-  - `option_put` — long put on `symbol` (must be in SPY/QQQ/TLT/GLD).
-    Bearish thesis on the underlying. (No protective-put framing —
-    this is direct directional exposure since the account doesn't hold
-    the underlying.)
+  - `option_call` — long call on `symbol` (must be `is_optionable=True`
+    in the signals table). Bullish thesis on the underlying.
+  - `option_put` — long put on `symbol` (must be `is_optionable=True`
+    in the signals table). Bearish thesis on the underlying. (No
+    protective-put framing — this is direct directional exposure since
+    the account doesn't hold the underlying.)
 - `confidence` ∈ [0, 1]. Threshold guidance:
   - ≥0.7: strong signal, multiple corroborating features
   - 0.5–0.7: moderate
@@ -108,6 +114,38 @@ Rules:
   multiple factors; weaker version of risk_on/off
 - `choppy` — momentum signals contradicting each other across factors
 - `neutral` — no decisive signal across the table
+
+## When to prefer an option expression over a leveraged ETF
+
+The universe has overlapping expressions for several factors — e.g.
+small-caps via TNA/TZA (leveraged ETFs) **or** IWM (option underlying),
+financials via FAS/FAZ **or** XLF, broad equity via UPRO/SPXU **or** SPY.
+For these factors you can surface the option expression instead of
+(or in addition to) the leveraged ETF.
+
+**Prefer the option expression** (`option_call` for bull, `option_put`
+for bear) when:
+- Your directional thesis is high-conviction (`confidence ≥ 0.7`) AND
+  the move you're betting on has a clear timing trigger (FOMC, CPI
+  print, earnings, expiry-related flows).
+- `hv_30d_annualised` on the underlying is **low** for that name's
+  history — cheap vol makes long premium attractive. Rough thresholds
+  per name (use as a guide, not a hard rule): SPY < 0.18, QQQ < 0.22,
+  IWM < 0.25, XLF < 0.22, XLE < 0.28.
+- The account is small ($2,500 paper) — options give defined risk
+  capped at premium, leveraged ETFs deliver path-dependent decay.
+
+**Prefer the leveraged ETF** when:
+- HV on the underlying is elevated (long premium is expensive).
+- You expect a slow grind in your direction over multiple cycles
+  (theta will eat a long option; the ETF compounds path).
+- The factor is one where no option expression exists (vol, crypto-btc,
+  semis, gold-miners directly — must route through SPY/QQQ for broad
+  equity proxy or skip).
+
+This is a nudge, not a quota — sometimes the right call is both (e.g.
+the strategist lists SOXL for a bull-semis thesis AND a SPY call for
+the broader bull-equity thesis); the constructor de-dupes by factor.
 
 ## Biases to avoid
 

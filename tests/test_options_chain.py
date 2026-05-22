@@ -233,3 +233,77 @@ def test_lookup_nearest_otm_uses_partial_pages_on_mid_pagination_error():
     # the previous version would have None'd out the whole lookup.
     assert contract is not None
     assert contract.strike == 541.0
+
+
+class _QuoteBroker:
+    """Broker stub with both get_option_contracts (via _client) and
+    get_option_quote — covers the Tier B path that populates the
+    real bid/ask mid in chain_lookups so the constructor sizes against
+    actual cost instead of HV-based estimates."""
+    def __init__(self, client, quote: tuple[float, float] | None):
+        self._client = client
+        self._quote = quote
+        self.quote_calls: list[str] = []
+
+    def get_option_quote(self, osi_symbol: str):
+        self.quote_calls.append(osi_symbol)
+        return self._quote
+
+
+def test_lookup_nearest_otm_populates_premium_from_quote():
+    """When the broker exposes a live bid/ask, lookup_nearest_otm fills
+    premium_estimate with the mid, and the bid/ask fields with the
+    raw quote. This is the fix for the $2,500-account option-sizing
+    starvation: the constructor needs real premium to know whether
+    1 contract clears the 15% cap."""
+    exp = "2026-06-19"
+    client = _FakePaginatingTradingClient([
+        [_FakeContract(exp, 541.0), _FakeContract(exp, 600.0)],
+    ])
+    broker = _QuoteBroker(client, quote=(2.10, 2.20))
+    contract = options_chain.lookup_nearest_otm(
+        "SPY", side="call", spot=540.0, target_dte=37, broker=broker,
+    )
+    assert contract is not None
+    assert contract.strike == 541.0
+    assert contract.bid == 2.10
+    assert contract.ask == 2.20
+    assert contract.premium_estimate == 2.15
+    # The quote endpoint was hit exactly once with the OSI we returned.
+    assert broker.quote_calls == [contract.osi_symbol]
+
+
+def test_lookup_nearest_otm_falls_back_when_quote_unavailable():
+    """When get_option_quote returns None (no entitlement, illiquid, network),
+    premium fields stay None — preserving the pre-quote behaviour. The
+    constructor's HV-based estimate kicks in."""
+    exp = "2026-06-19"
+    client = _FakePaginatingTradingClient([
+        [_FakeContract(exp, 541.0), _FakeContract(exp, 600.0)],
+    ])
+    broker = _QuoteBroker(client, quote=None)
+    contract = options_chain.lookup_nearest_otm(
+        "SPY", side="call", spot=540.0, target_dte=37, broker=broker,
+    )
+    assert contract is not None
+    assert contract.bid is None
+    assert contract.ask is None
+    assert contract.premium_estimate is None
+
+
+def test_lookup_nearest_otm_works_without_get_option_quote_method():
+    """Legacy brokers / test stubs that don't implement get_option_quote
+    still get a valid OptionContract back — the chain-lookup path must
+    not require the new method."""
+    exp = "2026-06-19"
+    client = _FakePaginatingTradingClient([
+        [_FakeContract(exp, 541.0), _FakeContract(exp, 600.0)],
+    ])
+    broker = _FakeBroker(client)  # no get_option_quote attr
+    contract = options_chain.lookup_nearest_otm(
+        "SPY", side="call", spot=540.0, target_dte=37, broker=broker,
+    )
+    assert contract is not None
+    assert contract.bid is None
+    assert contract.ask is None
+    assert contract.premium_estimate is None

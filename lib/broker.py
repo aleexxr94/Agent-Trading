@@ -121,3 +121,20 @@ class Broker(ABC):
         burning an order attempt on a doomed contract.
         """
         return True
+
+    def get_option_quote(self, osi_symbol: str) -> tuple[float, float] | None:
+        """Return (bid, ask) for an OSI option symbol, or None on any failure.
+
+        Used by lib/options_chain after the nearest-OTM contract is picked
+        so the constructor can size against the real mid premium instead
+        of priors. Returning None must be safe — the constructor falls
+        back to estimating from underlying HV when the quote is missing.
+
+        Default implementation returns None — concrete brokers override.
+        Failure modes that should return None (never raise):
+          - any HTTP / auth / network error
+          - the symbol exists but the feed returned no quote (rare; can
+            happen pre-market on illiquid strikes)
+          - non-numeric bid/ask in the response
+        """
+        return None
