@@ -34,6 +34,76 @@ from lib import state
 
 ROOT = Path(__file__).resolve().parent
 
+
+# ---------- cached views ----------
+# Streamlit re-runs the whole script on every interaction (tab clicks,
+# button presses, even mouse hover on Plotly charts). The JSONL readers
+# below are cheap individually but together add up — and trades_pnl_view
+# in particular is called from BOTH the Performance synthetic-balance
+# block and the Trades tab on every render, doing FIFO matching twice
+# for nothing. Wrapping them with `st.cache_data` and keying on file
+# mtimes gives sub-millisecond cache hits until the orchestrator (or
+# the operator via "Resync") writes a new row.
+#
+# `lib/dashboard_data.py` deliberately stays Streamlit-free; caching
+# lives here at the call-site layer.
+
+
+def _state_mtimes() -> tuple[int, int, int, int]:
+    """File-mtime tuple used as a cache key. Returns 0 for missing files
+    so the cache key is stable before the orchestrator has written any
+    state."""
+    def _m(p):
+        try:
+            return p.stat().st_mtime_ns
+        except FileNotFoundError:
+            return 0
+    return (
+        _m(state.TRADES_LOG),
+        _m(state.COSTS_LOG),
+        _m(state.NAV_HISTORY_LOG),
+        _m(state.DECISIONS_LOG),
+    )
+
+
+def _marks_key(marks: dict | None) -> tuple:
+    """Hashable cache key for a marks dict — Streamlit's cache_data
+    can hash tuples of primitives reliably."""
+    if not marks:
+        return ()
+    return tuple(sorted((str(k), float(v)) for k, v in marks.items()))
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _cached_trades_pnl_view(_mtimes: tuple, marks_key: tuple) -> dict:
+    marks = {k: v for k, v in marks_key} if marks_key else None
+    return dd.trades_pnl_view(marks=marks)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _cached_realized_balance_series(_mtimes: tuple) -> list:
+    return dd.realized_balance_series()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _cached_fees_running_total(_mtimes: tuple) -> list:
+    return dd.fees_running_total()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _cached_fees_by_month(_mtimes: tuple) -> list:
+    return dd.fees_by_month()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _cached_cost_by_month(_mtimes: tuple) -> list:
+    return dd.cost_by_month()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _cached_nav_history(_mtimes: tuple) -> list:
+    return dd.load_nav_history()
+
 RISK_WARNING_TEXT = (
     "PAPER TRADING — experimental autonomous AI agent. Leveraged ETFs and "
     "options on a small account are high-risk. Not financial advice."
@@ -1042,7 +1112,13 @@ with tabs[2]:
             f'<div class="at-section-label">{len(decisions)} stages logged — newest first</div>',
             unsafe_allow_html=True,
         )
-        for row in reversed(decisions):
+        # Construct→critic→reconstruct (CLAUDE.md §3.5) legitimately logs
+        # two rows for the same (run_id, stage). Counting up front lets us
+        # badge the second occurrence as a retry AND guarantees Streamlit
+        # widget keys stay unique even before the index-suffix below.
+        from collections import Counter
+        _stage_counts = Counter((r["run_id"], r["stage"]) for r in decisions)
+        for idx, row in enumerate(reversed(decisions)):
             stage = row['stage']
             stage_icon = {
                 "market_gate": "🕰️",
@@ -1055,8 +1131,9 @@ with tabs[2]:
                 "meta": "🕒",
                 "monitor": "🛡️",
             }.get(stage, "•")
+            retry_badge = " 🔁 retry" if _stage_counts[(row["run_id"], stage)] > 1 else ""
             with st.expander(
-                f"{stage_icon}  {stage:<14} • {row['model']:<28} • "
+                f"{stage_icon}  {stage:<14}{retry_badge} • {row['model']:<28} • "
                 f"{_fmt_ts(row.get('started_at',''))} • ${row.get('cost_usd', 0):.4f}",
                 expanded=False,
             ):
@@ -1067,7 +1144,7 @@ with tabs[2]:
                     st.markdown(f"**Artifact:** `{artifact.relative_to(ROOT)}`")
                     if st.button(
                         f"View {stage} artifact",
-                        key=f"view-{row['run_id']}-{stage}",
+                        key=f"view-{idx}-{row['run_id']}-{stage}",
                     ):
                         st.json(json.loads(artifact.read_text()))
 
@@ -1076,12 +1153,11 @@ with tabs[2]:
 with tabs[3]:
     # Drive the entire P&L summary off the same SyntheticBalance the
     # hero card uses — no parallel computation, no risk of divergence.
-    _synth = dd.compute_synthetic_balance(
-        marks=broker_marks or {},
-        portfolio=portfolio,
-        broker_costs=broker_costs or {},
-        held_keys=broker_view.held_keys if broker_view.available else None,
-    )
+    # Reuse _synth_live computed above the hero header (identical args)
+    # so trades_pnl_view + FIFO matching don't run a second time per
+    # render. Saves one full pass over trades.jsonl on the Performance
+    # tab.
+    _synth = _synth_live
 
     st.markdown('<div class="at-section-label">Synthetic balance breakdown</div>',
                 unsafe_allow_html=True)
@@ -1167,53 +1243,187 @@ with tabs[3]:
         "modelled fees taper as positions close."
     )
 
-    st.markdown('<div class="at-section-label">Synthetic balance over time</div>',
+    st.markdown('<div class="at-section-label">Portfolio balance over time</div>',
                 unsafe_allow_html=True)
-    # Two-trace chart:
+    # Single chart with a source toggle:
     #
-    # 1. **Historical realized line** — reconstructed deterministically
-    #    from trades.jsonl + costs.jsonl, plus all-time real trading
-    #    fees. Stable; doesn't move with intraday marks. Math:
-    #    $2,500 + closed_gross(t) − LLM(t) − real_fees(t).
+    # 1. **Actual NAV (per-cycle)** — `state/nav_history.jsonl`. One
+    #    point per orchestrator cycle, plus a live-broker-equity tip.
+    #    What the orchestrator actually saw at cycle end. This is the
+    #    chart users want when they ask "what is the bot doing right
+    #    now". Falls back to the synthetic trace when the file is empty.
     #
-    # 2. **Live tip** — a single marker at utcnow() with the current
-    #    hero value (open P&L + modelled open fees included). Dashed
-    #    grey segment connects the last historical point to it so the
-    #    operator sees explicitly that the chart's TIP reflects the
-    #    hero card. Tooltip labels it as "Live".
-    series = dd.realized_balance_series()
-    live_tip = dd.live_balance_tip(synthetic_balance=_synth)
-    if series or live_tip["synthetic_balance_usd"] != _synth.starting_balance_usd or _synth.open_gross_pnl_usd:
-        # Window filter + DataFrame for the historical trace.
-        nav_df = pd.DataFrame(series) if series else pd.DataFrame(columns=[
-            "at", "synthetic_realized_balance_usd",
-            "closed_gross_pnl_usd", "llm_cost_total_usd",
-            "trading_fees_total_usd",
-        ])
+    # 2. **Synthetic balance (reconstructed)** — deterministically built
+    #    from trades.jsonl + costs.jsonl. Independent of broker
+    #    availability. Math: $2,500 + closed_gross(t) − LLM(t) − fees(t).
+    #    Plus a live tip including open P&L + modelled fees.
+    chart_controls = st.columns([2, 3])
+    with chart_controls[0]:
+        source_choice = st.radio(
+            "Source",
+            ["Actual NAV (per-cycle)", "Synthetic balance (reconstructed)"],
+            index=0,
+            horizontal=False,
+            help="Actual NAV plots the portfolio equity the orchestrator "
+                 "recorded at the end of each cycle (from "
+                 "state/nav_history.jsonl). Synthetic balance is a "
+                 "deterministic reconstruction from trades + costs that "
+                 "works even when the broker is unreachable.",
+        )
+    with chart_controls[1]:
         window_choice = st.radio(
             "Window",
             ["1D", "1W", "1M", "1Y", "All"],
             index=4,
             horizontal=True,
-            label_visibility="collapsed",
-            help="Filter the historical line to the trailing window. "
-                 "Affects this chart only; underlying trades/costs logs "
-                 "are untouched. The live tip is always shown.",
+            help="Filter the chart to the trailing window. Affects this "
+                 "chart only; underlying logs are untouched. The live tip "
+                 "is always shown.",
         )
-        window_days = {"1D": 1, "1W": 7, "1M": 30, "1Y": 365}.get(window_choice)
-        if window_days is not None and "at" in nav_df.columns and not nav_df.empty:
-            from datetime import datetime, timezone, timedelta
-            cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
-            nav_df = nav_df.copy()
-            nav_df["_at_dt"] = pd.to_datetime(
-                nav_df["at"].str.replace("Z", "+00:00", regex=False),
-                utc=True,
-                errors="coerce",
-            )
-            nav_df = nav_df[nav_df["_at_dt"] >= cutoff]
+    window_days = {"1D": 1, "1W": 7, "1M": 30, "1Y": 365}.get(window_choice)
 
+    def _apply_window(df: pd.DataFrame, time_col: str = "at") -> pd.DataFrame:
+        if window_days is None or df.empty or time_col not in df.columns:
+            return df
+        from datetime import datetime, timezone, timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+        out = df.copy()
+        out["_at_dt"] = pd.to_datetime(
+            out[time_col].astype(str).str.replace("Z", "+00:00", regex=False),
+            utc=True, errors="coerce",
+        )
+        return out[out["_at_dt"] >= cutoff]
+
+    if source_choice.startswith("Actual"):
+        # Per-cycle NAV from orchestrator.py:932-943, reset-aware for any
+        # nav_offset configured (legacy — currently unused in this build
+        # but preserved for promotion-to-live; apply_nav_offset_to_history
+        # is a no-op when offset is 0).
+        raw_rows = _cached_nav_history(_state_mtimes())
+        # Read the offset once so the history line AND the live broker
+        # tip below use the SAME unit space. Codex P2 (PR #87): the
+        # earlier version offset-corrected the history but used raw
+        # broker equity for the live tip, producing a false vertical
+        # jump equal to the offset whenever a NAV anchor was set.
+        _nav_offset_usd = state.nav_offset_usd()
+        nav_rows = dd.apply_nav_offset_to_history(
+            raw_rows, nav_offset_usd=_nav_offset_usd,
+        )
+        if not nav_rows:
+            st.info(
+                "No NAV history yet — `state/nav_history.jsonl` is empty. "
+                "The orchestrator writes one row per cycle that reaches "
+                "stage_execute. Switch the source above to **Synthetic "
+                "balance (reconstructed)** to see a chart from trades + "
+                "costs in the meantime."
+            )
+        else:
+            nav_df = pd.DataFrame(nav_rows)
+            # Codex P1 (PR #87): state.append_nav only REQUIRES run_id,
+            # at, nav_usd — the other hover columns are optional. Older
+            # or externally-written rows that omit positions_count /
+            # gross_pnl_usd / net_pnl_usd / nav_source would crash the
+            # `nav_df[[...]]` slice with KeyError. Ensure every hover
+            # column exists with a sensible default before the slice.
+            for col, default in [
+                ("run_id", "—"),
+                ("positions_count", 0),
+                ("gross_pnl_usd", 0.0),
+                ("net_pnl_usd", 0.0),
+                ("nav_source", "—"),
+            ]:
+                if col not in nav_df.columns:
+                    nav_df[col] = default
+            nav_df = _apply_window(nav_df, time_col="at")
+            # Live tip: prefer real broker equity when available; fall
+            # back to the synthetic balance (hero card) so the operator
+            # always sees a current marker even when the broker is offline.
+            # When nav_offset is configured, broker equity must be
+            # offset-corrected to match the history line's units (Codex
+            # P2). The synthetic fallback is already in virtual units so
+            # no offset applies.
+            live_at = state.utcnow_iso()
+            if broker_view.available and getattr(broker_view, "nav_usd", None) is not None:
+                live_nav = float(broker_view.nav_usd) - _nav_offset_usd
+                live_label = "Live broker equity"
+            else:
+                live_nav = float(_synth.synthetic_balance_usd)
+                live_label = "Live (synthetic — broker offline)"
+            fig_nav = go.Figure()
+            if not nav_df.empty:
+                fig_nav.add_trace(go.Scatter(
+                    x=nav_df["at"],
+                    y=nav_df["nav_usd"],
+                    mode="lines+markers",
+                    name="Per-cycle NAV",
+                    line=dict(width=2.5, color="#059669"),
+                    marker=dict(size=6, color="#059669"),
+                    hovertemplate=(
+                        "%{x}"
+                        "<br>NAV: $%{y:,.2f}"
+                        "<br>Run: %{customdata[0]}"
+                        "<br>Positions: %{customdata[1]}"
+                        "<br>Gross P&L: $%{customdata[2]:,.2f}"
+                        "<br>Net P&L: $%{customdata[3]:,.2f}"
+                        "<br>Source: %{customdata[4]}"
+                        "<extra></extra>"
+                    ),
+                    customdata=nav_df[[
+                        "run_id", "positions_count",
+                        "gross_pnl_usd", "net_pnl_usd", "nav_source",
+                    ]].fillna("—").values,
+                ))
+                # Dashed connector from last cycle to live tip.
+                fig_nav.add_trace(go.Scatter(
+                    x=[nav_df["at"].iloc[-1], live_at],
+                    y=[float(nav_df["nav_usd"].iloc[-1]), live_nav],
+                    mode="lines",
+                    line=dict(width=1.5, color="#94a3b8", dash="dash"),
+                    name="(live gap)",
+                    hoverinfo="skip",
+                ))
+            fig_nav.add_trace(go.Scatter(
+                x=[live_at], y=[live_nav],
+                mode="markers",
+                name=live_label,
+                marker=dict(
+                    size=12, color="#d97706", symbol="diamond",
+                    line=dict(width=1.5, color="#0f172a"),
+                ),
+                hovertemplate=f"{live_label}: $%{{y:,.2f}}<extra></extra>",
+            ))
+            fig_nav.update_layout(
+                template="plotly_white",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                height=380, yaxis_title="Portfolio NAV (USD)",
+                yaxis=dict(gridcolor="#e2e8f0", color="#059669"),
+                xaxis=dict(gridcolor="#e2e8f0"),
+                margin=dict(l=10, r=10, t=20, b=10),
+                legend=dict(orientation="h", y=1.1, font=dict(size=12)),
+            )
+            st.plotly_chart(fig_nav, width="stretch")
+            st.caption(
+                f"Green line = portfolio NAV at the end of each "
+                f"orchestrator cycle from `state/nav_history.jsonl` "
+                f"({len(nav_df)} of {len(nav_rows)} cycles shown). "
+                f"Diamond = {live_label.lower()}, refreshed on each "
+                f"dashboard reload. Toggle Source → *Synthetic balance* "
+                f"for a broker-independent reconstruction from "
+                f"trades.jsonl + costs.jsonl."
+            )
+    else:
+        # Synthetic balance — preserved from the previous implementation
+        # so the deterministic "broker-independent" view stays available.
+        series = _cached_realized_balance_series(_state_mtimes())
+        live_tip = dd.live_balance_tip(synthetic_balance=_synth)
+        nav_df = pd.DataFrame(series) if series else pd.DataFrame(columns=[
+            "at", "synthetic_realized_balance_usd",
+            "closed_gross_pnl_usd", "llm_cost_total_usd",
+            "trading_fees_total_usd",
+        ])
+        nav_df = _apply_window(nav_df, time_col="at")
         fig_nav = go.Figure()
-        # Trace 1: historical realized line.
         if not nav_df.empty:
             fig_nav.add_trace(go.Scatter(
                 x=nav_df["at"],
@@ -1235,20 +1445,15 @@ with tabs[3]:
                     "trading_fees_total_usd",
                 ]].values,
             ))
-            # Dashed connector from last historical point to live tip.
-            last_at = nav_df["at"].iloc[-1]
-            last_y = nav_df["synthetic_realized_balance_usd"].iloc[-1]
             fig_nav.add_trace(go.Scatter(
-                x=[last_at, live_tip["at"]],
-                y=[last_y, live_tip["synthetic_balance_usd"]],
+                x=[nav_df["at"].iloc[-1], live_tip["at"]],
+                y=[nav_df["synthetic_realized_balance_usd"].iloc[-1],
+                   live_tip["synthetic_balance_usd"]],
                 mode="lines",
                 line=dict(width=1.5, color="#94a3b8", dash="dash"),
                 name="(open P&L + modelled fees)",
                 hoverinfo="skip",
             ))
-        # Trace 2: live tip marker — always rendered so the operator
-        # sees the current hero value on the chart even when no
-        # realized events exist yet.
         fig_nav.add_trace(go.Scatter(
             x=[live_tip["at"]],
             y=[live_tip["synthetic_balance_usd"]],
@@ -1277,27 +1482,28 @@ with tabs[3]:
             template="plotly_white",
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            height=360, yaxis_title="Synthetic balance (USD)",
+            height=380, yaxis_title="Synthetic balance (USD)",
             yaxis=dict(gridcolor="#e2e8f0", color="#059669"),
             xaxis=dict(gridcolor="#e2e8f0"),
             margin=dict(l=10, r=10, t=20, b=10),
             legend=dict(orientation="h", y=1.1, font=dict(size=12)),
         )
-        st.plotly_chart(fig_nav, width="stretch")
-        st.caption(
-            "Green line = historical realized balance reconstructed from "
-            "`state/trades.jsonl` + `state/costs.jsonl` (closed gross + "
-            "real fees + LLM, exact). Diamond marker = live snapshot, "
-            "matches the hero card exactly (adds open P&L + modelled "
-            "open fees). The dashed segment is the gap the open positions "
-            "represent at this moment."
-        )
-    else:
-        st.info(
-            "No realized events and no open positions yet — the curve "
-            "populates with the first closed trade, LLM cost row, or "
-            "open position with marks."
-        )
+        if nav_df.empty and live_tip["synthetic_balance_usd"] == _synth.starting_balance_usd and not _synth.open_gross_pnl_usd:
+            st.info(
+                "No realized events and no open positions yet — the "
+                "synthetic line populates with the first closed trade, "
+                "LLM cost row, or open position with marks."
+            )
+        else:
+            st.plotly_chart(fig_nav, width="stretch")
+            st.caption(
+                "Green line = historical realized balance reconstructed "
+                "from `state/trades.jsonl` + `state/costs.jsonl` (closed "
+                "gross + real fees + LLM, exact). Diamond = live snapshot, "
+                "matches the hero card (adds open P&L + modelled open "
+                "fees). The dashed segment is the gap the open positions "
+                "represent at this moment."
+            )
 
     st.markdown('<div class="at-section-label">LLM cost over time</div>', unsafe_allow_html=True)
     if costs:
@@ -1331,7 +1537,7 @@ with tabs[3]:
         '<div class="at-section-label">Trading fees over time (real, from Alpaca fills)</div>',
         unsafe_allow_html=True,
     )
-    fees_cum = dd.fees_running_total()
+    fees_cum = _cached_fees_running_total(_state_mtimes())
     if fees_cum:
         df_fees = pd.DataFrame(fees_cum)
         fig_fees = go.Figure()
@@ -1367,7 +1573,7 @@ with tabs[3]:
         )
 
     st.markdown('<div class="at-section-label">Trading fees by month</div>', unsafe_allow_html=True)
-    fees_m = dd.fees_by_month()
+    fees_m = _cached_fees_by_month(_state_mtimes())
     if fees_m:
         df_fm = pd.DataFrame(fees_m)
         df_fm["fees_usd"] = df_fm["fees_usd"].map(lambda v: f"${v:,.2f}")
@@ -1385,7 +1591,7 @@ with tabs[3]:
 
     st.markdown('<div class="at-section-label">Cost & tokens by month (this project only)</div>',
                 unsafe_allow_html=True)
-    by_month = dd.cost_by_month()
+    by_month = _cached_cost_by_month(_state_mtimes())
     if by_month:
         df_m = pd.DataFrame(by_month)
         df_m["cost_usd"] = df_m["cost_usd"].map(lambda v: f"${v:,.4f}")
@@ -1416,7 +1622,28 @@ with tabs[4]:
         "LLM cost is the opening run's total split evenly across the positions "
         "it opened (per the locked methodology). Net = gross − fees − LLM."
     )
-    view = dd.trades_pnl_view(marks=broker_marks)
+
+    # Surface the orchestrator's last activities-sync error. The sync is
+    # wrapped in try/except at orchestrator.py:898-911 and the failure
+    # string lands in state/next_run.json["trades_sync_error"] — without
+    # this banner a silently-failing sync looks identical to "no fills
+    # yet", which is the symptom that first hid closed trades from the
+    # operator. The Settings tab has a one-click "Resync" button to
+    # retry without restarting the orchestrator.
+    _sync_err = ""
+    if state.NEXT_RUN.exists():
+        try:
+            _sync_err = state.read_json(state.NEXT_RUN).get("trades_sync_error", "") or ""
+        except Exception:
+            _sync_err = ""
+    if _sync_err:
+        st.warning(
+            f"⚠️ Last activities sync failed — closed trades may be stale. "
+            f"`{_sync_err}`. Use **Settings → Resync from Alpaca activities** "
+            f"to retry, or check Alpaca API keys."
+        )
+
+    view = _cached_trades_pnl_view(_state_mtimes(), _marks_key(broker_marks))
     # Local name MUST NOT shadow the module-level `totals` which the
     # Settings tab below reads as a dd.total_token_cost() dict (keys
     # `cost_usd`, `calls`, `total_tokens`, …). Streamlit re-runs every
@@ -1501,6 +1728,36 @@ with tabs[4]:
             "No closed trades yet. Closed-trade rows appear once a position "
             "is fully sold and the activities sync picks up the close."
         )
+
+    # Surface sells that arrived in trades.jsonl with no matching prior
+    # buy lot — FIFO drops them on the floor (they never appear in the
+    # closed table) but the operator needs to see them to diagnose
+    # missing-history situations: out-of-order activities sync, manual
+    # broker close before orchestrator opened the lot locally, or a wipe
+    # that cleared buys but not sells.
+    _unmatched = view.get("unmatched_sells", [])
+    if _unmatched:
+        with st.expander(
+            f"⚠️ Unmatched sells ({len(_unmatched)}) — sells with no prior buy in trades.jsonl",
+            expanded=False,
+        ):
+            st.caption(
+                "These sells couldn't be paired against an open buy lot by "
+                "FIFO. Common causes: history was wiped while positions were "
+                "still open, the activities sync ran out of order, or the "
+                "position was opened outside the orchestrator. They are NOT "
+                "included in Realised P&L above."
+            )
+            df_unm = pd.DataFrame(_unmatched).rename(columns={
+                "symbol": "Symbol",
+                "kind": "Kind",
+                "qty": "Qty",
+                "fill_price": "Fill price",
+                "filled_at": "Filled at",
+                "activity_id": "Activity ID",
+            })
+            sty_unm = df_unm.style.format({"Fill price": "${:,.4f}"})
+            st.dataframe(sty_unm, width="stretch", hide_index=True)
 
     st.markdown(
         '<div class="at-section-label" style="margin-top:1.2rem;">'
@@ -1760,6 +2017,39 @@ with tabs[6]:
     # Stale state files (state/nav_offset.json,
     # state/nav_manual_baseline.json) are harmlessly left on disk and
     # wiped by the "Wipe history" button below.
+
+    st.markdown(
+        '<div class="at-section-label">Resync trades from Alpaca</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Pull the full activities history from Alpaca (FILLS + fees) and "
+        "append any rows not already in `state/trades.jsonl`. Idempotent — "
+        "rows are keyed by Alpaca's `activity_id`, so re-running this is "
+        "safe. Use after a transient API failure (the Trades tab banner "
+        "will say so), after wiping history, or any time closed trades "
+        "look stale."
+    )
+    if st.button(
+        "🔁 Resync from Alpaca activities",
+        help="Runs lib.trades_sync.sync_fills_from_alpaca with no since-cursor. "
+             "Requires ALPACA_API_KEY / ALPACA_API_SECRET in env.",
+    ):
+        try:
+            from lib import trades_sync
+            res = trades_sync.sync_fills_from_alpaca(
+                order_id_to_run_id=trades_sync.order_id_to_run_id_from_runs(),
+            )
+            st.success(
+                f"Sync complete — wrote {res.new_fills_written} new fill(s), "
+                f"saw {res.fills_seen} activities, matched fees on "
+                f"{res.fees_matched} fill(s). Refresh to see the Trades tab."
+            )
+        except Exception as e:
+            st.error(
+                f"Sync failed: `{type(e).__name__}: {e}`. Check ALPACA_API_KEY "
+                "/ ALPACA_API_SECRET and that the broker is reachable."
+            )
 
     st.markdown('<div class="at-section-label">Wipe history (start fresh)</div>', unsafe_allow_html=True)
     st.caption(
