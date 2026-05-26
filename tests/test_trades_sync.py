@@ -413,6 +413,52 @@ def test_sync_propagates_400_with_other_codes(tmp_state):
         trades_sync.sync_fills_from_alpaca(trading_client=tc)
 
 
+def test_sync_skips_invalid_activity_type_without_status_code_attr(tmp_state):
+    """PR #90 regression: alpaca-py's APIError is version-dependent —
+    some versions don't attach status_code on the exception instance
+    at all. On the VPS resync after PR #89 merged, the swallow path
+    didn't engage because status_code was None and the 400-gated
+    branch didn't fire, so the error propagated even though the message
+    body unambiguously identified the documented case.
+
+    The fix removes the status_code gate for the 40010001 / "invalid
+    activity type" combination — the message-body signals alone are
+    tight enough (Codex P2 concern about over-broad swallowing is still
+    addressed because the message phrase only matches the documented
+    response).
+    """
+    class _Alpaca400NoStatusAttr(Exception):
+        """Mimics an alpaca-py APIError that doesn't expose status_code
+        on the instance (or via .response). Same JSON body as the real
+        paper-API response."""
+        def __init__(self, activity_type: str = "OCC"):
+            super().__init__(
+                f'{{"code":40010001,"message":"invalid activity type: {activity_type}"}}'
+            )
+            # Deliberately NOT setting status_code or response — that's
+            # the SDK-variance scenario this test pins.
+
+    tc = _FakeTrading(
+        responses={
+            "/account/activities/FILL": [_fill(order_id="ord-X")],
+            "/account/activities/FEE": [_fee(
+                order_id="ord-X", net_amount="-0.07",
+                activity_type="FEE",
+            )],
+        },
+        raise_on={
+            f"/account/activities/{t}": _Alpaca400NoStatusAttr(t)
+            for t in ("OCC", "ORF", "REG", "SEC", "TAF", "FINRA_TAF")
+        },
+    )
+    # No status_code on the exception, but the message body identifies
+    # the documented case → swallowed, sync completes, fee from FEE
+    # is folded into the fill.
+    res = trades_sync.sync_fills_from_alpaca(trading_client=tc)
+    assert res.new_fills_written == 1
+    assert state.read_trades()[0]["fees_usd"] == pytest.approx(0.07)
+
+
 def test_sync_propagates_400_with_40010001_but_unrelated_message(tmp_state):
     """Codex P2 (PR #89 second pass): Alpaca reuses code 40010001 for
     multiple validation failures (invalid date, invalid symbol, etc.),
