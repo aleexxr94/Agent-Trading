@@ -413,6 +413,27 @@ def test_sync_propagates_400_with_other_codes(tmp_state):
         trades_sync.sync_fills_from_alpaca(trading_client=tc)
 
 
+def test_sync_propagates_400_with_40010001_but_unrelated_message(tmp_state):
+    """Codex P2 (PR #89 second pass): Alpaca reuses code 40010001 for
+    multiple validation failures (invalid date, invalid symbol, etc.),
+    not just unsupported activity types. A 400 with code 40010001 but a
+    message like 'invalid date: 2099-99-99' must NOT be silently swallowed
+    — that would mask real bugs in our request payloads. The swallow
+    requires BOTH the code AND the specific 'invalid activity type'
+    message phrase to engage.
+    """
+    class _Alpaca400ValidationDate(Exception):
+        def __init__(self):
+            super().__init__('{"code":40010001,"message":"invalid date: 2099-99-99"}')
+            self.status_code = 400
+    tc = _FakeTrading(
+        responses={"/account/activities/FILL": [_fill()]},
+        raise_on={"/account/activities/OCC": _Alpaca400ValidationDate()},
+    )
+    with pytest.raises(_Alpaca400ValidationDate):
+        trades_sync.sync_fills_from_alpaca(trading_client=tc)
+
+
 def test_sync_queries_FEE_activity_type(tmp_state):
     """Codex P1 on PR #89: Alpaca paper rejects every fee category-specific
     type with HTTP 400 'invalid activity type' — only `FEE` is accepted.

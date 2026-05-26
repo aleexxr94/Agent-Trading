@@ -149,12 +149,17 @@ def _is_unsupported_activity_type_error(exc: BaseException) -> bool:
     if status == 404:
         return True
     if status == 400:
-        # alpaca-py's APIError stringifies as the raw JSON body. The
-        # 40010001 code is the only one that means "this activity type
-        # name isn't valid". Match on the code OR the literal phrase so
-        # a docs change to the message text doesn't re-break the swallow.
+        # Codex P2 (PR #89 second pass): require BOTH signals — the
+        # `40010001` code AND the literal "invalid activity type"
+        # phrase. Alpaca reuses code 40010001 for unrelated validation
+        # failures (invalid date, invalid symbol, etc.) so matching on
+        # the code alone would silently swallow real errors and let
+        # sync_fills_from_alpaca proceed with incomplete fees. Matching
+        # on the message alone is fragile to localization/refactor;
+        # AND-ing both gives a tight pin on the documented case while
+        # remaining robust to either signal being reformatted alone.
         msg = str(exc)
-        return "40010001" in msg or "invalid activity type" in msg.lower()
+        return "40010001" in msg and "invalid activity type" in msg.lower()
     return False
 
 
