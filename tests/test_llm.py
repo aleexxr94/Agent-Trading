@@ -890,6 +890,60 @@ def test_strip_fences_returns_input_when_no_json_found():
     assert llm.strip_markdown_fences(text) == text
 
 
+def test_strip_fences_preserves_top_level_array_unfenced():
+    """Codex P2 (PR #89): top-level JSON arrays are valid LLM output.
+    The original implementation returned unfenced JSON unchanged, so an
+    array root survived. The brace-only extractor regressed this by
+    finding the first ``{`` inside the array and returning just that
+    element. The fix detects whichever opening delimiter (``{`` or
+    ``[``) comes first and balances against its matching close."""
+    text = '[{"a": 1}, {"b": 2}]'
+    out = llm.strip_markdown_fences(text)
+    assert out == '[{"a": 1}, {"b": 2}]'
+    assert json.loads(out) == [{"a": 1}, {"b": 2}]
+
+
+def test_strip_fences_preserves_top_level_array_with_prose_preamble():
+    """Same as above but with a prose preamble — the extractor must
+    walk past the prose and surface the entire array, not the first
+    object inside it."""
+    text = 'Here is the list:\n[{"x": 1}, {"y": 2}, {"z": 3}]\nThanks.'
+    out = llm.strip_markdown_fences(text)
+    assert json.loads(out) == [{"x": 1}, {"y": 2}, {"z": 3}]
+
+
+def test_strip_fences_preserves_top_level_array_inside_fences():
+    """Fenced JSON whose root is an array survives the fence-strip pass
+    and isn't subsequently truncated by the balanced-delimiter scan."""
+    text = '```json\n[{"a": 1}, {"b": 2}]\n```'
+    out = llm.strip_markdown_fences(text)
+    assert json.loads(out) == [{"a": 1}, {"b": 2}]
+
+
+def test_strip_fences_picks_first_opening_character():
+    """If both ``{`` and ``[`` appear (e.g. prose mentioning ``{example}``
+    BEFORE the actual array root), the extractor still finds the
+    correct first JSON-opening character. Conversely, an object root
+    with a stray ``[`` in the preamble doesn't get hijacked."""
+    # Array root after prose that contains a literal ``{``.
+    text_arr = "Note: the {placeholder} below.\n[1, 2, 3]"
+    # First non-string ``{`` appears before ``[`` — extractor returns
+    # the object-shaped slice from ``{placeholder}``. That's the
+    # documented "first JSON-opening character wins" behaviour; the
+    # caller's json.loads will raise on the prose, preserving the
+    # error context. We pin this so a future refactor doesn't quietly
+    # flip the precedence rule.
+    out_arr = llm.strip_markdown_fences(text_arr)
+    assert out_arr == "{placeholder}"
+
+    # Object root with a stray ``[`` in the preamble.
+    text_obj = 'See list [a, b]:\n{"final": true}'
+    out_obj = llm.strip_markdown_fences(text_obj)
+    # First opener is ``[`` so the extractor returns ``[a, b]`` (which
+    # is not valid JSON — caller will see the parse error). Same logic.
+    assert out_obj == "[a, b]"
+
+
 def test_structured_call_parses_fenced_response(tmp_state):
     """Even if the model wraps JSON in markdown fences, structured_call should
     parse it cleanly instead of triggering the schema-retry path."""

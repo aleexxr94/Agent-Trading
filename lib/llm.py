@@ -269,13 +269,17 @@ def strip_markdown_fences(text: str) -> str:
          (handles (a) and (b)). The closing fence is matched as
          ``\\n``` to avoid truncating triple-backticks legitimately
          embedded inside a JSON string value.
-      2. Otherwise (handles (c)): find the first balanced ``{…}`` block.
-         Scan from the first ``{``, track brace depth honouring quoted
-         strings + backslash escapes, return the slice when depth hits 0.
+      2. Otherwise (handles (c)): find the first balanced ``{…}`` OR
+         ``[…]`` block — whichever opening character appears first.
+         Scan from there, track depth on the matching delimiter pair
+         honouring quoted strings + backslash escapes, return the slice
+         when depth hits 0. Top-level arrays are valid JSON
+         (``[{"a":1},{"b":2}]``) and must survive intact, not be
+         truncated to their first element (Codex P2 on PR #89).
       3. If neither yields a result, return the stripped input unchanged
          and let the caller's `json.loads` raise — the original behaviour.
 
-    The brace-balanced extraction is necessary because regex can't
+    The balanced-delimiter extraction is necessary because regex can't
     correctly handle nested objects in JSON values (e.g. a strategist
     candidates array with nested greeks dicts).
     """
@@ -295,10 +299,26 @@ def strip_markdown_fences(text: str) -> str:
             # that the closing-fence cut left with trailing junk; fall
             # through to it instead of returning here.
             t = stripped or t
-    # --- (c): prose around raw JSON — pull the first balanced {…} ---
-    first = t.find("{")
-    if first == -1:
+    # --- (c): prose around raw JSON — pull the first balanced {…} or […] ---
+    # Top-level JSON can legitimately be an array (`[{"a":1},{"b":2}]`),
+    # not just an object. Codex P2 (PR #89): the original brace-only
+    # scan truncated such arrays to their first element. Detect the
+    # first JSON-opening character and balance against the matching
+    # close so both shapes survive intact.
+    first_obj = t.find("{")
+    first_arr = t.find("[")
+    if first_obj == -1 and first_arr == -1:
         return t
+    if first_obj == -1:
+        first, open_ch, close_ch = first_arr, "[", "]"
+    elif first_arr == -1:
+        first, open_ch, close_ch = first_obj, "{", "}"
+    else:
+        # Whichever opening character comes first wins.
+        if first_obj < first_arr:
+            first, open_ch, close_ch = first_obj, "{", "}"
+        else:
+            first, open_ch, close_ch = first_arr, "[", "]"
     depth = 0
     in_str = False
     escape = False
@@ -315,14 +335,14 @@ def strip_markdown_fences(text: str) -> str:
             continue
         if in_str:
             continue
-        if ch == "{":
+        if ch == open_ch:
             depth += 1
-        elif ch == "}":
+        elif ch == close_ch:
             depth -= 1
             if depth == 0:
                 return t[first:i + 1]
-    # Unbalanced braces — return the stripped input so the caller's
-    # json.loads raises with the original context. Pre-existing behaviour.
+    # Unbalanced — return the stripped input so the caller's json.loads
+    # raises with the original context. Pre-existing behaviour.
     return t
 
 
