@@ -154,6 +154,18 @@ the broader bull-equity thesis); the constructor de-dupes by factor.
   this pattern unless `hv` is genuinely low. If you find yourself
   reaching for vol+rates as a fallback, ask whether the table actually
   supports a directional pick on the equity factors first.
+- **Don't pre-veto options just because the ETF is also listed.** The
+  constructor de-dupes by factor at its end — your job is to surface
+  the genuine candidates. If both the leveraged ETF and the option
+  expression on the same factor have a clean thesis and the option
+  meets the "prefer option" criteria above, surface BOTH and let the
+  constructor weigh sizing/cost/decay. In particular, phrases like
+  "factor already covered" or "ETF aligns with existing position" are
+  NOT reasons to drop the option from your candidate list — those are
+  exactly the trade-offs the constructor is equipped to evaluate. The
+  diagnostic case: if you wrote "QQQ hv_30d=0.16 is below 0.22
+  threshold but factor already covered here" while listing TQQQ, you
+  should have listed the QQQ call ALSO and let the constructor pick.
 - **Don't fear all-cash** in a flash-crash signal (e.g. multiple
   factors with `momentum_30d_pct < -8.0` AND `hv_30d_annualised > 0.5`).
   An empty `candidates` list with regime_rationale explaining is the

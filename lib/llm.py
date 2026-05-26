@@ -248,45 +248,102 @@ _CLOSING_FENCE_RE = re.compile(r"\n```")
 
 
 def strip_markdown_fences(text: str) -> str:
-    """Strip a leading ```json … ``` fence and any prose that may follow.
+    """Extract the first JSON object from LLM output, tolerating prose
+    preamble, prose epilogue, and markdown fences in any combination.
 
-    The screener / scenarios prompts forbid markdown fences, but Haiku in
-    particular occasionally:
-      (a) wraps the JSON in ```json … ``` and stops there (the original
-          observation that motivated this helper), or
-      (b) wraps the JSON in ```json … ``` AND THEN appends a "Regime
-          flags & rationale:" prose epilogue OUTSIDE the closing fence
-          (observed in the live paper run at 2026-05-12T21:23 UTC — the
-          screener produced 12 well-formed candidates inside the fenced
-          block but json.loads choked on the trailing prose, fell back to
-          a `raw` envelope, and zeroed `passed`/`rejected` for the rest
-          of the cycle).
+    Three observed failure modes in production:
+      (a) ```json … ``` fence with nothing after the closer (Haiku, 2025).
+      (b) ```json … ``` fence AND a "Regime flags & rationale:" prose
+          epilogue outside the closing fence (live paper run 2026-05-12;
+          screener produced 12 valid candidates but json.loads choked on
+          the trailing prose).
+      (c) No fence at all — Sonnet 4.6 with adaptive thinking writes
+          a reasoning preamble + raw JSON + a trailing summary, so the
+          string is "Here is the next-run plan: {…} This schedules…".
+          Observed on the orchestrator-meta stage producing
+          "meta call failed (JSONDecodeError); using heuristic" on
+          ~100% of cycles on the 2026-05-22 VPS deploy.
 
-    Both shapes resolve to "extract the FIRST fenced block, drop the
-    fence and anything after it". For unfenced JSON (the happy path) we
-    return the input unchanged after stripping whitespace.
+    Resolution strategy:
+      1. If the text starts with ``` strip the fence + trailing prose
+         (handles (a) and (b)). The closing fence is matched as
+         ``\\n``` to avoid truncating triple-backticks legitimately
+         embedded inside a JSON string value.
+      2. Otherwise (handles (c)): find the first balanced ``{…}`` OR
+         ``[…]`` block — whichever opening character appears first.
+         Scan from there, track depth on the matching delimiter pair
+         honouring quoted strings + backslash escapes, return the slice
+         when depth hits 0. Top-level arrays are valid JSON
+         (``[{"a":1},{"b":2}]``) and must survive intact, not be
+         truncated to their first element (Codex P2 on PR #89).
+      3. If neither yields a result, return the stripped input unchanged
+         and let the caller's `json.loads` raise — the original behaviour.
 
-    Codex P2 (PR #58): the closing fence is matched as ``\\n```'' — a
-    triple-backtick sequence at the START of a line. A naive
-    ``body.find('```')`` would falsely truncate when a JSON string value
-    legitimately contains triple backticks (e.g. markdown content
-    embedded in a field). Unescaped real newlines are illegal inside
-    JSON string literals (they must be `\\n` two-char escapes), so the
-    `\\n` prefix on the terminator guarantees we only cut at an actual
-    fence line, never inside a JSON value.
+    The balanced-delimiter extraction is necessary because regex can't
+    correctly handle nested objects in JSON values (e.g. a strategist
+    candidates array with nested greeks dicts).
     """
     t = text.strip()
-    if not t.startswith("```"):
+    if not t:
         return t
-    # Drop the opening fence line (with optional language tag, e.g. ```json).
-    nl = t.find("\n")
-    if nl == -1:
+    # --- (a) / (b): leading markdown fence ---
+    if t.startswith("```"):
+        nl = t.find("\n")
+        if nl != -1:
+            body = t[nl + 1:]
+            m = _CLOSING_FENCE_RE.search(body)
+            if m is not None:
+                body = body[:m.start()]
+            stripped = body.strip()
+            # The brace-balanced extractor below also handles a body
+            # that the closing-fence cut left with trailing junk; fall
+            # through to it instead of returning here.
+            t = stripped or t
+    # --- (c): prose around raw JSON — pull the first balanced {…} or […] ---
+    # Top-level JSON can legitimately be an array (`[{"a":1},{"b":2}]`),
+    # not just an object. Codex P2 (PR #89): the original brace-only
+    # scan truncated such arrays to their first element. Detect the
+    # first JSON-opening character and balance against the matching
+    # close so both shapes survive intact.
+    first_obj = t.find("{")
+    first_arr = t.find("[")
+    if first_obj == -1 and first_arr == -1:
         return t
-    body = t[nl + 1:]
-    m = _CLOSING_FENCE_RE.search(body)
-    if m is not None:
-        body = body[:m.start()]
-    return body.strip()
+    if first_obj == -1:
+        first, open_ch, close_ch = first_arr, "[", "]"
+    elif first_arr == -1:
+        first, open_ch, close_ch = first_obj, "{", "}"
+    else:
+        # Whichever opening character comes first wins.
+        if first_obj < first_arr:
+            first, open_ch, close_ch = first_obj, "{", "}"
+        else:
+            first, open_ch, close_ch = first_arr, "[", "]"
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(first, len(t)):
+        ch = t[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_str:
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return t[first:i + 1]
+    # Unbalanced — return the stripped input so the caller's json.loads
+    # raises with the original context. Pre-existing behaviour.
+    return t
 
 
 class CostCapExceeded(RuntimeError):
