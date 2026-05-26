@@ -103,25 +103,52 @@ def _normalize_side(side: Any) -> str:
     return "buy" if s == "buy" else "sell"
 
 
-def _is_unsupported_activity_404(exc: BaseException) -> bool:
-    """Return True iff ``exc`` represents an Alpaca 404 for an unsupported
-    activity type — the only fee-endpoint failure mode we want to silently
-    skip. Anything else (auth, 5xx, rate limit, parse error) must surface
-    so the operator notices instead of writing fills with silently-wrong
-    fees_usd=0.
+def _is_unsupported_activity_type_error(exc: BaseException) -> bool:
+    """Return True iff ``exc`` represents Alpaca's "this account / API
+    doesn't support that activity type" — the only fee-endpoint failure
+    mode we want to silently skip. Anything else (auth, 5xx, rate limit,
+    parse error) must surface so the operator notices instead of writing
+    fills with silently-wrong fees_usd=0.
 
-    Detection: alpaca-py wraps Alpaca's error responses in
-    ``alpaca.common.exceptions.APIError`` with a ``.status_code`` attribute.
-    A 404 here means the activity type isn't applicable to this account
-    (e.g. TAF on an account that never traded equities). httpx-level
-    HTTPStatusError can also surface; we honour the same status check.
+    Two manifestations from the real Alpaca paper API (probed 2026-05-26):
+      - **404 Not Found** — the historical contract: "this account doesn't
+        have this activity type" (e.g. TAF on an account that never
+        traded equities). Documented in alpaca-py.
+      - **400 Bad Request, code 40010001 "invalid activity type: X"** —
+        the newer contract: the paper API simply rejects every fee
+        category except `FEE`. Observed verbatim for OCC, OCC_FEE, ORF,
+        REG, SEC, TAF, FINRA_TAF on a fresh paper account.
+
+    Without the 400 branch, the very first iteration of the fee-pull
+    loop raises and kills `sync_fills_from_alpaca` entirely — no fills
+    ever land in trades.jsonl, the Trades tab shows 0, the Performance
+    tab's realized line stays flat. This caused a multi-week silent
+    blackout on the VPS deploy (May 22 → May 26).
+
+    The 400-classification is narrow: we only swallow `40010001`
+    "invalid activity type" responses. A 400 with a different code
+    (auth scope, malformed query, rate limit) still raises.
     """
     status = getattr(exc, "status_code", None)
     if status is None:
-        # httpx-level errors carry status via .response.status_code.
         resp = getattr(exc, "response", None)
         status = getattr(resp, "status_code", None) if resp is not None else None
-    return status == 404
+    if status == 404:
+        return True
+    if status == 400:
+        # alpaca-py's APIError stringifies as the raw JSON body. The
+        # 40010001 code is the only one that means "this activity type
+        # name isn't valid". Match on the code OR the literal phrase so
+        # a docs change to the message text doesn't re-break the swallow.
+        msg = str(exc)
+        return "40010001" in msg or "invalid activity type" in msg.lower()
+    return False
+
+
+# Back-compat alias — the old name was misleadingly 404-specific.
+# Keep it pointing at the new helper so external callers / tests don't
+# break if anyone imported it directly.
+_is_unsupported_activity_404 = _is_unsupported_activity_type_error
 
 
 def _paginate_activities(
@@ -234,7 +261,7 @@ def sync_fills_from_alpaca(
                 trading_client, activity_type=ftype, after=after,
             ))
         except Exception as e:
-            if _is_unsupported_activity_404(e):
+            if _is_unsupported_activity_type_error(e):
                 continue
             raise
 

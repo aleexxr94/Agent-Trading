@@ -25,6 +25,19 @@ class _Alpaca500(Exception):
         self.status_code = 500
 
 
+class _AlpacaInvalidActivityType400(Exception):
+    """Mimics the real Alpaca paper-API response when a fee activity-type
+    string isn't valid for this account/API. Observed on 2026-05-26 for
+    OCC / OCC_FEE / ORF / REG / SEC / TAF / FINRA_TAF on a paper account
+    — only ``FEE`` was accepted. The raw exception stringifies as the
+    JSON error body, so we mimic that shape too."""
+    def __init__(self, activity_type: str = "OCC"):
+        super().__init__(
+            f'{{"code":40010001,"message":"invalid activity type: {activity_type}"}}'
+        )
+        self.status_code = 400
+
+
 class _FakeTrading:
     """Stub TradingClient. ``responses`` is a dict {path: list[dict]}.
 
@@ -355,6 +368,48 @@ def test_sync_propagates_unexpected_exception(tmp_state):
         raise_on={"/account/activities/OCC": RuntimeError("parse error")},
     )
     with pytest.raises(RuntimeError):
+        trades_sync.sync_fills_from_alpaca(trading_client=tc)
+
+
+def test_sync_skips_400_invalid_activity_type(tmp_state):
+    """Alpaca's paper API rejects most fee activity types with HTTP 400
+    code 40010001 'invalid activity type: X' (probed 2026-05-26 — only
+    FEE works on paper). The fee-pull loop must treat that the same as
+    404: silently skip the unsupported type and continue. Without this,
+    the very first iteration (OCC) raises and kills the whole sync —
+    the bug that caused multi-week silent sync blackout on the VPS.
+    """
+    tc = _FakeTrading(
+        responses={"/account/activities/FILL": [_fill()]},
+        raise_on={
+            "/account/activities/OCC": _AlpacaInvalidActivityType400("OCC"),
+            "/account/activities/ORF": _AlpacaInvalidActivityType400("ORF"),
+            "/account/activities/REG": _AlpacaInvalidActivityType400("REG"),
+            "/account/activities/SEC": _AlpacaInvalidActivityType400("SEC"),
+            "/account/activities/TAF": _AlpacaInvalidActivityType400("TAF"),
+            "/account/activities/FINRA_TAF": _AlpacaInvalidActivityType400("FINRA_TAF"),
+        },
+    )
+    # Every fee endpoint 400s except the implicit FILL → ETF row lands
+    # with fees_usd=0 and sync_fills_from_alpaca does NOT raise.
+    res = trades_sync.sync_fills_from_alpaca(trading_client=tc)
+    assert res.new_fills_written == 1
+    assert state.read_trades()[0]["fees_usd"] == 0.0
+
+
+def test_sync_propagates_400_with_other_codes(tmp_state):
+    """A 400 with a different code (auth scope, malformed query) is NOT
+    'invalid activity type' and must propagate so the operator sees the
+    real failure instead of writing zero-fee fills."""
+    class _Alpaca400OtherCode(Exception):
+        def __init__(self):
+            super().__init__('{"code":40010099,"message":"some other 400"}')
+            self.status_code = 400
+    tc = _FakeTrading(
+        responses={"/account/activities/FILL": [_fill()]},
+        raise_on={"/account/activities/OCC": _Alpaca400OtherCode()},
+    )
+    with pytest.raises(_Alpaca400OtherCode):
         trades_sync.sync_fills_from_alpaca(trading_client=tc)
 
 

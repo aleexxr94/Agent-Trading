@@ -838,6 +838,58 @@ def test_strip_fences_keeps_in_string_backticks_with_trailing_prose():
     assert parsed == payload
 
 
+def test_strip_fences_extracts_json_from_prose_preamble():
+    """Regression for the orchestrator-meta JSONDecodeError loop observed
+    on the 2026-05-22 VPS deploy (~100% of cycles falling back to the
+    heuristic). Sonnet 4.6 with adaptive thinking sometimes returns
+    'Here is the next-run plan: {…} This schedules…' — no fences, prose
+    on both sides. The extractor must walk the brace structure and
+    surface only the first balanced ``{…}``.
+    """
+    text = (
+        "Here is the next-run plan based on the regime analysis:\n\n"
+        '{"next_run_at": "2026-05-26T21:30:00Z", "rationale": "x"}\n\n'
+        "This timing aligns with the PCE release on Friday."
+    )
+    out = llm.strip_markdown_fences(text)
+    parsed = json.loads(out)
+    assert parsed["next_run_at"] == "2026-05-26T21:30:00Z"
+
+
+def test_strip_fences_handles_nested_objects_in_prose():
+    """Strategist payload with nested greeks dicts wrapped in prose —
+    naive regex would stop at the first ``}`` and break the JSON.
+    The brace-depth scan tracks nesting and only returns when depth=0.
+    """
+    payload = {
+        "regime": "risk_on",
+        "candidates": [
+            {"symbol": "SPY", "greeks": {"delta": 0.35, "iv": 0.18}},
+            {"symbol": "QQQ", "greeks": {"delta": 0.42}},
+        ],
+    }
+    text = "Some preamble.\n" + json.dumps(payload) + "\nSome epilogue."
+    out = llm.strip_markdown_fences(text)
+    assert json.loads(out) == payload
+
+
+def test_strip_fences_ignores_braces_inside_strings():
+    """A JSON value containing literal ``}`` characters must not trick the
+    brace-depth scanner into closing too early."""
+    payload = {"thesis": "the close } should not end the object", "x": 1}
+    text = "Preamble " + json.dumps(payload) + " epilogue"
+    out = llm.strip_markdown_fences(text)
+    assert json.loads(out) == payload
+
+
+def test_strip_fences_returns_input_when_no_json_found():
+    """Pure prose with no JSON object at all — return the stripped input
+    unchanged. json.loads will then raise with the original context so
+    the caller can decide how to handle it."""
+    text = "I cannot complete this request because of policy."
+    assert llm.strip_markdown_fences(text) == text
+
+
 def test_structured_call_parses_fenced_response(tmp_state):
     """Even if the model wraps JSON in markdown fences, structured_call should
     parse it cleanly instead of triggering the schema-retry path."""
