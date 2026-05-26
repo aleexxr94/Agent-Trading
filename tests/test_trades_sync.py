@@ -413,6 +413,38 @@ def test_sync_propagates_400_with_other_codes(tmp_state):
         trades_sync.sync_fills_from_alpaca(trading_client=tc)
 
 
+def test_sync_queries_FEE_activity_type(tmp_state):
+    """Codex P1 on PR #89: Alpaca paper rejects every fee category-specific
+    type with HTTP 400 'invalid activity type' — only `FEE` is accepted.
+    The sync must include FEE in _FEE_ACTIVITY_TYPES so paper accounts
+    still get a fee row pulled and folded into the fill. Without this,
+    the 400-swallow path silently writes every fill with fees_usd=0.
+    """
+    tc = _FakeTrading(
+        responses={
+            "/account/activities/FILL": [_fill(order_id="ord-X")],
+            "/account/activities/FEE": [_fee(
+                order_id="ord-X", net_amount="-0.12",
+                activity_type="FEE",
+            )],
+        },
+        # Every category-specific type returns 400 on paper, mimicking
+        # the real probe output: OCC/OCC_FEE/ORF/REG/SEC/TAF/FINRA_TAF
+        # all error with invalid-activity-type.
+        raise_on={
+            f"/account/activities/{t}": _AlpacaInvalidActivityType400(t)
+            for t in ("OCC", "ORF", "REG", "SEC", "TAF", "FINRA_TAF")
+        },
+    )
+    res = trades_sync.sync_fills_from_alpaca(trading_client=tc)
+    assert res.new_fills_written == 1
+    assert res.fees_matched == 1
+    r = state.read_trades()[0]
+    # The fee from /account/activities/FEE was folded in (flipped to
+    # positive). Without FEE in _FEE_ACTIVITY_TYPES this would be 0.
+    assert r["fees_usd"] == pytest.approx(0.12)
+
+
 def test_sync_uses_status_via_response_attribute(tmp_state):
     """httpx-style errors carry status via .response.status_code, not .status_code.
     The predicate must check both shapes."""

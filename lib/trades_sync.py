@@ -56,8 +56,21 @@ _MAX_PAGES = 200   # 20k rows; far above any plausible single-sync volume
 #   REG / SEC — SEC fee on sells
 #   TAF — Trading Activity Fee (FINRA)
 #   FINRA_TAF — FINRA TAF on sells
+#   FEE — generic Alpaca fee bucket
 # Equities paper has no commission; options paper charges OCC/REG schedule.
+#
+# Empirical probe (2026-05-26, paper account): Alpaca paper rejects every
+# category-specific type with HTTP 400 code 40010001 "invalid activity
+# type". Only `FEE` is accepted on paper. Live (USD-funded) accounts may
+# still expose the granular types — Alpaca's docs imply they're
+# account-class-dependent. We list all of them and rely on
+# _is_unsupported_activity_type_error to swallow the 400s on accounts
+# that only expose FEE. Codex P1 on PR #89: without listing FEE we
+# would silently write every fill with fees_usd=0 on paper, distorting
+# realized PnL — even though on paper fees are nominally $0, real-fee
+# bookkeeping should still flow through the same code path.
 _FEE_ACTIVITY_TYPES: tuple[str, ...] = (
+    "FEE",
     "OCC", "ORF", "REG", "SEC", "TAF", "FINRA_TAF",
 )
 
