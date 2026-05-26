@@ -127,20 +127,30 @@ def _is_unsupported_activity_type_error(exc: BaseException) -> bool:
       - **404 Not Found** — the historical contract: "this account doesn't
         have this activity type" (e.g. TAF on an account that never
         traded equities). Documented in alpaca-py.
-      - **400 Bad Request, code 40010001 "invalid activity type: X"** —
-        the newer contract: the paper API simply rejects every fee
-        category except `FEE`. Observed verbatim for OCC, OCC_FEE, ORF,
-        REG, SEC, TAF, FINRA_TAF on a fresh paper account.
+      - **Code 40010001 "invalid activity type: X"** — the newer
+        contract: the paper API rejects every fee category except `FEE`.
+        Observed verbatim for OCC, OCC_FEE, ORF, REG, SEC, TAF,
+        FINRA_TAF on a fresh paper account.
 
-    Without the 400 branch, the very first iteration of the fee-pull
+    Without the 40010001 branch, the very first iteration of the fee-pull
     loop raises and kills `sync_fills_from_alpaca` entirely — no fills
     ever land in trades.jsonl, the Trades tab shows 0, the Performance
     tab's realized line stays flat. This caused a multi-week silent
     blackout on the VPS deploy (May 22 → May 26).
 
-    The 400-classification is narrow: we only swallow `40010001`
-    "invalid activity type" responses. A 400 with a different code
-    (auth scope, malformed query, rate limit) still raises.
+    Why we don't gate on ``status_code == 400`` (PR #90, observed on the
+    deployed fix): alpaca-py's ``APIError`` is version-dependent — sometimes
+    it attaches ``.status_code``, sometimes ``.response.status_code``,
+    sometimes neither (the body is the only signal). The first VPS resync
+    after PR #89 merged still hit the propagated exception even though
+    the code path was correct, because ``status_code`` was None and the
+    400-gated branch didn't engage. We now require BOTH signals from the
+    exception's stringified body — the `40010001` code AND the literal
+    "invalid activity type" message phrase — and accept the match
+    regardless of how the SDK happens to surface the status. Codex P2's
+    concern (don't swallow other 40010001 validation failures) is still
+    addressed because the message-phrase half of the AND only matches
+    the documented unsupported-activity-type response.
     """
     status = getattr(exc, "status_code", None)
     if status is None:
@@ -148,19 +158,12 @@ def _is_unsupported_activity_type_error(exc: BaseException) -> bool:
         status = getattr(resp, "status_code", None) if resp is not None else None
     if status == 404:
         return True
-    if status == 400:
-        # Codex P2 (PR #89 second pass): require BOTH signals — the
-        # `40010001` code AND the literal "invalid activity type"
-        # phrase. Alpaca reuses code 40010001 for unrelated validation
-        # failures (invalid date, invalid symbol, etc.) so matching on
-        # the code alone would silently swallow real errors and let
-        # sync_fills_from_alpaca proceed with incomplete fees. Matching
-        # on the message alone is fragile to localization/refactor;
-        # AND-ing both gives a tight pin on the documented case while
-        # remaining robust to either signal being reformatted alone.
-        msg = str(exc)
-        return "40010001" in msg and "invalid activity type" in msg.lower()
-    return False
+    # The combination of code AND phrase is the documented Alpaca
+    # 'invalid activity type' response. Don't gate on status_code —
+    # alpaca-py SDK versions vary in whether they attach it. The two
+    # message-body signals together are tight enough on their own.
+    msg = str(exc)
+    return "40010001" in msg and "invalid activity type" in msg.lower()
 
 
 # Back-compat alias — the old name was misleadingly 404-specific.
