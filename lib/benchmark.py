@@ -273,12 +273,28 @@ def monthly_returns(equity: "pd.Series", *, as_of: date | None = None) -> "pd.Da
     last_date = eq.index[-1]
     if not isinstance(last_date, date) or isinstance(last_date, datetime):
         last_date = _to_date(last_date)
+    first_date = eq.index[0]
+    if not isinstance(first_date, date) or isinstance(first_date, datetime):
+        first_date = _to_date(first_date)
     reference = as_of or last_date
-    last_month = eom["month"].iloc[-1]
     is_partial_flags = [False] * len(eom)
+
+    # Last bucket: partial if as_of hasn't reached month-end.
+    last_month = eom["month"].iloc[-1]
     last_period_end = pd.Period(last_month, freq="M").end_time.date()
     if reference < last_period_end:
         is_partial_flags[-1] = True
+
+    # First bucket: partial unless inception was at/near the month start.
+    # A late-month inception (e.g. Jan 31) leaves us with only a tiny
+    # stub of January — counting that as a "completed month" would
+    # poison the `% months beat SPY` metric. Threshold of 5 calendar
+    # days covers weekend/holiday-affected month starts (e.g. Jan 1
+    # 2026 was a Thursday and a market holiday; first trading day was
+    # Jan 2) without being too strict.
+    if first_date.day > 5:
+        is_partial_flags[0] = True
+
     eom["is_partial"] = is_partial_flags
     return eom[["month", "ret_pct", "eom_value", "is_partial"]]
 

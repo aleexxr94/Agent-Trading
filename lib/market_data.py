@@ -72,18 +72,32 @@ def total_return_history(
     dividend-adjusted — i.e. equivalent to reinvesting dividends. Used
     by ``lib.benchmark`` for the SPY benchmark comparison.
 
+    Both ``start`` and ``end`` are treated as INCLUSIVE — internally we
+    pass ``end + 1 day`` to yfinance because its ``history(end=...)``
+    parameter is exclusive (verified in PriceHistory.history docstring
+    of the installed yfinance). Without this bump the most recent
+    trading day is silently dropped, which on a brand-new install with
+    only 2 days of NAV history collapses the inner-join to length 1
+    and keeps the dashboard stuck in the empty state.
+
     Caches per ``run_id`` identically to ``history()``; in the dashboard
     context ``run_id`` is None and Streamlit's ``@st.cache_data`` handles
     caching at the call site.
     """
+    import datetime as _dt  # noqa: WPS433
     import pandas as pd  # noqa: WPS433
+
+    end_obj = end if isinstance(end, _dt.date) else _dt.date.fromisoformat(str(end))
     start_s = str(start)
-    end_s = str(end)
-    cp = _cache_path(run_id, f"tr_{symbol}_{start_s}_{end_s}")
+    end_inclusive_s = str(end)
+    end_for_yf_s = (end_obj + _dt.timedelta(days=1)).isoformat()
+    # Cache key uses the inclusive end so two callers asking for the same
+    # logical date range share an entry, regardless of internal bumping.
+    cp = _cache_path(run_id, f"tr_{symbol}_{start_s}_{end_inclusive_s}")
     if cp is not None and cp.exists():
         return pd.read_parquet(cp)
     yf = _yf()
-    df = yf.Ticker(symbol).history(start=start_s, end=end_s, auto_adjust=True)
+    df = yf.Ticker(symbol).history(start=start_s, end=end_for_yf_s, auto_adjust=True)
     if cp is not None and not df.empty:
         try:
             df.to_parquet(cp)

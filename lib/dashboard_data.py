@@ -749,10 +749,14 @@ def benchmark_view(
     eod = bench.align_to_eod(rows)
     if len(eod) < 2:
         return None
-    try:
-        spy = bench.fetch_spy_total_return(eod.index[0], _date.today())
-    except Exception:
-        return None
+    # Let yfinance/network errors propagate. Streamlit's ``cache_data``
+    # does NOT cache exceptions, so a transient outage will be retried
+    # on the next render. The dashboard wraps the cached call in a
+    # try/except to render a graceful error message — but if we caught
+    # the exception here and returned None, the None *would* get cached
+    # for the full TTL, leaving the tab stuck in the empty state for an
+    # hour after the data source recovered.
+    spy = bench.fetch_spy_total_return(eod.index[0], _date.today())
     return bench.build_comparison(
         eod,
         spy,

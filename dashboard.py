@@ -1754,9 +1754,20 @@ with tabs[4]:
         _live_nav_bench = float(_synth_live.synthetic_balance_usd)
         _live_label_bench = "Live (synthetic — broker offline)"
 
-    bundle = _benchmark_cached(2500.0, _live_nav_bench, _state_mtimes())
+    try:
+        bundle = _benchmark_cached(2500.0, _live_nav_bench, _state_mtimes())
+        _bench_error = None
+    except Exception as exc:  # noqa: BLE001 — yfinance/network surface area is wide
+        bundle = None
+        _bench_error = f"{type(exc).__name__}: {exc}"
 
-    if bundle is None:
+    if _bench_error is not None:
+        st.warning(
+            "SPY benchmark data is temporarily unavailable — "
+            f"`{_bench_error}`. The tab will retry automatically on the "
+            "next dashboard refresh; the error is not cached."
+        )
+    elif bundle is None:
         st.info(
             "Not enough data yet — need at least 2 cycles of NAV history "
             "(spanning ≥1 trading day) before the benchmark comparison is "

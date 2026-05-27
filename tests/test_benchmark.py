@@ -167,6 +167,27 @@ def test_monthly_returns_partial_current_month():
     assert feb["is_partial"] == True  # noqa: E712
 
 
+def test_monthly_returns_late_inception_flags_first_month_partial():
+    # Jan 31 inception + Feb 1 observation. The Jan bucket has only a
+    # single-day stub of data — counting it as a completed month would
+    # poison the % months beat SPY metric (regression for codex P2).
+    idx = [date(2026, 1, 31), date(2026, 2, 1)]
+    eq = pd.Series([100.0, 100.5], index=idx)
+    out = bench.monthly_returns(eq, as_of=date(2026, 2, 1))
+    jan = out[out["month"] == "2026-01"].iloc[0]
+    assert jan["is_partial"] == True  # noqa: E712
+
+
+def test_monthly_returns_early_inception_keeps_first_month_complete():
+    # Inception at the start of January (Jan 2 = first trading day in 2026).
+    # The first month should still count as completed once February is full.
+    idx = [date(2026, 1, 2), date(2026, 1, 30), date(2026, 2, 27)]
+    eq = pd.Series([100.0, 105.0, 110.0], index=idx)
+    out = bench.monthly_returns(eq, as_of=date(2026, 3, 1))
+    jan = out[out["month"] == "2026-01"].iloc[0]
+    assert jan["is_partial"] == False  # noqa: E712
+
+
 # ---------- build_comparison ----------
 
 
@@ -269,6 +290,45 @@ def test_build_comparison_cagr_populated_when_span_exceeds_90_days():
     assert bundle is not None
     assert bundle.cagr_strategy is not None
     assert bundle.cagr_spy is not None
+
+
+def test_total_return_history_passes_end_plus_one_day_to_yfinance(monkeypatch):
+    """yfinance treats history(end=...) as EXCLUSIVE. The wrapper must
+    pass end+1 day so the caller's inclusive end date is actually
+    returned. Regression for codex P2: without this, a freshly-installed
+    dashboard with 2 trading days of NAV history would get only 1 SPY
+    close back and stay stuck in the empty state.
+    """
+    from datetime import date as _date
+
+    captured: dict = {}
+
+    class _FakeTicker:
+        def __init__(self, symbol):
+            captured["symbol"] = symbol
+
+        def history(self, *, start, end, auto_adjust):
+            captured["start"] = start
+            captured["end"] = end
+            captured["auto_adjust"] = auto_adjust
+            import pandas as _pd
+            return _pd.DataFrame()
+
+    class _FakeYf:
+        def Ticker(self, symbol):
+            return _FakeTicker(symbol)
+
+    from lib import market_data
+    monkeypatch.setattr(market_data, "_yf", lambda: _FakeYf())
+
+    market_data.total_return_history(
+        "SPY", start=_date(2026, 1, 5), end=_date(2026, 1, 10),
+    )
+
+    assert captured["symbol"] == "SPY"
+    assert captured["start"] == "2026-01-05"
+    assert captured["end"] == "2026-01-11"  # end + 1 day
+    assert captured["auto_adjust"] is True
 
 
 def test_build_comparison_months_table_populated_after_one_month():
