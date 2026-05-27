@@ -1758,16 +1758,21 @@ with tabs[4]:
         "includes open-position MTM. Deposits/withdrawals are not tracked."
     )
 
-    # Live tip: prefer real broker equity (offset-corrected to match the
-    # nav_history unit space, same as the Performance tab); fall back to
-    # the synthetic balance so the diamond is always present.
-    _bench_offset = state.nav_offset_usd()
-    if broker_view.available and getattr(broker_view, "nav_usd", None) is not None:
-        _live_nav_bench = float(broker_view.nav_usd) - _bench_offset
-        _live_label_bench = "Live broker equity"
-    else:
-        _live_nav_bench = float(_synth_live.synthetic_balance_usd)
-        _live_label_bench = "Live (synthetic — broker offline)"
+    # Live tip is always the synthetic balance (= $2,500 + closed +
+    # open − LLM − fees). The historical strategy curve is built from
+    # realized_balance_series which is in the same synthetic-unit
+    # space, so we MUST stay in those units — using raw broker equity
+    # here would inject a ~$100k point onto a ~$2,500 history in the
+    # default VIRTUAL_NAV_USD=2500 setup with Alpaca reachable
+    # (regression for codex P2). The synthetic balance includes
+    # open-position MTM via broker marks when available and falls back
+    # gracefully when the broker is offline.
+    _live_nav_bench = float(_synth_live.synthetic_balance_usd)
+    _live_label_bench = (
+        "Live synthetic balance (open MTM included)"
+        if broker_view.available else
+        "Live synthetic balance (broker offline — closed-only)"
+    )
 
     try:
         bundle = _benchmark_cached(2500.0, _live_nav_bench, _benchmark_mtimes())

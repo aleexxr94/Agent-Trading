@@ -394,7 +394,13 @@ def build_comparison(
     spy_curve = spy_equiv.copy()
 
     today = as_of or date.today()
-    if live_nav_usd is not None and live_nav_usd > 0:
+    if live_nav_usd is not None:
+        # Only None means "no live value, skip". Zero or negative are
+        # valid live states for a wiped-out account and MUST be
+        # surfaced — otherwise the headline cards would still show
+        # the last positive historical point as "current" while the
+        # account is actually $0 (regression for codex P2). The CAGR
+        # helper already handles end_val <= 0 explicitly.
         if today not in strat.index:
             strat.loc[today] = float(live_nav_usd)
             # SPY live tip: use the most recent SPY close at or before

@@ -592,6 +592,48 @@ def test_benchmark_view_anchors_inception_at_oldest_nav_row(tmp_state, monkeypat
     assert float(bundle.strategy_curve.loc[_date(2026, 1, 20), "nav"]) == 2550.0
 
 
+def test_build_comparison_includes_zero_live_nav_for_wipeout():
+    """Wiped-out live account (live_nav_usd=0.0) must still be
+    appended — otherwise the headline cards show the last positive
+    historical point as 'current' while the account is actually $0
+    (regression for codex P2). Only None should mean 'skip'.
+    """
+    start = date(2026, 1, 5)
+    strat = _strategy_eod(start, [2500.0, 2400.0, 2200.0])
+    spy = _spy_df(start, [400.0, 402.0, 404.0])
+    today = date(2026, 1, 9)
+    bundle = bench.build_comparison(
+        strat, spy, 2500.0, live_nav_usd=0.0, as_of=today,
+    )
+    assert bundle is not None
+    # Today's strategy value must be 0 (the wipe-out), not the last
+    # historical $2,200.
+    assert float(bundle.strategy_curve.loc[today, "nav"]) == 0.0
+    # Total return collapses to -100%.
+    assert bundle.strategy_total_return_pct == pytest.approx(-100.0, abs=1e-6)
+
+
+def test_build_comparison_skips_only_none_live_nav():
+    """live_nav_usd=None means 'no live value, skip'. Negative values
+    are still surfaced (account briefly negative is possible)."""
+    start = date(2026, 1, 5)
+    strat = _strategy_eod(start, [2500.0, 2510.0])
+    spy = _spy_df(start, [400.0, 402.0])
+    today = date(2026, 1, 7)
+    bundle_none = bench.build_comparison(
+        strat, spy, 2500.0, live_nav_usd=None, as_of=today,
+    )
+    assert bundle_none is not None
+    # None → no live row → strategy curve ends at last historical point.
+    assert today not in bundle_none.strategy_curve.index
+    bundle_neg = bench.build_comparison(
+        strat, spy, 2500.0, live_nav_usd=-50.0, as_of=today,
+    )
+    assert bundle_neg is not None
+    # Negative live value is surfaced.
+    assert float(bundle_neg.strategy_curve.loc[today, "nav"]) == -50.0
+
+
 def test_build_comparison_weekend_inception_ffills_to_first_trading_day():
     """Saturday inception + Tuesday realized event, with no strategy
     row on Monday. The Saturday $2,500 baseline must propagate through
