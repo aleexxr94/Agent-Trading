@@ -150,11 +150,21 @@ def cagr(start_val: float, end_val: float, days: int) -> float:
     """Compound annual growth rate.
 
     (end/start)^(365/days) - 1. Works for negative total returns as long
-    as both values are positive (a fully-blown account would break the
-    formula, but we never let NAV reach zero in practice).
+    as both values are positive.
+
+    Special-cases a wiped-out account: if end_val <= 0 we return -1.0
+    (= -100% annualised) so the dashboard's CAGR card shows -100%
+    instead of a misleading flat 0% — relevant for this options-heavy
+    $2,500 experiment where losses + logged costs could in principle
+    consume the baseline (regression for codex P2). Returns 0.0 only
+    for clearly invalid inputs (non-positive start_val, non-positive
+    days) which shouldn't occur in practice given the >=90-day gate
+    upstream.
     """
-    if days <= 0 or start_val <= 0 or end_val <= 0:
+    if days <= 0 or start_val <= 0:
         return 0.0
+    if end_val <= 0:
+        return -1.0
     return (end_val / start_val) ** (365.0 / float(days)) - 1.0
 
 

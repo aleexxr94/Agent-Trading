@@ -764,7 +764,25 @@ def benchmark_view(
         return None
 
     inception_at = nav_rows[0]["at"] if nav_rows else realized[0]["at"]
-    events = [{"at": inception_at, "value": float(starting_balance_usd)}]
+
+    # Stamp the baseline at the START of inception day (00:00 UTC) so
+    # any same-day realized event (e.g. first-cycle LLM cost stamped
+    # mid-LLM-stage, before append_nav writes the cycle-end NAV row)
+    # wins via align_to_eod's last-sample-per-day semantics — otherwise
+    # day-one costs/fees get silently overwritten by the $2,500
+    # baseline (regression for codex P2).
+    import datetime as _dt
+    _at_dt = _dt.datetime.fromisoformat(str(inception_at).replace("Z", "+00:00"))
+    if _at_dt.tzinfo is None:
+        _at_dt = _at_dt.replace(tzinfo=_dt.timezone.utc)
+    baseline_at = (
+        _at_dt.astimezone(_dt.timezone.utc)
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+    events = [{"at": baseline_at, "value": float(starting_balance_usd)}]
     for r in realized:
         events.append({
             "at": r["at"],
@@ -773,8 +791,15 @@ def benchmark_view(
 
     from . import benchmark as bench  # local import — keeps optional deps lazy
 
+    # Only ≥1 EOD anchor required here: build_comparison's ffill step
+    # densifies a single-row strategy across the SPY trading-day index,
+    # producing a flat strategy line vs a moving SPY. That's the right
+    # picture for cases like an all-cash account or immediately after
+    # "Reset ALL LLM costs" — the tab should render the honest "you
+    # held cash while SPY moved" view instead of dying in the empty
+    # state (regression for codex P2).
     eod = bench.align_to_eod(events, value_key="value")
-    if len(eod) < 2:
+    if len(eod) < 1:
         return None
     spy = bench.fetch_spy_total_return(eod.index[0], _date.today())
     return bench.build_comparison(

@@ -25,10 +25,18 @@ def test_cagr_negative_return():
     assert bench.cagr(100.0, 50.0, 730) == pytest.approx(-0.2929, abs=1e-3)
 
 
-def test_cagr_degenerate_inputs_return_zero():
+def test_cagr_invalid_start_or_days_returns_zero():
     assert bench.cagr(0.0, 100.0, 365) == 0.0
-    assert bench.cagr(100.0, 0.0, 365) == 0.0
+    assert bench.cagr(-50.0, 100.0, 365) == 0.0
     assert bench.cagr(100.0, 121.0, 0) == 0.0
+
+
+def test_cagr_wiped_out_account_returns_negative_one():
+    # Regression for codex P2: a wiped-out account ($2,500 → $0 over
+    # 365 days) must show -100% CAGR, not 0%. Same for a negative
+    # balance (theoretically possible after option assignment + costs).
+    assert bench.cagr(2500.0, 0.0, 365) == pytest.approx(-1.0, abs=1e-9)
+    assert bench.cagr(2500.0, -10.0, 365) == pytest.approx(-1.0, abs=1e-9)
 
 
 def test_sharpe_zero_returns_returns_zero():
@@ -460,6 +468,86 @@ def test_benchmark_view_uses_realized_balance_series(tmp_state, monkeypatch):
     assert 2535.0 in nav_values
     # Inception baseline row is anchored at $2,500 on Jan 5.
     assert float(bundle.strategy_curve.loc[_date(2026, 1, 5), "nav"]) == 2500.0
+
+
+def test_benchmark_view_renders_flat_when_no_realized_events(tmp_state, monkeypatch):
+    """nav_history has multiple cycles but realized_balance_series is
+    empty (all-cash account, or right after Reset ALL LLM costs). The
+    tab must still render — a flat strategy curve vs moving SPY is the
+    honest picture (regression for codex P2). Previously this case
+    returned None because events had only one row.
+    """
+    from lib import dashboard_data as dd
+    from lib import benchmark as bench_mod
+    from lib import state as state_mod
+    from datetime import date as _date
+
+    for at in ("2026-01-05T13:00:00Z", "2026-01-08T13:00:00Z", "2026-01-10T13:00:00Z"):
+        state_mod.append_nav({
+            "run_id": f"run-{at}",
+            "at": at,
+            "nav_usd": 2500.0,
+            "nav_source": "virtual",
+        })
+    monkeypatch.setattr(dd, "realized_balance_series", lambda **_: [])
+    fake_spy = pd.DataFrame(
+        {"close": [400.0 + i * 0.5 for i in range(6)]},
+        index=pd.bdate_range(start=_date(2026, 1, 5), periods=6).date,
+    )
+    monkeypatch.setattr(bench_mod, "fetch_spy_total_return", lambda *_, **__: fake_spy)
+
+    bundle = dd.benchmark_view(2500.0)
+    assert bundle is not None
+    # Strategy line is flat at $2,500 throughout the comparison window.
+    assert (bundle.strategy_curve["nav"] == 2500.0).all()
+    # SPY moved, so the delta should be non-zero.
+    assert bundle.delta_usd != 0.0
+
+
+def test_benchmark_view_baseline_does_not_overwrite_first_day_cost(tmp_state, monkeypatch):
+    """First-cycle LLM cost lands at T1 (during the run); append_nav
+    writes the cycle-end NAV at T2 (later same day). If we stamp the
+    baseline at T2 (the nav_history at), align_to_eod's last-sample-
+    per-day rule overwrites the $2,499.95 realized balance with $2,500
+    — the day-one cost loss silently shifts into the next interval
+    (regression for codex P2). Baseline must be stamped at 00:00 UTC
+    so any same-day realized event wins.
+    """
+    from lib import dashboard_data as dd
+    from lib import benchmark as bench_mod
+    from lib import state as state_mod
+    from datetime import date as _date
+
+    # Cycle end is at 13:00; first LLM cost landed at 13:00 same day.
+    state_mod.append_nav({
+        "run_id": "run-1",
+        "at": "2026-01-05T13:00:00Z",
+        "nav_usd": 2500.0,
+        "nav_source": "virtual",
+    })
+    state_mod.append_nav({
+        "run_id": "run-2",
+        "at": "2026-01-06T13:00:00Z",
+        "nav_usd": 2500.0,
+        "nav_source": "virtual",
+    })
+    # First realized event also on Jan 5, AFTER 00:00 baseline but
+    # BEFORE the 13:00 nav_history row. With the fix, this event wins
+    # for Jan 5.
+    fake_realized = [
+        {"at": "2026-01-05T12:30:00Z", "synthetic_realized_balance_usd": 2499.95},
+    ]
+    monkeypatch.setattr(dd, "realized_balance_series", lambda **_: fake_realized)
+    fake_spy = pd.DataFrame(
+        {"close": [400.0, 401.0]},
+        index=[_date(2026, 1, 5), _date(2026, 1, 6)],
+    )
+    monkeypatch.setattr(bench_mod, "fetch_spy_total_return", lambda *_, **__: fake_spy)
+
+    bundle = dd.benchmark_view(2500.0)
+    assert bundle is not None
+    # Day 1 must show the realized loss, not the $2,500 baseline.
+    assert float(bundle.strategy_curve.loc[_date(2026, 1, 5), "nav"]) == 2499.95
 
 
 def test_benchmark_view_anchors_inception_at_oldest_nav_row(tmp_state, monkeypatch):
