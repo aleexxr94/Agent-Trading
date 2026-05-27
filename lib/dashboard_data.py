@@ -753,7 +753,13 @@ def benchmark_view(
     from datetime import date as _date
 
     realized = realized_balance_series(starting_balance_usd=starting_balance_usd)
-    nav_rows = load_nav_history(limit=1)
+    # OLDEST nav_history row anchors inception. read_nav_history's
+    # ``limit`` slices from the END (rows[-limit:]) so limit=1 would
+    # return the LATEST cycle — which would then pre-pend the $2,500
+    # baseline at today's date and let align_to_eod overwrite the real
+    # realized balance for today, creating a false jump/recovery
+    # (regression for codex P2).
+    nav_rows = load_nav_history()
     if not realized and not nav_rows:
         return None
 

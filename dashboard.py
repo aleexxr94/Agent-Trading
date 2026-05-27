@@ -1714,6 +1714,19 @@ with tabs[3]:
 
 
 # ===== Tab 5: vs S&P 500 =====
+def _benchmark_mtimes() -> tuple:
+    """Cache key for the benchmark tab. Extends `_state_mtimes()` with
+    the all-time cost-reset flag mtime so hitting the operator's
+    "Reset ALL LLM costs" button invalidates the cached bundle —
+    realized_balance_series is reset-aware, but cost_all_time_reset.json
+    isn't part of _state_mtimes() (regression for codex P2)."""
+    try:
+        reset_mtime = state.ALL_TIME_COST_RESET_FLAG.stat().st_mtime_ns
+    except FileNotFoundError:
+        reset_mtime = 0
+    return _state_mtimes() + (reset_mtime,)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _benchmark_cached(starting: float, live_nav: float | None, mtimes: tuple):
     return dd.benchmark_view(starting, live_nav_usd=live_nav)
@@ -1757,7 +1770,7 @@ with tabs[4]:
         _live_label_bench = "Live (synthetic — broker offline)"
 
     try:
-        bundle = _benchmark_cached(2500.0, _live_nav_bench, _state_mtimes())
+        bundle = _benchmark_cached(2500.0, _live_nav_bench, _benchmark_mtimes())
         _bench_error = None
     except Exception as exc:  # noqa: BLE001 — yfinance/network surface area is wide
         bundle = None

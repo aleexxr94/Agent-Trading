@@ -462,6 +462,78 @@ def test_benchmark_view_uses_realized_balance_series(tmp_state, monkeypatch):
     assert float(bundle.strategy_curve.loc[_date(2026, 1, 5), "nav"]) == 2500.0
 
 
+def test_benchmark_view_anchors_inception_at_oldest_nav_row(tmp_state, monkeypatch):
+    """load_nav_history(limit=N) slices rows[-N:] (newest), so the
+    inception anchor must be read without a limit and use rows[0]
+    (oldest). Regression for codex P2: previously the $2,500 baseline
+    was being pre-pended at TODAY's date and overwriting the real
+    realized balance there.
+    """
+    from lib import dashboard_data as dd
+    from lib import benchmark as bench_mod
+    from lib import state as state_mod
+    from datetime import date as _date
+
+    # Three nav_history rows. Inception = Jan 5, then Jan 10, then Jan 20.
+    for at in ("2026-01-05T13:00:00Z", "2026-01-10T13:00:00Z", "2026-01-20T13:00:00Z"):
+        state_mod.append_nav({
+            "run_id": f"run-{at}",
+            "at": at,
+            "nav_usd": 2500.0,
+            "nav_source": "virtual",
+        })
+    # Realized event on Jan 20 — moves balance to $2,550.
+    fake_realized = [
+        {"at": "2026-01-20T15:00:00Z", "synthetic_realized_balance_usd": 2550.0},
+    ]
+    monkeypatch.setattr(dd, "realized_balance_series", lambda **_: fake_realized)
+    fake_spy = pd.DataFrame(
+        {"close": [400.0 + i * 0.1 for i in range(12)]},
+        index=pd.bdate_range(start=_date(2026, 1, 5), periods=12).date,
+    )
+    monkeypatch.setattr(bench_mod, "fetch_spy_total_return", lambda *_, **__: fake_spy)
+
+    bundle = dd.benchmark_view(2500.0)
+    assert bundle is not None
+    # Strategy curve should START at Jan 5 with $2,500 baseline — NOT
+    # overwrite Jan 20's $2,550 realized balance.
+    assert bundle.strategy_curve.index[0] == _date(2026, 1, 5)
+    assert float(bundle.strategy_curve.iloc[0, 0]) == 2500.0
+    # Jan 20 must still reflect the $2,550 realized event (not clobbered
+    # by a baseline pre-pended at the newest cycle).
+    assert float(bundle.strategy_curve.loc[_date(2026, 1, 20), "nav"]) == 2550.0
+
+
+def test_build_comparison_forward_fills_strategy_across_quiet_days():
+    """Strategy events on day 0 and day 5; SPY closes on every trading
+    day. After forward-fill, every trading day between 0 and 5 carries
+    forward day 0's value, so daily returns are well-defined and
+    Sharpe/vol/correlation are comparable to SPY (regression for codex P2).
+    """
+    start = date(2026, 1, 5)
+    idx_full = pd.bdate_range(start=start, periods=6)
+    spy = pd.DataFrame(
+        {"close": [400.0 + i for i in range(6)]},
+        index=[d.date() for d in idx_full],
+    )
+    # Strategy: only two events — inception ($2,500) and day 5 ($2,560).
+    strat = pd.DataFrame(
+        {"nav": [2500.0, 2560.0]},
+        index=[idx_full[0].date(), idx_full[5].date()],
+    )
+    bundle = bench.build_comparison(strat, spy, 2500.0, as_of=idx_full[5].date())
+    assert bundle is not None
+    # All 6 trading days must be present in the strategy curve.
+    assert len(bundle.strategy_curve) == 6
+    # Quiet days carry forward the prior value.
+    for i in range(1, 5):
+        assert float(bundle.strategy_curve.iloc[i, 0]) == 2500.0
+    # Day 5 reflects the new event.
+    assert float(bundle.strategy_curve.iloc[5, 0]) == 2560.0
+    # Correlation is now well-defined (was 0 with just 2 sparse points).
+    assert bundle.correlation != 0.0
+
+
 def test_build_comparison_months_table_populated_after_one_month():
     # Two full months of trading data.
     start = date(2026, 1, 2)

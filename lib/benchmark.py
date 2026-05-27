@@ -349,7 +349,19 @@ def build_comparison(
     if getattr(strategy_eod, "empty", True) or getattr(spy, "empty", True):
         return None
 
-    joined = strategy_eod.join(spy, how="inner")
+    # Forward-fill the strategy curve across SPY's trading-day index.
+    # realized_balance_series only emits rows on event days (close/cost/
+    # fee); during a multi-week hold with no events the raw series has
+    # one or two points. Inner-joining sparse strategy against dense SPY
+    # would then compute "one big multi-week return" for the strategy
+    # while SPY has daily returns — Sharpe/vol/correlation become
+    # incomparable (regression for codex P2). After ffill, quiet trading
+    # days correctly show a 0% strategy return for that day.
+    spy_in_range = spy[spy.index >= strategy_eod.index[0]]
+    if spy_in_range.empty:
+        return None
+    strat_dense = strategy_eod.reindex(spy_in_range.index).ffill().dropna()
+    joined = strat_dense.join(spy_in_range, how="inner")
     if len(joined) < 2:
         return None
 
