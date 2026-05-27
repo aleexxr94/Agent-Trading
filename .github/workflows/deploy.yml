@@ -48,6 +48,16 @@ jobs:
               -o ConnectTimeout=15 \
               "root@${VPS_HOST}" <<'REMOTE'
           set -euo pipefail
-          bash /opt/agent-trading/deploy/install.sh
+          REPO_DIR=/opt/agent-trading
+          AGENT_USER=agent
+          # Bootstrap: refresh the repo BEFORE invoking install.sh so that any
+          # changes to install.sh itself in this deploy are picked up. The
+          # script self-fetches too, but only after bash has already loaded
+          # the on-disk bytes — without this pre-fetch, install.sh changes
+          # would be one deploy behind.
+          chown -R "$AGENT_USER:$AGENT_USER" "$REPO_DIR"
+          sudo -u "$AGENT_USER" git -C "$REPO_DIR" fetch --quiet origin main
+          sudo -u "$AGENT_USER" git -C "$REPO_DIR" reset --hard --quiet origin/main
+          bash "$REPO_DIR/deploy/install.sh"
           systemctl restart agent-dashboard.service
           REMOTE
