@@ -724,6 +724,44 @@ def load_nav_history(limit: int | None = None) -> list[dict]:
     return state.read_nav_history(limit=limit)
 
 
+def benchmark_view(
+    starting_balance_usd: float = 2500.0,
+    *,
+    live_nav_usd: float | None = None,
+):
+    """Assemble the S&P-500-comparison MetricsBundle from local state + yfinance.
+
+    Returns None when fewer than 2 cycles of NAV history exist (the tab
+    renders a friendly empty-state placeholder). The expensive yfinance
+    fetch is cached at the call site in dashboard.py via
+    ``@st.cache_data(ttl=3600)``; keeping the network call here keeps
+    this module Streamlit-free.
+    """
+    from datetime import date as _date
+
+    rows = load_nav_history()
+    if len(rows) < 2:
+        return None
+    rows = apply_nav_offset_to_history(rows, nav_offset_usd=state.nav_offset_usd())
+
+    from . import benchmark as bench  # local import — keeps optional deps lazy
+
+    eod = bench.align_to_eod(rows)
+    if len(eod) < 2:
+        return None
+    try:
+        spy = bench.fetch_spy_total_return(eod.index[0], _date.today())
+    except Exception:
+        return None
+    return bench.build_comparison(
+        eod,
+        spy,
+        starting_balance_usd,
+        live_nav_usd=live_nav_usd,
+        as_of=_date.today(),
+    )
+
+
 def load_trades() -> list[dict]:
     """Read state/trades.jsonl. Each row is one Alpaca fill with real
     fees_usd. Empty list when the log doesn't exist yet.

@@ -59,6 +59,39 @@ def history(req: HistoryRequest, *, run_id: str | None = None) -> "pd.DataFrame"
     return df
 
 
+def total_return_history(
+    symbol: str,
+    *,
+    start,
+    end,
+    run_id: str | None = None,
+) -> "pd.DataFrame":
+    """Daily total-return history (dividends reinvested) between two dates.
+
+    Uses ``auto_adjust=True`` so the ``Close`` column is split- and
+    dividend-adjusted — i.e. equivalent to reinvesting dividends. Used
+    by ``lib.benchmark`` for the SPY benchmark comparison.
+
+    Caches per ``run_id`` identically to ``history()``; in the dashboard
+    context ``run_id`` is None and Streamlit's ``@st.cache_data`` handles
+    caching at the call site.
+    """
+    import pandas as pd  # noqa: WPS433
+    start_s = str(start)
+    end_s = str(end)
+    cp = _cache_path(run_id, f"tr_{symbol}_{start_s}_{end_s}")
+    if cp is not None and cp.exists():
+        return pd.read_parquet(cp)
+    yf = _yf()
+    df = yf.Ticker(symbol).history(start=start_s, end=end_s, auto_adjust=True)
+    if cp is not None and not df.empty:
+        try:
+            df.to_parquet(cp)
+        except Exception:
+            cp.with_suffix(".json").write_text(df.reset_index().to_json(orient="records"))
+    return df
+
+
 def average_daily_volume(symbol: str, *, lookback_days: int = 30, run_id: str | None = None) -> float:
     df = history(HistoryRequest(symbol=symbol, period=f"{max(lookback_days, 30)}d"), run_id=run_id)
     if df.empty or "Volume" not in df.columns:

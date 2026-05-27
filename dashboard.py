@@ -13,6 +13,7 @@ Layout:
     📒 Cycles — per-run summaries (rationale, candidate counts, cost)
     📜 Decisions — chronological stage decisions with full agent reasoning
     📈 Performance — equity curve, LLM-cost-over-time, trading-fees-over-time, monthly cost breakdown
+    📈 vs S&P 500 — strategy NAV vs hypothetical buy-and-hold SPY (total return) since inception
     💱 Trades — per-trade PnL (gross − fees − attributed LLM cost), closed + open lots, totals
     🤖 Agent Logs — latest artifacts (market_gate/signals/view/portfolio/sanity/orders), next-run plan
     ⚙️ Settings — halt flag toggle, cost totals, README link
@@ -315,6 +316,11 @@ st.markdown(
       /* small-muted text */
       .small-muted { color: var(--text-2); font-size: 0.85rem; }
 
+      /* monthly outperformance row tint (vs S&P 500 tab) */
+      .at-month-pos { background-color: var(--green-soft); }
+      .at-month-neg { background-color: var(--red-soft); }
+      .at-help-icon { font-size: 0.85em; opacity: 0.55; cursor: help; margin-left: 4px; }
+
       /* slightly larger body type for readability */
       .stMarkdown, .stCaption, p { font-size: 0.95rem; }
     </style>
@@ -546,12 +552,23 @@ st.markdown(
 # ---------- stats grid ----------
 
 
-def _stat_card(label: str, value: str, *, sub: str = "", tone: str = "") -> str:
+def _stat_card(
+    label: str,
+    value: str,
+    *,
+    sub: str = "",
+    tone: str = "",
+    help_text: str = "",
+) -> str:
     cls = f"at-stat-value {tone}".strip()
     sub_html = f'<div class="at-stat-sub">{sub}</div>' if sub else ""
+    help_html = (
+        f'<span class="at-help-icon" title="{html.escape(help_text)}">ⓘ</span>'
+        if help_text else ""
+    )
     return (
         f'<div class="at-stat">'
-        f'<div class="at-stat-label">{label}</div>'
+        f'<div class="at-stat-label">{label}{help_html}</div>'
         f'<div class="{cls}">{value}</div>'
         f'{sub_html}'
         f'</div>'
@@ -605,6 +622,7 @@ tabs = st.tabs([
     "📒 Cycles",
     "📜 Decisions",
     "📈 Performance",
+    "📈 vs S&P 500",
     "💱 Trades",
     "🤖 Agent Logs",
     "⚙️ Settings",
@@ -1695,8 +1713,316 @@ with tabs[3]:
         st.info("No monthly cost data yet.")
 
 
-# ===== Tab 4: Trades =====
+# ===== Tab 5: vs S&P 500 =====
+@st.cache_data(ttl=3600, show_spinner=False)
+def _benchmark_cached(starting: float, live_nav: float | None, _mtimes: tuple):
+    return dd.benchmark_view(starting, live_nav_usd=live_nav)
+
+
+def _month_row_tone(row: "pd.Series") -> list[str]:
+    delta = float(row.get("delta_pct", 0.0) or 0.0)
+    if delta > 0:
+        bg = "background-color: #d1fae5"
+    elif delta < 0:
+        bg = "background-color: #fee2e2"
+    else:
+        bg = ""
+    return [bg] * len(row)
+
+
 with tabs[4]:
+    st.markdown(
+        '<div class="at-section-label">Strategy vs S&amp;P 500 (SPY total return)</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Compares the live strategy NAV against an equivalent buy-and-hold "
+        "position in SPY (dividends reinvested) since the first orchestrator "
+        "cycle. Assumes a fixed $2,500 starting balance — deposits/withdrawals "
+        "are not tracked. Strategy NAV is downsampled to the last cycle of "
+        "each UTC trading day; weekend/holiday cycles are dropped."
+    )
+
+    # Live tip: prefer real broker equity (offset-corrected to match the
+    # nav_history unit space, same as the Performance tab); fall back to
+    # the synthetic balance so the diamond is always present.
+    _bench_offset = state.nav_offset_usd()
+    if broker_view.available and getattr(broker_view, "nav_usd", None) is not None:
+        _live_nav_bench = float(broker_view.nav_usd) - _bench_offset
+        _live_label_bench = "Live broker equity"
+    else:
+        _live_nav_bench = float(_synth_live.synthetic_balance_usd)
+        _live_label_bench = "Live (synthetic — broker offline)"
+
+    bundle = _benchmark_cached(2500.0, _live_nav_bench, _state_mtimes())
+
+    if bundle is None:
+        st.info(
+            "Not enough data yet — need at least 2 cycles of NAV history "
+            "(spanning ≥1 trading day) before the benchmark comparison is "
+            "meaningful. Run `python orchestrator.py` a few more times."
+        )
+    else:
+        # ---- (b) Headline 3-column stat cards ----
+        strat_end = float(bundle.strategy_curve["nav"].iloc[-1])
+        spy_end = float(bundle.spy_curve["nav"].iloc[-1])
+        delta_tone = "pos" if bundle.delta_usd >= 0 else "neg"
+        cols = st.columns(3)
+        cols[0].markdown(
+            _stat_card(
+                "Strategy NAV",
+                f"${strat_end:,.2f}",
+                sub=f"SPY-equivalent ${spy_end:,.2f}",
+            ),
+            unsafe_allow_html=True,
+        )
+        cols[1].markdown(
+            _stat_card(
+                "Delta vs SPY",
+                f"${bundle.delta_usd:+,.2f}",
+                sub=f"{bundle.delta_pct:+.2f} pp on total return",
+                tone=delta_tone,
+                help_text=(
+                    "Dollar and percentage-point gap between the strategy "
+                    "and the SPY-equivalent NAV today. Positive = ahead."
+                ),
+            ),
+            unsafe_allow_html=True,
+        )
+        beating = bundle.strategy_total_return_pct >= bundle.spy_total_return_pct
+        cols[2].markdown(
+            _stat_card(
+                "Total return",
+                f"{bundle.strategy_total_return_pct:+.2f}%",
+                sub=f"SPY {bundle.spy_total_return_pct:+.2f}%",
+                tone="pos" if beating else "neg",
+            ),
+            unsafe_allow_html=True,
+        )
+
+        # ---- (c) Headline equity-curve chart ----
+        strat_df = bundle.strategy_curve.reset_index()
+        spy_df = bundle.spy_curve.reset_index()
+        fig_bench = go.Figure()
+        fig_bench.add_trace(go.Scatter(
+            x=strat_df["date"],
+            y=strat_df["nav"],
+            mode="lines",
+            name="Strategy",
+            line=dict(width=2.5, color="#059669"),
+            hovertemplate="%{x|%Y-%m-%d}<br>Strategy: $%{y:,.2f}<extra></extra>",
+        ))
+        fig_bench.add_trace(go.Scatter(
+            x=spy_df["date"],
+            y=spy_df["nav"],
+            mode="lines",
+            name="SPY-equivalent",
+            line=dict(width=2.5, color="#d97706"),
+            hovertemplate="%{x|%Y-%m-%d}<br>SPY-eqv: $%{y:,.2f}<extra></extra>",
+        ))
+        # Diamond live tip for the strategy's current value.
+        fig_bench.add_trace(go.Scatter(
+            x=[strat_df["date"].iloc[-1]],
+            y=[strat_end],
+            mode="markers",
+            name=_live_label_bench,
+            marker=dict(
+                size=12, color="#d97706", symbol="diamond",
+                line=dict(width=1.5, color="#0f172a"),
+            ),
+            hovertemplate=f"{_live_label_bench}: $%{{y:,.2f}}<extra></extra>",
+        ))
+        # End-of-line value annotations.
+        fig_bench.add_annotation(
+            x=strat_df["date"].iloc[-1], y=strat_end,
+            text=f"  ${strat_end:,.0f}",
+            showarrow=False, xanchor="left",
+            font=dict(color="#059669", size=12, family="monospace"),
+        )
+        fig_bench.add_annotation(
+            x=spy_df["date"].iloc[-1], y=spy_end,
+            text=f"  ${spy_end:,.0f}",
+            showarrow=False, xanchor="left",
+            font=dict(color="#d97706", size=12, family="monospace"),
+        )
+        fig_bench.update_layout(
+            template="plotly_white",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            height=380,
+            yaxis_title="Portfolio value (USD)",
+            xaxis_title="",
+            yaxis=dict(gridcolor="#e2e8f0"),
+            xaxis=dict(gridcolor="#e2e8f0"),
+            margin=dict(l=10, r=80, t=20, b=10),
+            legend=dict(orientation="h", y=1.1, font=dict(size=12)),
+        )
+        st.plotly_chart(fig_bench, width="stretch")
+        st.caption(
+            f"Inception {bundle.inception.isoformat()} → as of "
+            f"{bundle.as_of.isoformat()} · {len(strat_df)} trading-day points · "
+            "Sharpe risk-free rate = 0%."
+        )
+
+        # ---- (d) Risk-adjusted comparison cards ----
+        st.markdown(
+            '<div class="at-section-label">Risk-adjusted comparison</div>',
+            unsafe_allow_html=True,
+        )
+        rcols = st.columns(4)
+        rcols[0].markdown(
+            _stat_card(
+                "Sharpe (ann.)",
+                f"{bundle.sharpe_strategy:.2f}",
+                sub=f"SPY {bundle.sharpe_spy:.2f}",
+                tone="pos" if bundle.sharpe_strategy >= bundle.sharpe_spy else "neg",
+                help_text=(
+                    "Return earned per unit of risk. Higher is better; >1 "
+                    "good, >2 excellent. Annualised, risk-free rate = 0%."
+                ),
+            ),
+            unsafe_allow_html=True,
+        )
+        dd_strat_pct, _, _ = bundle.max_dd_strategy
+        dd_spy_pct, _, _ = bundle.max_dd_spy
+        rcols[1].markdown(
+            _stat_card(
+                "Max drawdown",
+                f"{dd_strat_pct * 100:.2f}%",
+                sub=f"SPY {dd_spy_pct * 100:.2f}%",
+                tone="neg" if dd_strat_pct < dd_spy_pct else "",
+                help_text=(
+                    "Largest peak-to-trough decline so far. Closer to 0% "
+                    "is better. Negative values indicate the drawdown size."
+                ),
+            ),
+            unsafe_allow_html=True,
+        )
+        rcols[2].markdown(
+            _stat_card(
+                "Volatility (ann.)",
+                f"{bundle.vol_strategy_ann * 100:.2f}%",
+                sub=f"SPY {bundle.vol_spy_ann * 100:.2f}%",
+                help_text=(
+                    "Annualised standard deviation of daily returns. Higher "
+                    "means the strategy's day-to-day swings are larger."
+                ),
+            ),
+            unsafe_allow_html=True,
+        )
+        if bundle.pct_months_strategy_beat is None:
+            beat_value = "—"
+            beat_sub = "Available after 1 full month"
+            beat_tone = ""
+        else:
+            beat_value = f"{bundle.pct_months_strategy_beat:.0f}%"
+            beat_sub = "of completed months"
+            beat_tone = "pos" if bundle.pct_months_strategy_beat >= 50.0 else "neg"
+        rcols[3].markdown(
+            _stat_card(
+                "% months beat SPY",
+                beat_value,
+                sub=beat_sub,
+                tone=beat_tone,
+                help_text=(
+                    "Share of completed calendar months where the strategy "
+                    "outperformed SPY. Partial current month is excluded."
+                ),
+            ),
+            unsafe_allow_html=True,
+        )
+
+        # ---- (e) Secondary stats: CAGR + correlation ----
+        scols = st.columns(2)
+        if bundle.cagr_strategy is None:
+            cagr_value = "—"
+            cagr_sub = "Available after 90 days"
+            cagr_tone = ""
+        else:
+            cagr_value = f"{bundle.cagr_strategy * 100:+.2f}%"
+            cagr_sub = (
+                f"SPY {bundle.cagr_spy * 100:+.2f}%"
+                if bundle.cagr_spy is not None else ""
+            )
+            cagr_tone = (
+                "pos" if (bundle.cagr_spy is None or
+                          bundle.cagr_strategy >= bundle.cagr_spy) else "neg"
+            )
+        scols[0].markdown(
+            _stat_card(
+                "CAGR (annualised)",
+                cagr_value,
+                sub=cagr_sub,
+                tone=cagr_tone,
+                help_text=(
+                    "Compound annual growth rate — what the strategy would "
+                    "earn per year if it kept compounding at this pace. "
+                    "Available after 90 days of data."
+                ),
+            ),
+            unsafe_allow_html=True,
+        )
+        scols[1].markdown(
+            _stat_card(
+                "Correlation with SPY",
+                f"{bundle.correlation:+.2f}",
+                sub=f"{bundle.correlation_label_text} co-movement",
+                help_text=(
+                    "Pearson correlation of daily returns. 1.0 = lockstep, "
+                    "0 = unrelated, −1 = opposite. Low/Moderate/High buckets "
+                    "use thresholds 0.3 and 0.7."
+                ),
+            ),
+            unsafe_allow_html=True,
+        )
+
+        # ---- (f) Collapsible monthly breakdown ----
+        if bundle.months_table is None or bundle.months_table.empty:
+            st.caption("Monthly breakdown available after one full calendar month.")
+        else:
+            with st.expander("Monthly breakdown", expanded=False):
+                mt = bundle.months_table.copy()
+                mt["month_display"] = [
+                    f"{m} *" if partial else m
+                    for m, partial in zip(mt["month"], mt["is_partial"])
+                ]
+                display_df = mt[[
+                    "month_display", "strat_ret_pct", "spy_ret_pct",
+                    "delta_pct", "strat_eom", "spy_eom",
+                ]].rename(columns={"month_display": "month"})
+                styled = display_df.style.apply(_month_row_tone, axis=1)
+                st.dataframe(
+                    styled,
+                    column_config={
+                        "month": st.column_config.TextColumn("Month"),
+                        "strat_ret_pct": st.column_config.NumberColumn(
+                            "Strategy %", format="%.2f%%",
+                            help="Month-over-month return of the strategy.",
+                        ),
+                        "spy_ret_pct": st.column_config.NumberColumn(
+                            "SPY %", format="%.2f%%",
+                            help="Month-over-month return of SPY total return.",
+                        ),
+                        "delta_pct": st.column_config.NumberColumn(
+                            "Δ vs SPY (pp)", format="%+.2f",
+                            help="Strategy − SPY. Green tint = beat, red = lagged.",
+                        ),
+                        "strat_eom": st.column_config.NumberColumn(
+                            "Strategy EoM $", format="$%d",
+                        ),
+                        "spy_eom": st.column_config.NumberColumn(
+                            "SPY EoM $", format="$%d",
+                        ),
+                    },
+                    hide_index=True,
+                    width="stretch",
+                )
+                if mt["is_partial"].any():
+                    st.caption("`*` partial month — current month not yet ended.")
+
+
+# ===== Tab 6: Trades =====
+with tabs[5]:
     st.markdown(
         '<div class="at-section-label">Per-trade PnL — gross − fees − attributed LLM cost</div>',
         unsafe_allow_html=True,
@@ -1880,8 +2206,8 @@ with tabs[4]:
         )
 
 
-# ===== Tab 5: Agent Logs =====
-with tabs[5]:
+# ===== Tab 7: Agent Logs =====
+with tabs[6]:
     if latest_rid is None:
         st.info("No runs yet.")
     else:
@@ -1976,8 +2302,8 @@ with tabs[5]:
         st.info("No next-run plan written yet.")
 
 
-# ===== Tab 6: Settings =====
-with tabs[6]:
+# ===== Tab 8: Settings =====
+with tabs[7]:
     st.markdown('<div class="at-section-label">Mode</div>', unsafe_allow_html=True)
     mode_pills = []
     mode_pills.append('<span class="at-pill paper">● PAPER</span>' if not live_trading
