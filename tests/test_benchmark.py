@@ -216,6 +216,47 @@ def test_build_comparison_basic():
     assert bundle.delta_usd == pytest.approx(2560.0 - 2531.25, abs=1e-6)
 
 
+def test_build_comparison_strategy_return_anchored_at_starting_balance():
+    # First aligned NAV sample is NOT starting_balance_usd — e.g. the
+    # first logged cycle already includes costs/fills. The strategy
+    # total return and CAGR must still be computed against
+    # starting_balance_usd so they're symmetric with the SPY anchor
+    # (regression for codex P2).
+    start = date(2026, 1, 5)
+    strat = _strategy_eod(start, [2498.0, 2510.0, 2520.0, 2540.0, 2575.0])
+    spy = _spy_df(start, [400.0, 402.0, 404.0, 405.0, 410.0])
+    bundle = bench.build_comparison(strat, spy, 2500.0, as_of=date(2026, 1, 9))
+    # Strategy total return: 2575 / 2500 - 1 = +3.00% (NOT 2575/2498 ≈ +3.08%).
+    assert bundle.strategy_total_return_pct == pytest.approx(3.0, abs=1e-6)
+    # SPY: anchored at $2,500 by construction → 2562.50 / 2500 - 1 = +2.50%.
+    assert bundle.spy_total_return_pct == pytest.approx(2.5, abs=1e-6)
+    # Dollar delta is independent of denominator choice.
+    assert bundle.delta_usd == pytest.approx(2575.0 - 2562.5, abs=1e-6)
+
+
+def test_build_comparison_cagr_anchored_at_starting_balance():
+    # 120 days of trading data with a first-cycle dip below the baseline.
+    # CAGR must use the starting balance, not the first observed NAV.
+    start = date(2026, 1, 5)
+    days = 120
+    idx = pd.bdate_range(start=start, periods=days)
+    # Strategy starts at $2,490 (already down 0.4%) and ends at $2,800.
+    strat = pd.DataFrame(
+        {"nav": [2490.0] + [2490.0 + i * 2.6 for i in range(1, days)]},
+        index=[d.date() for d in idx],
+    )
+    spy = pd.DataFrame(
+        {"close": [400.0 + i * 0.1 for i in range(days)]},
+        index=[d.date() for d in idx],
+    )
+    bundle = bench.build_comparison(strat, spy, 2500.0, as_of=idx[-1].date())
+    # CAGR must reflect (final / 2500), not (final / 2490).
+    final_nav = float(strat["nav"].iloc[-1])
+    span_days = (idx[-1].date() - idx[0].date()).days
+    expected = bench.cagr(2500.0, final_nav, span_days)
+    assert bundle.cagr_strategy == pytest.approx(expected, abs=1e-9)
+
+
 def test_build_comparison_empty_spy_returns_none():
     start = date(2026, 1, 5)
     strat = _strategy_eod(start, [2500.0, 2520.0])

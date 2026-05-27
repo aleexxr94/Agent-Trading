@@ -355,18 +355,25 @@ def build_comparison(
     as_of_final = _to_date(strat.index[-1])
     span_days = max(1, (as_of_final - inception).days)
 
-    strat_start = float(strat.iloc[0])
-    spy_start = float(spy_curve.iloc[0])
+    # SPY is anchored at the configured starting balance by construction
+    # (above). For symmetry — and so the dashboard caption's "fixed $2,500
+    # starting balance" promise actually holds — the strategy's total
+    # return and CAGR are also computed against starting_balance_usd
+    # rather than the first observed NAV sample. The first cycle may
+    # already reflect fees/fills/lag and using it as the denominator
+    # would silently erase the strategy's day-one P&L (regression for
+    # codex P2).
+    strat_baseline = float(starting_balance_usd)
     strat_end = float(strat.iloc[-1])
     spy_end = float(spy_curve.iloc[-1])
 
-    strat_total_pct = (strat_end / strat_start - 1.0) * 100.0
-    spy_total_pct = (spy_end / spy_start - 1.0) * 100.0
+    strat_total_pct = (strat_end / strat_baseline - 1.0) * 100.0
+    spy_total_pct = (spy_end / strat_baseline - 1.0) * 100.0
     delta_usd = strat_end - spy_end
     delta_pct = strat_total_pct - spy_total_pct
 
-    cagr_strat = cagr(strat_start, strat_end, span_days) if span_days >= 90 else None
-    cagr_spy_v = cagr(spy_start, spy_end, span_days) if span_days >= 90 else None
+    cagr_strat = cagr(strat_baseline, strat_end, span_days) if span_days >= 90 else None
+    cagr_spy_v = cagr(strat_baseline, spy_end, span_days) if span_days >= 90 else None
 
     strat_daily = strat.pct_change().dropna()
     spy_daily = spy_curve.pct_change().dropna()
