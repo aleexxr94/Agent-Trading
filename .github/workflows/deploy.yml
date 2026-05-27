@@ -1,0 +1,53 @@
+name: Deploy to VPS
+
+# Runs deploy/install.sh on the production VPS whenever main advances,
+# then restarts the dashboard. install.sh self-fetches origin/main, so
+# this workflow does not need to ship code — it only triggers the pull.
+#
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   VPS_HOST          host or IP of the VPS (e.g. 95.217.233.216)
+#   VPS_SSH_KEY       private key for the dedicated deploy keypair
+#   VPS_HOST_KEY      output of `ssh-keyscan -H <VPS_HOST>` run from a
+#                     trusted machine (locks the host fingerprint so a
+#                     MITM on the GitHub runner can't redirect deploys)
+#
+# See deploy/README.md → "Update the deployment" for the one-time setup.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: vps-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST_KEY: ${{ secrets.VPS_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY"  > ~/.ssh/deploy_key
+          printf '%s\n' "$VPS_HOST_KEY" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+
+      - name: Run install.sh + restart dashboard
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+              -o BatchMode=yes \
+              -o ConnectTimeout=15 \
+              "root@${VPS_HOST}" <<'REMOTE'
+          set -euo pipefail
+          bash /opt/agent-trading/deploy/install.sh
+          systemctl restart agent-dashboard.service
+          REMOTE

@@ -163,7 +163,9 @@ Or click **Emergency stop** on the dashboard's Settings tab.
 
 ## Update the deployment
 
-When new code lands on `main`:
+**Automated:** merging to `main` triggers `.github/workflows/deploy.yml`, which SSHes into the VPS, runs `install.sh`, and restarts the dashboard. Check the Actions tab on GitHub for status. One-time setup of the three repo secrets (`VPS_HOST`, `VPS_SSH_KEY`, `VPS_HOST_KEY`) is documented in the workflow file's header comment.
+
+**Manual fallback** (if the Action is disabled or failing):
 
 ```bash
 ssh root@<your-ip>
