@@ -357,10 +357,20 @@ def build_comparison(
     # while SPY has daily returns — Sharpe/vol/correlation become
     # incomparable (regression for codex P2). After ffill, quiet trading
     # days correctly show a 0% strategy return for that day.
+    #
+    # Use the UNION of strategy and SPY indexes before ffill, then
+    # select SPY dates. Reindexing directly to spy_in_range.index would
+    # discard a weekend/holiday inception row before ffill could carry
+    # it to the next SPY trading day — e.g. Saturday $2,500 inception
+    # + Tuesday realized event with SPY rows Mon/Tue would lose
+    # Saturday and leave Monday as NaN → dropped → joined len 1 →
+    # benchmark returns None (regression for codex P2).
     spy_in_range = spy[spy.index >= strategy_eod.index[0]]
     if spy_in_range.empty:
         return None
-    strat_dense = strategy_eod.reindex(spy_in_range.index).ffill().dropna()
+    union_idx = strategy_eod.index.union(spy_in_range.index)
+    strat_union = strategy_eod.reindex(union_idx).ffill()
+    strat_dense = strat_union.loc[spy_in_range.index].dropna()
     joined = strat_dense.join(spy_in_range, how="inner")
     if len(joined) < 2:
         return None

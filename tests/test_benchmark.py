@@ -504,6 +504,32 @@ def test_benchmark_view_anchors_inception_at_oldest_nav_row(tmp_state, monkeypat
     assert float(bundle.strategy_curve.loc[_date(2026, 1, 20), "nav"]) == 2550.0
 
 
+def test_build_comparison_weekend_inception_ffills_to_first_trading_day():
+    """Saturday inception + Tuesday realized event, with no strategy
+    row on Monday. The Saturday $2,500 baseline must propagate through
+    ffill so Monday and Tuesday both have strategy values — without
+    this, Monday becomes NaN and gets dropped, leaving only 1 joined
+    row and the tab incorrectly returning None (regression for codex P2).
+    """
+    saturday = date(2026, 5, 23)
+    monday = date(2026, 5, 25)
+    tuesday = date(2026, 5, 26)
+    # Strategy: only Saturday baseline + Tuesday realized event.
+    strat = pd.DataFrame(
+        {"nav": [2500.0, 2535.0]},
+        index=[saturday, tuesday],
+    )
+    spy = pd.DataFrame(
+        {"close": [400.0, 401.0]},
+        index=[monday, tuesday],
+    )
+    bundle = bench.build_comparison(strat, spy, 2500.0, as_of=tuesday)
+    assert bundle is not None
+    # Monday must be ffilled from Saturday's baseline.
+    assert float(bundle.strategy_curve.loc[monday, "nav"]) == 2500.0
+    assert float(bundle.strategy_curve.loc[tuesday, "nav"]) == 2535.0
+
+
 def test_build_comparison_forward_fills_strategy_across_quiet_days():
     """Strategy events on day 0 and day 5; SPY closes on every trading
     day. After forward-fill, every trading day between 0 and 5 carries
