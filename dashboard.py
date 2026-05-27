@@ -1715,7 +1715,7 @@ with tabs[3]:
 
 # ===== Tab 5: vs S&P 500 =====
 @st.cache_data(ttl=3600, show_spinner=False)
-def _benchmark_cached(starting: float, live_nav: float | None, _mtimes: tuple):
+def _benchmark_cached(starting: float, live_nav: float | None, mtimes: tuple):
     return dd.benchmark_view(starting, live_nav_usd=live_nav)
 
 
