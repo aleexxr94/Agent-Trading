@@ -234,6 +234,54 @@ def test_build_comparison_strategy_return_anchored_at_starting_balance():
     assert bundle.delta_usd == pytest.approx(2575.0 - 2562.5, abs=1e-6)
 
 
+def test_monthly_returns_baseline_anchors_first_month():
+    # First observed value $2,400; Jan EoM $2,500. Default behaviour
+    # (no baseline) reports Jan as +4.17%. Passing baseline=$2,500
+    # anchors against the configured baseline → Jan = 0% (regression
+    # for codex P2).
+    idx = [date(2026, 1, 2), date(2026, 1, 15), date(2026, 1, 30)]
+    eq = pd.Series([2400.0, 2450.0, 2500.0], index=idx)
+    out_default = bench.monthly_returns(eq, as_of=date(2026, 1, 31))
+    assert out_default["ret_pct"].iloc[0] == pytest.approx(4.1667, abs=1e-3)
+    out_anchored = bench.monthly_returns(eq, as_of=date(2026, 1, 31), baseline=2500.0)
+    assert out_anchored["ret_pct"].iloc[0] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_align_to_eod_respects_value_key():
+    rows = [
+        {"at": "2026-05-25T13:00:00Z", "synthetic_realized_balance_usd": 2498.0},
+        {"at": "2026-05-25T17:00:00Z", "synthetic_realized_balance_usd": 2497.5},
+        {"at": "2026-05-26T13:00:00Z", "synthetic_realized_balance_usd": 2510.0},
+    ]
+    df = bench.align_to_eod(rows, value_key="synthetic_realized_balance_usd")
+    assert list(df.index) == [date(2026, 5, 25), date(2026, 5, 26)]
+    assert df.loc[date(2026, 5, 25), "nav"] == 2497.5
+    assert df.loc[date(2026, 5, 26), "nav"] == 2510.0
+
+
+def test_build_comparison_live_tip_uses_today_spy_close_when_available():
+    # SPY has rows through Jan 7; strategy only has rows through Jan 6.
+    # Live tip is appended at Jan 7. Without the fix, the SPY live tip
+    # would be Jan 6's close (the last inner-joined date); with the fix
+    # it uses Jan 7's actual close from the raw spy frame
+    # (regression for codex P2).
+    start = date(2026, 1, 5)
+    strat = _strategy_eod(start, [2500.0, 2510.0])  # Jan 5, 6
+    spy = pd.DataFrame(
+        {"close": [400.0, 401.0, 405.0]},  # Jan 5, 6, 7
+        index=[date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7)],
+    )
+    bundle = bench.build_comparison(
+        strat, spy, 2500.0,
+        live_nav_usd=2530.0,
+        as_of=date(2026, 1, 7),
+    )
+    assert bundle is not None
+    # SPY live tip should be 2500 * 405/400 = 2531.25, NOT 2500 * 401/400 = 2506.25.
+    spy_today = float(bundle.spy_curve.loc[date(2026, 1, 7), "nav"])
+    assert spy_today == pytest.approx(2531.25, abs=1e-6)
+
+
 def test_build_comparison_cagr_anchored_at_starting_balance():
     # 120 days of trading data with a first-cycle dip below the baseline.
     # CAGR must use the starting balance, not the first observed NAV.
@@ -370,6 +418,48 @@ def test_total_return_history_passes_end_plus_one_day_to_yfinance(monkeypatch):
     assert captured["start"] == "2026-01-05"
     assert captured["end"] == "2026-01-11"  # end + 1 day
     assert captured["auto_adjust"] is True
+
+
+def test_benchmark_view_uses_realized_balance_series(tmp_state, monkeypatch):
+    """benchmark_view should source the strategy curve from
+    realized_balance_series (= actual P&L), not nav_history.jsonl
+    (= sizing notional, which is constant $2,500 in default config).
+    Regression for codex P2.
+    """
+    from lib import dashboard_data as dd
+    from lib import benchmark as bench_mod
+    from lib import state as state_mod
+    from datetime import date as _date
+
+    # Inception cycle: write one nav_history row so benchmark_view can
+    # anchor the baseline at the first cycle's timestamp.
+    state_mod.append_nav({
+        "run_id": "20260105T130000Z-aaaaaa",
+        "at": "2026-01-05T13:00:00Z",
+        "nav_usd": 2500.0,
+        "nav_source": "virtual",
+    })
+    # Stub realized_balance_series with two events that move the balance.
+    fake_realized = [
+        {"at": "2026-01-12T15:00:00Z", "synthetic_realized_balance_usd": 2510.0},
+        {"at": "2026-01-15T15:00:00Z", "synthetic_realized_balance_usd": 2535.0},
+    ]
+    monkeypatch.setattr(dd, "realized_balance_series", lambda **_: fake_realized)
+    # Stub SPY fetch with a flat-ish series spanning the same dates.
+    fake_spy = pd.DataFrame(
+        {"close": [400.0, 401.0, 402.0]},
+        index=[_date(2026, 1, 5), _date(2026, 1, 12), _date(2026, 1, 15)],
+    )
+    monkeypatch.setattr(bench_mod, "fetch_spy_total_return", lambda *_, **__: fake_spy)
+
+    bundle = dd.benchmark_view(2500.0, live_nav_usd=2540.0)
+    assert bundle is not None
+    # Strategy curve should reflect the realised P&L (not flat $2,500).
+    nav_values = bundle.strategy_curve["nav"].tolist()
+    assert 2510.0 in nav_values
+    assert 2535.0 in nav_values
+    # Inception baseline row is anchored at $2,500 on Jan 5.
+    assert float(bundle.strategy_curve.loc[_date(2026, 1, 5), "nav"]) == 2500.0
 
 
 def test_build_comparison_months_table_populated_after_one_month():

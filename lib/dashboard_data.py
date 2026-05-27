@@ -731,31 +731,45 @@ def benchmark_view(
 ):
     """Assemble the S&P-500-comparison MetricsBundle from local state + yfinance.
 
-    Returns None when fewer than 2 cycles of NAV history exist (the tab
-    renders a friendly empty-state placeholder). The expensive yfinance
-    fetch is cached at the call site in dashboard.py via
-    ``@st.cache_data(ttl=3600)``; keeping the network call here keeps
-    this module Streamlit-free.
+    Strategy curve source: ``realized_balance_series()`` (= starting
+    balance + closed gross P&L − LLM cost − trading fees). Same series
+    the Performance tab's "Synthetic balance (reconstructed)" toggle
+    plots. Chosen over ``state/nav_history.jsonl`` because in the
+    default ``VIRTUAL_NAV_USD=2500`` config nav_history stores the
+    orchestrator's sizing notional (constant $2,500 every cycle)
+    rather than actual P&L, which would make the strategy curve
+    silently flat against a moving SPY (codex P2 finding).
+
+    A baseline anchor row at the first cycle's timestamp is
+    pre-pended so the equity curve starts at ``starting_balance_usd``
+    on inception day even before any trade closes — the dashboard
+    chart would otherwise begin abruptly at the first realised event.
+
+    Returns None when fewer than 2 distinct trading-day points
+    exist (the tab renders a friendly empty-state placeholder).
+    Lets yfinance/network errors propagate so Streamlit's cache_data
+    doesn't cache transient failures as missing-history.
     """
     from datetime import date as _date
 
-    rows = load_nav_history()
-    if len(rows) < 2:
+    realized = realized_balance_series(starting_balance_usd=starting_balance_usd)
+    nav_rows = load_nav_history(limit=1)
+    if not realized and not nav_rows:
         return None
-    rows = apply_nav_offset_to_history(rows, nav_offset_usd=state.nav_offset_usd())
+
+    inception_at = nav_rows[0]["at"] if nav_rows else realized[0]["at"]
+    events = [{"at": inception_at, "value": float(starting_balance_usd)}]
+    for r in realized:
+        events.append({
+            "at": r["at"],
+            "value": float(r["synthetic_realized_balance_usd"]),
+        })
 
     from . import benchmark as bench  # local import — keeps optional deps lazy
 
-    eod = bench.align_to_eod(rows)
+    eod = bench.align_to_eod(events, value_key="value")
     if len(eod) < 2:
         return None
-    # Let yfinance/network errors propagate. Streamlit's ``cache_data``
-    # does NOT cache exceptions, so a transient outage will be retried
-    # on the next render. The dashboard wraps the cached call in a
-    # try/except to render a graceful error message — but if we caught
-    # the exception here and returned None, the None *would* get cached
-    # for the full TTL, leaving the tab stuck in the empty state for an
-    # hour after the data source recovered.
     spy = bench.fetch_spy_total_return(eod.index[0], _date.today())
     return bench.build_comparison(
         eod,

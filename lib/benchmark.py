@@ -77,26 +77,36 @@ def _parse_iso_utc(ts: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def align_to_eod(nav_rows: list[dict]) -> "pd.DataFrame":
-    """Downsample per-cycle strategy NAV to one row per UTC trading day.
+def align_to_eod(
+    nav_rows: list[dict],
+    *,
+    value_key: str = "nav_usd",
+) -> "pd.DataFrame":
+    """Downsample per-event strategy values to one row per UTC trading day.
 
-    Takes the LAST cycle of each date (latest `at` wins). Returns a
+    Takes the LAST sample of each date (latest `at` wins). Returns a
     DataFrame indexed by `date` with a single column `nav`. Rows whose
-    `at` or `nav_usd` cannot be parsed are skipped.
+    `at` or value can't be parsed are skipped.
+
+    ``value_key`` is the field name to read for each row's value —
+    defaults to ``nav_usd`` for backward compatibility with
+    ``state/nav_history.jsonl``. The benchmark tab passes the realised-
+    P&L key (``synthetic_realized_balance_usd``) so the strategy curve
+    reflects actual P&L rather than sizing notional.
     """
     import pandas as pd  # noqa: WPS433
 
     parsed: list[tuple[date, datetime, float]] = []
     for row in nav_rows or []:
         at = row.get("at")
-        nav = row.get("nav_usd")
-        if at is None or not isinstance(nav, (int, float)):
+        val = row.get(value_key)
+        if at is None or not isinstance(val, (int, float)):
             continue
         try:
             dt = _parse_iso_utc(str(at))
         except (ValueError, TypeError):
             continue
-        parsed.append((dt.date(), dt, float(nav)))
+        parsed.append((dt.date(), dt, float(val)))
 
     if not parsed:
         return pd.DataFrame(columns=["nav"]).rename_axis("date")
@@ -238,7 +248,12 @@ def correlation_label(r: float) -> str:
     return "High"
 
 
-def monthly_returns(equity: "pd.Series", *, as_of: date | None = None) -> "pd.DataFrame":
+def monthly_returns(
+    equity: "pd.Series",
+    *,
+    as_of: date | None = None,
+    baseline: float | None = None,
+) -> "pd.DataFrame":
     """End-of-month equity values and month-over-month returns.
 
     Returns a DataFrame with columns:
@@ -246,10 +261,15 @@ def monthly_returns(equity: "pd.Series", *, as_of: date | None = None) -> "pd.Da
       ret_pct     : month-over-month return as percent (12.34 = +12.34%)
       eom_value   : last equity value in that month
       is_partial  : True for the most recent month when as_of is before
-                    that month's end (or, conservatively, always True for
-                    the latest bucket).
-    The first month is anchored against the starting equity value
-    (`equity.iloc[0]`).
+                    that month's end, OR for the first month when
+                    inception was after day 5 of that month.
+
+    ``baseline`` overrides the first month's denominator. The benchmark
+    tab passes ``starting_balance_usd`` so the monthly table and the
+    headline metrics share an anchor — without this, a first observed
+    NAV of $2,400 followed by $2,500 EoM would report January as
+    +4.17% even though the fixed-baseline experiment return is 0%.
+    Defaults to ``equity.iloc[0]`` for backward compatibility.
     """
     import pandas as pd  # noqa: WPS433
 
@@ -263,7 +283,7 @@ def monthly_returns(equity: "pd.Series", *, as_of: date | None = None) -> "pd.Da
     df["month"] = df.index.to_period("M").astype(str)
     eom = df.groupby("month", as_index=False).agg(eom_value=("nav", "last"))
 
-    start_val = float(eq.iloc[0])
+    start_val = float(baseline) if baseline is not None else float(eq.iloc[0])
     prevs = [start_val] + eom["eom_value"].tolist()[:-1]
     eom["ret_pct"] = [
         (cur / prev - 1.0) * 100.0 if prev > 0 else 0.0
@@ -345,7 +365,22 @@ def build_comparison(
     if live_nav_usd is not None and live_nav_usd > 0:
         if today not in strat.index:
             strat.loc[today] = float(live_nav_usd)
-            spy_curve.loc[today] = float(spy_curve.iloc[-1])
+            # SPY live tip: use the most recent SPY close at or before
+            # `today` from the raw input frame. spy_curve here is the
+            # inner-joined version which is truncated to dates where the
+            # strategy also had a sample — if today's SPY close exists
+            # but the orchestrator hasn't written a same-day NAV row,
+            # carrying spy_curve.iloc[-1] forward would compare today's
+            # live strategy value against yesterday's SPY close
+            # (regression for codex P2).
+            spy_idx_le_today = spy.index[spy.index <= today]
+            if len(spy_idx_le_today) > 0:
+                latest_spy_close = float(spy.loc[spy_idx_le_today[-1], "close"])
+                spy_curve.loc[today] = (
+                    float(starting_balance_usd) * latest_spy_close / spy_anchor
+                )
+            else:
+                spy_curve.loc[today] = float(spy_curve.iloc[-1])
             strat = strat.sort_index()
             spy_curve = spy_curve.sort_index()
         else:
@@ -397,8 +432,22 @@ def build_comparison(
         months_table = None
         pct_beat = None
     else:
-        strat_months = monthly_returns(strat, as_of=as_of_final)
-        spy_months = monthly_returns(spy_curve, as_of=as_of_final)
+        # Pass `baseline=starting_balance_usd` so the first month's
+        # return is anchored at the configured baseline, same as the
+        # headline total-return / CAGR calculations above. Without
+        # this, a first observed NAV of $2,400 followed by $2,500 EoM
+        # would report January as +4.17% and could count as beating
+        # SPY in the % months metric, despite the fixed-$2,500
+        # experiment return for that month being 0%.
+        strat_months = monthly_returns(
+            strat, as_of=as_of_final, baseline=strat_baseline,
+        )
+        # SPY curve is already anchored at strat_baseline by
+        # construction, so passing it explicitly is a no-op — but
+        # symmetric and safer if the construction ever changes.
+        spy_months = monthly_returns(
+            spy_curve, as_of=as_of_final, baseline=strat_baseline,
+        )
         merged = strat_months.merge(
             spy_months[["month", "ret_pct", "eom_value"]],
             on="month",

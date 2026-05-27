@@ -1736,11 +1736,13 @@ with tabs[4]:
         unsafe_allow_html=True,
     )
     st.caption(
-        "Compares the live strategy NAV against an equivalent buy-and-hold "
+        "Compares the live strategy P&L against an equivalent buy-and-hold "
         "position in SPY (dividends reinvested) since the first orchestrator "
-        "cycle. Assumes a fixed $2,500 starting balance — deposits/withdrawals "
-        "are not tracked. Strategy NAV is downsampled to the last cycle of "
-        "each UTC trading day; weekend/holiday cycles are dropped."
+        "cycle. Strategy curve is the realised synthetic balance "
+        "(= $2,500 + closed gross P&L − LLM cost − trading fees), the same "
+        "series the Performance tab's 'Synthetic balance' toggle plots. "
+        "Flat segments mean nothing closed that day. The live diamond "
+        "includes open-position MTM. Deposits/withdrawals are not tracked."
     )
 
     # Live tip: prefer real broker equity (offset-corrected to match the
