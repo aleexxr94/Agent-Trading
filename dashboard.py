@@ -1321,7 +1321,7 @@ with tabs[3]:
         marks_status + " LLM cost is reset-aware (the Settings tab "
         "'Reset ALL LLM costs' button bumps the synthetic balance upward "
         "by the historical attribution). Trading fees combine real "
-        "broker fees on closed trades (from `state/trades.jsonl`; \$0 "
+        "broker fees on closed trades (from `state/trades.jsonl`; \\$0 "
         "on Alpaca paper ETFs) with the IBKR-Pro round-trip estimate "
         "on currently-open positions — same source the positions "
         "table's per-row Fees column uses. Real fees never reset; "
