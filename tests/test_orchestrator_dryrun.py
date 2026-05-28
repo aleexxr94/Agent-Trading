@@ -522,3 +522,51 @@ def test_stage_execute_skips_opens_when_dd_halt_active(tmp_state, monkeypatch):
     assert next_run["order_plan"]["closes"] == 1         # SQQQ close kept
     # Only the SQQQ sell (close) was actually submitted; no TQQQ buy.
     assert submitted == [("SQQQ", "sell", 10)]
+
+
+def test_stage_execute_allows_derisking_reduction_during_dd_halt(tmp_state, monkeypatch):
+    """Codex P1 (PR #98): a same-sign REDUCTION (long 10 -> long 5 = sell 5)
+    lands in plan.requests, not closes. During a DD halt it must still be
+    submitted (it de-risks); only BUYs are skipped."""
+    from lib.broker import BrokerPosition, OrderResult
+
+    monkeypatch.setenv("ORDERS_ENABLED", "true")
+    monkeypatch.setattr(
+        orchestrator, "_compute_next_run_at",
+        lambda *, ctx, portfolio, view: ("2026-05-28T20:00:00Z", "stub", "trade"),
+    )
+    state.set_dd_halt(dd_pct=10.0, sod_nav=2500.0, current_nav=2250.0)
+
+    submitted: list = []
+
+    class _FakeBroker:
+        def get_positions(self):
+            return [BrokerPosition(
+                symbol="TQQQ", qty=10, avg_cost=70.0, market_value=700.0,
+                unrealized_pl_usd=0.0, asset_class="us_equity",
+            )]
+
+        def submit_order(self, req):
+            submitted.append((req.symbol, req.side, req.qty))
+            return OrderResult(
+                broker_order_id="1", symbol=req.symbol, qty=req.qty,
+                side=req.side, submitted_at="", status="accepted",
+            )
+
+        def option_contract_tradable(self, symbol):
+            return True
+
+    portfolio = {
+        "run_id": "r-dd2", "nav_usd": 2500.0, "cash_usd": 100.0, "all_cash": False,
+        "positions": [{
+            "kind": "etf", "symbol": "TQQQ", "shares": 5, "avg_cost": 70.0,
+            "leverage_factor": 3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 14.0,
+        }],
+    }
+    ctx = orchestrator.StageContext(run_id="r-dd2", dry_run=False, broker=_FakeBroker())
+    next_run = orchestrator.stage_execute(ctx, portfolio, {"candidates": []})
+
+    assert next_run["dd_halt"]["active"] is True
+    # The reduction (sell 5) is de-risking and must go through during a halt.
+    assert ("TQQQ", "sell", 5) in submitted

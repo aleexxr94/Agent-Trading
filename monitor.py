@@ -339,10 +339,28 @@ def main(argv: list[str] | None = None) -> int:
     marks = marks_lib.marks_from_positions(positions)
     cost_basis = marks_lib.cost_basis_from_positions(positions)
     enforce = _enforce_stops_enabled()
+    # Fresh underlying spots for option price stops (Codex P2 on PR #98): an
+    # option's underlying_price_below/above references the underlying (e.g.
+    # SPY), not the option mark, so fetch the live underlying price per held
+    # option. Best-effort — None just skips that option's price stop.
+    spots: dict[str, float] = {}
+    if broker is not None and enforce:
+        underlyings = {
+            p["underlying"] for p in portfolio.get("positions", [])
+            if p.get("kind") == "option" and p.get("underlying")
+        }
+        for u in underlyings:
+            try:
+                px = broker.get_underlying_price(u)
+            except Exception:
+                px = None
+            if px is not None:
+                spots[u] = px
     actions = evaluate_portfolio(
         portfolio=portfolio,
         marks=marks,
         cost_basis=cost_basis,
+        spots=spots,
         broker_positions=(positions if broker is not None else None),
         enforce_stops=enforce,
     )

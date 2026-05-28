@@ -252,6 +252,35 @@ def test_monitor_flattens_orphan_on_loss_cap(tmp_state, monkeypatch):
     assert any("orphan" in f["reason"] for f in _read_shadow()[-1]["fired"])
 
 
+def test_monitor_enforces_option_underlying_price_stop(tmp_state):
+    """Codex P2 (#98): an option's underlying_price_below fires off the
+    underlying spot (passed in `spots`), even when the option mark shows no
+    loss. SPY spot 490 ≤ kill_below 500 → flatten the contract."""
+    option_pos = {
+        "kind": "option", "underlying": "SPY", "type": "call",
+        "strike": 530.0, "expiry": "2026-06-19", "dte": 40,
+        "contracts": 1, "premium_paid": 6.50,
+        "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04,
+                   "vega": 0.18, "iv": 0.18, "iv_percentile": 35},
+        "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 100, "underlying_price_below": 500.0},
+        "position_pct": 5.0,
+    }
+    bp = BrokerPosition(
+        symbol="SPY260619C00530000", qty=1, avg_cost=6.50, market_value=650.0,
+        unrealized_pl_usd=0.0, asset_class="us_option",
+    )
+    actions = monitor.evaluate_portfolio(
+        portfolio={"positions": [option_pos]},
+        marks={"SPY|530.0|2026-06-19|call": 6.50},  # mark == premium → no loss
+        broker_positions=[bp],
+        spots={"SPY": 490.0},
+    )
+    assert len(actions) == 1
+    assert actions[0]["symbol"] == "SPY260619C00530000"
+    assert "kill_below" in actions[0]["reason"]
+
+
 def test_monitor_kill_switch_disables_price_time_stops(tmp_state, monkeypatch):
     """MONITOR_ENFORCE_STOPS=false reverts to loss-cap-only: a tripped time
     stop does NOT flatten an otherwise-healthy position."""

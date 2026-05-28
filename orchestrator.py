@@ -872,15 +872,23 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
             next_run["order_plan_error"] = f"get_positions: {type(e).__name__}: {e}"
             current = []
         plan = orders.diff_portfolio(portfolio, current)
-        # Phase 2: when the 8% daily-drawdown breaker is active, submit only
-        # the closes (de-risking) and skip new opens for the rest of the UTC
-        # day. The flag is written by monitor.py and auto-expires next day.
+        # Phase 2: when the 8% daily-drawdown breaker is active, allow
+        # de-risking (full closes AND same-sign reductions — both are SELLs on
+        # a long-only book) but skip BUYs that add/open exposure for the rest
+        # of the UTC day. The flag auto-expires next day. Codex P1 (PR #98):
+        # _plan_for_symbol puts reductions in `requests`, so filter by side
+        # rather than dropping every request.
         if risk.dd_breaker_enabled() and state.dd_halt_active():
-            plan = orders.OrderPlan(requests=[], closes=plan.closes, skipped=plan.skipped)
+            derisking = [r for r in plan.requests if r.side == "sell"]
+            skipped_opens = len(plan.requests) - len(derisking)
+            plan = orders.OrderPlan(
+                requests=derisking, closes=plan.closes, skipped=plan.skipped,
+            )
             next_run["dd_halt"] = {
                 "active": True,
                 "detail": state.read_dd_halt() or {},
-                "note": "8% daily drawdown breaker active — opens skipped, closes allowed",
+                "opens_skipped": skipped_opens,
+                "note": "8% daily drawdown breaker active — buys skipped; closes + reductions allowed",
             }
         results = orders.submit_plan(plan, broker=ctx.broker)
         next_run["order_plan"] = {

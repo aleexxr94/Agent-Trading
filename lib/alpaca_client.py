@@ -233,6 +233,39 @@ class AlpacaBroker(Broker):
             return None
         return bid, ask
 
+    def get_underlying_price(self, symbol: str) -> float | None:
+        """Latest trade price for an equity/ETF underlying via Alpaca's stock
+        data feed, used by monitor.py for option underlying price stops.
+
+        Lazy-constructs StockHistoricalDataClient on first use and caches it.
+        Returns None on any failure — never raises — so a missing quote just
+        skips the option's price stop (loss cap + time stop still apply).
+        """
+        try:
+            from alpaca.data.historical.stock import StockHistoricalDataClient  # noqa: WPS433
+            from alpaca.data.requests import StockLatestTradeRequest  # noqa: WPS433
+        except ImportError:
+            return None
+        client = getattr(self, "_stock_data_client", None)
+        if client is None:
+            try:
+                client = StockHistoricalDataClient(self._api_key, self._api_secret)
+            except Exception:
+                return None
+            self._stock_data_client = client
+        try:
+            resp = client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))
+        except Exception:
+            return None
+        trade = resp.get(symbol) if hasattr(resp, "get") else None
+        if trade is None:
+            return None
+        try:
+            px = float(getattr(trade, "price", None) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        return px if px > 0 else None
+
     def option_contract_tradable(self, symbol: str) -> bool:
         """Query Alpaca for a single option contract by OSI symbol.
 
