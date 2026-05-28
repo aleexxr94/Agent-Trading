@@ -129,11 +129,6 @@ def shadow_report(*, portfolio: dict, broker: Broker | None, marks: dict[str, fl
         except Exception:
             broker_positions = []
     broker_syms = {p.symbol for p in broker_positions}
-    spot_by_sym = {
-        p.symbol: p.current_price
-        for p in broker_positions
-        if p.asset_class == "us_equity" and p.current_price is not None
-    }
 
     # Expected broker symbols implied by the target portfolio, so we can
     # surface target-vs-broker drift (finding 5).
@@ -170,7 +165,10 @@ def shadow_report(*, portfolio: dict, broker: Broker | None, marks: dict[str, fl
                 "detail": f"time_stop {kc.get('time_stop_utc')} passed", "enforced": False,
             })
         below, above = kc.get("underlying_price_below"), kc.get("underlying_price_above")
-        spot = spot_by_sym.get(symbol) if not is_option else None
+        # For an ETF the mark IS the per-share spot (marks prefers the broker's
+        # current_price, falling back to market_value/qty), so use it directly —
+        # a missing current_price field must not drop the price-stop shadow.
+        spot = marks.get(mark_key) if not is_option else None
         if spot is not None:
             if below is not None and spot <= below:
                 would_fire.append({"symbol": symbol, "kind": "etf", "rule": "underlying_price_below",
@@ -189,7 +187,9 @@ def shadow_report(*, portfolio: dict, broker: Broker | None, marks: dict[str, fl
     ref_nav = rows[-1].get("nav_usd") if rows else None
     dd_pct: float | None = None
     dd_would_halt = False
-    if sod_nav and ref_nav and float(sod_nav) > 0:
+    # ``is not None`` (not truthiness): a total wipeout where ref_nav == 0.0 is
+    # a 100% drawdown the breaker should flag, not a row to skip (Codex P2).
+    if sod_nav is not None and ref_nav is not None and float(sod_nav) > 0:
         dd_would_halt, dd_pct = risk.daily_circuit_breaker_tripped(
             sod_nav_usd=float(sod_nav), current_nav_usd=float(ref_nav),
         )
@@ -252,8 +252,11 @@ def main(argv: list[str] | None = None) -> int:
         f"monitor: {len(marks)} marks, {len(actions)} actions "
         f"(dry_run={args.dry_run}, broker={'on' if broker else 'off'})"
     )
-    # Phase 0 shadow telemetry — fully guarded so an observability bug can
-    # never take down the real kill loop. No action is taken here.
+    if not args.dry_run:
+        execute_actions(actions, broker=broker)
+    # Phase 0 shadow telemetry — runs AFTER real risk actions so its extra
+    # broker round-trip can never delay a loss-cap flatten (Codex P1). Fully
+    # guarded so an observability bug can never take down the real kill loop.
     try:
         report = shadow_report(portfolio=portfolio, broker=broker, marks=marks)
         state.append_monitor_shadow(report)
@@ -267,8 +270,6 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception as e:
         print(f"monitor-shadow: telemetry error ({type(e).__name__}: {e}); ignored")
-    if not args.dry_run:
-        execute_actions(actions, broker=broker)
     return 0
 
 
