@@ -1,13 +1,17 @@
-"""Tests for orchestrator._account_nav — VIRTUAL_NAV_USD override.
+"""Tests for orchestrator._account_nav — synthetic-NAV sizing (Phase 3).
 
 Alpaca paper accounts ship with $100k of fake equity. CLAUDE.md sizes for a
-$2,500 experimental account, so the agent must size against the smaller
-virtual NAV rather than the broker-reported equity when the operator sets
-the override. Falls back to broker equity, then to the $2,500 baseline.
+$2,500 experimental account, so the agent sizes against the SYNTHETIC balance
+($2,500 baseline, VIRTUAL_NAV_USD-overridable, + realized P&L) and NEVER the
+broker's ~$100k equity. Phase 3 removed the broker-equity fallback entirely so
+a missing/garbled env var can't make the agent size ~40× too large.
+
+These tests use tmp_state so the synthetic balance reads empty logs (→ baseline).
 """
 from __future__ import annotations
 
 import orchestrator
+from lib import state
 from lib.broker import Account
 
 
@@ -34,48 +38,55 @@ def _ctx(broker=None) -> orchestrator.StageContext:
     return orchestrator.StageContext(run_id="t", dry_run=True, broker=broker)
 
 
-def test_account_nav_uses_virtual_override_when_set(monkeypatch):
-    """VIRTUAL_NAV_USD pins NAV regardless of broker-reported equity."""
+def test_account_nav_uses_virtual_override_as_baseline(tmp_state, monkeypatch):
+    """VIRTUAL_NAV_USD is the synthetic baseline; with no trades, NAV == it,
+    regardless of broker-reported equity."""
     monkeypatch.setenv("VIRTUAL_NAV_USD", "2500")
     broker = _FakeBroker(equity_usd=100_000)
     assert orchestrator._account_nav(_ctx(broker)) == 2500.0
 
 
-def test_account_nav_override_wins_over_broker_even_for_zero(monkeypatch):
-    """Override must take precedence — operator could legitimately want $0
-    to test all-cash behaviour without disconnecting the broker."""
+def test_account_nav_override_baseline_even_for_low_value(tmp_state, monkeypatch):
     monkeypatch.setenv("VIRTUAL_NAV_USD", "1500.50")
     broker = _FakeBroker(equity_usd=100_000)
     assert orchestrator._account_nav(_ctx(broker)) == 1500.50
 
 
-def test_account_nav_falls_back_to_broker_when_no_override(monkeypatch):
+def test_account_nav_never_uses_broker_equity(tmp_state, monkeypatch):
+    """Phase 3: broker equity ($100k paper) must NEVER leak into sizing, even
+    with no VIRTUAL_NAV_USD set. Falls to the $2,500 synthetic baseline."""
     monkeypatch.delenv("VIRTUAL_NAV_USD", raising=False)
-    broker = _FakeBroker(equity_usd=4242.0)
-    assert orchestrator._account_nav(_ctx(broker)) == 4242.0
+    broker = _FakeBroker(equity_usd=100_000)
+    assert orchestrator._account_nav(_ctx(broker)) == 2500.0
 
 
-def test_account_nav_falls_back_to_baseline_when_no_broker(monkeypatch):
+def test_account_nav_falls_back_to_baseline_when_no_broker(tmp_state, monkeypatch):
     monkeypatch.delenv("VIRTUAL_NAV_USD", raising=False)
     assert orchestrator._account_nav(_ctx(None)) == 2500.0
 
 
-def test_account_nav_ignores_unparseable_override(monkeypatch):
-    """Garbage override must not crash — fall through to broker / baseline."""
+def test_account_nav_ignores_unparseable_override(tmp_state, monkeypatch):
+    """Garbage override must not crash — fall through to the $2,500 baseline."""
     monkeypatch.setenv("VIRTUAL_NAV_USD", "not-a-number")
     monkeypatch.delenv("ALPACA_API_KEY", raising=False)
     assert orchestrator._account_nav(_ctx(None)) == 2500.0
 
 
-def test_account_nav_override_used_when_broker_raises(monkeypatch):
-    """If the broker call errors, the override should still win cleanly."""
+def test_account_nav_tracks_realized_pnl(tmp_state, monkeypatch):
+    """Phase 3: a banked round-trip lifts the synthetic NAV the agent sizes
+    against. Buy TQQQ ×4 @ $70, sell @ $80 → +$40 realized → NAV $2,540."""
     monkeypatch.setenv("VIRTUAL_NAV_USD", "2500")
-
-    class _BrokenBroker(_FakeBroker):
-        def get_account(self): raise RuntimeError("network down")
-
-    broker = _BrokenBroker(equity_usd=0)
-    assert orchestrator._account_nav(_ctx(broker)) == 2500.0
+    state.append_trade({
+        "activity_id": "a1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 4, "fill_price": 70.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-28T14:00:00Z",
+    })
+    state.append_trade({
+        "activity_id": "a2", "alpaca_order_id": "o2", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 4, "fill_price": 80.0,
+        "fees_usd": 0.0, "filled_at": "2026-05-28T15:00:00Z",
+    })
+    assert orchestrator._account_nav(_ctx(None)) == 2540.0
 
 
 def test_parsed_virtual_nav_override_returns_none_when_unset(monkeypatch):

@@ -417,17 +417,24 @@ def _parsed_virtual_nav_override() -> float | None:
 
 
 def _account_nav(ctx: StageContext) -> float:
-    """$2.5k notional override unless VIRTUAL_NAV_USD set or broker
-    reports a different equity figure. Same as v1."""
-    parsed = _parsed_virtual_nav_override()
-    if parsed is not None:
-        return parsed
-    if ctx.broker is not None:
-        try:
-            return ctx.broker.get_account().equity_usd
-        except Exception:
-            pass
-    return 2500.0  # $2.5k paper baseline
+    """Synthetic NAV the agent sizes against: the $2,500 baseline
+    (VIRTUAL_NAV_USD-overridable) + realized P&L to date. NEVER the broker's
+    ~$100k paper equity — Phase 3 removed that fallback so a missing/garbled
+    env var can't make the agent size ~40× too large. Sourced from the same
+    trades.jsonl-derived balance the dashboard shows, so sizing and the
+    headline agree.
+
+    Realized (settled) basis is intentional: it tracks closed P&L — compounds
+    as wins are banked, de-risks after realized losses — without whipsawing on
+    open-position mark-to-market. Falls back to the baseline if the synthetic
+    computation errors.
+    """
+    try:
+        from lib import dashboard_data
+        return dashboard_data.realized_synthetic_nav()
+    except Exception:
+        parsed = _parsed_virtual_nav_override()
+        return parsed if parsed is not None else 2500.0
 
 
 def _broker_portfolio_summary_for_meta(ctx: StageContext) -> dict:
@@ -922,28 +929,26 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
     if not ctx.dry_run:
         state.write_json(state.NEXT_RUN, next_run)
         # NAV history: one row per cycle for the dashboard equity curve.
-        # Marks aren't wired here — gross/net P&L includes the modelled-
-        # cost entry-leg estimate only. Real marks come through the
-        # broker-position path in lib/marks.py.
-        #
-        # `nav_source` records whether nav_usd is in raw broker units
-        # or virtual (VIRTUAL_NAV_USD-overridden) units. The dashboard's
-        # NAV anchor offset only applies to broker-unit rows; without
-        # this tag a row written under VIRTUAL_NAV_USD=2500 would get
-        # the broker offset subtracted again and land at ~-$95k.
-        #
-        # Derive the tag from the SAME parsing logic _account_nav uses
-        # (Codex P1 on PR #76): a malformed env var like
-        # VIRTUAL_NAV_USD="not-a-number" falls through to broker
-        # equity, so the row is broker-units despite the var existing.
+        # Phase 3: nav_usd is stamped DETERMINISTICALLY from the synthetic
+        # balance (trades.jsonl-derived realized P&L over the $2,500 baseline),
+        # NOT the constructor's self-reported portfolio.nav_usd. trades_sync
+        # ran just above, so this reflects ACTUAL fills — even if some orders
+        # were skipped/failed this cycle, the row is honest (only filled trades
+        # count). This is the same number _account_nav sizes against and the
+        # dashboard shows. nav_source is always "virtual" now (synthetic units,
+        # never raw broker equity), so the dashboard applies no broker offset.
+        from lib import dashboard_data as _dd
         from lib import pnl as pnl_lib
         breakdown = pnl_lib.compute_portfolio_pnl(portfolio=portfolio, marks=None)
-        nav_source = "virtual" if _parsed_virtual_nav_override() is not None else "broker"
+        try:
+            synthetic_nav = _dd.realized_synthetic_nav()
+        except Exception:
+            synthetic_nav = portfolio.get("nav_usd", 0.0)
         state.append_nav({
             "run_id": ctx.run_id,
             "at": state.utcnow_iso(),
-            "nav_usd": portfolio.get("nav_usd", 0.0),
-            "nav_source": nav_source,
+            "nav_usd": synthetic_nav,
+            "nav_source": "virtual",
             "cash_usd": portfolio.get("cash_usd", 0.0),
             "positions_count": len(portfolio.get("positions", [])),
             "all_cash": portfolio.get("all_cash", False),
