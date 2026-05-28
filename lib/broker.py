@@ -138,3 +138,14 @@ class Broker(ABC):
           - non-numeric bid/ask in the response
         """
         return None
+
+    def get_underlying_price(self, symbol: str) -> float | None:
+        """Return the latest price for an equity/ETF underlying, or None.
+
+        Used by monitor.py to evaluate option positions' underlying price
+        stops (underlying_price_below/above), which reference the underlying
+        (e.g. SPY), not the option mark. Returning None is safe — the monitor
+        simply skips the price stop for that option (its loss cap + time stop
+        still apply). Default returns None; concrete brokers override.
+        """
+        return None

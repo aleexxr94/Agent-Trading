@@ -417,17 +417,24 @@ def _parsed_virtual_nav_override() -> float | None:
 
 
 def _account_nav(ctx: StageContext) -> float:
-    """$2.5k notional override unless VIRTUAL_NAV_USD set or broker
-    reports a different equity figure. Same as v1."""
-    parsed = _parsed_virtual_nav_override()
-    if parsed is not None:
-        return parsed
-    if ctx.broker is not None:
-        try:
-            return ctx.broker.get_account().equity_usd
-        except Exception:
-            pass
-    return 2500.0  # $2.5k paper baseline
+    """Synthetic NAV the agent sizes against: the $2,500 baseline
+    (VIRTUAL_NAV_USD-overridable) + realized P&L to date. NEVER the broker's
+    ~$100k paper equity — Phase 3 removed that fallback so a missing/garbled
+    env var can't make the agent size ~40× too large. Sourced from the same
+    trades.jsonl-derived balance the dashboard shows, so sizing and the
+    headline agree.
+
+    Realized (settled) basis is intentional: it tracks closed P&L — compounds
+    as wins are banked, de-risks after realized losses — without whipsawing on
+    open-position mark-to-market. Falls back to the baseline if the synthetic
+    computation errors.
+    """
+    try:
+        from lib import dashboard_data
+        return dashboard_data.realized_synthetic_nav()
+    except Exception:
+        parsed = _parsed_virtual_nav_override()
+        return parsed if parsed is not None else 2500.0
 
 
 def _broker_portfolio_summary_for_meta(ctx: StageContext) -> dict:
@@ -449,12 +456,14 @@ def _broker_portfolio_summary_for_meta(ctx: StageContext) -> dict:
     """
     positions = _current_positions_summary(ctx)
     nav = _account_nav(ctx)
-    cash_usd = 0.0
-    if ctx.broker is not None and not ctx.dry_run:
-        try:
-            cash_usd = ctx.broker.get_account().cash_usd
-        except Exception:
-            cash_usd = 0.0
+    # Cash buffer in SYNTHETIC units, not raw broker cash (Codex P2 on PR #98):
+    # the agent sizes against synthetic NAV (~$2.5k), so positions hold ~real
+    # small dollars while broker cash is ~$100k — dividing raw broker cash by
+    # synthetic NAV produced nonsensical thousands-of-percent buffers. Derive
+    # cash as the synthetic NAV not currently deployed into open positions
+    # (their market_value is on the same small-dollar scale as the sizing).
+    invested = sum(abs(float(p.get("market_value") or 0.0)) for p in positions)
+    cash_usd = max(0.0, nav - invested)
     cash_pct = (cash_usd / nav * 100.0) if nav > 0 else 100.0
     return {
         "positions": positions,
@@ -865,6 +874,24 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
             next_run["order_plan_error"] = f"get_positions: {type(e).__name__}: {e}"
             current = []
         plan = orders.diff_portfolio(portfolio, current)
+        # Phase 2: when the 8% daily-drawdown breaker is active, allow
+        # de-risking (full closes AND same-sign reductions — both are SELLs on
+        # a long-only book) but skip BUYs that add/open exposure for the rest
+        # of the UTC day. The flag auto-expires next day. Codex P1 (PR #98):
+        # _plan_for_symbol puts reductions in `requests`, so filter by side
+        # rather than dropping every request.
+        if risk.dd_breaker_enabled() and state.dd_halt_active():
+            derisking = [r for r in plan.requests if r.side == "sell"]
+            skipped_opens = len(plan.requests) - len(derisking)
+            plan = orders.OrderPlan(
+                requests=derisking, closes=plan.closes, skipped=plan.skipped,
+            )
+            next_run["dd_halt"] = {
+                "active": True,
+                "detail": state.read_dd_halt() or {},
+                "opens_skipped": skipped_opens,
+                "note": "8% daily drawdown breaker active — buys skipped; closes + reductions allowed",
+            }
         results = orders.submit_plan(plan, broker=ctx.broker)
         next_run["order_plan"] = {
             "total_legs": plan.total_legs,
@@ -912,28 +939,26 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
     if not ctx.dry_run:
         state.write_json(state.NEXT_RUN, next_run)
         # NAV history: one row per cycle for the dashboard equity curve.
-        # Marks aren't wired here — gross/net P&L includes the modelled-
-        # cost entry-leg estimate only. Real marks come through the
-        # broker-position path in lib/marks.py.
-        #
-        # `nav_source` records whether nav_usd is in raw broker units
-        # or virtual (VIRTUAL_NAV_USD-overridden) units. The dashboard's
-        # NAV anchor offset only applies to broker-unit rows; without
-        # this tag a row written under VIRTUAL_NAV_USD=2500 would get
-        # the broker offset subtracted again and land at ~-$95k.
-        #
-        # Derive the tag from the SAME parsing logic _account_nav uses
-        # (Codex P1 on PR #76): a malformed env var like
-        # VIRTUAL_NAV_USD="not-a-number" falls through to broker
-        # equity, so the row is broker-units despite the var existing.
+        # Phase 3: nav_usd is stamped DETERMINISTICALLY from the synthetic
+        # balance (trades.jsonl-derived realized P&L over the $2,500 baseline),
+        # NOT the constructor's self-reported portfolio.nav_usd. trades_sync
+        # ran just above, so this reflects ACTUAL fills — even if some orders
+        # were skipped/failed this cycle, the row is honest (only filled trades
+        # count). This is the same number _account_nav sizes against and the
+        # dashboard shows. nav_source is always "virtual" now (synthetic units,
+        # never raw broker equity), so the dashboard applies no broker offset.
+        from lib import dashboard_data as _dd
         from lib import pnl as pnl_lib
         breakdown = pnl_lib.compute_portfolio_pnl(portfolio=portfolio, marks=None)
-        nav_source = "virtual" if _parsed_virtual_nav_override() is not None else "broker"
+        try:
+            synthetic_nav = _dd.realized_synthetic_nav()
+        except Exception:
+            synthetic_nav = portfolio.get("nav_usd", 0.0)
         state.append_nav({
             "run_id": ctx.run_id,
             "at": state.utcnow_iso(),
-            "nav_usd": portfolio.get("nav_usd", 0.0),
-            "nav_source": nav_source,
+            "nav_usd": synthetic_nav,
+            "nav_source": "virtual",
             "cash_usd": portfolio.get("cash_usd", 0.0),
             "positions_count": len(portfolio.get("positions", [])),
             "all_cash": portfolio.get("all_cash", False),

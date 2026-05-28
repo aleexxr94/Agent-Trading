@@ -14,10 +14,12 @@ from lib import state
 from lib.broker import BrokerPosition
 
 
-def _bp(symbol, qty, market_value, asset_class="us_equity") -> BrokerPosition:
+def _bp(symbol, qty, market_value, asset_class="us_equity", avg_cost=None) -> BrokerPosition:
+    # avg_cost defaults to market_value/qty (i.e. no P&L) unless overridden —
+    # the monitor now uses the broker's avg_entry_price as the cost basis.
     return BrokerPosition(
         symbol=symbol, qty=qty,
-        avg_cost=market_value / qty if qty else 0,
+        avg_cost=avg_cost if avg_cost is not None else (market_value / qty if qty else 0),
         market_value=market_value, unrealized_pl_usd=0.0,
         asset_class=asset_class,
     )
@@ -97,10 +99,10 @@ def test_monitor_no_broker_no_marks_no_kill(tmp_state, monkeypatch, capsys):
 
 
 def test_monitor_flattens_when_loss_exceeds_25_pct(tmp_state, monkeypatch):
-    """ETF entered at $70, current mark $52 = 25.7% loss → must flatten."""
+    """ETF entered at $70 (broker avg_cost), current mark $52 = 25.7% loss → flatten."""
     _write_portfolio([_etf_pos(symbol="TQQQ", shares=4, avg_cost=70.0)])
     flat_log: list = []
-    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 52.0)], flatten_log=flat_log)
+    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 52.0, avg_cost=70.0)], flatten_log=flat_log)
     monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
     monitor.main([])
     assert flat_log == ["TQQQ"]
@@ -110,8 +112,8 @@ def test_monitor_does_not_flatten_at_24_pct_loss(tmp_state, monkeypatch):
     """24% loss is under the 25% kill — no flatten action."""
     _write_portfolio([_etf_pos(symbol="TQQQ", shares=4, avg_cost=70.0)])
     flat_log: list = []
-    # 4 shares at $53.20 = $212.80 vs cost basis $280 = 24% loss
-    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 53.20)], flatten_log=flat_log)
+    # 4 shares at $53.20 = $212.80 vs broker cost basis $280 = 24% loss
+    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 53.20, avg_cost=70.0)], flatten_log=flat_log)
     monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
     monitor.main([])
     assert flat_log == []
@@ -121,10 +123,22 @@ def test_monitor_dry_run_evaluates_but_does_not_flatten(tmp_state, monkeypatch):
     """--dry-run computes actions but never calls broker.flatten."""
     _write_portfolio([_etf_pos(symbol="TQQQ", shares=4, avg_cost=70.0)])
     flat_log: list = []
-    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 50.0)], flatten_log=flat_log)
+    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 50.0, avg_cost=70.0)], flatten_log=flat_log)
     monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
     monitor.main(["--dry-run"])
     assert flat_log == []
+
+
+def test_monitor_uses_broker_cost_basis_not_portfolio(tmp_state, monkeypatch):
+    """Broker truth (Finding 5): loss is computed from the broker's
+    avg_entry_price, not the portfolio's stored avg_cost. Portfolio says
+    $100 (would be a 52% loss → flatten); broker says $50 (4% loss → hold)."""
+    _write_portfolio([_etf_pos(symbol="TQQQ", shares=4, avg_cost=100.0)])
+    flat_log: list = []
+    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 48.0, avg_cost=50.0)], flatten_log=flat_log)
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
+    monitor.main([])
+    assert flat_log == []  # 4% broker loss, not the 52% the portfolio basis implies
 
 
 def test_monitor_option_flatten_uses_osi_symbol(tmp_state):
@@ -176,35 +190,29 @@ def _read_shadow() -> list:
     ]
 
 
-def test_monitor_shadow_records_time_stop_would_fire(tmp_state, monkeypatch):
-    """Phase 0: a past time_stop_utc is reported as a would-fire event that
-    is NOT enforced, and no flatten happens. get_account raising on the fake
-    broker must not break the shadow path."""
+def test_monitor_enforces_time_stop(tmp_state, monkeypatch):
+    """Phase 1: a past time_stop_utc flattens the position even when it's in
+    profit (loss cap not hit). The audit records the fire."""
     past = "2000-01-01T00:00:00Z"
     _write_portfolio([_etf_pos(
-        symbol="TQQQ", shares=4, avg_cost=70.0,
+        symbol="TQQQ", shares=4, avg_cost=80.0,
         kill_conditions={"max_loss_pct": 25, "time_stop_utc": past},
     )])
     flat_log: list = []
-    # In profit so the real loss-cap doesn't flatten — isolates the shadow path.
-    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 80.0)], flatten_log=flat_log)
+    # In profit (mark 80 == cost 80) so only the time stop can fire.
+    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 80.0, avg_cost=80.0)], flatten_log=flat_log)
     monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
     monitor.main([])
-    assert flat_log == []  # shadow never acts
-    rows = _read_shadow()
-    assert len(rows) == 1
-    wf = rows[0]["would_fire"]
-    assert any(e["rule"] == "time_stop_utc" and e["symbol"] == "TQQQ" for e in wf)
-    assert all(e.get("enforced") is False for e in wf)
-    assert rows[0]["coverage"]["portfolio_positions"] == 1
-    assert rows[0]["coverage"]["broker_positions"] == 1
+    assert flat_log == ["TQQQ"]
+    fired = _read_shadow()[-1]["fired"]
+    assert any(f["symbol"] == "TQQQ" and "time stop" in f["reason"] for f in fired)
 
 
-def test_monitor_shadow_flags_orphans_and_missing(tmp_state, monkeypatch):
-    """Phase 0: surface target-vs-broker drift — broker holds a symbol the
-    target doesn't (orphan) and the target names one the broker doesn't (missing)."""
+def test_monitor_audit_flags_orphans_and_missing(tmp_state, monkeypatch):
+    """Phase 1 audit: surface target-vs-broker drift — broker holds a symbol
+    the target doesn't (orphan) and the target names one the broker doesn't."""
     _write_portfolio([_etf_pos(symbol="SOXL", shares=10, avg_cost=25.0)])
-    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 80.0)])
+    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 80.0, avg_cost=80.0)])
     monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
     monitor.main([])
     cov = _read_shadow()[-1]["coverage"]
@@ -213,26 +221,223 @@ def test_monitor_shadow_flags_orphans_and_missing(tmp_state, monkeypatch):
     assert cov["unmarked"] == 1  # SOXL has no broker mark
 
 
-def test_monitor_shadow_price_stop_uses_mark_fallback(tmp_state):
-    """Codex P2: the ETF price-stop shadow must use the mark (which falls back
-    to market_value/qty) as the spot, so a broker position lacking
-    current_price still produces a would-fire event."""
+def test_monitor_enforces_etf_price_stop_via_mark(tmp_state):
+    """Phase 1: an ETF price stop fires off the mark (spot=mark) even when the
+    loss cap isn't hit. Mark 50 ≤ kill_below 60, while loss is only ~4%."""
     portfolio = {"positions": [{
         "kind": "etf", "symbol": "TQQQ", "shares": 4, "avg_cost": 52.0,
         "kill_conditions": {"max_loss_pct": 25, "underlying_price_below": 60.0},
         "position_pct": 11.2,
     }]}
-    report = monitor.shadow_report(portfolio=portfolio, broker=None, marks={"TQQQ": 50.0})
-    wf = report["would_fire"]
-    assert any(e["rule"] == "underlying_price_below" and e["symbol"] == "TQQQ" for e in wf)
+    bp = _bp("TQQQ", 4, 4 * 50.0, avg_cost=52.0)
+    actions = monitor.evaluate_portfolio(
+        portfolio=portfolio, marks={"TQQQ": 50.0},
+        cost_basis={"TQQQ": 52.0}, broker_positions=[bp],
+    )
+    assert any(a["symbol"] == "TQQQ" and a["action"] == "flatten" for a in actions)
+    assert "kill_below" in actions[0]["reason"]
 
 
-def test_monitor_shadow_dd_flags_total_wipeout(tmp_state):
-    """Codex P2: a latest NAV of 0.0 is a 100% drawdown the breaker shadow must
+def test_monitor_flattens_orphan_on_loss_cap(tmp_state, monkeypatch):
+    """Phase 1: a broker position the target portfolio doesn't name still gets
+    the hard loss cap — nothing held goes unmonitored (Finding 5)."""
+    _write_portfolio([])  # all-cash target, but the broker still holds SQQQ
+    flat_log: list = []
+    fake = _FakeBroker(
+        [_bp("SQQQ", 10, 10 * 40.0, avg_cost=60.0)], flatten_log=flat_log,
+    )  # cost $600, value $400 → 33% loss
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
+    monitor.main([])
+    assert flat_log == ["SQQQ"]
+    assert any("orphan" in f["reason"] for f in _read_shadow()[-1]["fired"])
+
+
+def test_monitor_enforces_option_underlying_price_stop(tmp_state):
+    """Codex P2 (#98): an option's underlying_price_below fires off the
+    underlying spot (passed in `spots`), even when the option mark shows no
+    loss. SPY spot 490 ≤ kill_below 500 → flatten the contract."""
+    option_pos = {
+        "kind": "option", "underlying": "SPY", "type": "call",
+        "strike": 530.0, "expiry": "2026-06-19", "dte": 40,
+        "contracts": 1, "premium_paid": 6.50,
+        "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04,
+                   "vega": 0.18, "iv": 0.18, "iv_percentile": 35},
+        "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 100, "underlying_price_below": 500.0},
+        "position_pct": 5.0,
+    }
+    bp = BrokerPosition(
+        symbol="SPY260619C00530000", qty=1, avg_cost=6.50, market_value=650.0,
+        unrealized_pl_usd=0.0, asset_class="us_option",
+    )
+    actions = monitor.evaluate_portfolio(
+        portfolio={"positions": [option_pos]},
+        marks={"SPY|530.0|2026-06-19|call": 6.50},  # mark == premium → no loss
+        broker_positions=[bp],
+        spots={"SPY": 490.0},
+    )
+    assert len(actions) == 1
+    assert actions[0]["symbol"] == "SPY260619C00530000"
+    assert "kill_below" in actions[0]["reason"]
+
+
+def test_monitor_option_key_normalizes_integer_strike(tmp_state):
+    """Codex P2 (#98): an integer JSON strike (530) must match a float-keyed
+    mark (SPY|530.0|...) via the canonical key, so the kill loop doesn't treat
+    the position as unmarked. Premium mark 0.0 → 100% loss → flatten."""
+    option_pos = {
+        "kind": "option", "underlying": "SPY", "type": "call",
+        "strike": 530, "expiry": "2026-06-19", "dte": 40,  # integer strike
+        "contracts": 1, "premium_paid": 6.50,
+        "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04,
+                   "vega": 0.18, "iv": 0.18, "iv_percentile": 35},
+        "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 100},
+        "position_pct": 5.0,
+    }
+    actions = monitor.evaluate_portfolio(
+        portfolio={"positions": [option_pos]},
+        marks={"SPY|530.0|2026-06-19|call": 0.0},  # float-keyed, 100% loss
+    )
+    assert len(actions) == 1
+    assert actions[0]["symbol"] == "SPY260619C00530000"
+
+
+def test_monitor_option_loss_cap_via_broker_value_without_mark(tmp_state):
+    """Codex P2 (#98, round 3): with no premium mark (key mismatch), the loss
+    cap must still fire off the broker's market_value. A contract at $0
+    market value vs $650 cost = 100% loss → flatten, no price/time stop needed."""
+    option_pos = {
+        "kind": "option", "underlying": "SPY", "type": "call",
+        "strike": 530.0, "expiry": "2026-06-19", "dte": 40,
+        "contracts": 1, "premium_paid": 6.50,
+        "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04,
+                   "vega": 0.18, "iv": 0.18, "iv_percentile": 35},
+        "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 100},  # loss cap only — no price/time stop
+        "position_pct": 5.0,
+    }
+    bp = BrokerPosition(
+        symbol="SPY260619C00530000", qty=1, avg_cost=6.50, market_value=0.0,
+        unrealized_pl_usd=-650.0, asset_class="us_option",
+    )
+    actions = monitor.evaluate_portfolio(
+        portfolio={"positions": [option_pos]},
+        marks={},  # premium mark missing / key-mismatched
+        broker_positions=[bp],
+        spots={},
+    )
+    assert len(actions) == 1
+    assert actions[0]["symbol"] == "SPY260619C00530000"
+    assert "cap" in actions[0]["reason"]
+
+
+def test_monitor_option_price_stop_fires_without_premium_mark(tmp_state):
+    """Codex P2 (#98, round 2): an option's underlying price stop must fire
+    even when its PREMIUM mark is missing/key-mismatched, because the
+    underlying spot is fetched independently. marks={} (no premium mark),
+    spots SPY=490 ≤ kill_below 500 → flatten."""
+    option_pos = {
+        "kind": "option", "underlying": "SPY", "type": "call",
+        "strike": 530.0, "expiry": "2026-06-19", "dte": 40,
+        "contracts": 1, "premium_paid": 6.50,
+        "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04,
+                   "vega": 0.18, "iv": 0.18, "iv_percentile": 35},
+        "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 100, "underlying_price_below": 500.0},
+        "position_pct": 5.0,
+    }
+    bp = BrokerPosition(
+        symbol="SPY260619C00530000", qty=1, avg_cost=6.50, market_value=650.0,
+        unrealized_pl_usd=0.0, asset_class="us_option",
+    )
+    actions = monitor.evaluate_portfolio(
+        portfolio={"positions": [option_pos]},
+        marks={},  # premium mark missing / key-mismatched
+        broker_positions=[bp],
+        spots={"SPY": 490.0},
+    )
+    assert len(actions) == 1
+    assert actions[0]["symbol"] == "SPY260619C00530000"
+    assert "kill_below" in actions[0]["reason"]
+
+
+def test_monitor_kill_switch_disables_price_time_stops(tmp_state, monkeypatch):
+    """MONITOR_ENFORCE_STOPS=false reverts to loss-cap-only: a tripped time
+    stop does NOT flatten an otherwise-healthy position."""
+    monkeypatch.setenv("MONITOR_ENFORCE_STOPS", "false")
+    past = "2000-01-01T00:00:00Z"
+    _write_portfolio([_etf_pos(
+        symbol="TQQQ", shares=4, avg_cost=80.0,
+        kill_conditions={"max_loss_pct": 25, "time_stop_utc": past},
+    )])
+    flat_log: list = []
+    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 80.0, avg_cost=80.0)], flatten_log=flat_log)
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
+    monitor.main([])
+    assert flat_log == []  # stops disabled; loss cap not hit
+
+
+def test_monitor_audit_dd_flags_total_wipeout(tmp_state):
+    """Codex P2: a latest NAV of 0.0 is a 100% drawdown the audit proxy must
     flag, not skip via a truthiness check."""
     state.append_nav({"run_id": "r1", "at": state.utcnow_iso(), "nav_usd": 2500.0})
     state.append_nav({"run_id": "r2", "at": state.utcnow_iso(), "nav_usd": 0.0})
-    report = monitor.shadow_report(portfolio={"positions": []}, broker=None, marks={})
+    report = monitor.audit_report(
+        portfolio={"positions": []}, broker_positions=[], marks={},
+        actions=[], enforce_stops=True,
+    )
     dd = report["daily_dd_shadow"]
     assert dd["would_halt_new_orders"] is True
     assert dd["dd_pct"] == 100.0
+
+
+# ---- Phase 2: 8% daily-drawdown breaker ----
+
+
+def test_run_dd_breaker_trips_and_writes_halt(tmp_state):
+    """≥8% intraday drawdown writes the auto-expiring dd_halt flag."""
+    state.set_sod_nav_today(2500.0)
+    info = monitor.run_dd_breaker(current_nav=2250.0, enabled=True)  # 10% DD
+    assert info["tripped"] is True
+    assert info["dd_pct"] == 10.0
+    assert state.dd_halt_active() is True
+
+
+def test_run_dd_breaker_no_trip_under_threshold(tmp_state):
+    state.set_sod_nav_today(2500.0)
+    info = monitor.run_dd_breaker(current_nav=2400.0, enabled=True)  # 4% DD
+    assert info["tripped"] is False
+    assert state.dd_halt_active() is False
+
+
+def test_run_dd_breaker_disabled_does_not_write_flag(tmp_state):
+    """Kill-switch off: DD is still computed but no halt flag is written."""
+    state.set_sod_nav_today(2500.0)
+    info = monitor.run_dd_breaker(current_nav=2000.0, enabled=False)  # 20% DD
+    assert info["tripped"] is True
+    assert state.dd_halt_active() is False
+
+
+def test_run_dd_breaker_dry_run_does_not_persist(tmp_state):
+    """persist=False (dry-run) computes the trip but writes no halt flag."""
+    state.set_sod_nav_today(2500.0)
+    info = monitor.run_dd_breaker(current_nav=2000.0, enabled=True, persist=False)
+    assert info["tripped"] is True
+    assert state.dd_halt_active() is False
+
+
+def test_run_dd_breaker_first_obs_sets_baseline(tmp_state):
+    """First observation of the day sets the baseline → DD 0, no trip."""
+    info = monitor.run_dd_breaker(current_nav=2400.0, enabled=True)
+    assert info["tripped"] is False
+    assert state.read_sod_nav_today() == 2400.0
+
+
+def test_dd_halt_auto_expires_next_utc_day(tmp_state):
+    state.set_dd_halt(dd_pct=10.0, sod_nav=2500.0, current_nav=2250.0)
+    assert state.dd_halt_active() is True
+    stale = state.read_dd_halt()
+    stale["date"] = "2000-01-01"
+    state.DD_HALT_FLAG.write_text(json.dumps(stale))
+    assert state.dd_halt_active() is False  # prior-day flag is expired

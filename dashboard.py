@@ -1585,12 +1585,13 @@ with tabs[3]:
             # P2). The synthetic fallback is already in virtual units so
             # no offset applies.
             live_at = state.utcnow_iso()
-            if broker_view.available and getattr(broker_view, "nav_usd", None) is not None:
-                live_nav = float(broker_view.nav_usd) - _nav_offset_usd
-                live_label = "Live broker equity"
-            else:
-                live_nav = float(_synth.synthetic_balance_usd)
-                live_label = "Live (synthetic — broker offline)"
+            # The persisted Actual-NAV rows are in synthetic units (the
+            # orchestrator stamps the synthetic balance), so the live tip must
+            # be too — otherwise the line jumps from ~$2.5k history to the
+            # broker's ~$100k equity at the tip (Codex P2 on PR #98). Use the
+            # mark-aware synthetic balance, the same figure as the hero card.
+            live_nav = float(_synth_live.synthetic_balance_usd)
+            live_label = "Live (synthetic balance)"
             # Fold the live value into one continuous line so the curve
             # flows into "now" and the y-axis fits the whole series tightly
             # (the old floating diamond sat ~$100 above the line and blew

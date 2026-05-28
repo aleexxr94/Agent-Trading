@@ -194,11 +194,12 @@ def compute_portfolio_pnl(
     costs = costs or {}
     gross = 0.0
     cost_total = 0.0
+    from .marks import option_synthetic_key
     for p in portfolio.get("positions", []):
         if p["kind"] == "etf":
             key = p["symbol"]
         else:
-            key = f"{p['underlying']}|{p['strike']}|{p['expiry']}|{p['type']}"
+            key = option_synthetic_key(p["underlying"], p["strike"], p["expiry"], p["type"])
         b = compute_position_pnl(
             position=p,
             current_mark_usd=marks.get(key),

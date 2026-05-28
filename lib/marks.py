@@ -20,6 +20,26 @@ from __future__ import annotations
 from .broker import Broker, BrokerPosition
 
 
+def option_synthetic_key(underlying: str, strike, expiry: str, type_: str) -> str:
+    """Canonical synthetic key for an option position/mark:
+    ``UNDERLYING|STRIKE|EXPIRY|TYPE`` with the strike normalised through
+    ``float()``.
+
+    Why normalise: a portfolio JSON row may carry an integer strike (``530``)
+    while the broker-parsed mark uses a float (``530.0``). Without a single
+    canonical form the two keys differ (``"...|530|..."`` vs ``"...|530.0|..."``),
+    so marks / cost-basis / value lookups silently miss and the P&L, the
+    monitor kill loop, AND the daily-drawdown-breaker NAV all treat the
+    position as unmarked/closed (Codex, PR #98). Every site that builds this
+    key must go through here.
+    """
+    try:
+        strike = float(strike)
+    except (TypeError, ValueError):
+        pass
+    return f"{underlying}|{strike}|{expiry}|{type_}"
+
+
 def _osi_to_synthetic(osi: str) -> str | None:
     """Reverse the OSI symbol back into monitor/PnL's synthetic key shape.
 
@@ -43,7 +63,7 @@ def _osi_to_synthetic(osi: str) -> str | None:
     strike = int(strike_part) / 1000.0
     type_ = "call" if type_char == "C" else "put"
     expiry = f"20{yymmdd[:2]}-{yymmdd[2:4]}-{yymmdd[4:6]}"
-    return f"{underlying}|{strike}|{expiry}|{type_}"
+    return option_synthetic_key(underlying, strike, expiry, type_)
 
 
 def _key_for_broker_position(p: BrokerPosition) -> str:
@@ -164,5 +184,7 @@ def portfolio_to_mark_keys(portfolio: dict) -> dict[str, str]:
         if pos["kind"] == "etf":
             out[str(i)] = pos["symbol"]
         else:
-            out[str(i)] = f"{pos['underlying']}|{pos['strike']}|{pos['expiry']}|{pos['type']}"
+            out[str(i)] = option_synthetic_key(
+                pos["underlying"], pos["strike"], pos["expiry"], pos["type"],
+            )
     return out

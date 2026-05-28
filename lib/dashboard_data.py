@@ -443,6 +443,79 @@ def compute_synthetic_balance(
     )
 
 
+def synthetic_base_usd() -> float:
+    """The synthetic starting balance ($2,500 spec target), overridable via
+    VIRTUAL_NAV_USD. This is the baseline both the dashboard and (from Phase 3)
+    the agent's position sizing build on — never the broker's ~$100k equity."""
+    import os
+    raw = os.environ.get("VIRTUAL_NAV_USD")
+    if not raw:
+        return 2500.0
+    try:
+        return float(raw)
+    except ValueError:
+        return 2500.0
+
+
+def _raw_llm_cost_total_usd() -> float:
+    """Sum of ALL LLM cost rows from the raw audit log — NOT honoring the
+    dashboard's display cost-reset markers. Trading/risk NAV must use this so
+    that hiding costs in the UI can't silently inflate sizing capital (Codex
+    P2 on PR #98)."""
+    if not state.COSTS_LOG.exists():
+        return 0.0
+    total = 0.0
+    for line in state.COSTS_LOG.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            total += float(json.loads(line).get("cost_usd", 0.0) or 0.0)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+    return total
+
+
+def _risk_nav_from(sb: "SyntheticBalance") -> float:
+    """Recompute a SyntheticBalance's level using the RAW LLM cost total
+    instead of the reset-aware display total. Used only by the sizing/risk
+    paths (sizing NAV + the drawdown breaker), never the dashboard display."""
+    return (
+        sb.starting_balance_usd
+        + sb.closed_gross_pnl_usd
+        + sb.open_gross_pnl_usd
+        - _raw_llm_cost_total_usd()
+        - sb.trading_fees_total_usd
+    )
+
+
+def live_synthetic_nav(
+    *,
+    marks: dict[str, float] | None = None,
+    portfolio: dict | None = None,
+    broker_costs: dict[str, float] | None = None,
+) -> float:
+    """Mark-aware synthetic equity (RAW costs) = starting + closed + open P&L
+    − raw LLM cost − fees. Used by the daily-drawdown breaker (it must see
+    intraday unrealized moves and must not move on a display cost reset)."""
+    marks = marks or {}
+    sb = compute_synthetic_balance(
+        starting_balance_usd=synthetic_base_usd(),
+        marks=marks,
+        portfolio=portfolio,
+        broker_costs=broker_costs,
+        held_keys=frozenset(marks.keys()),
+    )
+    return _risk_nav_from(sb)
+
+
+def realized_synthetic_nav() -> float:
+    """Realized-only synthetic balance the agent sizes against (Phase 3),
+    using RAW LLM costs so a display cost reset can't inflate sizing capital.
+    Reads logs only; no broker round trip."""
+    sb = compute_synthetic_balance(starting_balance_usd=synthetic_base_usd(), marks={})
+    return _risk_nav_from(sb)
+
+
 def realized_balance_series(
     *, starting_balance_usd: float = 2500.0,
 ) -> list[dict]:
@@ -1142,7 +1215,8 @@ def mark_key_for_position(pos: dict) -> str:
     """
     if pos["kind"] == "etf":
         return pos["symbol"]
-    return f"{pos['underlying']}|{pos['strike']}|{pos['expiry']}|{pos['type']}"
+    from .marks import option_synthetic_key
+    return option_synthetic_key(pos["underlying"], pos["strike"], pos["expiry"], pos["type"])
 
 
 def split_positions_by_broker_holdings(
@@ -1666,9 +1740,10 @@ def position_table_rows(
         else:
             contracts = p["contracts"]
             g = p["greeks"]
-            # Look up via synthetic key (the convention the rest of the
-            # codebase uses); fall back to OSI for backwards compat.
-            synth_key = f"{p['underlying']}|{p['strike']}|{p['expiry']}|{p['type']}"
+            # Look up via the canonical synthetic key (strike-normalised so an
+            # integer JSON strike matches the broker's float); fall back to OSI.
+            from .marks import option_synthetic_key
+            synth_key = option_synthetic_key(p["underlying"], p["strike"], p["expiry"], p["type"])
             mark = marks.get(synth_key)
             broker_cost = costs.get(synth_key)
             opened_at = None

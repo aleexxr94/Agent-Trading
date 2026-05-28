@@ -61,6 +61,14 @@ LAST_CYCLE_HASH = STATE_DIR / "last_cycle_hash.json"
 # gate orders. Lets the operator watch the controls before enforcement is
 # enabled in later phases.
 MONITOR_SHADOW_LOG = STATE_DIR / "monitor_shadow.jsonl"
+# Phase 2 daily-drawdown circuit breaker. A separate, auto-expiring halt
+# distinct from the manual halt.flag: monitor.py writes it when intraday
+# synthetic drawdown ≥ 8%, the orchestrator reads it to skip NEW orders
+# (closes still allowed). The file stamps the UTC date it was set, so it
+# auto-clears at the next UTC day without manual intervention.
+DD_HALT_FLAG = STATE_DIR / "dd_halt.flag"
+# Start-of-day synthetic NAV baseline for the breaker: {date, sod_nav_usd, set_at}.
+SOD_NAV_FILE = STATE_DIR / "sod_nav.json"
 
 # NAV display anchor (PR following #73). Alpaca paper accounts default
 # to $100,000 USD and can't always be reset to a lower target. The
@@ -134,6 +142,74 @@ def set_halt(reason: str = "manual") -> None:
 def clear_halt() -> None:
     if HALT_FLAG.exists():
         HALT_FLAG.unlink()
+
+
+# --------- daily drawdown breaker (Phase 2) ---------
+
+
+def read_sod_nav_today() -> float | None:
+    """Start-of-day synthetic NAV for TODAY (UTC), or None if not set today.
+    A stale (prior-day) baseline reads as None so each UTC day re-baselines."""
+    if not SOD_NAV_FILE.exists():
+        return None
+    try:
+        d = json.loads(SOD_NAV_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(d, dict) or d.get("date") != utcnow().date().isoformat():
+        return None
+    v = d.get("sod_nav_usd")
+    return float(v) if isinstance(v, (int, float)) else None
+
+
+def set_sod_nav_today(nav: float) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    SOD_NAV_FILE.write_text(
+        json.dumps({
+            "date": utcnow().date().isoformat(),
+            "sod_nav_usd": float(nav),
+            "set_at": utcnow_iso(),
+        }, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def set_dd_halt(*, dd_pct: float, sod_nav: float, current_nav: float,
+                reason: str = "daily drawdown ≥ 8%") -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    DD_HALT_FLAG.write_text(
+        json.dumps({
+            "date": utcnow().date().isoformat(),
+            "dd_pct": round(float(dd_pct), 2),
+            "sod_nav_usd": float(sod_nav),
+            "current_nav_usd": float(current_nav),
+            "reason": reason,
+            "set_at": utcnow_iso(),
+        }, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def read_dd_halt() -> dict | None:
+    if not DD_HALT_FLAG.exists():
+        return None
+    try:
+        d = json.loads(DD_HALT_FLAG.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def dd_halt_active() -> bool:
+    """True iff a drawdown halt was set TODAY (UTC). Prior-day flags are
+    treated as expired so the breaker resets each UTC day."""
+    d = read_dd_halt()
+    return bool(d) and d.get("date") == utcnow().date().isoformat()
+
+
+def clear_dd_halt() -> None:
+    if DD_HALT_FLAG.exists():
+        DD_HALT_FLAG.unlink()
 
 
 # --------- schema registry ---------
@@ -684,6 +760,7 @@ def wipe_run_history(*, include_costs: bool = True, backup: bool = True) -> dict
         STATE_DIR / "scheduler_last_fired.txt",
         COST_RESET_FLAG, ALL_TIME_COST_RESET_FLAG,
         NAV_OFFSET_FLAG, NAV_MANUAL_BASELINE_FLAG,
+        DD_HALT_FLAG, SOD_NAV_FILE,
     ]
     for f in snapshots:
         if f.exists():
