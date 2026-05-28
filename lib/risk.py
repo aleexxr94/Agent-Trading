@@ -11,8 +11,16 @@ Spec invariants:
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+
+
+def dd_breaker_enabled() -> bool:
+    """Kill-switch for the Phase 2 automatic 8% daily-drawdown breaker.
+    Default ON. Set DD_BREAKER_ENABLED=false to disable both the monitor's
+    halt-flag write and the orchestrator's order gating without redeploying."""
+    return os.environ.get("DD_BREAKER_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 
 
 def parse_iso_utc(s: str | None) -> datetime | None:

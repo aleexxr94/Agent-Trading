@@ -865,6 +865,16 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
             next_run["order_plan_error"] = f"get_positions: {type(e).__name__}: {e}"
             current = []
         plan = orders.diff_portfolio(portfolio, current)
+        # Phase 2: when the 8% daily-drawdown breaker is active, submit only
+        # the closes (de-risking) and skip new opens for the rest of the UTC
+        # day. The flag is written by monitor.py and auto-expires next day.
+        if risk.dd_breaker_enabled() and state.dd_halt_active():
+            plan = orders.OrderPlan(requests=[], closes=plan.closes, skipped=plan.skipped)
+            next_run["dd_halt"] = {
+                "active": True,
+                "detail": state.read_dd_halt() or {},
+                "note": "8% daily drawdown breaker active — opens skipped, closes allowed",
+            }
         results = orders.submit_plan(plan, broker=ctx.broker)
         next_run["order_plan"] = {
             "total_legs": plan.total_legs,

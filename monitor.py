@@ -36,6 +36,48 @@ def _enforce_stops_enabled() -> bool:
     return os.environ.get("MONITOR_ENFORCE_STOPS", "true").strip().lower() in ("1", "true", "yes")
 
 
+def _live_synthetic_nav(*, portfolio: dict, marks: dict, cost_basis: dict) -> float | None:
+    """Mark-aware synthetic equity for the drawdown breaker. Returns None on
+    any failure so a data problem can never crash the kill loop."""
+    try:
+        from lib import dashboard_data
+        return dashboard_data.live_synthetic_nav(
+            marks=marks, portfolio=portfolio, broker_costs=cost_basis,
+        )
+    except Exception:
+        return None
+
+
+def run_dd_breaker(*, current_nav: float | None, enabled: bool, persist: bool = True) -> dict:
+    """Manage the start-of-day baseline + the 8% daily-drawdown halt.
+
+    The first observation of each UTC day sets the baseline. When current
+    synthetic NAV is ≥8% below it AND ``enabled``, writes the auto-expiring
+    ``dd_halt`` flag the orchestrator reads to skip NEW orders (closes still
+    allowed). ``persist=False`` (dry-run) computes without writing state.
+    Returns an info dict for the audit/log.
+    """
+    if current_nav is None:
+        return {
+            "sod_nav_usd": None, "current_nav_usd": None, "dd_pct": None,
+            "tripped": False, "enabled": enabled, "halt_active": state.dd_halt_active(),
+        }
+    sod = state.read_sod_nav_today()
+    if sod is None:
+        if persist:
+            state.set_sod_nav_today(current_nav)
+        sod = current_nav
+    tripped, dd = risk.daily_circuit_breaker_tripped(
+        sod_nav_usd=sod, current_nav_usd=current_nav,
+    )
+    if tripped and enabled and persist:
+        state.set_dd_halt(dd_pct=dd, sod_nav=sod, current_nav=current_nav)
+    return {
+        "sod_nav_usd": sod, "current_nav_usd": current_nav, "dd_pct": round(dd, 2),
+        "tripped": tripped, "enabled": enabled, "halt_active": state.dd_halt_active(),
+    }
+
+
 def evaluate_portfolio(
     *,
     portfolio: dict,
@@ -174,6 +216,7 @@ def audit_report(
     marks: dict[str, float],
     actions: list[dict],
     enforce_stops: bool,
+    dd_info: dict | None = None,
 ) -> dict:
     """Per-cycle monitor audit appended to state/monitor_shadow.jsonl.
 
@@ -210,19 +253,36 @@ def audit_report(
         if marks.get(mark_key) is None:
             unmarked.append({"symbol": symbol, "kind": pos.get("kind"), "mark_key": mark_key})
 
-    # Daily-DD shadow at nav_history (cycle) granularity. Phase 2 wires the
-    # live intra-day breaker; this stays as the audit record.
-    rows = state.read_nav_history(limit=1000)
-    today = state.utcnow().date().isoformat()
-    todays = [r for r in rows if str(r.get("at") or "").startswith(today)]
-    sod_nav = todays[0].get("nav_usd") if todays else None
-    ref_nav = rows[-1].get("nav_usd") if rows else None
-    dd_pct: float | None = None
-    dd_would_halt = False
-    if sod_nav is not None and ref_nav is not None and float(sod_nav) > 0:
-        dd_would_halt, dd_pct = risk.daily_circuit_breaker_tripped(
-            sod_nav_usd=float(sod_nav), current_nav_usd=float(ref_nav),
-        )
+    # Prefer the live (Phase 2) breaker state when the caller computed it;
+    # fall back to a nav_history (cycle-granularity) proxy otherwise.
+    if dd_info is not None:
+        daily_dd = {
+            "sod_nav_usd": dd_info.get("sod_nav_usd"),
+            "current_nav_usd": dd_info.get("current_nav_usd"),
+            "dd_pct": dd_info.get("dd_pct"),
+            "halt_active": dd_info.get("halt_active", False),
+            "enabled": dd_info.get("enabled"),
+            "source": "live_synthetic_nav",
+        }
+    else:
+        rows = state.read_nav_history(limit=1000)
+        today = state.utcnow().date().isoformat()
+        todays = [r for r in rows if str(r.get("at") or "").startswith(today)]
+        sod_nav = todays[0].get("nav_usd") if todays else None
+        ref_nav = rows[-1].get("nav_usd") if rows else None
+        dd_pct: float | None = None
+        dd_would_halt = False
+        if sod_nav is not None and ref_nav is not None and float(sod_nav) > 0:
+            dd_would_halt, dd_pct = risk.daily_circuit_breaker_tripped(
+                sod_nav_usd=float(sod_nav), current_nav_usd=float(ref_nav),
+            )
+        daily_dd = {
+            "sod_nav_usd": sod_nav,
+            "ref_nav_usd": ref_nav,
+            "dd_pct": round(dd_pct, 2) if dd_pct is not None else None,
+            "would_halt_new_orders": dd_would_halt,
+            "source": "nav_history_proxy",
+        }
 
     return {
         "at": state.utcnow_iso(),
@@ -236,13 +296,7 @@ def audit_report(
             "missing": sorted(expected - broker_syms),
         },
         "fired": [{"symbol": a["symbol"], "reason": a["reason"]} for a in actions],
-        "daily_dd_shadow": {
-            "sod_nav_usd": sod_nav,
-            "ref_nav_usd": ref_nav,
-            "dd_pct": round(dd_pct, 2) if dd_pct is not None else None,
-            "would_halt_new_orders": dd_would_halt,
-            "note": "nav_history proxy; live intra-day DD lands in Phase 2",
-        },
+        "daily_dd_shadow": daily_dd,
     }
 
 
@@ -299,12 +353,30 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not args.dry_run:
         execute_actions(actions, broker=broker)
+    # Phase 2: 8% daily-drawdown breaker. Computes live synthetic equity from
+    # the positions already fetched, manages the start-of-day baseline, and
+    # writes the auto-expiring dd_halt flag the orchestrator reads to skip new
+    # orders. Guarded so a data problem can never break the kill loop.
+    dd_info = None
+    try:
+        dd_enabled = risk.dd_breaker_enabled()
+        current_nav = _live_synthetic_nav(portfolio=portfolio, marks=marks, cost_basis=cost_basis)
+        dd_info = run_dd_breaker(
+            current_nav=current_nav, enabled=dd_enabled, persist=not args.dry_run,
+        )
+        if dd_info.get("tripped"):
+            print(
+                f"monitor: DAILY DD BREAKER dd={dd_info['dd_pct']}% ≥ 8% "
+                f"(enabled={dd_info['enabled']}) — new orders halted for the UTC day"
+            )
+    except Exception as e:
+        print(f"monitor: dd-breaker error ({type(e).__name__}: {e}); ignored")
     # Per-cycle audit — reuses the already-fetched positions (no extra round
     # trip). Fully guarded so a telemetry bug can never break the kill loop.
     try:
         report = audit_report(
             portfolio=portfolio, broker_positions=positions, marks=marks,
-            actions=actions, enforce_stops=enforce,
+            actions=actions, enforce_stops=enforce, dd_info=dd_info,
         )
         state.append_monitor_shadow(report)
         cov = report["coverage"]

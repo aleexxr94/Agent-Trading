@@ -468,3 +468,57 @@ def test_peak_nav_30d_handles_hourly_cadence(tmp_state, monkeypatch):
         })
     # All 600 rows are within the 30-day window, including the 3000 peak.
     assert orchestrator._peak_nav_30d() == 3000.0
+
+
+# ---- Phase 2: orchestrator skips opens when the daily-DD breaker is active ----
+
+
+def test_stage_execute_skips_opens_when_dd_halt_active(tmp_state, monkeypatch):
+    """When dd_halt is active, stage_execute submits closes (de-risking) but
+    skips new opens for the UTC day. Closes still go through."""
+    from lib.broker import BrokerPosition, OrderResult
+
+    monkeypatch.setenv("ORDERS_ENABLED", "true")
+    # Avoid the meta-scheduler LLM call.
+    monkeypatch.setattr(
+        orchestrator, "_compute_next_run_at",
+        lambda *, ctx, portfolio, view: ("2026-05-28T20:00:00Z", "stub", "trade"),
+    )
+    state.set_dd_halt(dd_pct=10.0, sod_nav=2500.0, current_nav=2250.0)
+
+    submitted: list = []
+
+    class _FakeBroker:
+        def get_positions(self):
+            # Broker holds SQQQ (a close target); target portfolio wants TQQQ (an open).
+            return [BrokerPosition(
+                symbol="SQQQ", qty=10, avg_cost=40.0, market_value=400.0,
+                unrealized_pl_usd=0.0, asset_class="us_equity",
+            )]
+
+        def submit_order(self, req):
+            submitted.append((req.symbol, req.side, req.qty))
+            return OrderResult(
+                broker_order_id="1", symbol=req.symbol, qty=req.qty,
+                side=req.side, submitted_at="", status="accepted",
+            )
+
+        def option_contract_tradable(self, symbol):
+            return True
+
+    portfolio = {
+        "run_id": "r-dd", "nav_usd": 2500.0, "cash_usd": 100.0, "all_cash": False,
+        "positions": [{
+            "kind": "etf", "symbol": "TQQQ", "shares": 4, "avg_cost": 70.0,
+            "leverage_factor": 3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 11.0,
+        }],
+    }
+    ctx = orchestrator.StageContext(run_id="r-dd", dry_run=False, broker=_FakeBroker())
+    next_run = orchestrator.stage_execute(ctx, portfolio, {"candidates": []})
+
+    assert next_run["dd_halt"]["active"] is True
+    assert next_run["order_plan"]["opens"] == 0          # TQQQ open skipped
+    assert next_run["order_plan"]["closes"] == 1         # SQQQ close kept
+    # Only the SQQQ sell (close) was actually submitted; no TQQQ buy.
+    assert submitted == [("SQQQ", "sell", 10)]

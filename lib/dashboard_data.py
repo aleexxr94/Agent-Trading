@@ -443,6 +443,46 @@ def compute_synthetic_balance(
     )
 
 
+def synthetic_base_usd() -> float:
+    """The synthetic starting balance ($2,500 spec target), overridable via
+    VIRTUAL_NAV_USD. This is the baseline both the dashboard and (from Phase 3)
+    the agent's position sizing build on — never the broker's ~$100k equity."""
+    import os
+    raw = os.environ.get("VIRTUAL_NAV_USD")
+    if not raw:
+        return 2500.0
+    try:
+        return float(raw)
+    except ValueError:
+        return 2500.0
+
+
+def live_synthetic_nav(
+    *,
+    marks: dict[str, float] | None = None,
+    portfolio: dict | None = None,
+    broker_costs: dict[str, float] | None = None,
+) -> float:
+    """Mark-aware synthetic equity = starting + closed + open P&L − costs − fees.
+    Used by the daily-drawdown breaker (it must see intraday unrealized moves)."""
+    marks = marks or {}
+    return compute_synthetic_balance(
+        starting_balance_usd=synthetic_base_usd(),
+        marks=marks,
+        portfolio=portfolio,
+        broker_costs=broker_costs,
+        held_keys=frozenset(marks.keys()),
+    ).synthetic_balance_usd
+
+
+def realized_synthetic_nav() -> float:
+    """Realized-only synthetic balance (open MTM excluded) — the stable base
+    the agent sizes against in Phase 3. Reads logs only; no broker round trip."""
+    return compute_synthetic_balance(
+        starting_balance_usd=synthetic_base_usd(), marks={},
+    ).synthetic_balance_usd
+
+
 def realized_balance_series(
     *, starting_balance_usd: float = 2500.0,
 ) -> list[dict]:

@@ -269,8 +269,8 @@ def test_monitor_kill_switch_disables_price_time_stops(tmp_state, monkeypatch):
 
 
 def test_monitor_audit_dd_flags_total_wipeout(tmp_state):
-    """Codex P2: a latest NAV of 0.0 is a 100% drawdown the audit must flag,
-    not skip via a truthiness check."""
+    """Codex P2: a latest NAV of 0.0 is a 100% drawdown the audit proxy must
+    flag, not skip via a truthiness check."""
     state.append_nav({"run_id": "r1", "at": state.utcnow_iso(), "nav_usd": 2500.0})
     state.append_nav({"run_id": "r2", "at": state.utcnow_iso(), "nav_usd": 0.0})
     report = monitor.audit_report(
@@ -280,3 +280,54 @@ def test_monitor_audit_dd_flags_total_wipeout(tmp_state):
     dd = report["daily_dd_shadow"]
     assert dd["would_halt_new_orders"] is True
     assert dd["dd_pct"] == 100.0
+
+
+# ---- Phase 2: 8% daily-drawdown breaker ----
+
+
+def test_run_dd_breaker_trips_and_writes_halt(tmp_state):
+    """≥8% intraday drawdown writes the auto-expiring dd_halt flag."""
+    state.set_sod_nav_today(2500.0)
+    info = monitor.run_dd_breaker(current_nav=2250.0, enabled=True)  # 10% DD
+    assert info["tripped"] is True
+    assert info["dd_pct"] == 10.0
+    assert state.dd_halt_active() is True
+
+
+def test_run_dd_breaker_no_trip_under_threshold(tmp_state):
+    state.set_sod_nav_today(2500.0)
+    info = monitor.run_dd_breaker(current_nav=2400.0, enabled=True)  # 4% DD
+    assert info["tripped"] is False
+    assert state.dd_halt_active() is False
+
+
+def test_run_dd_breaker_disabled_does_not_write_flag(tmp_state):
+    """Kill-switch off: DD is still computed but no halt flag is written."""
+    state.set_sod_nav_today(2500.0)
+    info = monitor.run_dd_breaker(current_nav=2000.0, enabled=False)  # 20% DD
+    assert info["tripped"] is True
+    assert state.dd_halt_active() is False
+
+
+def test_run_dd_breaker_dry_run_does_not_persist(tmp_state):
+    """persist=False (dry-run) computes the trip but writes no halt flag."""
+    state.set_sod_nav_today(2500.0)
+    info = monitor.run_dd_breaker(current_nav=2000.0, enabled=True, persist=False)
+    assert info["tripped"] is True
+    assert state.dd_halt_active() is False
+
+
+def test_run_dd_breaker_first_obs_sets_baseline(tmp_state):
+    """First observation of the day sets the baseline → DD 0, no trip."""
+    info = monitor.run_dd_breaker(current_nav=2400.0, enabled=True)
+    assert info["tripped"] is False
+    assert state.read_sod_nav_today() == 2400.0
+
+
+def test_dd_halt_auto_expires_next_utc_day(tmp_state):
+    state.set_dd_halt(dd_pct=10.0, sod_nav=2500.0, current_nav=2250.0)
+    assert state.dd_halt_active() is True
+    stale = state.read_dd_halt()
+    stale["date"] = "2000-01-01"
+    state.DD_HALT_FLAG.write_text(json.dumps(stale))
+    assert state.dd_halt_active() is False  # prior-day flag is expired
