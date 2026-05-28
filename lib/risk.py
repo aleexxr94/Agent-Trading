@@ -12,6 +12,21 @@ Spec invariants:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+
+
+def parse_iso_utc(s: str | None) -> datetime | None:
+    """Tolerant ISO-8601 → aware-UTC parse. Returns None on anything
+    unparseable. Shared by monitor.py (shadow + enforcement) so the
+    time-stop format handling lives in one place."""
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
 
 # Hard, repo-wide constants — do not parameterise without a CLAUDE.md change.
 MAX_POSITION_PCT = 15.0
@@ -83,21 +98,35 @@ def should_kill_position(
     is_option: bool,
     extra_kill: dict | None = None,
     spot_price: float | None = None,
+    now_utc: datetime | None = None,
 ) -> tuple[bool, str]:
-    """Evaluate kill conditions for a single position. Returns (kill?, reason)."""
+    """Evaluate kill conditions for a single position. Returns (kill?, reason).
+
+    Checks, in order: the hard loss cap (25% ETF / 100% option), the
+    underlying price stops (when ``spot_price`` is known), and the
+    ``time_stop_utc`` time stop (when set). ``now_utc`` defaults to the
+    current UTC time; callers may inject it for deterministic tests.
+    """
     cap = MAX_OPTION_LOSS_PCT if is_option else MAX_POSITION_LOSS_PCT
     loss = position_loss_pct(
         current_value_usd=current_value_usd, cost_basis_usd=cost_basis_usd
     )
     if loss >= cap:
         return True, f"loss {loss:.1f}% ≥ {cap:.0f}% cap"
-    if extra_kill and spot_price is not None:
-        below = extra_kill.get("underlying_price_below")
-        if below is not None and spot_price <= below:
-            return True, f"spot {spot_price} ≤ kill_below {below}"
-        above = extra_kill.get("underlying_price_above")
-        if above is not None and spot_price >= above:
-            return True, f"spot {spot_price} ≥ kill_above {above}"
+    if extra_kill:
+        if spot_price is not None:
+            below = extra_kill.get("underlying_price_below")
+            if below is not None and spot_price <= below:
+                return True, f"spot {spot_price} ≤ kill_below {below}"
+            above = extra_kill.get("underlying_price_above")
+            if above is not None and spot_price >= above:
+                return True, f"spot {spot_price} ≥ kill_above {above}"
+        ts = extra_kill.get("time_stop_utc")
+        if ts:
+            t = parse_iso_utc(ts)
+            now = now_utc or datetime.now(timezone.utc)
+            if t is not None and now >= t:
+                return True, f"time stop {ts} reached"
     return False, ""
 
 
