@@ -142,6 +142,11 @@ def evaluate_portfolio(
             if basis_per_unit is None:
                 basis_per_unit = bp.avg_cost
             cost_basis_usd = basis_per_unit * qty * mult
+            # Value from the broker's own market_value — robust to marks-dict
+            # key mismatches (e.g. strike 530 vs 530.0) that would otherwise
+            # neutralise the loss cap and let a -100% option stay open
+            # (Codex P2 on PR #98, round 3).
+            current_value_usd = abs(bp.market_value)
         else:
             qty = pos["contracts"] if is_option else pos["shares"]
             cost_basis_usd = (
@@ -149,19 +154,13 @@ def evaluate_portfolio(
             )
             if mark is None:
                 continue  # legacy: can't value an unmarked position
-
-        # Spot for price stops is INDEPENDENT of the option's premium mark
-        # (Codex P2 on PR #98): ETFs use their own mark as the spot; options
-        # use the fetched underlying spot. So an option's underlying price stop
-        # still fires even when its premium mark is missing or keyed
-        # differently (e.g. strike 530 vs 530.0).
-        spot = (spots.get(symbol) if is_option else mark) if enforce_stops else None
-        # Unmarked-but-held: neutralise the loss check (loss=0) so price/time
-        # stops can still fire on a position we genuinely hold.
-        if mark is None:
-            current_value_usd = cost_basis_usd
-        else:
             current_value_usd = mark * qty * mult
+
+        # Spot for price stops is independent of the option's premium mark:
+        # ETFs use their own mark as the spot; options use the fetched
+        # underlying spot — so the underlying stop fires regardless of whether
+        # the premium mark resolved.
+        spot = (spots.get(symbol) if is_option else mark) if enforce_stops else None
 
         kill, reason = risk.should_kill_position(
             current_value_usd=current_value_usd,

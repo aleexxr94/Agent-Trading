@@ -281,6 +281,35 @@ def test_monitor_enforces_option_underlying_price_stop(tmp_state):
     assert "kill_below" in actions[0]["reason"]
 
 
+def test_monitor_option_loss_cap_via_broker_value_without_mark(tmp_state):
+    """Codex P2 (#98, round 3): with no premium mark (key mismatch), the loss
+    cap must still fire off the broker's market_value. A contract at $0
+    market value vs $650 cost = 100% loss → flatten, no price/time stop needed."""
+    option_pos = {
+        "kind": "option", "underlying": "SPY", "type": "call",
+        "strike": 530.0, "expiry": "2026-06-19", "dte": 40,
+        "contracts": 1, "premium_paid": 6.50,
+        "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04,
+                   "vega": 0.18, "iv": 0.18, "iv_percentile": 35},
+        "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 100},  # loss cap only — no price/time stop
+        "position_pct": 5.0,
+    }
+    bp = BrokerPosition(
+        symbol="SPY260619C00530000", qty=1, avg_cost=6.50, market_value=0.0,
+        unrealized_pl_usd=-650.0, asset_class="us_option",
+    )
+    actions = monitor.evaluate_portfolio(
+        portfolio={"positions": [option_pos]},
+        marks={},  # premium mark missing / key-mismatched
+        broker_positions=[bp],
+        spots={},
+    )
+    assert len(actions) == 1
+    assert actions[0]["symbol"] == "SPY260619C00530000"
+    assert "cap" in actions[0]["reason"]
+
+
 def test_monitor_option_price_stop_fires_without_premium_mark(tmp_state):
     """Codex P2 (#98, round 2): an option's underlying price stop must fire
     even when its PREMIUM mark is missing/key-mismatched, because the
