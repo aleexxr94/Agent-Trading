@@ -55,6 +55,12 @@ NAV_HISTORY_LOG = STATE_DIR / "nav_history.jsonl"
 # constructor + execute and just re-writes next_run.json. Saves ~$0.25
 # on quiet markets.
 LAST_CYCLE_HASH = STATE_DIR / "last_cycle_hash.json"
+# Phase 0 shadow telemetry: append-only log of what the (currently inert)
+# price/time stops + 8% daily-DD breaker WOULD have done each monitor cycle,
+# plus monitor-vs-broker coverage. Observational only — nothing reads this to
+# gate orders. Lets the operator watch the controls before enforcement is
+# enabled in later phases.
+MONITOR_SHADOW_LOG = STATE_DIR / "monitor_shadow.jsonl"
 
 # NAV display anchor (PR following #73). Alpaca paper accounts default
 # to $100,000 USD and can't always be reset to a lower target. The
@@ -546,6 +552,16 @@ def append_nav(entry: dict) -> None:
         f.write(json.dumps(entry, sort_keys=False) + "\n")
 
 
+def append_monitor_shadow(entry: dict) -> None:
+    """Append one Phase-0 shadow-telemetry row to state/monitor_shadow.jsonl.
+
+    Observational only (no schema, no gating). One row per monitor cycle.
+    """
+    MONITOR_SHADOW_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with MONITOR_SHADOW_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, sort_keys=False) + "\n")
+
+
 def read_nav_history(limit: int | None = None) -> list[dict]:
     """Return all NAV history rows (oldest first). Pass `limit` to cap."""
     if not NAV_HISTORY_LOG.exists():
@@ -646,7 +662,7 @@ def wipe_run_history(*, include_costs: bool = True, backup: bool = True) -> dict
 
     # Truncate (don't unlink) the JSONL audit logs so anything that holds
     # a file handle keeps writing without recreating mode/owner issues.
-    jsonl_files = [DECISIONS_LOG, TRADES_LOG, NAV_HISTORY_LOG]
+    jsonl_files = [DECISIONS_LOG, TRADES_LOG, NAV_HISTORY_LOG, MONITOR_SHADOW_LOG]
     if include_costs:
         jsonl_files.append(COSTS_LOG)
     for f in jsonl_files:
