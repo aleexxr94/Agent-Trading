@@ -105,6 +105,106 @@ def _cached_cost_by_month(_mtimes: tuple) -> list:
 def _cached_nav_history(_mtimes: tuple) -> list:
     return dd.load_nav_history()
 
+
+# ---------- chart helpers ----------
+# Plotly's defaults make every chart click-to-zoom, which on touch/mobile
+# fires an instant zoom on tap. NO_ZOOM_CONFIG + per-axis fixedrange=True
+# disables all zoom/pan while leaving hover tooltips alive (staticPlot
+# would kill hover, so it stays False).
+NO_ZOOM_CONFIG = {
+    "displayModeBar": False,
+    "scrollZoom": False,
+    "doubleClick": False,
+    "staticPlot": False,
+    "displaylogo": False,
+}
+
+
+def _fnum(v, default: float = 0.0) -> float:
+    """Coerce a possibly-None / NaN / string cell to float for plotting
+    and money formatting."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return default if pd.isna(f) else f
+
+
+def _rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _tight_yrange(ys, min_pad: float = 5.0, frac: float = 0.08):
+    """Explicit y-range hugging the data with proportional padding (and a
+    dollar floor so a flat line still has headroom). Replaces autorange,
+    which gets dragged wide by the single live tip and flattens the line."""
+    vals = [_fnum(v) for v in ys if v is not None and not (isinstance(v, float) and pd.isna(v))]
+    if not vals:
+        return None
+    lo, hi = min(vals), max(vals)
+    pad = max((hi - lo) * frac, min_pad)
+    return [lo - pad, hi + pad]
+
+
+def _render_balance_chart(*, xs, ys, hover_texts, yaxis_title: str, caption: str) -> None:
+    """CoinGecko-style balance chart: one smooth area line that flows into
+    the current value at a labelled end dot. Direction-aware colour (green
+    up / red down over the visible window), tight y-axis, zoom disabled."""
+    up = len(ys) < 2 or _fnum(ys[-1]) >= _fnum(ys[0])
+    col = "#059669" if up else "#dc2626"
+    shape = "spline" if len(ys) > 2 else "linear"
+    yrange = _tight_yrange(ys)
+    ybottom = yrange[0] if yrange else 0.0
+    fig = go.Figure()
+    # Invisible baseline at the bottom of the visible band so the gradient
+    # fill fades across the whole band. fill="tozeroy" on a non-zero axis
+    # would push the fade off-screen and leave a flat block of colour.
+    fig.add_trace(go.Scatter(
+        x=xs, y=[ybottom] * len(xs), mode="lines",
+        line=dict(width=0, color="rgba(0,0,0,0)"),
+        hoverinfo="skip", showlegend=False,
+    ))
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, mode="lines",
+        line=dict(width=2.5, color=col, shape=shape, smoothing=0.5),
+        fill="tonexty",
+        fillgradient=dict(type="vertical", colorscale=[
+            [0.0, _rgba(col, 0.0)],
+            [1.0, _rgba(col, 0.32)],
+        ]),
+        customdata=[[t] for t in hover_texts],
+        hovertemplate="%{customdata[0]}<extra></extra>",
+        showlegend=False,
+    ))
+    # Terminal dot marking the current value (hover handled by the line).
+    fig.add_trace(go.Scatter(
+        x=[xs[-1]], y=[ys[-1]], mode="markers",
+        marker=dict(size=8, color=col, line=dict(width=2, color="white")),
+        hoverinfo="skip", showlegend=False,
+    ))
+    fig.add_annotation(
+        x=xs[-1], y=ys[-1], text=f"${_fnum(ys[-1]):,.2f}",
+        showarrow=False, xanchor="left", yanchor="middle", xshift=10,
+        font=dict(size=13, color=col),
+        bgcolor=_rgba(col, 0.10), bordercolor=col, borderwidth=1, borderpad=4,
+    )
+    fig.update_layout(
+        template="plotly_white",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=380, yaxis_title=yaxis_title,
+        yaxis=dict(gridcolor="#e2e8f0", color=col, fixedrange=True, range=yrange),
+        xaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
+        margin=dict(l=10, r=70, t=20, b=10),
+        dragmode=False, showlegend=False,
+    )
+    st.plotly_chart(fig, width="stretch", config=NO_ZOOM_CONFIG)
+    if caption:
+        st.caption(caption)
+
+
 RISK_WARNING_TEXT = (
     "PAPER TRADING — experimental autonomous AI agent. Leveraged ETFs and "
     "options on a small account are high-risk. Not financial advice."
@@ -1491,68 +1591,36 @@ with tabs[3]:
             else:
                 live_nav = float(_synth.synthetic_balance_usd)
                 live_label = "Live (synthetic — broker offline)"
-            fig_nav = go.Figure()
-            if not nav_df.empty:
-                fig_nav.add_trace(go.Scatter(
-                    x=nav_df["at"],
-                    y=nav_df["nav_usd"],
-                    mode="lines+markers",
-                    name="Per-cycle NAV",
-                    line=dict(width=2.5, color="#059669"),
-                    marker=dict(size=6, color="#059669"),
-                    hovertemplate=(
-                        "%{x}"
-                        "<br>NAV: $%{y:,.2f}"
-                        "<br>Run: %{customdata[0]}"
-                        "<br>Positions: %{customdata[1]}"
-                        "<br>Gross P&L: $%{customdata[2]:,.2f}"
-                        "<br>Net P&L: $%{customdata[3]:,.2f}"
-                        "<br>Source: %{customdata[4]}"
-                        "<extra></extra>"
-                    ),
-                    customdata=nav_df[[
-                        "run_id", "positions_count",
-                        "gross_pnl_usd", "net_pnl_usd", "nav_source",
-                    ]].fillna("—").values,
-                ))
-                # Dashed connector from last cycle to live tip.
-                fig_nav.add_trace(go.Scatter(
-                    x=[nav_df["at"].iloc[-1], live_at],
-                    y=[float(nav_df["nav_usd"].iloc[-1]), live_nav],
-                    mode="lines",
-                    line=dict(width=1.5, color="#94a3b8", dash="dash"),
-                    name="(live gap)",
-                    hoverinfo="skip",
-                ))
-            fig_nav.add_trace(go.Scatter(
-                x=[live_at], y=[live_nav],
-                mode="markers",
-                name=live_label,
-                marker=dict(
-                    size=12, color="#d97706", symbol="diamond",
-                    line=dict(width=1.5, color="#0f172a"),
+            # Fold the live value into one continuous line so the curve
+            # flows into "now" and the y-axis fits the whole series tightly
+            # (the old floating diamond sat ~$100 above the line and blew
+            # the scale wide, flattening real cycle variation).
+            xs = list(nav_df["at"]) + [live_at]
+            ys = [_fnum(v) for v in nav_df["nav_usd"]] + [_fnum(live_nav)]
+            hover_texts = [
+                (
+                    f"{r['at']}<br>NAV: ${_fnum(r['nav_usd']):,.2f}"
+                    f"<br>Run: {r['run_id']}"
+                    f"<br>Positions: {r['positions_count']}"
+                    f"<br>Gross P&L: ${_fnum(r['gross_pnl_usd']):,.2f}"
+                    f"<br>Net P&L: ${_fnum(r['net_pnl_usd']):,.2f}"
+                    f"<br>Source: {r['nav_source']}"
+                )
+                for _, r in nav_df.iterrows()
+            ]
+            hover_texts.append(f"{live_label}<br>${_fnum(live_nav):,.2f}")
+            _render_balance_chart(
+                xs=xs, ys=ys, hover_texts=hover_texts,
+                yaxis_title="Portfolio NAV (USD)",
+                caption=(
+                    f"Line = portfolio NAV at the end of each orchestrator "
+                    f"cycle from `state/nav_history.jsonl` ({len(nav_df)} of "
+                    f"{len(nav_rows)} cycles shown), flowing into the current "
+                    f"{live_label.lower()} at the labelled end point. Colour "
+                    f"is green when up over the window, red when down. Toggle "
+                    f"Source → *Synthetic balance* for a broker-independent "
+                    f"reconstruction from trades.jsonl + costs.jsonl."
                 ),
-                hovertemplate=f"{live_label}: $%{{y:,.2f}}<extra></extra>",
-            ))
-            fig_nav.update_layout(
-                template="plotly_white",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                height=380, yaxis_title="Portfolio NAV (USD)",
-                yaxis=dict(gridcolor="#e2e8f0", color="#059669"),
-                xaxis=dict(gridcolor="#e2e8f0"),
-                margin=dict(l=10, r=10, t=20, b=10),
-                legend=dict(orientation="h", y=1.1, font=dict(size=12)),
-            )
-            st.plotly_chart(fig_nav, width="stretch")
-            st.caption(
-                f"Green line = portfolio NAV at the end of each "
-                f"orchestrator cycle from `state/nav_history.jsonl` "
-                f"({len(nav_df)} of {len(nav_rows)} cycles shown). "
-                f"Diamond = {live_label.lower()}, refreshed on each "
-                f"dashboard reload. Toggle Source → *Synthetic balance* "
-                f"for a broker-independent reconstruction from "
-                f"trades.jsonl + costs.jsonl."
             )
     else:
         # Synthetic balance — preserved from the previous implementation
@@ -1565,71 +1633,6 @@ with tabs[3]:
             "trading_fees_total_usd",
         ])
         nav_df = _apply_window(nav_df, time_col="at")
-        fig_nav = go.Figure()
-        if not nav_df.empty:
-            fig_nav.add_trace(go.Scatter(
-                x=nav_df["at"],
-                y=nav_df["synthetic_realized_balance_usd"],
-                mode="lines+markers",
-                name="Realized synthetic balance",
-                line=dict(width=2.5, color="#059669"),
-                marker=dict(size=5, color="#059669"),
-                hovertemplate=(
-                    "%{x}<br>Balance: $%{y:,.2f}"
-                    "<br>Closed gross: $%{customdata[0]:,.2f}"
-                    "<br>LLM: −$%{customdata[1]:,.2f}"
-                    "<br>Real fees: −$%{customdata[2]:,.2f}"
-                    "<extra></extra>"
-                ),
-                customdata=nav_df[[
-                    "closed_gross_pnl_usd",
-                    "llm_cost_total_usd",
-                    "trading_fees_total_usd",
-                ]].values,
-            ))
-            fig_nav.add_trace(go.Scatter(
-                x=[nav_df["at"].iloc[-1], live_tip["at"]],
-                y=[nav_df["synthetic_realized_balance_usd"].iloc[-1],
-                   live_tip["synthetic_balance_usd"]],
-                mode="lines",
-                line=dict(width=1.5, color="#94a3b8", dash="dash"),
-                name="(open P&L + modelled fees)",
-                hoverinfo="skip",
-            ))
-        fig_nav.add_trace(go.Scatter(
-            x=[live_tip["at"]],
-            y=[live_tip["synthetic_balance_usd"]],
-            mode="markers",
-            name="Live (includes open P&L)",
-            marker=dict(
-                size=12, color="#d97706", symbol="diamond",
-                line=dict(width=1.5, color="#0f172a"),
-            ),
-            hovertemplate=(
-                "Live: $%{y:,.2f}"
-                "<br>Closed gross: $%{customdata[0]:,.2f}"
-                "<br>Open gross: $%{customdata[1]:,.2f}"
-                "<br>LLM: −$%{customdata[2]:,.4f}"
-                "<br>Fees (real + modelled): −$%{customdata[3]:,.2f}"
-                "<extra></extra>"
-            ),
-            customdata=[[
-                live_tip["closed_gross_pnl_usd"],
-                live_tip["open_gross_pnl_usd"],
-                live_tip["llm_cost_total_usd"],
-                live_tip["trading_fees_total_usd"],
-            ]],
-        ))
-        fig_nav.update_layout(
-            template="plotly_white",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            height=380, yaxis_title="Synthetic balance (USD)",
-            yaxis=dict(gridcolor="#e2e8f0", color="#059669"),
-            xaxis=dict(gridcolor="#e2e8f0"),
-            margin=dict(l=10, r=10, t=20, b=10),
-            legend=dict(orientation="h", y=1.1, font=dict(size=12)),
-        )
         if nav_df.empty and live_tip["synthetic_balance_usd"] == _synth.starting_balance_usd and not _synth.open_gross_pnl_usd:
             st.info(
                 "No realized events and no open positions yet — the "
@@ -1637,14 +1640,41 @@ with tabs[3]:
                 "LLM cost row, or open position with marks."
             )
         else:
-            st.plotly_chart(fig_nav, width="stretch")
-            st.caption(
-                "Green line = historical realized balance reconstructed "
-                "from `state/trades.jsonl` + `state/costs.jsonl` (closed "
-                "gross + real fees + LLM, exact). Diamond = live snapshot, "
-                "matches the hero card (adds open P&L + modelled open "
-                "fees). The dashed segment is the gap the open positions "
-                "represent at this moment."
+            # Fold the live snapshot into one continuous line (see Actual
+            # branch) — drops the floating diamond + dashed gap.
+            xs = list(nav_df["at"]) + [live_tip["at"]]
+            ys = (
+                [_fnum(v) for v in nav_df["synthetic_realized_balance_usd"]]
+                + [_fnum(live_tip["synthetic_balance_usd"])]
+            )
+            hover_texts = [
+                (
+                    f"{r['at']}<br>Balance: "
+                    f"${_fnum(r['synthetic_realized_balance_usd']):,.2f}"
+                    f"<br>Closed gross: ${_fnum(r['closed_gross_pnl_usd']):,.2f}"
+                    f"<br>LLM: −${_fnum(r['llm_cost_total_usd']):,.2f}"
+                    f"<br>Real fees: −${_fnum(r['trading_fees_total_usd']):,.2f}"
+                )
+                for _, r in nav_df.iterrows()
+            ]
+            hover_texts.append(
+                f"Live: ${_fnum(live_tip['synthetic_balance_usd']):,.2f}"
+                f"<br>Closed gross: ${_fnum(live_tip['closed_gross_pnl_usd']):,.2f}"
+                f"<br>Open gross: ${_fnum(live_tip['open_gross_pnl_usd']):,.2f}"
+                f"<br>LLM: −${_fnum(live_tip['llm_cost_total_usd']):,.4f}"
+                f"<br>Fees (real + modelled): −"
+                f"${_fnum(live_tip['trading_fees_total_usd']):,.2f}"
+            )
+            _render_balance_chart(
+                xs=xs, ys=ys, hover_texts=hover_texts,
+                yaxis_title="Synthetic balance (USD)",
+                caption=(
+                    "Line = historical realized balance reconstructed from "
+                    "`state/trades.jsonl` + `state/costs.jsonl` (closed gross "
+                    "+ real fees + LLM, exact), flowing into the live snapshot "
+                    "(adds open P&L + modelled open fees) at the labelled end "
+                    "point — matches the hero card."
+                ),
             )
 
     st.markdown('<div class="at-section-label">LLM cost over time</div>', unsafe_allow_html=True)
@@ -1666,12 +1696,12 @@ with tabs[3]:
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
             height=320, yaxis_title="USD",
-            yaxis=dict(gridcolor="#e2e8f0"),
-            xaxis=dict(gridcolor="#e2e8f0"),
+            yaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
+            xaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
             margin=dict(l=10, r=10, t=10, b=10),
-            showlegend=False,
+            showlegend=False, dragmode=False,
         )
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, width="stretch", config=NO_ZOOM_CONFIG)
     else:
         st.info("No LLM cost history yet — run the orchestrator (live mode) to populate.")
 
@@ -1695,12 +1725,12 @@ with tabs[3]:
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
             height=320, yaxis_title="USD (fees)",
-            yaxis=dict(gridcolor="#e2e8f0"),
-            xaxis=dict(gridcolor="#e2e8f0"),
+            yaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
+            xaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
             margin=dict(l=10, r=10, t=10, b=10),
-            showlegend=False,
+            showlegend=False, dragmode=False,
         )
-        st.plotly_chart(fig_fees, width="stretch")
+        st.plotly_chart(fig_fees, width="stretch", config=NO_ZOOM_CONFIG)
         total_fees = dd.total_trading_fees_usd()
         st.caption(
             f"All-time trading fees: **${total_fees:,.2f}** across "
@@ -1922,12 +1952,13 @@ with tabs[4]:
             height=380,
             yaxis_title="Portfolio value (USD)",
             xaxis_title="",
-            yaxis=dict(gridcolor="#e2e8f0"),
-            xaxis=dict(gridcolor="#e2e8f0"),
+            yaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
+            xaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
             margin=dict(l=10, r=80, t=20, b=10),
             legend=dict(orientation="h", y=1.1, font=dict(size=12)),
+            dragmode=False,
         )
-        st.plotly_chart(fig_bench, width="stretch")
+        st.plotly_chart(fig_bench, width="stretch", config=NO_ZOOM_CONFIG)
         st.caption(
             f"Inception {bundle.inception.isoformat()} → as of "
             f"{bundle.as_of.isoformat()} · {len(strat_df)} trading-day points · "
