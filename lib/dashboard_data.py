@@ -1636,10 +1636,14 @@ def _opened_at_map_from_trades(trade_rows: list[dict]) -> dict[str, str]:
 
     Defensive: any failure (malformed log, out-of-order rows) falls back to
     an empty map so the positions table renders "—" rather than breaking.
+    Rows are sorted by ``filled_at`` first — the log is append-order, and an
+    out-of-order sell ahead of its buy would otherwise leave a phantom open
+    lot (mirrors the sorting other dashboard trade-log readers already do).
     """
     from . import trades as trades_lib
     try:
-        pnl = trades_lib.compute_trades_pnl(trade_rows)
+        rows = sorted(trade_rows, key=lambda r: r.get("filled_at") or "")
+        pnl = trades_lib.compute_trades_pnl(rows)
     except Exception:
         return {}
     out: dict[str, str] = {}

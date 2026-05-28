@@ -279,17 +279,40 @@ def test_cycle_dedup_skips_when_signals_and_positions_unchanged(tmp_state, monke
          "dist_from_200d_ma_pct": 15.0},
     ]}
     positions = [{"symbol": "TQQQ", "qty": 4.0}]
+    cooldown = {"SQQQ": "2026-05-26T15:00:00Z"}
     state.write_json(state.LAST_CYCLE_HASH, {
         "signals_fingerprint": orchestrator._signals_fingerprint(signals_out),
         "positions_fingerprint": orchestrator._positions_fingerprint(positions),
+        "cooldown_fingerprint": orchestrator._cooldown_fingerprint(cooldown),
         "updated_at": state.utcnow_iso(),
     })
     state.write_json(state.CURRENT_PORTFOLIO, {
         "run_id": "prior", "positions": [], "all_cash": True,
     })
-    result = orchestrator._check_cycle_dedup(signals_out, positions)
+    result = orchestrator._check_cycle_dedup(signals_out, positions, cooldown)
     assert result is not None
     assert "portfolio" in result
+
+
+def test_cycle_dedup_does_not_skip_when_cooldown_expires(tmp_state):
+    """Cooldown membership shrinks with time alone. When a symbol drops out
+    of cooldown but signals + positions are unchanged, dedup must NOT reuse
+    the cached portfolio — the constructor needs to reconsider the re-entry.
+    """
+    signals_out = {"tickers": [{"symbol": "TQQQ", "last_close": 72.0}]}
+    positions = [{"symbol": "TQQQ", "qty": 4.0}]
+    state.write_json(state.LAST_CYCLE_HASH, {
+        "signals_fingerprint": orchestrator._signals_fingerprint(signals_out),
+        "positions_fingerprint": orchestrator._positions_fingerprint(positions),
+        "cooldown_fingerprint": orchestrator._cooldown_fingerprint(
+            {"SQQQ": "2026-05-20T15:00:00Z"}
+        ),
+        "updated_at": state.utcnow_iso(),
+    })
+    state.write_json(state.CURRENT_PORTFOLIO, {"positions": [], "all_cash": True})
+    # SQQQ has since aged out of cooldown → empty cooldown set this cycle.
+    result = orchestrator._check_cycle_dedup(signals_out, positions, {})
+    assert result is None
 
 
 def test_cycle_dedup_does_not_skip_when_signals_change(tmp_state):

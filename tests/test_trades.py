@@ -430,3 +430,18 @@ def test_cooldown_reopened_symbol_not_flagged():
     ]
     out = trades.symbols_in_cooldown(rows, now=_now("2026-05-26T15:00:00Z"), window_days=7)
     assert out == {}
+
+
+def test_cooldown_robust_to_out_of_order_log():
+    """A sell appended ahead of its earlier buy (out-of-order sync) must
+    still FIFO-match: the symbol is fully exited, so it IS in cooldown.
+    Without the chronological sort the buy would be a phantom open lot and
+    the symbol would be wrongly excluded."""
+    rows = [
+        _trade(activity_id="s1", side="sell", qty=10, fill_price=55.0,
+               filled_at="2026-05-24T15:00:00Z"),   # logged first (out of order)
+        _trade(activity_id="b1", side="buy", qty=10, fill_price=50.0,
+               filled_at="2026-05-10T15:00:00Z"),   # actually earlier
+    ]
+    out = trades.symbols_in_cooldown(rows, now=_now("2026-05-26T15:00:00Z"), window_days=7)
+    assert out == {"TQQQ": "2026-05-24T15:00:00Z"}

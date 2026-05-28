@@ -626,13 +626,34 @@ def _positions_fingerprint(positions: list[dict]) -> str:
     return _hash_inputs(json.dumps(rows, sort_keys=True))
 
 
-def _check_cycle_dedup(signals_out: dict, current_positions: list[dict]) -> dict | None:
+def _cooldown_fingerprint(cooldown_symbols: dict | None) -> str:
+    """Stable hash of the re-entry-cooldown symbol set, used as a dedup key.
+
+    Codex P2 on PR #99: cooldown membership shrinks purely with the passage
+    of time (a symbol drops out once its 7-day window expires) even when
+    signals + broker positions are unchanged. Without folding it into the
+    dedup fingerprint, a portfolio kept flat *because* a symbol was in
+    cooldown could be reused indefinitely, suppressing a now-valid re-entry
+    until some unrelated signal/position change invalidated dedup. Including
+    the sorted cooldown symbol set means cooldown expiry bumps the hash and
+    forces a fresh cycle so the constructor reconsiders the re-entry.
+    """
+    syms = sorted((cooldown_symbols or {}).keys())
+    return _hash_inputs(json.dumps(syms, sort_keys=True))
+
+
+def _check_cycle_dedup(
+    signals_out: dict,
+    current_positions: list[dict],
+    cooldown_symbols: dict | None = None,
+) -> dict | None:
     """Return the cached portfolio dict if dedup applies; None otherwise.
 
     Dedup applies when:
       - state/last_cycle_hash.json exists
       - signals_fingerprint matches the prior cycle's
       - positions_fingerprint matches the prior cycle's
+      - cooldown_fingerprint matches the prior cycle's
       - state/current_portfolio.json exists (the cached portfolio
         to reuse)
     """
@@ -644,9 +665,11 @@ def _check_cycle_dedup(signals_out: dict, current_positions: list[dict]) -> dict
         return None
     signals_fp = _signals_fingerprint(signals_out)
     positions_fp = _positions_fingerprint(current_positions)
+    cooldown_fp = _cooldown_fingerprint(cooldown_symbols)
     if (
         last.get("signals_fingerprint") != signals_fp
         or last.get("positions_fingerprint") != positions_fp
+        or last.get("cooldown_fingerprint") != cooldown_fp
     ):
         return None
     try:
@@ -695,13 +718,18 @@ def _write_dedup_next_run(rid: str, *, portfolio: dict, ctx: StageContext) -> di
     return next_run
 
 
-def _update_cycle_dedup_hash(signals_out: dict, current_positions: list[dict]) -> None:
+def _update_cycle_dedup_hash(
+    signals_out: dict,
+    current_positions: list[dict],
+    cooldown_symbols: dict | None = None,
+) -> None:
     """Called at the END of a successful cycle to record the fingerprints
     for the NEXT cycle's dedup check. Failures here are non-fatal."""
     try:
         state.write_json(state.LAST_CYCLE_HASH, {
             "signals_fingerprint": _signals_fingerprint(signals_out),
             "positions_fingerprint": _positions_fingerprint(current_positions),
+            "cooldown_fingerprint": _cooldown_fingerprint(cooldown_symbols),
             "updated_at": state.utcnow_iso(),
         })
     except Exception:
@@ -1288,13 +1316,19 @@ def run_pipeline(
     # vs churning the portfolio. Live only; dry-run uses empty list.
     current_positions = _current_positions_summary(ctx)
 
+    # Symbols fully exited within the re-entry cooldown window. Computed
+    # before dedup so it can participate in the dedup fingerprint (cooldown
+    # membership changes with time alone — see _cooldown_fingerprint) and
+    # then reused for the constructor prompt + sanity guardrail below.
+    cooldown_symbols = _cooldown_symbols_now()
+
     # ----- Cycle dedup -----
     # If the signals fingerprint matches the prior cycle AND the broker
-    # position set is unchanged, skip strategist + construct + execute
-    # and reuse the last portfolio. Saves ~$0.25 on a quiet 4h window
-    # where the market hasn't moved meaningfully.
+    # position set is unchanged AND the cooldown set is unchanged, skip
+    # strategist + construct + execute and reuse the last portfolio. Saves
+    # ~$0.25 on a quiet 4h window where nothing has moved meaningfully.
     if not dry_run:
-        dedup = _check_cycle_dedup(signals_out, current_positions)
+        dedup = _check_cycle_dedup(signals_out, current_positions, cooldown_symbols)
         if dedup is not None:
             next_run = _write_dedup_next_run(rid, portfolio=dedup["portfolio"], ctx=ctx)
             return {
@@ -1340,12 +1374,10 @@ def run_pipeline(
         peak_nav_30d=_peak_nav_30d(),
     )
 
-    # Symbols fully exited within the re-entry cooldown window. Fed to the
-    # constructor (soft prompt guidance, overridable at confidence >
-    # REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE) and to the sanity guardrail.
-    cooldown_symbols = _cooldown_symbols_now()
-
     # ----- Stage 3: construct (1 LLM call) -----
+    # cooldown_symbols (computed above, pre-dedup) is fed to the constructor
+    # as soft prompt guidance (overridable at confidence >
+    # REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE) and to the sanity guardrail.
     portfolio = _run_stage(
         ctx=ctx, stage_id="construct", schema="portfolio.schema.json",
         output_filename="portfolio.json",
@@ -1487,7 +1519,7 @@ def run_pipeline(
         state.write_json(state.CURRENT_PORTFOLIO, portfolio)
         # Update the cycle-dedup fingerprints so the next cycle can
         # short-circuit cleanly if nothing material changed.
-        _update_cycle_dedup_hash(signals_out, current_positions)
+        _update_cycle_dedup_hash(signals_out, current_positions, cooldown_symbols)
 
     return {
         "run_id": rid,

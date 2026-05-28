@@ -387,8 +387,14 @@ def symbols_in_cooldown(
     A symbol that is currently open (any remaining lot) is never in
     cooldown — that's a continuing hold, not a re-entry, so unrelated /
     still-held positions are not blocked.
+
+    ``trades`` is sorted by ``filled_at`` before FIFO-matching: the log is
+    append-order and a sync can append a sell ahead of its earlier buy,
+    which would otherwise leave the buy as a phantom open lot and wrongly
+    exclude a just-exited symbol from cooldown.
     """
-    pnl = compute_trades_pnl(trades)
+    rows = sorted(trades, key=lambda r: r.get("filled_at") or "")
+    pnl = compute_trades_pnl(rows)
     open_symbols = {lot.symbol for lot in pnl.open}
     last_exit: dict[str, str] = {}
     for ct in pnl.closed:
