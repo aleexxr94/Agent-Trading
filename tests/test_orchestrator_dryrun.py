@@ -96,8 +96,9 @@ def test_dry_run_writes_sanity_json_with_known_status(tmp_state):
     # Rule list mirrors lib/sanity.RULES — pin the count. v2 base had 6;
     # the winrate-improvements PR added position_within_adaptive_cap,
     # position_size_matches_confidence, position_notional_above_floor,
-    # position_adv_liquidity → 10 total.
-    assert len(sanity_doc["rules"]) == 10
+    # position_adv_liquidity → 10; the harvest/exit/cooldown PR added
+    # reentry_cooldown → 11 total.
+    assert len(sanity_doc["rules"]) == 11
 
 
 def test_sanity_pass_path_writes_summary_into_next_run(tmp_state, monkeypatch):

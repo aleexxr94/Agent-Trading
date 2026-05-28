@@ -539,6 +539,103 @@ def _r_position_adv_liquidity(portfolio: dict, view: dict | None) -> RuleResult:
     return RuleResult(name, severity, "pass")
 
 
+def _r_reentry_cooldown(portfolio: dict, view: dict | None) -> RuleResult:
+    """Discourage re-entering a symbol just fully exited (re-entry cooldown).
+
+    After a full exit, the system avoids re-buying the same symbol for
+    ``risk.REENTRY_COOLDOWN_DAYS`` (see lib/risk.py) — unless the strategist's
+    re-entry confidence on that name clears
+    ``risk.REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE``, in which case the re-entry
+    is an explicit, logged override rather than a violation.
+
+    Reads ``portfolio['_cooldown_symbols']`` (a ``{symbol: last_exit_iso}``
+    map injected by run_sanity_checks) and the strategist confidence per
+    ``(symbol, instrument_kind)`` from view.candidates. ``warn`` severity:
+    this is a soft, non-blocking guardrail — the LLM remains the decider
+    (consistent with the prompt-driven harvest/exit logic). The override
+    confidences and any offenders are recorded in ``meta`` so sanity.json
+    documents the decision.
+    """
+    from . import risk
+
+    name = "reentry_cooldown"
+    severity: Severity = "warn"
+    positions = portfolio.get("positions") or []
+    cooldown: dict = portfolio.get("_cooldown_symbols") or {}
+    if not positions:
+        return RuleResult(name, severity, "skip", "all-cash portfolio")
+    if not cooldown:
+        return RuleResult(name, severity, "skip", "no symbols in re-entry cooldown")
+
+    # Strategist confidence index keyed by (symbol, instrument_kind),
+    # mirroring _r_position_backed_by_strategist.
+    endorsed: dict[tuple[str, str], float] = {}
+    for c in (view or {}).get("candidates", []) or []:
+        sym = c.get("symbol")
+        kind = c.get("instrument_kind")
+        conf = c.get("confidence")
+        if sym and kind and isinstance(conf, (int, float)):
+            endorsed[(sym, kind)] = float(conf)
+
+    threshold = risk.REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE
+    offenders: list[dict] = []
+    overrides: list[dict] = []
+    for p in positions:
+        # The cooldown map is keyed by the broker symbol exactly as
+        # trades.jsonl stores it: ETF ticker, or the OSI option symbol.
+        # `match_key` is what we test for cooldown membership; `conf_key`
+        # is how view.candidates indexes confidence (underlying for options).
+        if p.get("kind") == "etf":
+            match_key = p.get("symbol", "")
+            conf_key = (match_key, "etf")
+        elif p.get("kind") == "option":
+            kind = "option_call" if p.get("type") == "call" else "option_put"
+            conf_key = (p.get("underlying", ""), kind)
+            try:
+                from .orders import osi_symbol
+                match_key = osi_symbol(
+                    underlying=p.get("underlying"), expiry=p.get("expiry"),
+                    type=p.get("type"), strike=p.get("strike"),
+                )
+            except (ValueError, KeyError, TypeError):
+                match_key = p.get("symbol") or ""
+        else:
+            continue
+        if match_key not in cooldown:
+            continue
+        sym = conf_key[0]
+        conf = endorsed.get(conf_key)
+        exited_at = cooldown.get(match_key)
+        if conf is not None and conf > threshold:
+            overrides.append({
+                "symbol": sym, "confidence": conf,
+                "exited_at": exited_at,
+                "reason": f"re-entry confidence {conf} > {threshold} override",
+            })
+        else:
+            offenders.append({
+                "symbol": sym, "confidence": conf, "exited_at": exited_at,
+                "issue": (
+                    f"re-entered within {risk.REENTRY_COOLDOWN_DAYS}d of full "
+                    f"exit without confidence > {threshold}"
+                ),
+            })
+
+    meta = {"overrides": overrides} if overrides else {}
+    if offenders:
+        meta["offenders"] = offenders
+        return RuleResult(
+            name, severity, severity,
+            detail=(
+                f"{len(offenders)} position(s) re-entered a symbol within the "
+                f"{risk.REENTRY_COOLDOWN_DAYS}-day cooldown without a "
+                f"confidence > {threshold} override"
+            ),
+            meta=meta,
+        )
+    return RuleResult(name, severity, "pass", meta=meta)
+
+
 # Registration order: list rules in roughly increasing severity so
 # dashboards rendering top-to-bottom show structural issues before
 # detail-level warnings.
@@ -553,6 +650,7 @@ RULES: list[Callable[[dict, dict | None], RuleResult]] = [
     _r_option_premium_above_floor,
     _r_position_notional_above_floor,
     _r_position_adv_liquidity,
+    _r_reentry_cooldown,
 ]
 
 
@@ -563,6 +661,7 @@ def run_sanity_checks(
     signals: dict | None = None,
     nav_usd: float | None = None,
     adaptive_cap_pct: float | None = None,
+    cooldown_symbols: dict | None = None,
 ) -> dict:
     """Run all registered rules. Return a sanity-report dict ready to
     write to ``sanity.json`` (run_id + generated_at are filled in by
@@ -571,17 +670,21 @@ def run_sanity_checks(
     Overall status is the worst per-rule status seen. Skips don't
     degrade the overall status.
 
-    The keyword args (signals, nav_usd, adaptive_cap_pct) are injected
-    into the portfolio dict on under-prefixed keys so the rule
-    functions can access them without changing the (portfolio, view)
-    signature. ``portfolio`` itself is NOT mutated — we operate on a
-    shallow copy.
+    The keyword args (signals, nav_usd, adaptive_cap_pct,
+    cooldown_symbols) are injected into the portfolio dict on
+    under-prefixed keys so the rule functions can access them without
+    changing the (portfolio, view) signature. ``cooldown_symbols`` is a
+    ``{symbol: last_exit_iso}`` map of recently fully-exited symbols (see
+    ``trades.symbols_in_cooldown``) consumed by ``_r_reentry_cooldown``.
+    ``portfolio`` itself is NOT mutated — we operate on a shallow copy.
     """
     enriched = dict(portfolio)
     if nav_usd is not None:
         enriched["_nav_usd"] = nav_usd
     if adaptive_cap_pct is not None:
         enriched["_adaptive_cap_pct"] = adaptive_cap_pct
+    if cooldown_symbols is not None:
+        enriched["_cooldown_symbols"] = cooldown_symbols
     if signals is not None:
         # adv_30d expressed in dollars (volume × last_close). The rule
         # consumes ADV-in-dollars so it compares directly to position

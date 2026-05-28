@@ -525,3 +525,76 @@ def test_run_sanity_checks_injects_extra_context_into_rules():
     rules_by_name = {r["name"]: r for r in report["rules"]}
     assert rules_by_name["position_within_adaptive_cap"]["status"] == "fail"
     assert rules_by_name["position_notional_above_floor"]["status"] == "pass"
+
+
+# ---- reentry cooldown ----
+
+
+def _with_cooldown(portfolio: dict, cooldown: dict) -> dict:
+    """Inject the _cooldown_symbols key the way run_sanity_checks does so the
+    rule can be exercised directly."""
+    enriched = dict(portfolio)
+    enriched["_cooldown_symbols"] = cooldown
+    return enriched
+
+
+def test_reentry_cooldown_skip_when_no_cooldown_symbols():
+    p = _portfolio([_etf("TQQQ", position_pct=10.0)])
+    v = _view_for({"TQQQ": 0.7})
+    r = sanity._r_reentry_cooldown(_with_cooldown(p, {}), v)
+    assert r.status == "skip"
+
+
+def test_reentry_cooldown_warns_on_reentry_below_override_confidence():
+    p = _portfolio([_etf("TQQQ", position_pct=10.0)])
+    v = _view_for({"TQQQ": 0.7})  # endorsed, but ≤ 0.8 override floor
+    cooldown = {"TQQQ": "2026-05-26T15:00:00Z"}
+    r = sanity._r_reentry_cooldown(_with_cooldown(p, cooldown), v)
+    assert r.status == "warn"
+    assert r.meta["offenders"][0]["symbol"] == "TQQQ"
+
+
+def test_reentry_cooldown_passes_with_high_confidence_override():
+    p = _portfolio([_etf("TQQQ", position_pct=10.0)])
+    v = _view_for({"TQQQ": 0.85})  # > 0.8 override floor
+    cooldown = {"TQQQ": "2026-05-26T15:00:00Z"}
+    r = sanity._r_reentry_cooldown(_with_cooldown(p, cooldown), v)
+    assert r.status == "pass"
+    assert r.meta["overrides"][0]["symbol"] == "TQQQ"
+    assert r.meta["overrides"][0]["confidence"] == 0.85
+
+
+def test_reentry_cooldown_ignores_symbols_not_in_cooldown():
+    """An unrelated held name must not be blocked by another name's cooldown."""
+    p = _portfolio([_etf("SOXL", position_pct=10.0)])
+    v = _view_for({"SOXL": 0.6})
+    cooldown = {"TQQQ": "2026-05-26T15:00:00Z"}  # different symbol
+    r = sanity._r_reentry_cooldown(_with_cooldown(p, cooldown), v)
+    assert r.status == "pass"
+    assert not r.meta.get("offenders")
+
+
+def test_reentry_cooldown_matches_options_by_osi():
+    """Option positions are matched against the cooldown map by their OSI
+    symbol (the key trades.jsonl uses), with confidence read by underlying."""
+    from lib.orders import osi_symbol
+    p = _portfolio([_option("TLT", type_="call", position_pct=10.0)])
+    osi = osi_symbol(underlying="TLT", expiry="2026-06-19", type="call", strike=85.0)
+    v = {
+        "run_id": "test", "generated_at": "2026-05-13T00:00:00Z",
+        "regime": "trending_up", "regime_rationale": "fixture",
+        "candidates": [
+            {"symbol": "TLT", "instrument_kind": "option_call",
+             "thesis": "x", "confidence": 0.65},  # ≤ 0.8 override floor
+        ],
+    }
+    r = sanity._r_reentry_cooldown(_with_cooldown(p, {osi: "2026-05-26T15:00:00Z"}), v)
+    assert r.status == "warn"
+    assert r.meta["offenders"][0]["symbol"] == "TLT"
+
+
+def test_reentry_cooldown_skip_on_all_cash():
+    p = _portfolio([])
+    p["all_cash"] = True
+    r = sanity._r_reentry_cooldown(_with_cooldown(p, {"TQQQ": "2026-05-26T15:00:00Z"}), None)
+    assert r.status == "skip"

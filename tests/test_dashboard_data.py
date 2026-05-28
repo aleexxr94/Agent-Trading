@@ -1360,17 +1360,55 @@ def test_days_held_none_when_no_opened_at(tmp_state):
     assert rows[0]["Days held"] is None
 
 
-def test_opened_at_map_picks_earliest_buy_per_symbol(tmp_state):
-    """When multiple buy fills exist for the same symbol (averaging-in),
-    Days held should anchor on the FIRST one — that's when the position
-    was opened, not when it was added to."""
+def _trade(symbol, side, qty, price, filled_at, kind="etf"):
+    return {
+        "symbol": symbol, "side": side, "qty": qty, "fill_price": price,
+        "filled_at": filled_at, "kind": kind, "fees_usd": 0.0,
+        "activity_id": f"{symbol}-{side}-{filled_at}", "run_id": None,
+    }
+
+
+def test_opened_at_map_anchors_on_earliest_open_lot_when_averaging_in(tmp_state):
+    """Continuous position (averaging-in, no full close): Days held anchors
+    on the FIRST open lot — that's when the position was opened, not when it
+    was added to."""
     trades = [
-        {"symbol": "TQQQ", "side": "buy",  "filled_at": "2026-04-10T15:00:00Z"},
-        {"symbol": "TQQQ", "side": "buy",  "filled_at": "2026-05-01T15:00:00Z"},
-        {"symbol": "TQQQ", "side": "sell", "filled_at": "2026-04-15T15:00:00Z"},  # noise
+        _trade("TQQQ", "buy", 10, 50.0, "2026-04-10T15:00:00Z"),
+        _trade("TQQQ", "buy", 5, 55.0, "2026-05-01T15:00:00Z"),
     ]
     out = dd._opened_at_map_from_trades(trades)
     assert out["TQQQ"] == "2026-04-10T15:00:00Z"
+
+
+def test_opened_at_map_keeps_original_anchor_on_partial_close(tmp_state):
+    """A partial close leaves the original lot partly open, so the position
+    stayed continuously held — Days held must NOT reset."""
+    trades = [
+        _trade("TQQQ", "buy", 10, 50.0, "2026-04-10T15:00:00Z"),
+        _trade("TQQQ", "sell", 4, 60.0, "2026-04-20T15:00:00Z"),
+    ]
+    out = dd._opened_at_map_from_trades(trades)
+    assert out["TQQQ"] == "2026-04-10T15:00:00Z"
+
+
+def test_opened_at_map_resets_after_full_close_and_reopen(tmp_state):
+    """The reported regression: a symbol closed fully then reopened must
+    anchor Days held on the REOPEN, not the original (now-closed) instance.
+    Mirrors the bug report: 14d hold, full exit, reopen 1d later showed 15d."""
+    trades = [
+        _trade("TQQQ", "buy", 10, 50.0, "2026-04-10T15:00:00Z"),
+        _trade("TQQQ", "sell", 10, 60.0, "2026-04-24T15:00:00Z"),  # full exit (14d)
+        _trade("TQQQ", "buy", 8, 61.0, "2026-04-25T15:00:00Z"),    # reopen 1d later
+    ]
+    out = dd._opened_at_map_from_trades(trades)
+    assert out["TQQQ"] == "2026-04-25T15:00:00Z"
+
+
+def test_opened_at_map_empty_on_malformed_log(tmp_state):
+    """Malformed rows (missing FIFO fields) degrade to an empty map rather
+    than raising — the positions table then renders '—'."""
+    trades = [{"symbol": "TQQQ", "side": "buy"}]  # no qty/fill_price/kind
+    assert dd._opened_at_map_from_trades(trades) == {}
 
 
 def test_load_decisions_empty_log(tmp_state):

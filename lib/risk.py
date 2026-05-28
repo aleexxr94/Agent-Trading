@@ -43,6 +43,24 @@ MAX_OPTION_LOSS_PCT = 100.0
 DAILY_DD_HALT_PCT = 8.0
 TARGET_POSITION_BAND = (1, 12)
 
+# --- Harvest / exit / re-entry guidance constants -----------------------
+# These centralise the numbers that the constructor + strategist prompts
+# quote and that the cooldown sanity rule enforces. The harvest / early-exit
+# / high-conviction-hold thresholds are LLM *judgment* inputs (surfaced in
+# the prompts), not mechanical code gates — capital allocation stays an
+# agent decision. Only the re-entry cooldown has a deterministic (warn-only)
+# sanity guardrail.
+HARVEST_MIN_GAIN_PCT = 30.0              # "winning" = unrealised P&L ≥ 30% of cost basis
+EARLY_EXIT_CONFIDENCE_FLOOR = 0.6        # confidence below this → may reduce / exit early
+HIGH_CONVICTION_HOLD_CONFIDENCE = 0.75   # above this + intact thesis → may let the position run
+# Re-entry cooldown after a FULL exit of a symbol. We use a 7-day wall-clock
+# window rather than a cycle count: cycles run every 4h on weekdays (~15
+# cycles ≈ 5 trading days < 7 days, so 7 days is the stricter bound), and
+# fills already carry wall-clock timestamps while the system has no cycle
+# counter — so wall-clock is both stricter and the clearer/available metric.
+REENTRY_COOLDOWN_DAYS = 7
+REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE = 0.8  # re-entry confidence above this overrides cooldown
+
 
 class RiskViolation(ValueError):
     """Raised when a sizing or risk rule is breached."""

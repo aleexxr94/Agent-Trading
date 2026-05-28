@@ -1618,25 +1618,39 @@ def _bias_for_position(pos: dict) -> str:
 
 
 def _opened_at_map_from_trades(trade_rows: list[dict]) -> dict[str, str]:
-    """Earliest buy-side `filled_at` per symbol, keyed as the broker stores it.
+    """Open timestamp of the CURRENT position instance per symbol.
 
-    Used to derive "Days held" on the positions table. Trades.jsonl stores
-    `symbol` as the broker symbol (ETF ticker, OSI for options), which is
-    the same convention the positions table uses for its `costs`/`marks`
-    lookups — so the caller passes the same `osi_symbol` resolution when
-    reading from this map.
+    Used to derive "Days held" on the positions table. Anchored on the
+    earliest *currently-open* buy lot (FIFO) — NOT the earliest buy fill
+    ever seen for the symbol. This matters when a position is fully closed
+    and later reopened: the old lots are consumed by the closing sell, so
+    the reopened position gets a fresh anchor (days-held resets) instead of
+    inheriting the original instance's age. A partial close / averaging-in
+    keeps the original anchor, because the position stayed continuously open.
+
+    Reuses the FIFO matcher in ``lib.trades.compute_trades_pnl`` — the same
+    engine that drives realised/unrealised PnL — so days-held and PnL agree
+    on what "the current open instance" is. Keyed by the broker symbol (ETF
+    ticker, OSI for options), the same convention the positions table uses
+    for its `costs`/`marks` lookups.
+
+    Defensive: any failure (malformed log, out-of-order rows) falls back to
+    an empty map so the positions table renders "—" rather than breaking.
     """
+    from . import trades as trades_lib
+    try:
+        pnl = trades_lib.compute_trades_pnl(trade_rows)
+    except Exception:
+        return {}
     out: dict[str, str] = {}
-    for t in trade_rows:
-        if t.get("side") != "buy":
-            continue
-        sym = t.get("symbol")
-        filled_at = t.get("filled_at") or ""
-        if not sym or not filled_at:
+    for lot in pnl.open:
+        sym = lot.symbol
+        opened_at = lot.opened_at or ""
+        if not sym or not opened_at:
             continue
         prev = out.get(sym)
-        if prev is None or filled_at < prev:
-            out[sym] = filled_at
+        if prev is None or opened_at < prev:
+            out[sym] = opened_at
     return out
 
 

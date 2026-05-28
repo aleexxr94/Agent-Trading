@@ -73,3 +73,16 @@ def test_circuit_breaker_8pct_drop():
 ])
 def test_position_band(count, all_cash, ok):
     assert risk.position_band_ok(count, all_cash) is ok
+
+
+# ---------- harvest / exit / cooldown guidance constants ----------
+
+
+def test_harvest_exit_cooldown_constants():
+    """These numbers are quoted in prompts/constructor.md + strategist.md and
+    enforced by the reentry-cooldown sanity rule. Keep them centralised here."""
+    assert risk.HARVEST_MIN_GAIN_PCT == 30.0
+    assert risk.EARLY_EXIT_CONFIDENCE_FLOOR == 0.6
+    assert risk.HIGH_CONVICTION_HOLD_CONFIDENCE == 0.75
+    assert risk.REENTRY_COOLDOWN_DAYS == 7
+    assert risk.REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE == 0.8

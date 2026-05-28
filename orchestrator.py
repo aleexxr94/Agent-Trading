@@ -39,7 +39,7 @@ except ImportError:
     pass
 from typing import Callable
 
-from lib import llm, market_gate, options_chain, risk, sanity, signals, stages, state
+from lib import llm, market_gate, options_chain, risk, sanity, signals, stages, state, trades
 from lib.broker import Broker
 
 ROOT = Path(__file__).resolve().parent
@@ -310,6 +310,40 @@ def stage_chain_lookup(ctx: StageContext, signals_out: dict, view: dict) -> dict
     return options_chain.lookup_for_view(view, signals_out, broker=ctx.broker)
 
 
+def _cooldown_prompt_line(cooldown_symbols: dict) -> str:
+    """One constructor-prompt line listing symbols in re-entry cooldown.
+
+    Empty string when nothing is in cooldown so the prompt stays clean.
+    The override threshold quoted here matches the deterministic sanity
+    rule (risk.REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE)."""
+    if not cooldown_symbols:
+        return ""
+    syms = ", ".join(sorted(cooldown_symbols))
+    return (
+        f"Symbols in re-entry cooldown (fully exited within "
+        f"{risk.REENTRY_COOLDOWN_DAYS} days): {syms}. Do NOT re-open these "
+        f"unless your re-entry confidence exceeds "
+        f"{risk.REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE}; if you override the "
+        f"cooldown, say so explicitly in construction_rationale.\n"
+    )
+
+
+def _cooldown_symbols_now() -> dict:
+    """Symbols in re-entry cooldown as of now, from the trade log.
+
+    Thin wrapper over trades.symbols_in_cooldown using the repo-wide
+    REENTRY_COOLDOWN_DAYS window. Failures are non-fatal — an empty map
+    just means no cooldown is applied this cycle."""
+    try:
+        return trades.symbols_in_cooldown(
+            state.read_trades(),
+            now=state.utcnow(),
+            window_days=risk.REENTRY_COOLDOWN_DAYS,
+        )
+    except Exception:
+        return {}
+
+
 def stage_construct(
     ctx: StageContext,
     signals_out: dict,
@@ -318,6 +352,7 @@ def stage_construct(
     current_positions: list[dict] | None = None,
     pnl_history: list[dict] | None = None,
     adaptive_cap_pct: float = 15.0,
+    cooldown_symbols: dict | None = None,
 ) -> dict:
     """One LLM call — Opus 4.7, ~$0.20. Reads signals + view + chain
     lookups + current positions + recent PnL feedback; emits the final
@@ -331,6 +366,7 @@ def stage_construct(
     chain_lookups = chain_lookups or {"lookups": []}
     current_positions = current_positions or []
     pnl_history = pnl_history or []
+    cooldown_symbols = cooldown_symbols or {}
     content = (
         f"Signals: {json.dumps(signals_out, sort_keys=True)}\n"
         f"Strategist view: {json.dumps(view, sort_keys=True)}\n"
@@ -341,6 +377,7 @@ def stage_construct(
         f"NAV (USD): {nav:.2f}\n"
         f"Adaptive per-position cap %: {adaptive_cap_pct:.2f} "
         f"(reduced from 15.0% when NAV is in drawdown)\n"
+        f"{_cooldown_prompt_line(cooldown_symbols)}"
         f"Run id: {ctx.run_id}\n"
         "Return JSON conforming to portfolio.schema.json. Use the OSI "
         "symbols + strikes from chain_lookups for option positions; do "
@@ -1303,6 +1340,11 @@ def run_pipeline(
         peak_nav_30d=_peak_nav_30d(),
     )
 
+    # Symbols fully exited within the re-entry cooldown window. Fed to the
+    # constructor (soft prompt guidance, overridable at confidence >
+    # REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE) and to the sanity guardrail.
+    cooldown_symbols = _cooldown_symbols_now()
+
     # ----- Stage 3: construct (1 LLM call) -----
     portfolio = _run_stage(
         ctx=ctx, stage_id="construct", schema="portfolio.schema.json",
@@ -1313,6 +1355,7 @@ def run_pipeline(
             current_positions=current_positions,
             pnl_history=pnl_history,
             adaptive_cap_pct=adaptive_cap,
+            cooldown_symbols=cooldown_symbols,
         ),
         inputs_hash_parts=(
             rid,
@@ -1352,6 +1395,7 @@ def run_pipeline(
                 f"Recent PnL history: {json.dumps(pnl_history, sort_keys=True)}\n"
                 f"NAV (USD): {_account_nav(ctx):.2f}\n"
                 f"Adaptive per-position cap %: {adaptive_cap:.2f}\n"
+                f"{_cooldown_prompt_line(cooldown_symbols)}"
                 f"Run id: {ctx.run_id}\n"
                 f"Critic rejected your first attempt: {critique.get('critique')}. "
                 f"Suggested changes: {json.dumps(critique.get('suggested_changes', []))}. "
@@ -1391,6 +1435,7 @@ def run_pipeline(
         signals=signals_out,
         nav_usd=_account_nav(ctx),
         adaptive_cap_pct=adaptive_cap,
+        cooldown_symbols=cooldown_symbols,
     )
     sanity_report["run_id"] = rid
     sanity_report["generated_at"] = state.utcnow_iso()
