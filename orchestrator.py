@@ -333,7 +333,11 @@ def _cooldown_symbols_now() -> dict:
 
     Thin wrapper over trades.symbols_in_cooldown using the repo-wide
     REENTRY_COOLDOWN_DAYS window. Failures are non-fatal — an empty map
-    just means no cooldown is applied this cycle."""
+    just means no cooldown is applied this cycle.
+
+    Accuracy depends on state/trades.jsonl being current; the trade cycle
+    calls _sync_fills_before_cooldown() before this so a symbol closed
+    between cycles (manual broker close, monitor flatten) is reflected."""
     try:
         return trades.symbols_in_cooldown(
             state.read_trades(),
@@ -342,6 +346,27 @@ def _cooldown_symbols_now() -> dict:
         )
     except Exception:
         return {}
+
+
+def _sync_fills_before_cooldown(ctx: StageContext) -> str | None:
+    """Pull Alpaca fills into state/trades.jsonl BEFORE the cooldown map is
+    derived, so a symbol fully exited between cycles outside the orchestrator
+    (manual broker close, monitor-driven flatten) is on the log when the
+    re-entry cooldown + dedup fingerprint are computed. Idempotent (dedupe
+    via known activity ids), mirroring the post-execute sync. Returns an
+    error string on failure (non-fatal — the cycle continues with whatever
+    the log already has, degrading the guardrail rather than aborting)."""
+    if ctx.dry_run:
+        return None
+    try:
+        from lib import trades_sync
+        trades_sync.sync_fills_from_alpaca(
+            trading_client=getattr(ctx.broker, "_client", None),
+            order_id_to_run_id=trades_sync.order_id_to_run_id_from_runs(),
+        )
+        return None
+    except Exception as e:
+        return f"sync_fills_from_alpaca(pre-cooldown): {type(e).__name__}: {e}"
 
 
 def stage_construct(
@@ -1316,6 +1341,11 @@ def run_pipeline(
     # vs churning the portfolio. Live only; dry-run uses empty list.
     current_positions = _current_positions_summary(ctx)
 
+    # Refresh the fill log from Alpaca before deriving cooldown state, so a
+    # symbol exited between cycles outside this orchestrator (manual close,
+    # monitor flatten) is reflected in the re-entry cooldown + dedup hash.
+    pre_cooldown_sync_error = _sync_fills_before_cooldown(ctx)
+
     # Symbols fully exited within the re-entry cooldown window. Computed
     # before dedup so it can participate in the dedup fingerprint (cooldown
     # membership changes with time alone — see _cooldown_fingerprint) and
@@ -1496,6 +1526,8 @@ def run_pipeline(
             },
             "cycle_intent": "trade",
         }
+        if pre_cooldown_sync_error:
+            next_run["pre_cooldown_sync_error"] = pre_cooldown_sync_error
         state.write_json(state.run_dir(rid) / "next_run.json", next_run)
         if not dry_run:
             state.write_json(state.NEXT_RUN, next_run)
@@ -1511,6 +1543,8 @@ def run_pipeline(
             "status": sanity_report["status"],
             "summary": sanity_report["summary"],
         }
+        if pre_cooldown_sync_error:
+            next_run["pre_cooldown_sync_error"] = pre_cooldown_sync_error
         state.write_json(state.run_dir(rid) / "next_run.json", next_run)
         if not dry_run:
             state.write_json(state.NEXT_RUN, next_run)

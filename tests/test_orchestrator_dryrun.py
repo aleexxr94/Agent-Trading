@@ -594,3 +594,39 @@ def test_stage_execute_allows_derisking_reduction_during_dd_halt(tmp_state, monk
     assert next_run["dd_halt"]["active"] is True
     # The reduction (sell 5) is de-risking and must go through during a halt.
     assert ("TQQQ", "sell", 5) in submitted
+
+
+def test_sync_fills_before_cooldown_noop_in_dry_run(monkeypatch):
+    """Dry-run must never hit the broker — the pre-cooldown sync is skipped."""
+    called = {"n": 0}
+
+    import lib.trades_sync as ts
+
+    def _boom(*a, **k):
+        called["n"] += 1
+        raise AssertionError("should not be called in dry-run")
+
+    monkeypatch.setattr(ts, "sync_fills_from_alpaca", _boom)
+    ctx = orchestrator.StageContext(run_id="r", dry_run=True, broker=None)
+    assert orchestrator._sync_fills_before_cooldown(ctx) is None
+    assert called["n"] == 0
+
+
+def test_sync_fills_before_cooldown_returns_error_string_on_failure(monkeypatch):
+    """A sync failure is non-fatal: it returns an error string so the cycle
+    can continue (and surface it on next_run) rather than abort."""
+    import lib.trades_sync as ts
+
+    monkeypatch.setattr(ts, "order_id_to_run_id_from_runs", lambda: {})
+    monkeypatch.setattr(
+        ts, "sync_fills_from_alpaca",
+        lambda **k: (_ for _ in ()).throw(RuntimeError("alpaca down")),
+    )
+
+    class _Broker:
+        _client = object()
+
+    ctx = orchestrator.StageContext(run_id="r", dry_run=False, broker=_Broker())
+    err = orchestrator._sync_fills_before_cooldown(ctx)
+    assert err is not None
+    assert "alpaca down" in err
