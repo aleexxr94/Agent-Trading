@@ -94,34 +94,80 @@ job:
   them disproportionately attractive (e.g. UVXY long with confidence
   0.45 makes sense in a `vol_elevated` regime).
 
-## Harvesting winning positions
+## Harvesting winning positions (profit-taking is a judgment call)
 
 Before deciding which strategist candidates to take, look at
 `current_positions` for any position with significant unrealized gain.
-A position is "winning" if its unrealized P&L is **≥ 20% of cost basis**
-(compute from `unrealized_pl_usd / (avg_cost × qty)` for ETFs; same
-shape for options with premium-per-contract).
+A position is a **harvest candidate** when its unrealized P&L is
+**≥ 30% of cost basis** (compute from `unrealized_pl_usd / (avg_cost ×
+qty)` for ETFs; same shape for options with premium-per-contract).
 
-**Default behaviour for winners: drop them from the target portfolio.**
-The strategist's next-cycle confidence on that name is your tiebreaker
-— if (and only if) the strategist re-endorses this exact
-`(symbol, instrument_kind)` pair this cycle with **confidence ≥ 0.8**,
-you may keep the position; otherwise harvest it (let the execute stage
-sell it for cash). Document the harvest in `construction_rationale`
-(e.g. "harvested SOXL at +28% unrealized; strategist confidence 0.76
-below 0.80 retention floor").
+**Reaching the +30% threshold does NOT force a sale.** It opens a
+decision. Use your judgment — weigh the trade thesis, current market
+conditions, risk, and the strategist's latest confidence on the name —
+and choose one of:
 
-**Why:** profitable positions where strategist conviction has softened
-are exactly the ones to bank. Riding 20%+ gains without re-endorsement
-turns realized profit into round-trip exposure. The 0.8 floor is
-intentionally a high bar — the strategist normally surfaces 0.6–0.75
-candidates; clearing 0.8 means "this thesis is still acutely alive,
-let it run."
+- **Take full profit:** drop the position from the target portfolio
+  entirely (the execute stage sells it for cash). Right when conviction
+  has softened or the thesis has largely played out.
+- **Trim / partial harvest:** keep the position but at a **smaller
+  target** `position_pct` / share / contract count than it currently
+  holds. The execute stage diffs target vs. current and sells only the
+  difference, so a partial trim banks some gain while keeping skin in a
+  thesis that's still alive. Prefer this over all-or-nothing when you
+  want to de-risk a winner without abandoning it.
+- **Let it run:** keep the full position. Especially when the
+  strategist **re-endorses this exact `(symbol, instrument_kind)` pair
+  this cycle with confidence > 0.75** AND the original entry thesis is
+  still intact — a high-conviction, intact-thesis winner does not need
+  to be sold or trimmed just because it crossed +30%. Banking a
+  compounding winner early is itself a cost.
 
-**Side effect to expect:** winners can rotate weekly; some round-trip
-slippage in exchange for compounding realised gains. Paired with the
-25% kill-loss cap on the downside, each position is bracketed into a
-roughly [-25%, +20%] band by default.
+Always document the harvest decision (full / partial / hold) and the
+reasoning in `construction_rationale` (e.g. "trimmed SOXL from 12%→6%
+NAV at +34% unrealized to bank half; strategist re-endorsed at 0.79 so
+kept a runner" or "held QQQ call in full at +41%; strategist 0.82,
+thesis intact — let it run").
+
+**Why:** banking gains matters, but mechanically dumping every winner
+at a fixed threshold caps your upside and churns the book. The +30%
+trigger plus partial-trim flexibility lets you compound conviction
+plays while still de-risking. Paired with the 25% kill-loss cap on the
+downside, an un-trimmed position sits in a roughly [-25%, +30%] band by
+default — but trimming or letting a runner go are both on the table.
+
+## Early-exit discretion (you may sell BEFORE the profit threshold)
+
+You don't have to wait for +30% to reduce or exit a position. Sell or
+trim a current position early when **either**:
+
+- The **original entry thesis has changed significantly** — the signal
+  that justified the trade has reversed or been invalidated (e.g. the
+  momentum that drove a bull ETF entry has rolled over, a macro catalyst
+  resolved against the thesis). Don't ride a position whose premise is gone.
+- The strategist's **confidence on the name has dropped below 0.6**.
+  A softening conviction reading is a cue to take risk off — exit fully
+  or trim, your call. (Note: a position whose strategist confidence falls
+  below 0.5 will also fail a sanity check, so anything that weak should
+  not remain in the target portfolio at all.)
+
+This is discretion, not obligation — explain the early exit in
+`construction_rationale`.
+
+## Re-entry cooldown (don't immediately re-buy what you just sold)
+
+The system avoids re-entering a symbol it recently fully exited. The
+prompt input lists any **symbols in re-entry cooldown** (fully closed
+within the cooldown window, ~1 week). **Do not re-open a symbol in
+cooldown unless your re-entry confidence exceeds 0.8** — i.e. the
+strategist is re-endorsing it this cycle with confidence > 0.8 and you
+genuinely believe the new entry is materially better than the exit you
+just made. If you do override the cooldown, **state it explicitly** in
+`construction_rationale` (e.g. "overriding TQQQ cooldown: strategist
+0.86, fresh breakout above 50d MA post-FOMC"). Re-entering a just-sold
+name on a marginal thesis is exactly the round-trip churn the cooldown
+exists to prevent. The cooldown applies per symbol — it never blocks
+unrelated names.
 
 ## Order direction safety
 

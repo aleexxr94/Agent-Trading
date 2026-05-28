@@ -103,6 +103,19 @@ Rules:
   Don't say "strong momentum" — say "momentum_30d_pct=8.4 and
   dist_from_50d_ma_pct=4.2 confirm uptrend." Specific > poetic.
 
+## Re-rating names the account already holds
+
+You receive `current_positions`. If the signals for a currently-held
+name have **deteriorated** — the thesis that justified it is weakening —
+re-surface that name with a **lowered confidence** so the constructor
+can act on it. Confidence **below 0.6** on a held name is the
+constructor's cue that it may reduce or exit early; below 0.5 the
+position can no longer be justified at all. Don't silently drop a
+held name from `candidates` when its setup has soured — an explicit
+low-confidence re-rating is more useful to the constructor than absence.
+Conversely, when a held winner's thesis is still acutely alive, a
+re-endorsement at **confidence > 0.75** signals "let it run."
+
 ## Guidance on regime classification
 
 - `risk_on` — broad equity uptrend, low vol, semis leading

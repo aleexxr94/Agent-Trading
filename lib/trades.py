@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Literal
 
 
@@ -354,3 +355,60 @@ def compute_trades_pnl(
     return TradesPnl(
         closed=closed, open=open_rows, unmatched_sells=unmatched_sells,
     )
+
+
+def _parse_iso_utc(s: str | None) -> datetime | None:
+    """Tolerant ISO-8601 → aware-UTC parse. Returns None on anything bad."""
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def symbols_in_cooldown(
+    trades: list[dict],
+    *,
+    now: datetime,
+    window_days: float,
+) -> dict[str, str]:
+    """Symbols that were FULLY exited within ``window_days`` of ``now``.
+
+    Returns ``{symbol: last_exit_iso}`` for each symbol that currently has
+    NO open lots (i.e. it was fully closed) AND whose most-recent close
+    happened within the cooldown window. Re-opening one of these symbols
+    is a "re-entry" the cooldown is meant to discourage (overridable by
+    high re-entry confidence — see ``risk.REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE``).
+
+    Keyed by the broker symbol (ETF ticker / OSI option), matching the
+    convention used by ``compute_trades_pnl`` and the rest of the system.
+    A symbol that is currently open (any remaining lot) is never in
+    cooldown — that's a continuing hold, not a re-entry, so unrelated /
+    still-held positions are not blocked.
+
+    ``trades`` is sorted by ``filled_at`` before FIFO-matching: the log is
+    append-order and a sync can append a sell ahead of its earlier buy,
+    which would otherwise leave the buy as a phantom open lot and wrongly
+    exclude a just-exited symbol from cooldown.
+    """
+    rows = sorted(trades, key=lambda r: r.get("filled_at") or "")
+    pnl = compute_trades_pnl(rows)
+    open_symbols = {lot.symbol for lot in pnl.open}
+    last_exit: dict[str, str] = {}
+    for ct in pnl.closed:
+        if ct.symbol in open_symbols:
+            continue
+        prev = last_exit.get(ct.symbol)
+        if prev is None or ct.closed_at > prev:
+            last_exit[ct.symbol] = ct.closed_at
+    out: dict[str, str] = {}
+    for sym, exit_iso in last_exit.items():
+        exit_dt = _parse_iso_utc(exit_iso)
+        if exit_dt is None:
+            continue
+        age_days = (now - exit_dt).total_seconds() / 86400.0
+        if 0 <= age_days <= window_days:
+            out[sym] = exit_iso
+    return out

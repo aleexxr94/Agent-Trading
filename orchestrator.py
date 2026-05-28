@@ -39,7 +39,7 @@ except ImportError:
     pass
 from typing import Callable
 
-from lib import llm, market_gate, options_chain, risk, sanity, signals, stages, state
+from lib import llm, market_gate, options_chain, risk, sanity, signals, stages, state, trades
 from lib.broker import Broker
 
 ROOT = Path(__file__).resolve().parent
@@ -310,6 +310,65 @@ def stage_chain_lookup(ctx: StageContext, signals_out: dict, view: dict) -> dict
     return options_chain.lookup_for_view(view, signals_out, broker=ctx.broker)
 
 
+def _cooldown_prompt_line(cooldown_symbols: dict) -> str:
+    """One constructor-prompt line listing symbols in re-entry cooldown.
+
+    Empty string when nothing is in cooldown so the prompt stays clean.
+    The override threshold quoted here matches the deterministic sanity
+    rule (risk.REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE)."""
+    if not cooldown_symbols:
+        return ""
+    syms = ", ".join(sorted(cooldown_symbols))
+    return (
+        f"Symbols in re-entry cooldown (fully exited within "
+        f"{risk.REENTRY_COOLDOWN_DAYS} days): {syms}. Do NOT re-open these "
+        f"unless your re-entry confidence exceeds "
+        f"{risk.REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE}; if you override the "
+        f"cooldown, say so explicitly in construction_rationale.\n"
+    )
+
+
+def _cooldown_symbols_now() -> dict:
+    """Symbols in re-entry cooldown as of now, from the trade log.
+
+    Thin wrapper over trades.symbols_in_cooldown using the repo-wide
+    REENTRY_COOLDOWN_DAYS window. Failures are non-fatal — an empty map
+    just means no cooldown is applied this cycle.
+
+    Accuracy depends on state/trades.jsonl being current; the trade cycle
+    calls _sync_fills_before_cooldown() before this so a symbol closed
+    between cycles (manual broker close, monitor flatten) is reflected."""
+    try:
+        return trades.symbols_in_cooldown(
+            state.read_trades(),
+            now=state.utcnow(),
+            window_days=risk.REENTRY_COOLDOWN_DAYS,
+        )
+    except Exception:
+        return {}
+
+
+def _sync_fills_before_cooldown(ctx: StageContext) -> str | None:
+    """Pull Alpaca fills into state/trades.jsonl BEFORE the cooldown map is
+    derived, so a symbol fully exited between cycles outside the orchestrator
+    (manual broker close, monitor-driven flatten) is on the log when the
+    re-entry cooldown + dedup fingerprint are computed. Idempotent (dedupe
+    via known activity ids), mirroring the post-execute sync. Returns an
+    error string on failure (non-fatal — the cycle continues with whatever
+    the log already has, degrading the guardrail rather than aborting)."""
+    if ctx.dry_run:
+        return None
+    try:
+        from lib import trades_sync
+        trades_sync.sync_fills_from_alpaca(
+            trading_client=getattr(ctx.broker, "_client", None),
+            order_id_to_run_id=trades_sync.order_id_to_run_id_from_runs(),
+        )
+        return None
+    except Exception as e:
+        return f"sync_fills_from_alpaca(pre-cooldown): {type(e).__name__}: {e}"
+
+
 def stage_construct(
     ctx: StageContext,
     signals_out: dict,
@@ -318,6 +377,7 @@ def stage_construct(
     current_positions: list[dict] | None = None,
     pnl_history: list[dict] | None = None,
     adaptive_cap_pct: float = 15.0,
+    cooldown_symbols: dict | None = None,
 ) -> dict:
     """One LLM call — Opus 4.7, ~$0.20. Reads signals + view + chain
     lookups + current positions + recent PnL feedback; emits the final
@@ -331,6 +391,7 @@ def stage_construct(
     chain_lookups = chain_lookups or {"lookups": []}
     current_positions = current_positions or []
     pnl_history = pnl_history or []
+    cooldown_symbols = cooldown_symbols or {}
     content = (
         f"Signals: {json.dumps(signals_out, sort_keys=True)}\n"
         f"Strategist view: {json.dumps(view, sort_keys=True)}\n"
@@ -341,6 +402,7 @@ def stage_construct(
         f"NAV (USD): {nav:.2f}\n"
         f"Adaptive per-position cap %: {adaptive_cap_pct:.2f} "
         f"(reduced from 15.0% when NAV is in drawdown)\n"
+        f"{_cooldown_prompt_line(cooldown_symbols)}"
         f"Run id: {ctx.run_id}\n"
         "Return JSON conforming to portfolio.schema.json. Use the OSI "
         "symbols + strikes from chain_lookups for option positions; do "
@@ -589,13 +651,34 @@ def _positions_fingerprint(positions: list[dict]) -> str:
     return _hash_inputs(json.dumps(rows, sort_keys=True))
 
 
-def _check_cycle_dedup(signals_out: dict, current_positions: list[dict]) -> dict | None:
+def _cooldown_fingerprint(cooldown_symbols: dict | None) -> str:
+    """Stable hash of the re-entry-cooldown symbol set, used as a dedup key.
+
+    Codex P2 on PR #99: cooldown membership shrinks purely with the passage
+    of time (a symbol drops out once its 7-day window expires) even when
+    signals + broker positions are unchanged. Without folding it into the
+    dedup fingerprint, a portfolio kept flat *because* a symbol was in
+    cooldown could be reused indefinitely, suppressing a now-valid re-entry
+    until some unrelated signal/position change invalidated dedup. Including
+    the sorted cooldown symbol set means cooldown expiry bumps the hash and
+    forces a fresh cycle so the constructor reconsiders the re-entry.
+    """
+    syms = sorted((cooldown_symbols or {}).keys())
+    return _hash_inputs(json.dumps(syms, sort_keys=True))
+
+
+def _check_cycle_dedup(
+    signals_out: dict,
+    current_positions: list[dict],
+    cooldown_symbols: dict | None = None,
+) -> dict | None:
     """Return the cached portfolio dict if dedup applies; None otherwise.
 
     Dedup applies when:
       - state/last_cycle_hash.json exists
       - signals_fingerprint matches the prior cycle's
       - positions_fingerprint matches the prior cycle's
+      - cooldown_fingerprint matches the prior cycle's
       - state/current_portfolio.json exists (the cached portfolio
         to reuse)
     """
@@ -607,9 +690,11 @@ def _check_cycle_dedup(signals_out: dict, current_positions: list[dict]) -> dict
         return None
     signals_fp = _signals_fingerprint(signals_out)
     positions_fp = _positions_fingerprint(current_positions)
+    cooldown_fp = _cooldown_fingerprint(cooldown_symbols)
     if (
         last.get("signals_fingerprint") != signals_fp
         or last.get("positions_fingerprint") != positions_fp
+        or last.get("cooldown_fingerprint") != cooldown_fp
     ):
         return None
     try:
@@ -658,13 +743,18 @@ def _write_dedup_next_run(rid: str, *, portfolio: dict, ctx: StageContext) -> di
     return next_run
 
 
-def _update_cycle_dedup_hash(signals_out: dict, current_positions: list[dict]) -> None:
+def _update_cycle_dedup_hash(
+    signals_out: dict,
+    current_positions: list[dict],
+    cooldown_symbols: dict | None = None,
+) -> None:
     """Called at the END of a successful cycle to record the fingerprints
     for the NEXT cycle's dedup check. Failures here are non-fatal."""
     try:
         state.write_json(state.LAST_CYCLE_HASH, {
             "signals_fingerprint": _signals_fingerprint(signals_out),
             "positions_fingerprint": _positions_fingerprint(current_positions),
+            "cooldown_fingerprint": _cooldown_fingerprint(cooldown_symbols),
             "updated_at": state.utcnow_iso(),
         })
     except Exception:
@@ -1251,13 +1341,24 @@ def run_pipeline(
     # vs churning the portfolio. Live only; dry-run uses empty list.
     current_positions = _current_positions_summary(ctx)
 
+    # Refresh the fill log from Alpaca before deriving cooldown state, so a
+    # symbol exited between cycles outside this orchestrator (manual close,
+    # monitor flatten) is reflected in the re-entry cooldown + dedup hash.
+    pre_cooldown_sync_error = _sync_fills_before_cooldown(ctx)
+
+    # Symbols fully exited within the re-entry cooldown window. Computed
+    # before dedup so it can participate in the dedup fingerprint (cooldown
+    # membership changes with time alone — see _cooldown_fingerprint) and
+    # then reused for the constructor prompt + sanity guardrail below.
+    cooldown_symbols = _cooldown_symbols_now()
+
     # ----- Cycle dedup -----
     # If the signals fingerprint matches the prior cycle AND the broker
-    # position set is unchanged, skip strategist + construct + execute
-    # and reuse the last portfolio. Saves ~$0.25 on a quiet 4h window
-    # where the market hasn't moved meaningfully.
+    # position set is unchanged AND the cooldown set is unchanged, skip
+    # strategist + construct + execute and reuse the last portfolio. Saves
+    # ~$0.25 on a quiet 4h window where nothing has moved meaningfully.
     if not dry_run:
-        dedup = _check_cycle_dedup(signals_out, current_positions)
+        dedup = _check_cycle_dedup(signals_out, current_positions, cooldown_symbols)
         if dedup is not None:
             next_run = _write_dedup_next_run(rid, portfolio=dedup["portfolio"], ctx=ctx)
             return {
@@ -1304,6 +1405,9 @@ def run_pipeline(
     )
 
     # ----- Stage 3: construct (1 LLM call) -----
+    # cooldown_symbols (computed above, pre-dedup) is fed to the constructor
+    # as soft prompt guidance (overridable at confidence >
+    # REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE) and to the sanity guardrail.
     portfolio = _run_stage(
         ctx=ctx, stage_id="construct", schema="portfolio.schema.json",
         output_filename="portfolio.json",
@@ -1313,6 +1417,7 @@ def run_pipeline(
             current_positions=current_positions,
             pnl_history=pnl_history,
             adaptive_cap_pct=adaptive_cap,
+            cooldown_symbols=cooldown_symbols,
         ),
         inputs_hash_parts=(
             rid,
@@ -1352,6 +1457,7 @@ def run_pipeline(
                 f"Recent PnL history: {json.dumps(pnl_history, sort_keys=True)}\n"
                 f"NAV (USD): {_account_nav(ctx):.2f}\n"
                 f"Adaptive per-position cap %: {adaptive_cap:.2f}\n"
+                f"{_cooldown_prompt_line(cooldown_symbols)}"
                 f"Run id: {ctx.run_id}\n"
                 f"Critic rejected your first attempt: {critique.get('critique')}. "
                 f"Suggested changes: {json.dumps(critique.get('suggested_changes', []))}. "
@@ -1391,6 +1497,7 @@ def run_pipeline(
         signals=signals_out,
         nav_usd=_account_nav(ctx),
         adaptive_cap_pct=adaptive_cap,
+        cooldown_symbols=cooldown_symbols,
     )
     sanity_report["run_id"] = rid
     sanity_report["generated_at"] = state.utcnow_iso()
@@ -1419,6 +1526,8 @@ def run_pipeline(
             },
             "cycle_intent": "trade",
         }
+        if pre_cooldown_sync_error:
+            next_run["pre_cooldown_sync_error"] = pre_cooldown_sync_error
         state.write_json(state.run_dir(rid) / "next_run.json", next_run)
         if not dry_run:
             state.write_json(state.NEXT_RUN, next_run)
@@ -1434,6 +1543,8 @@ def run_pipeline(
             "status": sanity_report["status"],
             "summary": sanity_report["summary"],
         }
+        if pre_cooldown_sync_error:
+            next_run["pre_cooldown_sync_error"] = pre_cooldown_sync_error
         state.write_json(state.run_dir(rid) / "next_run.json", next_run)
         if not dry_run:
             state.write_json(state.NEXT_RUN, next_run)
@@ -1442,7 +1553,7 @@ def run_pipeline(
         state.write_json(state.CURRENT_PORTFOLIO, portfolio)
         # Update the cycle-dedup fingerprints so the next cycle can
         # short-circuit cleanly if nothing material changed.
-        _update_cycle_dedup_hash(signals_out, current_positions)
+        _update_cycle_dedup_hash(signals_out, current_positions, cooldown_symbols)
 
     return {
         "run_id": rid,

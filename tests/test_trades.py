@@ -371,3 +371,77 @@ def test_unmatched_sells_records_leftover_after_partial_match():
     assert res.closed[0].qty == pytest.approx(1.0)
     assert len(res.unmatched_sells) == 1
     assert res.unmatched_sells[0].qty == pytest.approx(2.0)
+
+
+# ---------- symbols_in_cooldown ----------
+
+
+from datetime import datetime, timezone  # noqa: E402
+
+
+def _now(iso: str) -> datetime:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def test_cooldown_includes_symbol_fully_exited_within_window():
+    rows = [
+        _trade(activity_id="b1", side="buy", qty=10, fill_price=50.0,
+               filled_at="2026-05-10T15:00:00Z"),
+        _trade(activity_id="s1", side="sell", qty=10, fill_price=55.0,
+               filled_at="2026-05-24T15:00:00Z"),  # full exit
+    ]
+    out = trades.symbols_in_cooldown(rows, now=_now("2026-05-26T15:00:00Z"), window_days=7)
+    assert out == {"TQQQ": "2026-05-24T15:00:00Z"}
+
+
+def test_cooldown_excludes_exit_older_than_window():
+    rows = [
+        _trade(activity_id="b1", side="buy", qty=10, fill_price=50.0,
+               filled_at="2026-04-01T15:00:00Z"),
+        _trade(activity_id="s1", side="sell", qty=10, fill_price=55.0,
+               filled_at="2026-05-10T15:00:00Z"),  # 16 days before now
+    ]
+    out = trades.symbols_in_cooldown(rows, now=_now("2026-05-26T15:00:00Z"), window_days=7)
+    assert out == {}
+
+
+def test_cooldown_excludes_currently_open_symbol():
+    """A still-open position is a continuing hold, not a re-entry — never in cooldown."""
+    rows = [
+        _trade(activity_id="b1", side="buy", qty=10, fill_price=50.0,
+               filled_at="2026-05-10T15:00:00Z"),
+        _trade(activity_id="s1", side="sell", qty=4, fill_price=55.0,
+               filled_at="2026-05-24T15:00:00Z"),  # partial — 6 remain open
+    ]
+    out = trades.symbols_in_cooldown(rows, now=_now("2026-05-26T15:00:00Z"), window_days=7)
+    assert out == {}
+
+
+def test_cooldown_reopened_symbol_not_flagged():
+    """Closed then reopened within the window: currently open again, so not
+    a cooldown blocker for the position it already holds."""
+    rows = [
+        _trade(activity_id="b1", side="buy", qty=10, fill_price=50.0,
+               filled_at="2026-05-10T15:00:00Z"),
+        _trade(activity_id="s1", side="sell", qty=10, fill_price=55.0,
+               filled_at="2026-05-24T15:00:00Z"),
+        _trade(activity_id="b2", side="buy", qty=8, fill_price=56.0,
+               filled_at="2026-05-25T15:00:00Z"),  # reopened — now open
+    ]
+    out = trades.symbols_in_cooldown(rows, now=_now("2026-05-26T15:00:00Z"), window_days=7)
+    assert out == {}
+
+
+def test_cooldown_robust_to_out_of_order_log():
+    """A sell appended ahead of its earlier buy (out-of-order sync) must
+    still FIFO-match: the symbol is fully exited, so it IS in cooldown.
+    Without the chronological sort the buy would be a phantom open lot and
+    the symbol would be wrongly excluded."""
+    rows = [
+        _trade(activity_id="s1", side="sell", qty=10, fill_price=55.0,
+               filled_at="2026-05-24T15:00:00Z"),   # logged first (out of order)
+        _trade(activity_id="b1", side="buy", qty=10, fill_price=50.0,
+               filled_at="2026-05-10T15:00:00Z"),   # actually earlier
+    ]
+    out = trades.symbols_in_cooldown(rows, now=_now("2026-05-26T15:00:00Z"), window_days=7)
+    assert out == {"TQQQ": "2026-05-24T15:00:00Z"}

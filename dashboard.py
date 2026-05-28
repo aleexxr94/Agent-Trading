@@ -989,8 +989,9 @@ with tabs[0]:
                 "Days held": st.column_config.NumberColumn(
                     "Days held",
                     format="%d",
-                    help="Whole-days since the earliest buy fill for this "
-                         "symbol per state/trades.jsonl.",
+                    help="Whole-days since the earliest currently-open buy "
+                         "lot for this symbol (FIFO over state/trades.jsonl). "
+                         "Resets after a full close and reopen.",
                 ),
                 "Bias":      st.column_config.Column(
                     "Bias",
