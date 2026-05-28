@@ -164,3 +164,75 @@ def test_monitor_skips_position_with_no_mark(tmp_state, monkeypatch):
     monitor.main([])
     # No kills (TQQQ is in profit, SOXL is unmark-able) — and definitely no crash
     assert flat_log == []
+
+
+def _read_shadow() -> list:
+    if not state.MONITOR_SHADOW_LOG.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in state.MONITOR_SHADOW_LOG.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def test_monitor_shadow_records_time_stop_would_fire(tmp_state, monkeypatch):
+    """Phase 0: a past time_stop_utc is reported as a would-fire event that
+    is NOT enforced, and no flatten happens. get_account raising on the fake
+    broker must not break the shadow path."""
+    past = "2000-01-01T00:00:00Z"
+    _write_portfolio([_etf_pos(
+        symbol="TQQQ", shares=4, avg_cost=70.0,
+        kill_conditions={"max_loss_pct": 25, "time_stop_utc": past},
+    )])
+    flat_log: list = []
+    # In profit so the real loss-cap doesn't flatten — isolates the shadow path.
+    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 80.0)], flatten_log=flat_log)
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
+    monitor.main([])
+    assert flat_log == []  # shadow never acts
+    rows = _read_shadow()
+    assert len(rows) == 1
+    wf = rows[0]["would_fire"]
+    assert any(e["rule"] == "time_stop_utc" and e["symbol"] == "TQQQ" for e in wf)
+    assert all(e.get("enforced") is False for e in wf)
+    assert rows[0]["coverage"]["portfolio_positions"] == 1
+    assert rows[0]["coverage"]["broker_positions"] == 1
+
+
+def test_monitor_shadow_flags_orphans_and_missing(tmp_state, monkeypatch):
+    """Phase 0: surface target-vs-broker drift — broker holds a symbol the
+    target doesn't (orphan) and the target names one the broker doesn't (missing)."""
+    _write_portfolio([_etf_pos(symbol="SOXL", shares=10, avg_cost=25.0)])
+    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 80.0)])
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
+    monitor.main([])
+    cov = _read_shadow()[-1]["coverage"]
+    assert cov["orphans"] == ["TQQQ"]
+    assert cov["missing"] == ["SOXL"]
+    assert cov["unmarked"] == 1  # SOXL has no broker mark
+
+
+def test_monitor_shadow_price_stop_uses_mark_fallback(tmp_state):
+    """Codex P2: the ETF price-stop shadow must use the mark (which falls back
+    to market_value/qty) as the spot, so a broker position lacking
+    current_price still produces a would-fire event."""
+    portfolio = {"positions": [{
+        "kind": "etf", "symbol": "TQQQ", "shares": 4, "avg_cost": 52.0,
+        "kill_conditions": {"max_loss_pct": 25, "underlying_price_below": 60.0},
+        "position_pct": 11.2,
+    }]}
+    report = monitor.shadow_report(portfolio=portfolio, broker=None, marks={"TQQQ": 50.0})
+    wf = report["would_fire"]
+    assert any(e["rule"] == "underlying_price_below" and e["symbol"] == "TQQQ" for e in wf)
+
+
+def test_monitor_shadow_dd_flags_total_wipeout(tmp_state):
+    """Codex P2: a latest NAV of 0.0 is a 100% drawdown the breaker shadow must
+    flag, not skip via a truthiness check."""
+    state.append_nav({"run_id": "r1", "at": state.utcnow_iso(), "nav_usd": 2500.0})
+    state.append_nav({"run_id": "r2", "at": state.utcnow_iso(), "nav_usd": 0.0})
+    report = monitor.shadow_report(portfolio={"positions": []}, broker=None, marks={})
+    dd = report["daily_dd_shadow"]
+    assert dd["would_halt_new_orders"] is True
+    assert dd["dd_pct"] == 100.0

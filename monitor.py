@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -97,6 +98,127 @@ def execute_actions(actions: list[dict], *, broker: Broker | None) -> None:
         # halt_new_orders is observed by the orchestrator at next start
 
 
+def _parse_iso_utc(s: str | None) -> datetime | None:
+    """Tolerant ISO-8601 → aware-UTC parse. Returns None on anything unparseable."""
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def shadow_report(*, portfolio: dict, broker: Broker | None, marks: dict[str, float]) -> dict:
+    """Phase 0 shadow telemetry — PURELY OBSERVATIONAL.
+
+    Computes what the currently-inert controls (per-position price stops,
+    time stops, and the 8% daily-DD breaker) WOULD do this cycle, plus
+    monitor coverage vs broker truth (orphaned / unmarked / missing
+    positions). Takes NO action: never flattens, never gates orders, never
+    writes a halt flag. The real kill path in ``evaluate_portfolio`` is
+    untouched. Returns a dict the caller appends to state/monitor_shadow.jsonl.
+    """
+    now = state.utcnow()
+    positions = portfolio.get("positions") or []
+
+    broker_positions: list = []
+    if broker is not None:
+        try:
+            broker_positions = broker.get_positions()
+        except Exception:
+            broker_positions = []
+    broker_syms = {p.symbol for p in broker_positions}
+
+    # Expected broker symbols implied by the target portfolio, so we can
+    # surface target-vs-broker drift (finding 5).
+    expected: set[str] = set()
+    for pos in positions:
+        if pos.get("kind") == "option":
+            try:
+                from lib.orders import osi_symbol
+                expected.add(osi_symbol(
+                    underlying=pos["underlying"], expiry=pos["expiry"],
+                    type=pos["type"], strike=pos["strike"],
+                ))
+            except Exception:
+                pass
+        elif pos.get("symbol"):
+            expected.add(pos["symbol"])
+
+    would_fire: list[dict] = []
+    unmarked: list[dict] = []
+    for pos in positions:
+        is_option = pos.get("kind") == "option"
+        symbol = pos.get("underlying") if is_option else pos.get("symbol")
+        mark_key = symbol if not is_option else (
+            f"{symbol}|{pos.get('strike')}|{pos.get('expiry')}|{pos.get('type')}"
+        )
+        if marks.get(mark_key) is None:
+            unmarked.append({"symbol": symbol, "kind": pos.get("kind"), "mark_key": mark_key})
+
+        kc = pos.get("kill_conditions") or {}
+        ts = _parse_iso_utc(kc.get("time_stop_utc"))
+        if ts is not None and now >= ts:
+            would_fire.append({
+                "symbol": symbol, "kind": pos.get("kind"), "rule": "time_stop_utc",
+                "detail": f"time_stop {kc.get('time_stop_utc')} passed", "enforced": False,
+            })
+        below, above = kc.get("underlying_price_below"), kc.get("underlying_price_above")
+        # For an ETF the mark IS the per-share spot (marks prefers the broker's
+        # current_price, falling back to market_value/qty), so use it directly —
+        # a missing current_price field must not drop the price-stop shadow.
+        spot = marks.get(mark_key) if not is_option else None
+        if spot is not None:
+            if below is not None and spot <= below:
+                would_fire.append({"symbol": symbol, "kind": "etf", "rule": "underlying_price_below",
+                                   "detail": f"spot {spot} <= {below}", "enforced": False})
+            if above is not None and spot >= above:
+                would_fire.append({"symbol": symbol, "kind": "etf", "rule": "underlying_price_above",
+                                   "detail": f"spot {spot} >= {above}", "enforced": False})
+
+    # Daily-DD shadow at nav_history (cycle) granularity, same units on both
+    # sides to avoid the broker($100k)-vs-synthetic($2.5k) mismatch. A live
+    # intra-day version lands in Phase 2/3.
+    rows = state.read_nav_history(limit=1000)
+    today = now.date().isoformat()
+    todays = [r for r in rows if str(r.get("at") or "").startswith(today)]
+    sod_nav = todays[0].get("nav_usd") if todays else None
+    ref_nav = rows[-1].get("nav_usd") if rows else None
+    dd_pct: float | None = None
+    dd_would_halt = False
+    # ``is not None`` (not truthiness): a total wipeout where ref_nav == 0.0 is
+    # a 100% drawdown the breaker should flag, not a row to skip (Codex P2).
+    if sod_nav is not None and ref_nav is not None and float(sod_nav) > 0:
+        dd_would_halt, dd_pct = risk.daily_circuit_breaker_tripped(
+            sod_nav_usd=float(sod_nav), current_nav_usd=float(ref_nav),
+        )
+
+    return {
+        "at": state.utcnow_iso(),
+        "coverage": {
+            "portfolio_positions": len(positions),
+            "broker_positions": len(broker_positions),
+            "unmarked": len(unmarked),
+            "unmarked_detail": unmarked,
+            "orphans": sorted(broker_syms - expected),
+            "missing": sorted(expected - broker_syms),
+        },
+        "would_fire": would_fire,
+        "daily_dd_shadow": {
+            "sod_nav_usd": sod_nav,
+            "ref_nav_usd": ref_nav,
+            "dd_pct": round(dd_pct, 2) if dd_pct is not None else None,
+            "would_halt_new_orders": dd_would_halt,
+            "note": "nav_history proxy at cycle granularity; live intra-day version is Phase 2/3",
+        },
+        "note": (
+            "PHASE 0 SHADOW TELEMETRY — observational only; no action taken, "
+            "no orders gated, nothing flattened"
+        ),
+    }
+
+
 def _try_load_broker() -> Broker | None:
     """Best-effort AlpacaBroker construction. Returns None if creds are
     missing or the SDK isn't installed — monitor still runs (just can't
@@ -132,6 +254,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not args.dry_run:
         execute_actions(actions, broker=broker)
+    # Phase 0 shadow telemetry — runs AFTER real risk actions so its extra
+    # broker round-trip can never delay a loss-cap flatten (Codex P1). Fully
+    # guarded so an observability bug can never take down the real kill loop.
+    try:
+        report = shadow_report(portfolio=portfolio, broker=broker, marks=marks)
+        state.append_monitor_shadow(report)
+        cov, wf = report["coverage"], report["would_fire"]
+        tags = ",".join(f"{e['symbol']}:{e['rule']}" for e in wf) or "none"
+        print(
+            f"monitor-shadow: tracked={cov['portfolio_positions']} "
+            f"held={cov['broker_positions']} unmarked={cov['unmarked']} "
+            f"orphans={len(cov['orphans'])} missing={len(cov['missing'])}; "
+            f"would_fire={len(wf)} [{tags}]"
+        )
+    except Exception as e:
+        print(f"monitor-shadow: telemetry error ({type(e).__name__}: {e}); ignored")
     return 0
 
 
