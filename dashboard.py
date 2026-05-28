@@ -508,14 +508,52 @@ st.markdown(
 # beside it shows the per-trade contributions that built it.
 _synth_realized = dd.compute_synthetic_balance(marks={})
 _realized_balance = _synth_realized.synthetic_balance_usd
-_chips = dd.closed_trade_chips(marks=broker_marks or {}, limit=12)
-_chips_html = "".join(
+
+_recent_chips = dd.closed_trade_chips(marks=broker_marks or {}, limit=6)
+_recent_chips_html = "".join(
     f'<span class="at-chip {"pos" if c["net_pnl_usd"] >= 0 else "neg"}">'
     f'{html.escape(c["symbol"])} '
     f'<strong>{"+" if c["net_pnl_usd"] >= 0 else ""}${c["net_pnl_usd"]:,.2f}</strong>'
     f'</span>'
-    for c in _chips
+    for c in _recent_chips
 ) or '<span style="color: var(--text-2); font-size: 0.9rem;">No closed trades yet — chips appear here as positions close.</span>'
+
+_agg_chips = dd.closed_trade_chips_by_ticker(marks=broker_marks or {}, limit=12)
+
+def _agg_chip_html(c: dict) -> str:
+    tone = "pos" if c["net_pnl_usd"] >= 0 else "neg"
+    count_suffix = f" ×{c['trade_count']}" if c["trade_count"] > 1 else ""
+    sign = "+" if c["net_pnl_usd"] >= 0 else ""
+    return (
+        f'<span class="at-chip {tone}">'
+        f'{html.escape(c["symbol"])}{count_suffix} '
+        f'<strong>{sign}${c["net_pnl_usd"]:,.2f}</strong>'
+        f'</span>'
+    )
+
+_agg_chips_html = "".join(_agg_chip_html(c) for c in _agg_chips)
+
+_strip_label_style = (
+    "font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; "
+    "font-weight: 600; color: var(--text-2); margin-bottom: 0.25rem;"
+)
+_recent_block = (
+    f'<div>'
+    f'<div style="{_strip_label_style}">Recent closes</div>'
+    f'<div style="display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center;">'
+    f'{_recent_chips_html}'
+    f'</div>'
+    f'</div>'
+)
+_agg_block = (
+    f'<div>'
+    f'<div style="{_strip_label_style}">By ticker (all-time)</div>'
+    f'<div style="display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center;">'
+    f'{_agg_chips_html}'
+    f'</div>'
+    f'</div>'
+) if _agg_chips else ""
+
 _realized_tone = (
     "pos" if _realized_balance > _synth_realized.starting_balance_usd
     else "neg" if _realized_balance < _synth_realized.starting_balance_usd
@@ -532,8 +570,9 @@ st.markdown(
             Frozen at last close. Live mark P&L is in the hero above.
           </div>
         </div>
-        <div style="flex: 1; min-width: 280px; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center;">
-          {_chips_html}
+        <div style="flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 0.6rem;">
+          {_recent_block}
+          {_agg_block}
         </div>
       </div>
     </div>

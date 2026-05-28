@@ -600,6 +600,47 @@ def closed_trade_chips(
     return out
 
 
+def closed_trade_chips_by_ticker(
+    *,
+    marks: dict[str, float] | None = None,
+    limit: int = 12,
+) -> list[dict]:
+    """All-time closed-trade contribution per ticker, shaped for the
+    aggregate chip strip beneath the recent-closes strip.
+
+    Sums ``net_pnl_usd`` across every FIFO-matched round-trip for each
+    symbol so a ticker traded N times appears once with the full
+    realised contribution and a ``trade_count`` of N. Sorted by
+    absolute net P&L descending (biggest contributors first, positive
+    or negative); tiebreak on most-recent close.
+    """
+    view = trades_pnl_view(marks=marks)
+    closed_sorted = sorted(
+        view["closed"], key=lambda r: r.get("closed_at") or "",
+    )
+    by_symbol: dict[str, dict] = {}
+    for r in closed_sorted:
+        sym = r["symbol"]
+        bucket = by_symbol.setdefault(sym, {
+            "symbol": sym,
+            "kind": r.get("kind", "etf"),
+            "net_pnl_usd": 0.0,
+            "trade_count": 0,
+            "last_closed_at": "",
+        })
+        bucket["net_pnl_usd"] += r["net_pnl_usd"]
+        bucket["trade_count"] += 1
+        # closed_sorted is oldest-first, so the last assignment wins.
+        bucket["kind"] = r.get("kind", bucket["kind"])
+        bucket["last_closed_at"] = r.get("closed_at") or bucket["last_closed_at"]
+    rows = sorted(
+        by_symbol.values(),
+        key=lambda b: (abs(b["net_pnl_usd"]), b["last_closed_at"]),
+        reverse=True,
+    )
+    return rows[:limit]
+
+
 def cumulative_llm_cost_by_at() -> list[tuple[str, float]]:
     """Sorted (at_iso, cumulative_cost_usd) pairs across costs.jsonl,
     cost-reset-aware.

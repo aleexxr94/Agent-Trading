@@ -1229,6 +1229,70 @@ def test_closed_trade_chips_respects_limit(tmp_state):
     assert len(chips) == 3
 
 
+def test_closed_trade_chips_by_ticker_empty_when_no_closes(tmp_state):
+    assert dd.closed_trade_chips_by_ticker() == []
+
+
+def test_closed_trade_chips_by_ticker_aggregates_same_symbol(tmp_state):
+    """Two round-trips on the same symbol collapse into one chip with
+    ``trade_count=2`` and the summed net P&L — the whole point of the
+    aggregate strip vs the per-trade recent strip."""
+    for i, (buy_p, sell_p) in enumerate([(80.0, 82.0), (90.0, 93.0)]):
+        state.append_trade({
+            "activity_id": f"b{i}", "alpaca_order_id": f"ob{i}",
+            "symbol": "UPRO", "kind": "etf", "side": "buy",
+            "qty": 1, "fill_price": buy_p, "fees_usd": 0.0,
+            "filled_at": f"2026-05-{10+i:02d}T13:00:00Z", "run_id": None,
+        })
+        state.append_trade({
+            "activity_id": f"s{i}", "alpaca_order_id": f"os{i}",
+            "symbol": "UPRO", "kind": "etf", "side": "sell",
+            "qty": 1, "fill_price": sell_p, "fees_usd": 0.0,
+            "filled_at": f"2026-05-{10+i:02d}T14:00:00Z", "run_id": None,
+        })
+    chips = dd.closed_trade_chips_by_ticker()
+    assert len(chips) == 1
+    assert chips[0]["symbol"] == "UPRO"
+    assert chips[0]["trade_count"] == 2
+    # +$2 + +$3 = +$5 across both round-trips (no fees in fixture).
+    assert chips[0]["net_pnl_usd"] == pytest.approx(5.0)
+
+
+def test_closed_trade_chips_by_ticker_orders_by_abs_pnl(tmp_state):
+    """Aggregate strip leads with the biggest absolute contributor,
+    positive or negative — so a -$5 ticker outranks a +$2 ticker."""
+    # Symbol A: one round-trip losing $5.
+    state.append_trade({
+        "activity_id": "ab", "alpaca_order_id": "oab",
+        "symbol": "SQQQ", "kind": "etf", "side": "buy",
+        "qty": 1, "fill_price": 20.0, "fees_usd": 0.0,
+        "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    state.append_trade({
+        "activity_id": "as", "alpaca_order_id": "oas",
+        "symbol": "SQQQ", "kind": "etf", "side": "sell",
+        "qty": 1, "fill_price": 15.0, "fees_usd": 0.0,
+        "filled_at": "2026-05-11T13:00:00Z", "run_id": None,
+    })
+    # Symbol B: one round-trip winning $2.
+    state.append_trade({
+        "activity_id": "bb", "alpaca_order_id": "obb",
+        "symbol": "TQQQ", "kind": "etf", "side": "buy",
+        "qty": 1, "fill_price": 80.0, "fees_usd": 0.0,
+        "filled_at": "2026-05-10T13:00:00Z", "run_id": None,
+    })
+    state.append_trade({
+        "activity_id": "bs", "alpaca_order_id": "obs",
+        "symbol": "TQQQ", "kind": "etf", "side": "sell",
+        "qty": 1, "fill_price": 82.0, "fees_usd": 0.0,
+        "filled_at": "2026-05-11T13:00:00Z", "run_id": None,
+    })
+    chips = dd.closed_trade_chips_by_ticker()
+    assert [c["symbol"] for c in chips] == ["SQQQ", "TQQQ"]
+    assert chips[0]["net_pnl_usd"] == pytest.approx(-5.0)
+    assert chips[1]["net_pnl_usd"] == pytest.approx(2.0)
+
+
 def test_fees_column_populates_modelled_round_trip_cost(tmp_state):
     """The Fees column surfaces the modelled round-trip broker cost
     from compute_position_pnl — same definition as the Performance
