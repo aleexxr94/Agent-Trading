@@ -89,6 +89,20 @@ def test_account_nav_tracks_realized_pnl(tmp_state, monkeypatch):
     assert orchestrator._account_nav(_ctx(None)) == 2540.0
 
 
+def test_account_nav_uses_raw_llm_cost_ignoring_display_reset(tmp_state, monkeypatch):
+    """Codex P2 (#98): sizing NAV must use the RAW cost audit log, so clicking
+    'Reset all LLM costs' (a display-only marker) does not inflate the capital
+    the agent sizes against."""
+    monkeypatch.setenv("VIRTUAL_NAV_USD", "2500")
+    state.append_cost({
+        "run_id": "r", "stage": "construct", "model": "m",
+        "cost_usd": 50.0, "at": state.utcnow_iso(),
+    })
+    assert orchestrator._account_nav(_ctx(None)) == 2450.0  # 2500 − 50 raw cost
+    state.set_all_time_cost_reset()  # hide costs in the dashboard display
+    assert orchestrator._account_nav(_ctx(None)) == 2450.0  # unchanged — raw, not display
+
+
 def test_parsed_virtual_nav_override_returns_none_when_unset(monkeypatch):
     monkeypatch.delenv("VIRTUAL_NAV_USD", raising=False)
     assert orchestrator._parsed_virtual_nav_override() is None

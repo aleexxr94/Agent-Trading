@@ -456,12 +456,14 @@ def _broker_portfolio_summary_for_meta(ctx: StageContext) -> dict:
     """
     positions = _current_positions_summary(ctx)
     nav = _account_nav(ctx)
-    cash_usd = 0.0
-    if ctx.broker is not None and not ctx.dry_run:
-        try:
-            cash_usd = ctx.broker.get_account().cash_usd
-        except Exception:
-            cash_usd = 0.0
+    # Cash buffer in SYNTHETIC units, not raw broker cash (Codex P2 on PR #98):
+    # the agent sizes against synthetic NAV (~$2.5k), so positions hold ~real
+    # small dollars while broker cash is ~$100k — dividing raw broker cash by
+    # synthetic NAV produced nonsensical thousands-of-percent buffers. Derive
+    # cash as the synthetic NAV not currently deployed into open positions
+    # (their market_value is on the same small-dollar scale as the sizing).
+    invested = sum(abs(float(p.get("market_value") or 0.0)) for p in positions)
+    cash_usd = max(0.0, nav - invested)
     cash_pct = (cash_usd / nav * 100.0) if nav > 0 else 100.0
     return {
         "positions": positions,

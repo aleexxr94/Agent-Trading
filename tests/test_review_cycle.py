@@ -418,8 +418,9 @@ def test_review_meta_sees_real_broker_holdings(tmp_state, monkeypatch):
     # Phase 3: NAV is the synthetic balance ($2,500 baseline + realized P&L),
     # not broker equity ($2,800). With no trades logged it equals the baseline.
     assert captured_portfolio.get("nav_usd") == 2500.0
-    # cash_buffer_pct = broker cash 700 / synthetic NAV 2500 * 100 = 28.0
-    assert captured_portfolio.get("cash_buffer_pct") == pytest.approx(28.0)
+    # Cash buffer is synthetic: NAV 2500 minus deployed position market_value
+    # 360 = 2140 → 85.6% (NOT raw broker cash / synthetic NAV). Codex P2 #98.
+    assert captured_portfolio.get("cash_buffer_pct") == pytest.approx(85.6)
 
 
 def test_ignore_cap_without_cli_intent_does_not_bypass(tmp_state, monkeypatch):

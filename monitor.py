@@ -116,7 +116,7 @@ def evaluate_portfolio(
         is_option = pos["kind"] == "option"
         symbol = pos.get("underlying") if is_option else pos["symbol"]
         mark_key = (
-            f"{symbol}|{pos.get('strike')}|{pos.get('expiry')}|{pos.get('type')}"
+            marks_lib.option_synthetic_key(symbol, pos.get("strike"), pos.get("expiry"), pos.get("type"))
             if is_option else symbol
         )
         mult = 100 if is_option else 1
@@ -247,7 +247,7 @@ def audit_report(
         is_option = pos.get("kind") == "option"
         symbol = pos.get("underlying") if is_option else pos.get("symbol")
         mark_key = (
-            f"{symbol}|{pos.get('strike')}|{pos.get('expiry')}|{pos.get('type')}"
+            marks_lib.option_synthetic_key(symbol, pos.get("strike"), pos.get("expiry"), pos.get("type"))
             if is_option else symbol
         )
         if marks.get(mark_key) is None:
