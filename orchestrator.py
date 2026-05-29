@@ -365,6 +365,7 @@ def stage_construct(
     current_positions: list[dict] | None = None,
     pnl_history: list[dict] | None = None,
     adaptive_cap_pct: float = 15.0,
+    hold_ceiling_pct: float = 25.0,
     cooldown_symbols: dict | None = None,
 ) -> dict:
     """One LLM call — Opus 4.7, ~$0.20. Reads signals + view + current
@@ -385,8 +386,13 @@ def stage_construct(
         f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
         f"Recent PnL history (last cycles): {json.dumps(pnl_history, sort_keys=True)}\n"
         f"NAV (USD): {nav:.2f}\n"
-        f"Adaptive per-position cap %: {adaptive_cap_pct:.2f} "
-        f"(reduced from 15.0% when NAV is in drawdown)\n"
+        f"Entry/add cap %: {adaptive_cap_pct:.2f} (max weight to OPEN or ADD to "
+        f"a position; reduced from 15.0% when NAV is in drawdown)\n"
+        f"Hold ceiling %: {hold_ceiling_pct:.2f} (an already-open position that "
+        f"has appreciated may be KEPT up to this; reduced from 25.0% in "
+        f"drawdown). Do NOT trim a winner back to the entry cap just because it "
+        f"drifted above it — only trim weight above the hold ceiling. Never open "
+        f"or add a position above the entry cap.\n"
         f"{_cooldown_prompt_line(cooldown_symbols)}"
         f"Run id: {ctx.run_id}\n"
         "Return JSON conforming to portfolio.schema.json. All positions are "
@@ -1455,12 +1461,17 @@ def run_pipeline(
         model=strat_model,
     )
 
-    # Adaptive position-pct cap from current drawdown — feeds the
-    # constructor prompt as a soft ceiling. Real enforcement is in
-    # sanity (rule: position_within_adaptive_cap).
+    # Two-tier per-position bounds from current drawdown, fed to the
+    # constructor as soft guidance. Real enforcement is in sanity:
+    #   entry/add cap  → rule: entry_cap_on_adds
+    #   hold ceiling   → rule: position_within_adaptive_cap
+    _nav_now = _account_nav(ctx)
+    _peak_now = _peak_nav_30d()
     adaptive_cap = risk.adaptive_position_cap_pct(
-        current_nav=_account_nav(ctx),
-        peak_nav_30d=_peak_nav_30d(),
+        current_nav=_nav_now, peak_nav_30d=_peak_now,
+    )
+    hold_ceiling = risk.adaptive_hold_ceiling_pct(
+        current_nav=_nav_now, peak_nav_30d=_peak_now,
     )
 
     # ----- Stage 3: construct (1 LLM call) -----
@@ -1475,6 +1486,7 @@ def run_pipeline(
             current_positions=current_positions,
             pnl_history=pnl_history,
             adaptive_cap_pct=adaptive_cap,
+            hold_ceiling_pct=hold_ceiling,
             cooldown_symbols=cooldown_symbols,
         ),
         inputs_hash_parts=(
@@ -1512,7 +1524,9 @@ def run_pipeline(
                 f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
                 f"Recent PnL history: {json.dumps(pnl_history, sort_keys=True)}\n"
                 f"NAV (USD): {_account_nav(ctx):.2f}\n"
-                f"Adaptive per-position cap %: {adaptive_cap:.2f}\n"
+                f"Entry/add cap %: {adaptive_cap:.2f} (open/add limit); "
+                f"hold ceiling %: {hold_ceiling:.2f} (a drifted winner may be "
+                f"kept up to this; don't trim back to the entry cap)\n"
                 f"{_cooldown_prompt_line(cooldown_symbols)}"
                 f"Run id: {ctx.run_id}\n"
                 f"Critic rejected your first attempt: {critique.get('critique')}. "
@@ -1553,7 +1567,9 @@ def run_pipeline(
         signals=signals_out,
         nav_usd=_account_nav(ctx),
         adaptive_cap_pct=adaptive_cap,
+        hold_ceiling_pct=hold_ceiling,
         cooldown_symbols=cooldown_symbols,
+        current_positions=current_positions,
     )
     sanity_report["run_id"] = rid
     sanity_report["generated_at"] = state.utcnow_iso()

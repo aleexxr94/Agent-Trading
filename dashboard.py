@@ -965,8 +965,9 @@ with tabs[0]:
                     "% NAV",
                     format="%.1f%%",
                     help="Position notional as a share of total NAV. "
-                         "Entry cap is 15%; cap drops to 7.5% in ≥10% "
-                         "drawdown. Drift past the cap after entry is OK.",
+                         "Entry/add cap is 15% (→7.5% in ≥10% drawdown); an "
+                         "already-open winner may drift up to the 25% hold "
+                         "ceiling (→12.5% in drawdown) before a forced trim.",
                 ),
                 "Days held": st.column_config.NumberColumn(
                     "Days held",

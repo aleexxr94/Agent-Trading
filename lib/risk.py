@@ -37,7 +37,14 @@ def parse_iso_utc(s: str | None) -> datetime | None:
 
 
 # Hard, repo-wide constants — do not parameterise without a CLAUDE.md change.
-MAX_POSITION_PCT = 15.0
+# MAX_POSITION_PCT is the cap on OPENING or ADDING to a position (the "entry
+# cap"). An already-open position that drifts above this via appreciation is
+# NOT force-trimmed back to it — it may ride up to the HOLD_CEILING_BASE_PCT
+# (see adaptive_hold_ceiling_pct). The two-tier split exists because a flat
+# 15% schema cap was force-trimming intact winners back to entry weight every
+# cycle (see CLAUDE.md §System scope, 2026-05-29 note).
+MAX_POSITION_PCT = 15.0           # entry/add cap
+HOLD_CEILING_BASE_PCT = 25.0      # at-peak ceiling an OPEN position may drift to
 MAX_POSITION_LOSS_PCT = 25.0
 DAILY_DD_HALT_PCT = 8.0
 TARGET_POSITION_BAND = (1, 12)
@@ -197,3 +204,23 @@ def adaptive_position_cap_pct(*, current_nav: float, peak_nav_30d: float) -> flo
     # Linear interpolation between (0%, BASE) and (TRIGGER, FLOOR).
     fraction = drawdown_frac / ADAPTIVE_DRAWDOWN_TRIGGER
     return ADAPTIVE_CAP_BASE_PCT - fraction * (ADAPTIVE_CAP_BASE_PCT - ADAPTIVE_CAP_FLOOR_PCT)
+
+
+def adaptive_hold_ceiling_pct(*, current_nav: float, peak_nav_30d: float) -> float:
+    """Per-position % ceiling an ALREADY-OPEN position may drift up to.
+
+    Distinct from ``adaptive_position_cap_pct`` (the entry/add cap): a winner
+    that appreciates past the entry cap is allowed to ride up to this ceiling
+    before any forced trim. Rides the SAME drawdown curve as the entry cap —
+    so it tightens with drawdown too — just anchored higher:
+
+      Returns 25.0 when current NAV ≥ peak NAV.
+      Returns 12.5 when current NAV is ≥10% below peak.
+      Linear between those endpoints (e.g. 18.75 at 5% drawdown).
+
+    Implemented by scaling the entry cap by the fixed ratio of the two base
+    anchors, so the two ceilings can never drift apart or invert.
+    """
+    return adaptive_position_cap_pct(
+        current_nav=current_nav, peak_nav_30d=peak_nav_30d
+    ) * (HOLD_CEILING_BASE_PCT / ADAPTIVE_CAP_BASE_PCT)

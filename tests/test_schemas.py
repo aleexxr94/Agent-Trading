@@ -98,10 +98,17 @@ def test_position_kind_rejects_option(registry):
             _validator("position.schema.json", registry).validate(bad)
 
 
-def test_position_pct_cap_15(registry):
-    bad = _etf_position(position_pct=15.01)
+def test_position_pct_cap_25(registry):
+    """Schema bounds position_pct at the 25% hold ceiling. The 15% entry/add
+    cap is enforced at the sanity layer (entry_cap_on_adds), not the schema —
+    so a held winner that drifted to 18–25% is a valid position object."""
+    # Above the hold ceiling → rejected.
+    bad = _etf_position(position_pct=25.01)
     with pytest.raises(Exception):
         _validator("position.schema.json", registry).validate(bad)
+    # At/under the hold ceiling → valid (drifted winner representable).
+    _validator("position.schema.json", registry).validate(_etf_position(position_pct=25.0))
+    _validator("position.schema.json", registry).validate(_etf_position(position_pct=18.0))
 
 
 def test_etf_rejects_option_only_field(registry):

@@ -95,8 +95,9 @@ def test_dry_run_writes_sanity_json_with_known_status(tmp_state):
     # Rule list mirrors lib/sanity.RULES — pin the count. The two
     # option-specific rules (straddle_requires_low_iv, option_premium_above_floor)
     # were removed with options; the ETF safety hardening added
-    # symbol_in_universe, bringing the total to 10.
-    assert len(sanity_doc["rules"]) == 10
+    # symbol_in_universe (→10), and the entry-cap/hold-ceiling split added
+    # entry_cap_on_adds, bringing the total to 11.
+    assert len(sanity_doc["rules"]) == 11
 
 
 def test_sanity_pass_path_writes_summary_into_next_run(tmp_state, monkeypatch):
