@@ -21,7 +21,7 @@
     "cost_usd": {"type": "number", "minimum": 0},
     "started_at": {"type": "string", "format": "date-time"},
     "ended_at": {"type": "string", "format": "date-time"},
-    "status": {"enum": ["ok", "schema_retry", "aborted", "skipped", "skipped_market_closed", "skipped_review_cap"]},
+    "status": {"enum": ["ok", "schema_retry", "aborted", "skipped", "skipped_market_closed", "skipped_clock_error", "skipped_review_cap"]},
     "risk_warning": {"type": "string", "minLength": 1,
                       "description": "Mandatory warning string injected by lib/llm.py per spec."},
     "cycle_intent": {"enum": ["trade", "review"],

@@ -43,14 +43,16 @@ except ImportError:
     pass
 from typing import Callable
 
-from lib import llm, market_gate, risk, sanity, signals, stages, state, trades
+from lib import live_gate, llm, market_gate, risk, sanity, signals, stages, state, trades
 from lib.broker import Broker
 
 ROOT = Path(__file__).resolve().parent
 FIXTURE_DIR = ROOT / "tests" / "fixtures"
 
-# Hard-coded gate per spec §Critical preconditions #1.
-LIVE_VERSION = 0  # bump only when promoted; combined with LIVE_TRADING_ENABLED env var
+# Hard-coded gate per spec §Critical preconditions #1. The canonical constant
+# now lives in lib/live_gate.py (single source of truth shared with monitor.py);
+# re-exported here so existing references keep working.
+LIVE_VERSION = live_gate.LIVE_VERSION  # bump in lib/live_gate.py when promoted
 
 RISK_WARNING = (
     "PAPER TRADING. Leveraged & inverse ETFs decay path-dependently and are "
@@ -801,6 +803,41 @@ def _default_next_run_at(portfolio: dict) -> str:
     return (state.utcnow() + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _publishable_portfolio(portfolio: dict) -> dict:
+    """Return a copy of ``portfolio`` with any position the order layer would
+    refuse (option-shaped or non-universe) stripped out.
+
+    current_portfolio.json must never record a symbol that can't actually be
+    held: the order layer drops such targets into ``skipped`` and submits no
+    order, so publishing them would make the monitor treat them as holdings
+    (leaving real holdings as orphans, dropping their kill conditions) and let
+    a later dedup-skip reuse an invalid/unfilled portfolio. Strip them and
+    recompute ``all_cash`` when nothing tradable remains. Returns the original
+    object unchanged when every position is tradable (the common case).
+    """
+    from lib import orders
+    positions = portfolio.get("positions") or []
+    kept = [p for p in positions if orders.is_tradable_target(p)]
+    if len(kept) == len(positions):
+        return portfolio
+    cleaned = dict(portfolio)
+    cleaned["positions"] = kept
+    # The stripped positions were never submitted, so their intended allocation
+    # reverts to cash (NAV is unchanged — it's total account value). Add the
+    # freed notional back so cash_usd / cash_buffer_pct match what was actually
+    # held, keeping the published portfolio, NAV row, and dedup cache honest.
+    nav = float(portfolio.get("nav_usd") or 0.0)
+    dropped = [p for p in positions if not orders.is_tradable_target(p)]
+    freed = sum(float(p.get("position_pct") or 0.0) / 100.0 * nav for p in dropped)
+    if freed:
+        cleaned["cash_usd"] = float(portfolio.get("cash_usd") or 0.0) + freed
+        if nav > 0:
+            cleaned["cash_buffer_pct"] = round(cleaned["cash_usd"] / nav * 100.0, 4)
+    if not kept:
+        cleaned["all_cash"] = True
+    return cleaned
+
+
 # Orchestrator-meta returns a next-run timestamp; bounds enforced here.
 META_MIN_HOURS = 1.0
 META_MAX_HOURS = 24.0
@@ -941,11 +978,43 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
         and not ctx.dry_run
         and orders.is_enabled()
     ):
+        positions_ok = True
+        current: list = []
         try:
             current = ctx.broker.get_positions()
         except Exception as e:
+            # Fail closed: if we can't read current broker holdings we cannot
+            # safely diff against the target — planning opens against an
+            # assumed-empty account would double up exposure on top of
+            # whatever is actually held. Skip planning/submission entirely
+            # this cycle; still write an (empty) orders.json + next_run + NAV
+            # below so the next cycle is scheduled and the operator can see
+            # the skip. No orders are submitted, so no trades_sync is needed.
+            positions_ok = False
             next_run["order_plan_error"] = f"get_positions: {type(e).__name__}: {e}"
-            current = []
+            next_run["orders_skipped_reason"] = "get_positions failed — failing closed"
+            # Signal to run_pipeline that the target was NOT reconciled against
+            # the broker account. The caller must NOT publish this unexecuted
+            # target as current_portfolio.json nor advance the dedup hash —
+            # doing so would make monitor/dashboard/dedup treat unfilled targets
+            # as held positions and real prior holdings as orphans (dropping
+            # their configured kill conditions). Preserve the prior state.
+            next_run["current_portfolio_unreconciled"] = True
+            state.write_json(
+                state.run_dir(ctx.run_id) / "orders.json",
+                {
+                    "run_id": ctx.run_id,
+                    "submitted_at": state.utcnow_iso(),
+                    "order_ids": [],
+                },
+            )
+
+    if (
+        ctx.broker is not None
+        and not ctx.dry_run
+        and orders.is_enabled()
+        and positions_ok
+    ):
         plan = orders.diff_portfolio(portfolio, current)
         # Phase 2: when the 8% daily-drawdown breaker is active, allow
         # de-risking (full closes AND same-sign reductions — both are SELLs on
@@ -1011,30 +1080,43 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
             )
     if not ctx.dry_run:
         state.write_json(state.NEXT_RUN, next_run)
-        # NAV history: one row per cycle for the dashboard equity curve.
-        # Phase 3: nav_usd is stamped DETERMINISTICALLY from the synthetic
-        # balance (trades.jsonl-derived realized P&L over the $2,500 baseline),
-        # NOT the constructor's self-reported portfolio.nav_usd. trades_sync
-        # ran just above, so this reflects ACTUAL fills — even if some orders
-        # were skipped/failed this cycle, the row is honest (only filled trades
-        # count). This is the same number _account_nav sizes against and the
-        # dashboard shows. nav_source is always "virtual" now (synthetic units,
-        # never raw broker equity), so the dashboard applies no broker offset.
+    # NAV history: one row per cycle for the dashboard equity curve.
+    # Phase 3: nav_usd is stamped DETERMINISTICALLY from the synthetic
+    # balance (trades.jsonl-derived realized P&L over the $2,500 baseline),
+    # NOT the constructor's self-reported portfolio.nav_usd. trades_sync
+    # ran just above, so this reflects ACTUAL fills — even if some orders
+    # were skipped/failed this cycle, the row is honest (only filled trades
+    # count). This is the same number _account_nav sizes against and the
+    # dashboard shows. nav_source is always "virtual" now (synthetic units,
+    # never raw broker equity), so the dashboard applies no broker offset.
+    #
+    # Skip the row entirely when the cycle is unreconciled (broker positions
+    # couldn't be read, so the target was never executed): the positions_count
+    # / cash_usd / modelled PnL fields are derived from the unexecuted target
+    # and would otherwise record it as if held, corrupting the equity curve and
+    # the strategist's PnL feedback. A missing row during an outage is honest.
+    if not ctx.dry_run and not next_run.get("current_portfolio_unreconciled"):
         from lib import dashboard_data as _dd
         from lib import pnl as pnl_lib
-        breakdown = pnl_lib.compute_portfolio_pnl(portfolio=portfolio, marks=None)
+        # Base the row on the publishable subset — positions the order layer
+        # refused (option-shaped / non-universe) were never submitted or held,
+        # so their positions_count / cash / modelled PnL must not be recorded
+        # as if held (matches what _publishable_portfolio writes to
+        # current_portfolio.json).
+        nav_portfolio = _publishable_portfolio(portfolio)
+        breakdown = pnl_lib.compute_portfolio_pnl(portfolio=nav_portfolio, marks=None)
         try:
             synthetic_nav = _dd.realized_synthetic_nav()
         except Exception:
-            synthetic_nav = portfolio.get("nav_usd", 0.0)
+            synthetic_nav = nav_portfolio.get("nav_usd", 0.0)
         state.append_nav({
             "run_id": ctx.run_id,
             "at": state.utcnow_iso(),
             "nav_usd": synthetic_nav,
             "nav_source": "virtual",
-            "cash_usd": portfolio.get("cash_usd", 0.0),
-            "positions_count": len(portfolio.get("positions", [])),
-            "all_cash": portfolio.get("all_cash", False),
+            "cash_usd": nav_portfolio.get("cash_usd", 0.0),
+            "positions_count": len(nav_portfolio.get("positions", [])),
+            "all_cash": nav_portfolio.get("all_cash", False),
             "gross_pnl_usd": breakdown.gross_pnl_usd,
             "modelled_costs_usd": breakdown.modelled_costs_usd,
             "net_pnl_usd": breakdown.net_pnl_usd,
@@ -1278,6 +1360,11 @@ def run_pipeline(
         if not ms.is_open:
             nr = market_gate.write_closed_artifacts(rid, ms)
             state.write_json(state.NEXT_RUN, nr)
+            # Distinguish a clean closed-market skip from a fail-closed skip
+            # caused by an unreachable/missing broker clock — the operator and
+            # dashboard need to tell a transient broker outage apart from a
+            # normal weekend/holiday.
+            gate_status = "skipped_clock_error" if ms.clock_error else "skipped_market_closed"
             state.append_decision({
                 "run_id": rid,
                 "stage": "market_gate",
@@ -1288,7 +1375,7 @@ def run_pipeline(
                 "cost_usd": 0.0,
                 "started_at": state.utcnow_iso(),
                 "ended_at": state.utcnow_iso(),
-                "status": "skipped_market_closed",
+                "status": gate_status,
                 "risk_warning": RISK_WARNING,
                 "cycle_intent": ctx.cycle_intent,
                 "intent_source": ctx.intent_source,
@@ -1518,8 +1605,17 @@ def run_pipeline(
         if not dry_run:
             state.write_json(state.NEXT_RUN, next_run)
 
-    if not dry_run:
-        state.write_json(state.CURRENT_PORTFOLIO, portfolio)
+    # Fail-closed: if stage_execute couldn't read broker positions, the target
+    # was never reconciled against the account (no orders submitted). Do NOT
+    # publish the unexecuted target as current_portfolio.json nor advance the
+    # dedup fingerprint — that would make the monitor/dashboard/dedup treat
+    # unfilled targets as current holdings and real prior holdings as orphans,
+    # dropping their tailored kill conditions. Preserve the previous state so
+    # the next cycle reconciles cleanly once positions can be read again.
+    if not dry_run and not next_run.get("current_portfolio_unreconciled"):
+        # Publish only the tradable subset — never record an option-shaped or
+        # non-universe position the order layer refused (it was never held).
+        state.write_json(state.CURRENT_PORTFOLIO, _publishable_portfolio(portfolio))
         # Update the cycle-dedup fingerprints so the next cycle can
         # short-circuit cleanly if nothing material changed.
         _update_cycle_dedup_hash(signals_out, current_positions, cooldown_symbols)
@@ -1575,12 +1671,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if (
-        os.environ.get("LIVE_TRADING_ENABLED", "false").lower() == "true"
-        and LIVE_VERSION == 0
-    ):
-        print("LIVE_TRADING_ENABLED=true but LIVE_VERSION=0 — refusing to run.", file=sys.stderr)
-        return 2
+    gate_exit = live_gate.assert_live_gate(entrypoint="orchestrator")
+    if gate_exit is not None:
+        return gate_exit
 
     broker = None if args.dry_run else _try_load_broker()
 

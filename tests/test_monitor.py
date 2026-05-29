@@ -270,10 +270,11 @@ def test_monitor_etf_loss_cap_via_broker_value_without_mark(tmp_state):
     assert "cap" in actions[0]["reason"]
 
 
-def test_monitor_flattens_legacy_option_orphan(tmp_state):
-    """Defensive: a stray/legacy us_option position the ETF-only target
-    doesn't name is flattened outright as an unsupported instrument
-    (close-only) — it is never traded into, only purged."""
+def test_monitor_leaves_legacy_option_orphan_alone(tmp_state):
+    """A stray/legacy us_option position the ETF-only target doesn't name is
+    LEFT ALONE — the system never opens, sizes, or auto-flattens options. It
+    stays visible via the audit orphan list but monitor emits no action for
+    it (owner decision: no auto-flatten of legacy options)."""
     bp = BrokerPosition(
         symbol="SPY260619C00530000", qty=1, avg_cost=6.50, market_value=650.0,
         unrealized_pl_usd=0.0, asset_class="us_option",
@@ -283,10 +284,40 @@ def test_monitor_flattens_legacy_option_orphan(tmp_state):
         marks={},
         broker_positions=[bp],
     )
-    assert len(actions) == 1
-    assert actions[0]["symbol"] == "SPY260619C00530000"
-    assert actions[0]["action"] == "flatten"
-    assert "unsupported" in actions[0]["reason"]
+    assert actions == [], "legacy option orphan must not be auto-flattened"
+
+
+def test_monitor_still_covers_equity_orphan_with_option_present(tmp_state):
+    """An equity orphan still gets loss-cap coverage even when a legacy
+    option orphan is also held — removing the option-flatten branch must not
+    disturb equity orphan handling."""
+    flat_log: list = []
+    option_bp = BrokerPosition(
+        symbol="SPY260619C00530000", qty=1, avg_cost=6.50, market_value=650.0,
+        unrealized_pl_usd=0.0, asset_class="us_option",
+    )
+    # SQQQ entered at $60, now $40 → 33% loss, over the 25% cap → flatten.
+    equity_bp = _bp("SQQQ", 10, 10 * 40.0, avg_cost=60.0)
+    actions = monitor.evaluate_portfolio(
+        portfolio={"positions": []},
+        marks={},
+        broker_positions=[option_bp, equity_bp],
+    )
+    assert any(a["symbol"] == "SQQQ" and a["action"] == "flatten" for a in actions)
+    assert all(a["symbol"] != "SPY260619C00530000" for a in actions)
+
+
+def test_monitor_refuses_under_half_raised_live_gate(tmp_state, monkeypatch):
+    """B1: monitor can flatten/cancel, so it must refuse to run when
+    LIVE_TRADING_ENABLED=true while LIVE_VERSION==0 (fail closed). It must
+    never even construct a broker."""
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+
+    def _boom():  # pragma: no cover - must never be called
+        raise AssertionError("broker must not be loaded under a half-raised live gate")
+
+    monkeypatch.setattr(monitor, "_try_load_broker", _boom)
+    assert monitor.main([]) == 2
 
 
 def test_monitor_kill_switch_disables_price_time_stops(tmp_state, monkeypatch):

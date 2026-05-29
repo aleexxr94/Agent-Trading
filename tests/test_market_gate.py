@@ -45,19 +45,26 @@ def test_check_returns_open_when_broker_is_none():
     assert "no broker" in ms.rationale.lower()
 
 
-def test_check_returns_open_when_broker_does_not_implement_clock():
-    """Default Broker.get_clock returns None; fall open conservatively."""
+def test_check_returns_closed_when_broker_does_not_implement_clock():
+    """A present broker that can't report a clock (get_clock → None) FAILS
+    CLOSED in production: we don't run the LLM + order pipeline on the
+    assumption that markets are open. clock_error marks it as a
+    connectivity problem rather than a genuine closed market."""
     ms = market_gate.check(_StubBroker(clock=None))
-    assert ms.is_open is True
-    assert "did not return clock" in ms.rationale.lower()
+    assert ms.is_open is False
+    assert ms.clock_error is True
+    assert ms.next_open is None
+    assert "unavailable" in ms.rationale.lower()
 
 
-def test_check_returns_open_when_broker_raises():
-    """Transient API error → fall open. The order-side market-hours
-    check at Alpaca still rejects bad-time orders, so a brief gate
-    failure doesn't risk submitting orders into a closed market."""
+def test_check_returns_closed_when_broker_raises():
+    """Transient API error → FAIL CLOSED. We will not burn LLM calls or
+    submit orders on a stale assumption that markets are open; the daily
+    fallback timer re-runs the cycle later."""
     ms = market_gate.check(_StubBroker(clock_raises=RuntimeError("network glitch")))
-    assert ms.is_open is True
+    assert ms.is_open is False
+    assert ms.clock_error is True
+    assert ms.next_open is None
     assert "RuntimeError" in ms.rationale
 
 
@@ -83,6 +90,7 @@ def test_check_returns_closed_when_clock_reports_closed():
     )
     ms = market_gate.check(_StubBroker(clock=clock))
     assert ms.is_open is False
+    assert ms.clock_error is False  # genuine closed market, not a clock error
     assert ms.next_open == "2026-05-14T13:30:00Z"
     assert "market closed" in ms.rationale.lower()
 
@@ -132,3 +140,30 @@ def test_write_closed_artifacts_handles_missing_next_open(tmp_state):
     )
     next_run = market_gate.write_closed_artifacts(rid, ms)
     assert next_run["next_run_at"] == ""
+
+
+def test_write_closed_artifacts_marks_clock_error(tmp_state):
+    """A fail-closed clock error routes through the same closed-market
+    artifacts but carries clock_error=True (so the dashboard can flag a
+    broker-connectivity problem) and a NEAR-FUTURE next_run_at so a brief
+    broker-clock outage doesn't suppress the rest of the day's cycles."""
+    from datetime import datetime, timezone
+
+    rid = state.new_run_id()
+    ms = market_gate.MarketState(
+        is_open=False, next_open=None,
+        rationale="market_gate: broker clock fetch failed; failing closed",
+        clock_error=True,
+    )
+    next_run = market_gate.write_closed_artifacts(rid, ms)
+    assert next_run["clock_error"] is True
+    # next_run_at is a near-future retry (now + CLOCK_ERROR_RETRY_MINUTES),
+    # not empty (empty would defer to the daily fallback timer only).
+    assert next_run["next_run_at"] != ""
+    retry_at = datetime.strptime(next_run["next_run_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    delta_min = (retry_at - datetime.now(timezone.utc)).total_seconds() / 60.0
+    assert 0 < delta_min <= market_gate.CLOCK_ERROR_RETRY_MINUTES + 1
+
+    gate = json.loads((state.run_dir(rid) / "market_gate.json").read_text())
+    assert gate["clock_error"] is True
+    assert gate["is_open"] is False

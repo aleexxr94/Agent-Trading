@@ -26,9 +26,10 @@ def _normalize_asset_class(raw) -> str:
     """Map whatever Alpaca returns into our internal canonical values.
 
     The system is ETF-only and never opens options. A stray/legacy option
-    position is still normalised to 'us_option' so monitor.py can recognise
-    it as an unsupported instrument and flatten it (close-only) — it is
-    never traded into. Everything else maps to 'us_equity'.
+    position is still normalised to 'us_option' purely so it can be ingested
+    and stay visible (it is never traded into, and — as of the ETF safety
+    hardening — never auto-flattened either; monitor.py leaves it alone).
+    Everything else maps to 'us_equity'.
     """
     s = str(raw).lower()
     if "option" in s:

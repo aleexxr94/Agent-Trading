@@ -11,6 +11,13 @@ Scope:
 The system is ETF-only. Any option-shaped target (kind="option", an OSI
 symbol, or option-only fields like contracts/strike/expiry/premium_paid) is
 rejected defensively before it can reach the broker — it is never submitted.
+
+Hard universe guard (fail-closed): the tradable set is exactly the 29 symbols
+in lib/universe.py. Any non-universe symbol — a typo, a plain index ETF
+(SPY/QQQ), a single name (TSLA) — is refused at the order boundary, both when
+planning opens (diff_portfolio) and at submission (submit_plan), for BOTH buys
+and sells. Universe membership being enforced only by the upstream signals
+filter + constructor prompt was advisory; this is the real gate.
 """
 from __future__ import annotations
 
@@ -18,6 +25,7 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from . import universe
 from .broker import Broker, BrokerPosition, OrderRequest, OrderResult
 
 # OCC OSI option-symbol shape: 1-6 char underlying + YYMMDD + C/P + strike*1000
@@ -33,6 +41,29 @@ _OPTION_ONLY_FIELDS = ("contracts", "strike", "expiry", "premium_paid", "greeks"
 def is_osi_symbol(symbol: str) -> bool:
     """True iff ``symbol`` matches the OCC OSI option-symbol shape."""
     return bool(_OSI_RE.match(symbol or ""))
+
+
+# The exact tradable universe. Built once from lib/universe.py; the order
+# layer refuses anything outside it. Symbols are upper-case (schema-enforced).
+_UNIVERSE_SYMBOLS: frozenset[str] = frozenset(universe.all_symbols())
+
+# Reason strings (shared so tests can assert on a stable phrase).
+_NOT_IN_UNIVERSE_SKIP_REASON = "symbol not in ETF-only universe (29 symbols)"
+_NOT_IN_UNIVERSE_ORDER_STATUS = "skipped: symbol not in ETF-only universe (29 symbols)"
+
+
+def in_universe(symbol: str) -> bool:
+    """True iff ``symbol`` is one of the 29 tradable ETF tickers."""
+    return symbol in _UNIVERSE_SYMBOLS
+
+
+def is_tradable_target(position: dict) -> bool:
+    """True iff this target position is one the order layer would actually
+    submit: ETF-only (not option-shaped) AND in the 29-ticker universe. The
+    inverse of what diff_portfolio drops into ``skipped``. Used to keep
+    current_portfolio.json from recording a position that can never be held.
+    """
+    return not _is_option_like(position) and in_universe(position.get("symbol") or "")
 
 
 def _is_option_like(position: dict) -> bool:
@@ -159,6 +190,16 @@ def diff_portfolio(target_portfolio: dict, broker_positions: list[BrokerPosition
                 "reason": "option payloads are not supported (ETF-only system)",
             })
             continue
+        # Hard universe guard (fail-closed): never plan an open for a symbol
+        # outside the 29-ticker ETF universe — a typo or a non-universe ETF
+        # (SPY/QQQ/TSLA) is dropped here rather than sized into a position.
+        if not in_universe(p["symbol"]):
+            skipped.append({
+                "symbol": p["symbol"],
+                "kind": p.get("kind"),
+                "reason": _NOT_IN_UNIVERSE_SKIP_REASON,
+            })
+            continue
         target_etfs[p["symbol"]] = p["shares"]
 
     current_etfs = _current_etf_qty(broker_positions)
@@ -205,6 +246,13 @@ def submit_plan(plan: OrderPlan, *, broker: Broker) -> list[OrderResult]:
     Defensive option guard (fail-closed): the system is ETF-only and never
     builds option symbols, but if an OSI-shaped symbol ever reaches here it
     is refused outright rather than submitted to the broker.
+
+    Hard universe guard (fail-closed): any symbol outside the 29-ticker ETF
+    universe is refused here too — for BOTH buys and sells. This is the true
+    broker boundary (it also sees closes), so a non-universe symbol can never
+    reach broker.submit_order regardless of how the plan was built. Exiting a
+    stray/legacy non-universe holding is handled by monitor.py flatten or a
+    manual action, NOT this order path.
     """
     results: list[OrderResult] = []
     for req in plan.closes + plan.requests:
@@ -216,6 +264,16 @@ def submit_plan(plan: OrderPlan, *, broker: Broker) -> list[OrderResult]:
                 side=req.side,
                 submitted_at="",
                 status="skipped: option symbols are not supported (ETF-only system)",
+            ))
+            continue
+        if not in_universe(req.symbol):
+            results.append(OrderResult(
+                broker_order_id="",
+                symbol=req.symbol,
+                qty=req.qty,
+                side=req.side,
+                submitted_at="",
+                status=_NOT_IN_UNIVERSE_ORDER_STATUS,
             ))
             continue
         try:

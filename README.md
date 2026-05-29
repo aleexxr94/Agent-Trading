@@ -394,7 +394,7 @@ The dashboard's Performance and Settings tabs surface the same numbers without t
 Live trading is gated by a triple lock and is intentionally not buildable from this checkout:
 
 1. `LIVE_TRADING_ENABLED=true` env var — disabled by default.
-2. `LIVE_VERSION = 0` constant in `orchestrator.py` — must be bumped in code.
+2. `LIVE_VERSION = 0` constant in `lib/live_gate.py` — must be bumped in code. The shared `assert_live_gate()` guard (called by both `orchestrator.py` and `monitor.py`) refuses to run if the env var is set while the version is still 0.
 3. `lib/alpaca_client.py` refuses to construct against a non-paper base URL unless both gates are satisfied.
 
 The full set of pre-conditions (≥ 4 weeks paper, Sharpe ≥ 0.5, max DD ≤ 25%, IBKR client implemented for UK suitability) is documented in [CLAUDE.md §Promotion to live](./CLAUDE.md#promotion-to-live-documented-only--do-not-enable-in-code).

@@ -166,6 +166,66 @@ def test_etf_targets_unaffected_by_reject_path():
     assert len(plan.skipped) == 1
 
 
+# ---------- diff_portfolio hard universe guard ----------
+
+
+@pytest.mark.parametrize("symbol", ["SPY", "QQQ", "TSLA", "TQQ", "AAPL"])
+def test_diff_non_universe_target_is_skipped(symbol):
+    """Fail-closed: a non-universe symbol (plain index ETF, single name, or a
+    typo) is dropped into `skipped`, never planned as an open."""
+    plan = orders.diff_portfolio({"positions": [_etf(symbol, 5)]}, [])
+    assert plan.requests == []
+    assert len(plan.skipped) == 1
+    assert plan.skipped[0]["symbol"] == symbol
+    assert "universe" in plan.skipped[0]["reason"].lower()
+
+
+def test_diff_universe_targets_still_planned():
+    """Regression: valid universe ETFs still produce the expected opens."""
+    plan = orders.diff_portfolio(
+        {"positions": [_etf("TQQQ", 4), _etf("SOXL", 3), _etf("BITX", 2)]}, [],
+    )
+    assert {r.symbol for r in plan.requests} == {"TQQQ", "SOXL", "BITX"}
+    assert plan.skipped == []
+
+
+def test_in_universe_helper():
+    assert orders.in_universe("TQQQ") is True
+    assert orders.in_universe("SPY") is False
+
+
+# ---------- submit_plan hard universe guard ----------
+
+
+def test_submit_plan_refuses_non_universe_buy():
+    """A non-universe buy is refused at the broker boundary — broker.submit_order
+    is never called."""
+    from lib.broker import OrderRequest
+    plan = orders.OrderPlan(
+        requests=[OrderRequest(symbol="SPY", qty=5, side="buy", order_type="market")],
+    )
+    broker = _FakeBroker()
+    results = orders.submit_plan(plan, broker=broker)
+    assert len(results) == 1
+    assert results[0].status.startswith("skipped: symbol not in ETF-only universe")
+    assert broker.submitted == [], "no non-universe order should reach the broker"
+
+
+def test_submit_plan_refuses_non_universe_sell_close():
+    """Owner decision (block-everything): even a close/sell of a non-universe
+    symbol is refused here — stray-holding exits are handled by monitor flatten
+    or a manual action, not this order path."""
+    from lib.broker import OrderRequest
+    plan = orders.OrderPlan(
+        closes=[OrderRequest(symbol="AAPL", qty=10, side="sell", order_type="market")],
+    )
+    broker = _FakeBroker()
+    results = orders.submit_plan(plan, broker=broker)
+    assert len(results) == 1
+    assert results[0].status.startswith("skipped: symbol not in ETF-only universe")
+    assert broker.submitted == []
+
+
 # ---------- submit_plan ----------
 
 
