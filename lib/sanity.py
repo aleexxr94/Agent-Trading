@@ -34,6 +34,8 @@ Rule list (see docstrings on each ``_r_*`` for full rationale):
   - ``kill_conditions_complete``         (fail)
   - ``position_backed_by_strategist``    (fail) — v2
   - ``construction_rationale_meaningful`` (fail)
+  - ``symbol_in_universe``               (fail) — defense-in-depth mirror of
+    the hard order-layer universe guard in lib/orders.py
 """
 from __future__ import annotations
 
@@ -202,6 +204,38 @@ def _r_position_backed_by_strategist(portfolio: dict, view: dict | None) -> Rule
         return RuleResult(
             name, severity, severity,
             detail=f"{len(bad)} position(s) not endorsed by strategist with confidence ≥ 0.5",
+            meta={"offenders": bad},
+        )
+    return RuleResult(name, severity, "pass")
+
+
+def _r_symbol_in_universe(portfolio: dict, view: dict | None) -> RuleResult:
+    """Every position symbol must be in the 29-ticker ETF universe.
+
+    Defense-in-depth, advisory by default. The hard gate is in
+    lib/orders.py (diff_portfolio + submit_plan refuse non-universe symbols
+    at the broker boundary); this rule surfaces a non-universe symbol in the
+    Agent Logs tab so the operator can see it even before order time. Like
+    every sanity rule it only blocks stage_execute when
+    SANITY_BLOCK_ON_FAIL=true.
+    """
+    from . import universe
+
+    name = "symbol_in_universe"
+    severity: Severity = "fail"
+    positions = portfolio.get("positions") or []
+    if not positions:
+        return RuleResult(name, severity, "skip", "all-cash portfolio")
+    allowed = set(universe.all_symbols())
+    bad = [
+        {"symbol": p.get("symbol"), "kind": p.get("kind")}
+        for p in positions
+        if p.get("symbol") not in allowed
+    ]
+    if bad:
+        return RuleResult(
+            name, severity, severity,
+            detail=f"{len(bad)} position(s) outside the 29-ticker ETF universe",
             meta={"offenders": bad},
         )
     return RuleResult(name, severity, "pass")
@@ -490,6 +524,7 @@ def _r_reentry_cooldown(portfolio: dict, view: dict | None) -> RuleResult:
 # detail-level warnings.
 RULES: list[Callable[[dict, dict | None], RuleResult]] = [
     _r_construction_rationale_meaningful,
+    _r_symbol_in_universe,
     _r_kill_conditions_complete,
     _r_position_backed_by_strategist,
     _r_position_within_adaptive_cap,

@@ -94,8 +94,9 @@ def test_dry_run_writes_sanity_json_with_known_status(tmp_state):
     state.validate(sanity_doc, "sanity.schema.json")
     # Rule list mirrors lib/sanity.RULES — pin the count. The two
     # option-specific rules (straddle_requires_low_iv, option_premium_above_floor)
-    # were removed with options, leaving 9.
-    assert len(sanity_doc["rules"]) == 9
+    # were removed with options; the ETF safety hardening added
+    # symbol_in_universe, bringing the total to 10.
+    assert len(sanity_doc["rules"]) == 10
 
 
 def test_sanity_pass_path_writes_summary_into_next_run(tmp_state, monkeypatch):
@@ -252,6 +253,49 @@ def test_market_gate_closed_short_circuits_pipeline(tmp_state, monkeypatch):
     row = json.loads(lines[0])
     assert row["stage"] == "market_gate"
     assert row["status"] == "skipped_market_closed"
+
+
+def test_clock_error_short_circuits_pipeline_with_distinct_status(tmp_state, monkeypatch):
+    """A1: a present broker whose clock is unreachable fails closed — the
+    pipeline short-circuits before signals/LLM, writes a daily-fallback
+    next_run (empty next_run_at), and logs status=skipped_clock_error so a
+    transient broker outage is distinguishable from a genuine closed market."""
+    from lib import market_gate as mg
+    monkeypatch.setattr(
+        orchestrator.market_gate, "check",
+        lambda broker: mg.MarketState(
+            is_open=False, next_open=None,
+            rationale="test: broker clock fetch failed; failing closed",
+            clock_error=True,
+        ),
+    )
+
+    def _boom(*a, **kw):
+        raise AssertionError("LLM should not be called when failing closed on a clock error")
+    monkeypatch.setattr(orchestrator.llm, "structured_call", _boom)
+
+    class _StubBroker:
+        pass
+
+    result = orchestrator.run_pipeline(dry_run=False, broker=_StubBroker())
+    assert result["market_gate"]["is_open"] is False
+
+    rdir = state.RUNS_DIR / result["run_id"]
+    files = {p.name for p in rdir.iterdir() if p.is_file()}
+    assert "market_gate.json" in files
+    assert "signals.json" not in files
+    assert "view.json" not in files
+
+    # next_run uses the daily fallback (no next_open known) and flags clock_error.
+    nr = json.loads(state.NEXT_RUN.read_text())
+    assert nr["next_run_at"] == ""
+    assert nr["clock_error"] is True
+
+    lines = state.DECISIONS_LOG.read_text().strip().splitlines()
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row["stage"] == "market_gate"
+    assert row["status"] == "skipped_clock_error"
 
 
 # ---- v2 winrate features: cycle dedup, critic, state awareness ----
@@ -585,6 +629,50 @@ def test_stage_execute_allows_derisking_reduction_during_dd_halt(tmp_state, monk
     assert next_run["dd_halt"]["active"] is True
     # The reduction (sell 5) is de-risking and must go through during a halt.
     assert ("TQQQ", "sell", 5) in submitted
+
+
+def test_stage_execute_fails_closed_when_get_positions_raises(tmp_state, monkeypatch):
+    """Fail-closed (Issue 5): if get_positions() raises, stage_execute must NOT
+    build or submit any plan — planning opens against an assumed-empty account
+    would double exposure on top of whatever is actually held. It still writes
+    an empty orders.json + next_run carrying the skip reason, and schedules the
+    next cycle."""
+    monkeypatch.setenv("ORDERS_ENABLED", "true")
+    monkeypatch.setattr(
+        orchestrator, "_compute_next_run_at",
+        lambda *, ctx, portfolio, view: ("2026-05-28T20:00:00Z", "stub", "trade"),
+    )
+
+    submitted: list = []
+
+    class _FakeBroker:
+        def get_positions(self):
+            raise RuntimeError("alpaca 500")
+
+        def submit_order(self, req):  # pragma: no cover - must never be called
+            submitted.append(req)
+            raise AssertionError("submit_order must not be called on get_positions failure")
+
+    portfolio = {
+        "run_id": "r-fc", "nav_usd": 2500.0, "cash_usd": 100.0, "all_cash": False,
+        "positions": [{
+            "kind": "etf", "symbol": "TQQQ", "shares": 4, "avg_cost": 70.0,
+            "leverage_factor": 3.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 11.0,
+        }],
+    }
+    ctx = orchestrator.StageContext(run_id="r-fc", dry_run=False, broker=_FakeBroker())
+    next_run = orchestrator.stage_execute(ctx, portfolio, {"candidates": []})
+
+    assert submitted == [], "no orders should be submitted when positions can't be read"
+    assert "order_plan_error" in next_run
+    assert next_run["orders_skipped_reason"] == "get_positions failed — failing closed"
+    assert "order_plan" not in next_run, "no plan should be built on the fail-closed path"
+
+    orders_json = json.loads((state.run_dir("r-fc") / "orders.json").read_text())
+    assert orders_json["order_ids"] == []
+    # The next cycle is still scheduled.
+    assert next_run["next_run_at"] == "2026-05-28T20:00:00Z"
 
 
 def test_sync_fills_before_cooldown_noop_in_dry_run(monkeypatch):

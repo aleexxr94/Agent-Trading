@@ -43,14 +43,16 @@ except ImportError:
     pass
 from typing import Callable
 
-from lib import llm, market_gate, risk, sanity, signals, stages, state, trades
+from lib import live_gate, llm, market_gate, risk, sanity, signals, stages, state, trades
 from lib.broker import Broker
 
 ROOT = Path(__file__).resolve().parent
 FIXTURE_DIR = ROOT / "tests" / "fixtures"
 
-# Hard-coded gate per spec §Critical preconditions #1.
-LIVE_VERSION = 0  # bump only when promoted; combined with LIVE_TRADING_ENABLED env var
+# Hard-coded gate per spec §Critical preconditions #1. The canonical constant
+# now lives in lib/live_gate.py (single source of truth shared with monitor.py);
+# re-exported here so existing references keep working.
+LIVE_VERSION = live_gate.LIVE_VERSION  # bump in lib/live_gate.py when promoted
 
 RISK_WARNING = (
     "PAPER TRADING. Leveraged & inverse ETFs decay path-dependently and are "
@@ -941,11 +943,36 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
         and not ctx.dry_run
         and orders.is_enabled()
     ):
+        positions_ok = True
+        current: list = []
         try:
             current = ctx.broker.get_positions()
         except Exception as e:
+            # Fail closed: if we can't read current broker holdings we cannot
+            # safely diff against the target — planning opens against an
+            # assumed-empty account would double up exposure on top of
+            # whatever is actually held. Skip planning/submission entirely
+            # this cycle; still write an (empty) orders.json + next_run + NAV
+            # below so the next cycle is scheduled and the operator can see
+            # the skip. No orders are submitted, so no trades_sync is needed.
+            positions_ok = False
             next_run["order_plan_error"] = f"get_positions: {type(e).__name__}: {e}"
-            current = []
+            next_run["orders_skipped_reason"] = "get_positions failed — failing closed"
+            state.write_json(
+                state.run_dir(ctx.run_id) / "orders.json",
+                {
+                    "run_id": ctx.run_id,
+                    "submitted_at": state.utcnow_iso(),
+                    "order_ids": [],
+                },
+            )
+
+    if (
+        ctx.broker is not None
+        and not ctx.dry_run
+        and orders.is_enabled()
+        and positions_ok
+    ):
         plan = orders.diff_portfolio(portfolio, current)
         # Phase 2: when the 8% daily-drawdown breaker is active, allow
         # de-risking (full closes AND same-sign reductions — both are SELLs on
@@ -1278,6 +1305,11 @@ def run_pipeline(
         if not ms.is_open:
             nr = market_gate.write_closed_artifacts(rid, ms)
             state.write_json(state.NEXT_RUN, nr)
+            # Distinguish a clean closed-market skip from a fail-closed skip
+            # caused by an unreachable/missing broker clock — the operator and
+            # dashboard need to tell a transient broker outage apart from a
+            # normal weekend/holiday.
+            gate_status = "skipped_clock_error" if ms.clock_error else "skipped_market_closed"
             state.append_decision({
                 "run_id": rid,
                 "stage": "market_gate",
@@ -1288,7 +1320,7 @@ def run_pipeline(
                 "cost_usd": 0.0,
                 "started_at": state.utcnow_iso(),
                 "ended_at": state.utcnow_iso(),
-                "status": "skipped_market_closed",
+                "status": gate_status,
                 "risk_warning": RISK_WARNING,
                 "cycle_intent": ctx.cycle_intent,
                 "intent_source": ctx.intent_source,
@@ -1575,12 +1607,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if (
-        os.environ.get("LIVE_TRADING_ENABLED", "false").lower() == "true"
-        and LIVE_VERSION == 0
-    ):
-        print("LIVE_TRADING_ENABLED=true but LIVE_VERSION=0 — refusing to run.", file=sys.stderr)
-        return 2
+    gate_exit = live_gate.assert_live_gate(entrypoint="orchestrator")
+    if gate_exit is not None:
+        return gate_exit
 
     broker = None if args.dry_run else _try_load_broker()
 

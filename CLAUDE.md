@@ -215,11 +215,15 @@ changes required to move from paper to real money. Nothing here is enabled in th
 checkout — the triple lock is designed to fail closed at every layer.
 
 1. **Triple-lock release (the two deliberate edits).**
-   - `orchestrator.py:49` — bump `LIVE_VERSION = 0` → `1` (in code; can't be set via env).
+   - `lib/live_gate.py` — bump `LIVE_VERSION = 0` → `1` (in code; can't be set via env).
+     This is the single source of truth, shared by both `orchestrator.py` (which
+     re-exports it) and `monitor.py`.
    - `.env` — set `LIVE_TRADING_ENABLED=true`.
-   - Guard at `orchestrator.py:1609-1614` refuses to run if env is `true` while `LIVE_VERSION == 0`
-     (exit code 2), so the two must be raised together. `lib/alpaca_client.py:61` independently
-     refuses to construct a non-paper client unless `LIVE_TRADING_ENABLED=true`.
+   - `lib/live_gate.py:assert_live_gate()` refuses to run if env is `true` while
+     `LIVE_VERSION == 0` (exit code 2), and is called from BOTH `orchestrator.main`
+     and `monitor.main`, so the two must be raised together at either entrypoint.
+     `lib/alpaca_client.py:61` independently refuses to construct a non-paper
+     client unless `LIVE_TRADING_ENABLED=true`.
 
 2. **Broker.** UK retail **cannot** trade Alpaca live (precondition §2), so "going live" in
    practice means a new **`lib/ibkr_client.py:IBKRBroker(Broker)`** behind the existing seam

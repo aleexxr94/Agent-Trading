@@ -19,6 +19,7 @@ try:
 except ImportError:
     pass
 
+from lib import live_gate
 from lib import marks as marks_lib
 from lib import risk, state
 from lib.broker import Broker
@@ -96,8 +97,9 @@ def evaluate_portfolio(
     handles partial fills and uses the real ``avg_entry_price`` rather than
     the agent's intended ``avg_cost``. Broker positions the target portfolio
     doesn't name ('orphans') get loss-cap coverage so nothing held goes
-    unmonitored; a stray/legacy option position (unsupported instrument) is
-    flattened outright.
+    unmonitored. A stray/legacy option position (unsupported instrument) is
+    left alone — the system is ETF-only and never opens, sizes, or
+    auto-flattens options; it stays visible in the audit orphan list only.
 
     Legacy mode (``broker_positions is None``): falls back to the target
     portfolio's stored shares/avg_cost. Kept for direct callers/tests.
@@ -156,12 +158,12 @@ def evaluate_portfolio(
             if bkey in covered or abs(bp.qty) == 0:
                 continue
             # Unsupported instrument (e.g. a legacy option position): the
-            # system is ETF-only, so flatten it outright (close-only).
+            # system is ETF-only and no longer opens, sizes, or auto-flattens
+            # options. We deliberately leave such an orphan ALONE — it is not
+            # given equity loss-cap coverage and is not flattened. It remains
+            # visible via the audit_report orphan list; purging it (if ever
+            # wanted) is a manual action, not something monitor decides.
             if bp.asset_class == "us_option":
-                actions.append({
-                    "symbol": bkey, "action": "flatten",
-                    "reason": "unsupported instrument (options removed) — flattening",
-                })
                 continue
             qty = abs(bp.qty)
             kill, reason = risk.should_kill_position(
@@ -281,6 +283,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Kill-condition monitor")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+
+    # Same triple-lock guard as the orchestrator: monitor can flatten/cancel,
+    # so it must also refuse to run under a half-raised live gate (fail closed).
+    gate_exit = live_gate.assert_live_gate(entrypoint="monitor")
+    if gate_exit is not None:
+        return gate_exit
 
     if state.is_halted():
         print("halt.flag set; nothing to do.")

@@ -36,7 +36,8 @@ class BrokerPosition:
     unrealized_pl_usd: float
     # The system trades ETFs only. ``us_option`` is retained solely so a
     # stray/legacy option position at the broker can still be ingested and
-    # safely flattened (close-only) by monitor.py — it is never opened.
+    # stay visible — it is never opened, and (as of the ETF safety hardening)
+    # never auto-flattened by monitor.py either; it is left alone.
     asset_class: Literal["us_equity", "us_option"]
     # Optional Alpaca-derived fields — present when the broker reports them,
     # None for stub / test fixtures that don't bother. See lib/marks.py for
