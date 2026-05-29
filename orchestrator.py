@@ -803,6 +803,30 @@ def _default_next_run_at(portfolio: dict) -> str:
     return (state.utcnow() + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _publishable_portfolio(portfolio: dict) -> dict:
+    """Return a copy of ``portfolio`` with any position the order layer would
+    refuse (option-shaped or non-universe) stripped out.
+
+    current_portfolio.json must never record a symbol that can't actually be
+    held: the order layer drops such targets into ``skipped`` and submits no
+    order, so publishing them would make the monitor treat them as holdings
+    (leaving real holdings as orphans, dropping their kill conditions) and let
+    a later dedup-skip reuse an invalid/unfilled portfolio. Strip them and
+    recompute ``all_cash`` when nothing tradable remains. Returns the original
+    object unchanged when every position is tradable (the common case).
+    """
+    from lib import orders
+    positions = portfolio.get("positions") or []
+    kept = [p for p in positions if orders.is_tradable_target(p)]
+    if len(kept) == len(positions):
+        return portfolio
+    cleaned = dict(portfolio)
+    cleaned["positions"] = kept
+    if not kept:
+        cleaned["all_cash"] = True
+    return cleaned
+
+
 # Orchestrator-meta returns a next-run timestamp; bounds enforced here.
 META_MIN_HOURS = 1.0
 META_MAX_HOURS = 24.0
@@ -1045,15 +1069,22 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
             )
     if not ctx.dry_run:
         state.write_json(state.NEXT_RUN, next_run)
-        # NAV history: one row per cycle for the dashboard equity curve.
-        # Phase 3: nav_usd is stamped DETERMINISTICALLY from the synthetic
-        # balance (trades.jsonl-derived realized P&L over the $2,500 baseline),
-        # NOT the constructor's self-reported portfolio.nav_usd. trades_sync
-        # ran just above, so this reflects ACTUAL fills — even if some orders
-        # were skipped/failed this cycle, the row is honest (only filled trades
-        # count). This is the same number _account_nav sizes against and the
-        # dashboard shows. nav_source is always "virtual" now (synthetic units,
-        # never raw broker equity), so the dashboard applies no broker offset.
+    # NAV history: one row per cycle for the dashboard equity curve.
+    # Phase 3: nav_usd is stamped DETERMINISTICALLY from the synthetic
+    # balance (trades.jsonl-derived realized P&L over the $2,500 baseline),
+    # NOT the constructor's self-reported portfolio.nav_usd. trades_sync
+    # ran just above, so this reflects ACTUAL fills — even if some orders
+    # were skipped/failed this cycle, the row is honest (only filled trades
+    # count). This is the same number _account_nav sizes against and the
+    # dashboard shows. nav_source is always "virtual" now (synthetic units,
+    # never raw broker equity), so the dashboard applies no broker offset.
+    #
+    # Skip the row entirely when the cycle is unreconciled (broker positions
+    # couldn't be read, so the target was never executed): the positions_count
+    # / cash_usd / modelled PnL fields are derived from the unexecuted target
+    # and would otherwise record it as if held, corrupting the equity curve and
+    # the strategist's PnL feedback. A missing row during an outage is honest.
+    if not ctx.dry_run and not next_run.get("current_portfolio_unreconciled"):
         from lib import dashboard_data as _dd
         from lib import pnl as pnl_lib
         breakdown = pnl_lib.compute_portfolio_pnl(portfolio=portfolio, marks=None)
@@ -1565,7 +1596,9 @@ def run_pipeline(
     # dropping their tailored kill conditions. Preserve the previous state so
     # the next cycle reconciles cleanly once positions can be read again.
     if not dry_run and not next_run.get("current_portfolio_unreconciled"):
-        state.write_json(state.CURRENT_PORTFOLIO, portfolio)
+        # Publish only the tradable subset — never record an option-shaped or
+        # non-universe position the order layer refused (it was never held).
+        state.write_json(state.CURRENT_PORTFOLIO, _publishable_portfolio(portfolio))
         # Update the cycle-dedup fingerprints so the next cycle can
         # short-circuit cleanly if nothing material changed.
         _update_cycle_dedup_hash(signals_out, current_positions, cooldown_symbols)

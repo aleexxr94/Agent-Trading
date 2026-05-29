@@ -286,9 +286,10 @@ def test_clock_error_short_circuits_pipeline_with_distinct_status(tmp_state, mon
     assert "signals.json" not in files
     assert "view.json" not in files
 
-    # next_run uses the daily fallback (no next_open known) and flags clock_error.
+    # next_run schedules a near-future retry (not empty) and flags clock_error
+    # so a transient broker-clock outage doesn't suppress the rest of the day.
     nr = json.loads(state.NEXT_RUN.read_text())
-    assert nr["next_run_at"] == ""
+    assert nr["next_run_at"] != ""
     assert nr["clock_error"] is True
 
     lines = state.DECISIONS_LOG.read_text().strip().splitlines()
@@ -675,6 +676,43 @@ def test_stage_execute_fails_closed_when_get_positions_raises(tmp_state, monkeyp
     assert orders_json["order_ids"] == []
     # The next cycle is still scheduled.
     assert next_run["next_run_at"] == "2026-05-28T20:00:00Z"
+    # Codex P2: no NAV-history row is written for an unreconciled cycle — the
+    # target was never executed, so recording it as held would corrupt the
+    # equity curve + strategist PnL feedback.
+    assert state.read_nav_history() == []
+
+
+def test_publishable_portfolio_strips_non_universe_and_option_positions():
+    """Codex P2: current_portfolio.json must never record a position the order
+    layer would refuse. _publishable_portfolio drops option-shaped + non-universe
+    positions and recomputes all_cash when nothing tradable remains."""
+    portfolio = {
+        "all_cash": False, "cash_usd": 100.0,
+        "positions": [
+            {"kind": "etf", "symbol": "TQQQ", "shares": 4, "position_pct": 10.0},
+            {"kind": "etf", "symbol": "SPY", "shares": 5, "position_pct": 10.0},   # non-universe
+            {"kind": "option", "underlying": "QQQ", "strike": 400.0},               # option-shaped
+        ],
+    }
+    cleaned = orchestrator._publishable_portfolio(portfolio)
+    assert [p["symbol"] for p in cleaned["positions"]] == ["TQQQ"]
+    assert cleaned["all_cash"] is False  # TQQQ remains
+    # Original object is not mutated.
+    assert len(portfolio["positions"]) == 3
+
+    # All-untradable → empty + all_cash flipped True.
+    only_bad = {"all_cash": False, "positions": [
+        {"kind": "etf", "symbol": "TSLA", "shares": 1, "position_pct": 5.0},
+    ]}
+    cleaned2 = orchestrator._publishable_portfolio(only_bad)
+    assert cleaned2["positions"] == []
+    assert cleaned2["all_cash"] is True
+
+    # Clean portfolio is returned unchanged (same object).
+    clean = {"all_cash": False, "positions": [
+        {"kind": "etf", "symbol": "SOXL", "shares": 2, "position_pct": 8.0},
+    ]}
+    assert orchestrator._publishable_portfolio(clean) is clean
 
 
 def test_fail_closed_positions_read_preserves_current_portfolio(tmp_state, monkeypatch):

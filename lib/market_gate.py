@@ -33,9 +33,16 @@ Behaviour (fail-closed in production):
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 
 from . import state
 from .broker import Broker, MarketClock
+
+# How soon to retry after a broker-clock outage. A transient clock failure
+# during market hours must not suppress the rest of the day's cycles, so we
+# schedule a near-future retry rather than leaving next_run_at empty (which
+# deploy/run_scheduler.sh skips, falling back only to the daily timer).
+CLOCK_ERROR_RETRY_MINUTES = 30
 
 
 @dataclass(frozen=True)
@@ -141,14 +148,24 @@ def write_closed_artifacts(run_id: str, ms: MarketState) -> dict:
     }
     state.write_json(state.run_dir(run_id) / "market_gate.json", gate_payload)
 
+    # next_run_at resolution:
+    #   - clock_error → a near-future retry (now + CLOCK_ERROR_RETRY_MINUTES).
+    #     next_open is unknown on a clock outage, and leaving it empty would let
+    #     a brief broker hiccup suppress all remaining trade cycles for the day
+    #     (run_scheduler.sh skips empty values; only the daily fallback timer
+    #     would fire). A near-future retry recovers as soon as the broker is back.
+    #   - genuine closed market → the broker-reported next-open so the scheduler
+    #     picks up exactly when markets reopen; empty if unknown (daily fallback).
+    if ms.clock_error:
+        next_run_at = (
+            state.utcnow() + timedelta(minutes=CLOCK_ERROR_RETRY_MINUTES)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        next_run_at = ms.next_open or ""
+
     next_run = {
         "run_id": run_id,
-        # Use the broker-reported next-open if available so the scheduler
-        # picks up exactly when markets reopen, not 4-6h after via the
-        # heuristic fallback. Empty next_run_at means deploy/run_scheduler.sh
-        # will skip until the daily fallback timer fires — acceptable but
-        # not great; populated next_open is the happy path.
-        "next_run_at": ms.next_open or "",
+        "next_run_at": next_run_at,
         "rationale": (
             f"stage_execute skipped: {ms.rationale}. "
             "No LLM calls billed; no orders submitted."

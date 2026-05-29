@@ -145,8 +145,10 @@ def test_write_closed_artifacts_handles_missing_next_open(tmp_state):
 def test_write_closed_artifacts_marks_clock_error(tmp_state):
     """A fail-closed clock error routes through the same closed-market
     artifacts but carries clock_error=True (so the dashboard can flag a
-    broker-connectivity problem) and an empty next_run_at (next_open is
-    unknown → daily fallback timer covers the re-run)."""
+    broker-connectivity problem) and a NEAR-FUTURE next_run_at so a brief
+    broker-clock outage doesn't suppress the rest of the day's cycles."""
+    from datetime import datetime, timezone
+
     rid = state.new_run_id()
     ms = market_gate.MarketState(
         is_open=False, next_open=None,
@@ -154,8 +156,13 @@ def test_write_closed_artifacts_marks_clock_error(tmp_state):
         clock_error=True,
     )
     next_run = market_gate.write_closed_artifacts(rid, ms)
-    assert next_run["next_run_at"] == ""
     assert next_run["clock_error"] is True
+    # next_run_at is a near-future retry (now + CLOCK_ERROR_RETRY_MINUTES),
+    # not empty (empty would defer to the daily fallback timer only).
+    assert next_run["next_run_at"] != ""
+    retry_at = datetime.strptime(next_run["next_run_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    delta_min = (retry_at - datetime.now(timezone.utc)).total_seconds() / 60.0
+    assert 0 < delta_min <= market_gate.CLOCK_ERROR_RETRY_MINUTES + 1
 
     gate = json.loads((state.run_dir(rid) / "market_gate.json").read_text())
     assert gate["clock_error"] is True

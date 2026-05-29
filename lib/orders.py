@@ -57,6 +57,15 @@ def in_universe(symbol: str) -> bool:
     return symbol in _UNIVERSE_SYMBOLS
 
 
+def is_tradable_target(position: dict) -> bool:
+    """True iff this target position is one the order layer would actually
+    submit: ETF-only (not option-shaped) AND in the 29-ticker universe. The
+    inverse of what diff_portfolio drops into ``skipped``. Used to keep
+    current_portfolio.json from recording a position that can never be held.
+    """
+    return not _is_option_like(position) and in_universe(position.get("symbol") or "")
+
+
 def _is_option_like(position: dict) -> bool:
     """Defensive: detect an option-shaped target position so the order layer
     can refuse it. ETF-only system — this should never fire in normal
