@@ -958,6 +958,13 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
             positions_ok = False
             next_run["order_plan_error"] = f"get_positions: {type(e).__name__}: {e}"
             next_run["orders_skipped_reason"] = "get_positions failed — failing closed"
+            # Signal to run_pipeline that the target was NOT reconciled against
+            # the broker account. The caller must NOT publish this unexecuted
+            # target as current_portfolio.json nor advance the dedup hash —
+            # doing so would make monitor/dashboard/dedup treat unfilled targets
+            # as held positions and real prior holdings as orphans (dropping
+            # their configured kill conditions). Preserve the prior state.
+            next_run["current_portfolio_unreconciled"] = True
             state.write_json(
                 state.run_dir(ctx.run_id) / "orders.json",
                 {
@@ -1550,7 +1557,14 @@ def run_pipeline(
         if not dry_run:
             state.write_json(state.NEXT_RUN, next_run)
 
-    if not dry_run:
+    # Fail-closed: if stage_execute couldn't read broker positions, the target
+    # was never reconciled against the account (no orders submitted). Do NOT
+    # publish the unexecuted target as current_portfolio.json nor advance the
+    # dedup fingerprint — that would make the monitor/dashboard/dedup treat
+    # unfilled targets as current holdings and real prior holdings as orphans,
+    # dropping their tailored kill conditions. Preserve the previous state so
+    # the next cycle reconciles cleanly once positions can be read again.
+    if not dry_run and not next_run.get("current_portfolio_unreconciled"):
         state.write_json(state.CURRENT_PORTFOLIO, portfolio)
         # Update the cycle-dedup fingerprints so the next cycle can
         # short-circuit cleanly if nothing material changed.

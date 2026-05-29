@@ -668,11 +668,84 @@ def test_stage_execute_fails_closed_when_get_positions_raises(tmp_state, monkeyp
     assert "order_plan_error" in next_run
     assert next_run["orders_skipped_reason"] == "get_positions failed — failing closed"
     assert "order_plan" not in next_run, "no plan should be built on the fail-closed path"
+    # Signals run_pipeline to NOT publish the unexecuted target (Codex P1).
+    assert next_run["current_portfolio_unreconciled"] is True
 
     orders_json = json.loads((state.run_dir("r-fc") / "orders.json").read_text())
     assert orders_json["order_ids"] == []
     # The next cycle is still scheduled.
     assert next_run["next_run_at"] == "2026-05-28T20:00:00Z"
+
+
+def test_fail_closed_positions_read_preserves_current_portfolio(tmp_state, monkeypatch):
+    """Codex P1: when broker.get_positions() raises during execution, the
+    pipeline must NOT overwrite current_portfolio.json with the unexecuted
+    target (nor advance the dedup hash) — otherwise the monitor would treat
+    unfilled targets as held and real holdings as orphans, dropping their
+    kill conditions. The prior current_portfolio.json is preserved."""
+    from lib.llm import CallUsage, StructuredCallResult
+
+    fixtures = {
+        "signals": json.loads((Path(__file__).parent / "fixtures" / "signals.json").read_text()),
+        "view": json.loads((Path(__file__).parent / "fixtures" / "view.json").read_text()),
+        "portfolio": json.loads((Path(__file__).parent / "fixtures" / "portfolio.json").read_text()),
+    }
+
+    def fake_call(call, **kwargs):
+        if call.stage == "strategist":
+            payload = fixtures["view"]
+        elif call.stage == "construct":
+            payload = fixtures["portfolio"]
+        elif call.stage == "critic":
+            payload = {"accept": True, "critique": "ok", "suggested_changes": []}
+        else:
+            payload = {}
+        return StructuredCallResult(
+            payload=payload, usage=CallUsage(0, 0, 0, 0), cost_usd=0.0,
+            cache_hit_pct=0.0, raw_text=json.dumps(payload),
+        )
+
+    monkeypatch.setenv("ORDERS_ENABLED", "true")
+    # tmp_state doesn't redirect LAST_CYCLE_HASH; point it at the temp dir so
+    # the dedup check starts clean (no prior hash → no skip) and the post-run
+    # assertion is meaningful.
+    monkeypatch.setattr(state, "LAST_CYCLE_HASH", tmp_state / "last_cycle_hash.json")
+    monkeypatch.setattr(orchestrator.llm, "structured_call", fake_call)
+    monkeypatch.setattr(
+        orchestrator.signals, "compute_signals",
+        lambda *, run_id, symbols=None: fixtures["signals"],
+    )
+    from lib import market_gate as mg
+    monkeypatch.setattr(
+        orchestrator.market_gate, "check",
+        lambda broker: mg.MarketState(is_open=True, next_open=None, rationale="open"),
+    )
+    monkeypatch.setattr(
+        orchestrator, "_compute_next_run_at",
+        lambda *, ctx, portfolio, view: ("2026-05-28T20:00:00Z", "stub", "trade"),
+    )
+
+    # Pre-seed a prior current_portfolio.json with a sentinel marker.
+    prior = {"run_id": "prior", "sentinel": True, "positions": [], "all_cash": True}
+    state.write_json(state.CURRENT_PORTFOLIO, prior)
+
+    class _RaisingBroker:
+        @property
+        def name(self): return "raising"
+        def get_account(self): raise NotImplementedError
+        def get_positions(self): raise RuntimeError("alpaca 500")
+        def submit_order(self, req): raise AssertionError("must not submit")
+        def cancel_all(self): return 0
+        def flatten(self, sym): return None
+
+    orchestrator.run_pipeline(dry_run=False, broker=_RaisingBroker())
+
+    # current_portfolio.json is UNCHANGED — the prior sentinel is preserved.
+    preserved = json.loads(state.CURRENT_PORTFOLIO.read_text())
+    assert preserved.get("sentinel") is True
+    assert preserved["run_id"] == "prior"
+    # The dedup hash was not advanced (no last_cycle_hash written this cycle).
+    assert not state.LAST_CYCLE_HASH.exists()
 
 
 def test_sync_fills_before_cooldown_noop_in_dry_run(monkeypatch):
