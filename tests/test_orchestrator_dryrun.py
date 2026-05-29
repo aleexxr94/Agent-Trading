@@ -687,26 +687,32 @@ def test_publishable_portfolio_strips_non_universe_and_option_positions():
     layer would refuse. _publishable_portfolio drops option-shaped + non-universe
     positions and recomputes all_cash when nothing tradable remains."""
     portfolio = {
-        "all_cash": False, "cash_usd": 100.0,
+        "all_cash": False, "cash_usd": 100.0, "nav_usd": 2500.0, "cash_buffer_pct": 4.0,
         "positions": [
             {"kind": "etf", "symbol": "TQQQ", "shares": 4, "position_pct": 10.0},
             {"kind": "etf", "symbol": "SPY", "shares": 5, "position_pct": 10.0},   # non-universe
-            {"kind": "option", "underlying": "QQQ", "strike": 400.0},               # option-shaped
+            {"kind": "option", "underlying": "QQQ", "strike": 400.0, "position_pct": 6.0},  # option-shaped
         ],
     }
     cleaned = orchestrator._publishable_portfolio(portfolio)
     assert [p["symbol"] for p in cleaned["positions"]] == ["TQQQ"]
     assert cleaned["all_cash"] is False  # TQQQ remains
+    # Stripped SPY (10%) + option (6%) allocations revert to cash:
+    #   freed = (0.10 + 0.06) * 2500 = 400 → cash 100 + 400 = 500
+    assert cleaned["cash_usd"] == 500.0
+    assert cleaned["cash_buffer_pct"] == 20.0
     # Original object is not mutated.
     assert len(portfolio["positions"]) == 3
+    assert portfolio["cash_usd"] == 100.0
 
-    # All-untradable → empty + all_cash flipped True.
-    only_bad = {"all_cash": False, "positions": [
-        {"kind": "etf", "symbol": "TSLA", "shares": 1, "position_pct": 5.0},
+    # All-untradable → empty + all_cash flipped True + cash = full NAV.
+    only_bad = {"all_cash": False, "cash_usd": 100.0, "nav_usd": 2500.0, "positions": [
+        {"kind": "etf", "symbol": "TSLA", "shares": 1, "position_pct": 96.0},
     ]}
     cleaned2 = orchestrator._publishable_portfolio(only_bad)
     assert cleaned2["positions"] == []
     assert cleaned2["all_cash"] is True
+    assert cleaned2["cash_usd"] == 100.0 + 0.96 * 2500.0
 
     # Clean portfolio is returned unchanged (same object).
     clean = {"all_cash": False, "positions": [

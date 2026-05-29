@@ -822,6 +822,17 @@ def _publishable_portfolio(portfolio: dict) -> dict:
         return portfolio
     cleaned = dict(portfolio)
     cleaned["positions"] = kept
+    # The stripped positions were never submitted, so their intended allocation
+    # reverts to cash (NAV is unchanged — it's total account value). Add the
+    # freed notional back so cash_usd / cash_buffer_pct match what was actually
+    # held, keeping the published portfolio, NAV row, and dedup cache honest.
+    nav = float(portfolio.get("nav_usd") or 0.0)
+    dropped = [p for p in positions if not orders.is_tradable_target(p)]
+    freed = sum(float(p.get("position_pct") or 0.0) / 100.0 * nav for p in dropped)
+    if freed:
+        cleaned["cash_usd"] = float(portfolio.get("cash_usd") or 0.0) + freed
+        if nav > 0:
+            cleaned["cash_buffer_pct"] = round(cleaned["cash_usd"] / nav * 100.0, 4)
     if not kept:
         cleaned["all_cash"] = True
     return cleaned
