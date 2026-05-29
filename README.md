@@ -2,7 +2,7 @@
 
 > **PAPER TRADING — Experimental autonomous AI agent. Leveraged ETFs and listed options on a small account are high-risk. Not financial advice.**
 
-Autonomous multi-agent trading system that runs a deterministic-signals scan over 15 leveraged ETFs + option underlyings, asks a strategist agent for a regime call + ranked candidate ideas, and asks a constructor agent to build a **1–12 position portfolio (or all-cash)** that's then executed via **Alpaca paper**. Runs unattended on a Linux VPS (or on Windows under Task Scheduler) with a Streamlit dashboard.
+Autonomous multi-agent trading system that runs a deterministic-signals scan over a 21-ticker universe (14 leveraged ETFs + 7 option underlyings), asks a strategist agent for a regime call + ranked candidate ideas, and asks a constructor agent to build a **1–12 position portfolio (or all-cash)** that's then executed via **Alpaca paper**. Runs unattended on a Linux VPS (or on Windows under Task Scheduler) with a Streamlit dashboard.
 
 The canonical build spec is [CLAUDE.md](./CLAUDE.md). This README is the operator's manual.
 
@@ -25,7 +25,7 @@ systemd timer (Linux) / Task Scheduler (Windows) ──▶ orchestrator.py
                                                       ├─ Stage 2.5: chain_lookup (Alpaca options, $0)
                                                       ├─ Stage 3: construct     (Opus 4.7, ~$0.20, 1–12 or all-cash)
                                                       ├─ Stage 3.5: critic      (Sonnet 4.6 low, ~$0.03, +1 retry on reject)
-                                                      ├─ Stage 4: sanity        (deterministic Python, $0, 10 rules)
+                                                      ├─ Stage 4: sanity        (deterministic Python, $0, 11 rules)
                                                       └─ Stage 5: execute       (Alpaca paper) + write next_run.json
                                                             │
                                                             ▼
@@ -43,8 +43,8 @@ The v1 pipeline had 5 LLM-bearing stages (screen, bull/bear research × 8 candid
 
 v2 collapses screen + bull/bear + scenarios into a single **deterministic signals stage** (zero LLM cost, just yfinance features per ticker) plus a **single strategist LLM call** that produces a regime + ranked candidate list. The construct stage still owns position selection on Opus 4.7 because that IS the soft-judgement call. The v2-winrate add-on (PR after #67) layered a critic agent, chain-lookups, PnL feedback, cycle dedup, and a drawdown-adaptive cap on top.
 
-- LLM calls per cycle: **20 → 2–3** (~85% reduction, +1 for the critic on rejection retry)
-- Typical per-cycle cost: **~$0.28** (was ~$1.50–2.50; critic adds ~$0.03)
+- LLM calls per full trade cycle: **20 → 4** (strategist + construct + critic + meta-scheduler; ~80% reduction, +1 for the critic on rejection retry = 5)
+- Typical per-cycle cost: **~$0.30** (was ~$1.50–2.50; critic adds ~$0.03, the meta-scheduler call ~$0.02)
 - At 2 cycles/weekday: **~$12/month** (was ~$300/month)
 
 The market_gate stage is the cheapest reliability win: skip the entire pipeline cleanly when markets are closed instead of producing a portfolio that can't trade. Cycle-dedup further skips strategist + construct + execute when the signals fingerprint and broker positions are both unchanged from the prior cycle.
@@ -56,7 +56,7 @@ Per-stage model assignment matches the cost/quality demand of each decision. All
 | Stage | Model | Why |
 |---|---|---|
 | **market_gate** | n/a (deterministic) | Alpaca clock query — free, zero LLM call. |
-| **signals** | n/a (deterministic) | yfinance + universe metadata. 15 ticker rows out, zero LLM cost. Replaces the v1 screener + bull/bear + scenarios chain. |
+| **signals** | n/a (deterministic) | yfinance + universe metadata. 21 ticker rows out, zero LLM cost. Replaces the v1 screener + bull/bear + scenarios chain. |
 | **strategist** | `claude-sonnet-4-6` (effort `medium`) | Reads the signals table → emits a regime call + 0–6 candidate ideas with thesis + confidence. Sonnet + medium effort caps thinking-budget allocation (PR ε lesson on the v1 scenarios stage). |
 | **construct** | `claude-opus-4-7` (effort `high`) | **The actual trade decision** — picks positions, sizing, kill conditions. On a $2,500 leveraged-ETF + options account, position-selection quality has direct PnL impact: multi-position correlation reasoning + sizing math under a 15%/position cap + per-row kill-condition tailoring. Override with `MODEL_CONSTRUCTOR=claude-sonnet-4-6` if cost dominates. |
 | **orchestrator-meta** *(timing only)* | `claude-sonnet-4-6` | Decides next-run window from regime + portfolio state. Bounded 1–24h, falls back to a 4h/6h heuristic if the LLM output is unusable. Small payload, no schema — Sonnet is right-sized. |
@@ -67,7 +67,7 @@ Per-run cap defaults to $3; daily cap defaults to $12.
 
 ## What we scan & trade
 
-**Universe: 18 instruments** (trimmed from 33 in v2, expanded with gold on 2026-05-13) across 10 factor groups. Curated; entries that fail liquidity filters at signals time still appear in the table with their numeric features, but the strategist learns to ignore low-ADV rows.
+**Universe: 21 instruments** (trimmed from 33 to 15 in v2, expanded with gold to 18 on 2026-05-13, then to 21 with the IWM/XLF/XLE option cheapeners on 2026-05-22) across 11 factor groups. Curated; entries that fail liquidity filters at signals time still appear in the table with their numeric features, but the strategist learns to ignore low-ADV rows.
 
 ### Leveraged ETFs (14)
 
@@ -84,7 +84,7 @@ Direct positions in 1.5x / 2x / 3x daily-rebalancing ETFs. Subject to per-positi
 | VIX front-month (1.5x) | UVXY | — |
 | Bitcoin futures (2x) | BITX | — |
 
-### Option underlyings (4)
+### Option underlyings (7)
 
 The agent doesn't hold these as positions — only **listed calls / puts on them**. Long options only (no writes, no spreads). Subject to **100% premium kill condition**.
 
@@ -94,6 +94,11 @@ The agent doesn't hold these as positions — only **listed calls / puts on them
 | QQQ | Tech-heavy options chain, very liquid |
 | TLT | 20+ Year Treasury — rates exposure, anti-correlated to equity-long (no leveraged bond ETF in v2) |
 | GLD | SPDR Gold Shares — spot-gold tracker, distinct from NUGT/DUST (which carry equity beta + operational leverage on top of gold) |
+| IWM | iShares Russell 2000 — small-cap option expressions at affordable premium; shares the small-caps factor with TNA/TZA (constructor picks ETF vs option per sizing math) |
+| XLF | Financial Select Sector SPDR — cheapest equity-sector option expression in the universe; shares the financials factor with FAS/FAZ |
+| XLE | Energy Select Sector SPDR — energy/oil-gas factor with no leveraged ETF pair; option-only path |
+
+The last three (IWM/XLF/XLE, added 2026-05-22) are **cheapeners**: on a $2,500 account the 15% per-position cap is ~$375, and SPY/QQQ contracts ($500–800 premium) don't fit. Lower-priced underlyings let the option path actually clear ≥1 contract on factors beyond TLT/GLD.
 
 ### What we explicitly don't trade
 
@@ -108,25 +113,28 @@ The agent doesn't hold these as positions — only **listed calls / puts on them
 The v1 33-ticker universe produced the same TLT-straddle outcome cycle after cycle. Too many candidates contributed to constructor decision fatigue and convergence to a "hedge with vol" default. The v2 trim drops:
 
 - Russell 2000 alts (URTY/SRTY) — TNA/TZA already cover the factor
-- Regional banks (DPST), biotech (LABU/LABD), healthcare (CURE), China (YINN/YANG), energy (ERX/ERY), gold miners (NUGT/DUST), nat gas (BOIL), ether (ETHU), bitcoin alts (BITU/SBIT) — lower ADV; factor-redundant or speculative
-- IWM, DIA as option underlyings — Russell 2000 is covered via TNA/TZA already; DIA correlates ~99% with SPY
+- Regional banks (DPST), biotech (LABU/LABD), healthcare (CURE), China (YINN/YANG), leveraged energy (ERX/ERY), nat gas (BOIL), ether (ETHU), bitcoin alts (BITU/SBIT) — lower ADV; factor-redundant or speculative
+- DIA as an option underlying — correlates ~99% with SPY
+
+(Gold miners NUGT/DUST + spot GLD were added back on 2026-05-13 for gold-factor diversification, and IWM/XLF/XLE were added as option underlyings on 2026-05-22 — see the universe tables above.)
 
 ---
 
 ## How the agents work
 
-Each cycle runs as a sequence of **schema-validated stages**. Three are LLM calls (strategist, construct, critic); the rest are deterministic Python. The LLM agents read role-specific system prompts under [`prompts/`](./prompts/). Anthropic prompt caching keeps the static system block cheap across calls.
+Each cycle runs as a sequence of **schema-validated stages**. Four are LLM calls (strategist, construct, critic, and the meta-scheduler that picks the next-run window); the rest are deterministic Python. The LLM agents read role-specific system prompts under [`prompts/`](./prompts/). Anthropic prompt caching keeps the static system block cheap across calls.
 
 ### 0. Market gate — Alpaca clock, $0
 Queries `/v2/clock`. If markets are closed (weekend, holiday, after-hours), writes `market_gate.json` + a closed-market `next_run.json` pointing at the broker-reported next open, and exits. No LLM calls billed on a closed-market cycle.
 
 ### 1. Signals — deterministic Python, $0
-For each of the 18 universe tickers, computes from yfinance daily history:
+For each of the 21 universe tickers, computes from yfinance daily history:
 - `last_close`, `adv_30d` (liquidity)
 - `momentum_30d_pct` / `momentum_60d_pct` (trailing returns)
 - `hv_30d_annualised` / `hv_90d_annualised` (close-to-close vol)
 - `dist_from_50d_ma_pct` / `dist_from_200d_ma_pct` (trend position)
-- `is_optionable` (true for SPY/QQQ/TLT)
+- `is_optionable` (true for the 7 option underlyings: SPY/QQQ/TLT/GLD/IWM/XLF/XLE)
+- `upcoming_macro_events_7d` (per-ticker FOMC/CPI/NFP/PCE events within 7 days)
 
 Replaces the v1 screener + bull/bear research + scenarios chain entirely. Output: `signals.json`.
 
@@ -162,7 +170,7 @@ Adversarial second-pair-of-eyes pass. Reads `view.json` + `portfolio.json`, retu
 ### 4. Sanity — deterministic Python, $0
 Post-construct rules (see [`lib/sanity.py`](./lib/sanity.py)). Each rule has a fixed severity (`warn` or `fail`); the overall sanity status is the worst per-rule status. Non-blocking by default — `SANITY_BLOCK_ON_FAIL=true` escalates `fail` into a hard skip of `stage_execute`.
 
-Rules (10 total):
+Rules (11 total):
 - `construction_rationale_meaningful` — ≥ 80 chars
 - `kill_conditions_complete` — max_loss_pct ∈ (0,100] + at least one price/time stop
 - `position_backed_by_strategist` — every position has confidence ≥ 0.5 + matching instrument_kind in `view.json`
@@ -173,6 +181,7 @@ Rules (10 total):
 - `option_premium_above_floor` — premium ≥ $0.05
 - `position_notional_above_floor` — position notional ≥ $50 (spread + fees dominate below this on a $2,500 account)
 - `position_adv_liquidity` — position notional ≤ 1% of underlying's 30-day dollar ADV
+- `reentry_cooldown` — a symbol fully exited within the last 7 days isn't re-entered unless the strategist confidence clears the override threshold (≥ 0.8); pairs with the 30%-gain harvest rule to stop churn-and-re-buy
 
 Output: `sanity.json`.
 
@@ -194,9 +203,9 @@ Output: `sanity.json`.
 
 On a $2,500 paper account in a leveraged-ETF + listed-options universe, **the edge isn't sector picking — it's discipline**: positive-EV only, hard 15% per-position NAV cap, 25% kill for ETFs / 100% premium kill for long options, single-leg trades only, no multi-leg combos, no broker shorts (bearish views go via bear ETFs or long puts).
 
-The v2 pipeline reads deterministic signals (momentum, vol, MA distance) for 15 curated tickers and feeds them to a Sonnet strategist that picks ≤6 high-conviction ideas; an Opus constructor then sizes 1–12 positions. Cycles run every 4 hours during market hours; the cadence skips weekends/holidays automatically.
+The v2 pipeline reads deterministic signals (momentum, vol, MA distance) for 21 curated tickers and feeds them to a Sonnet strategist that picks ≤6 high-conviction ideas; an Opus constructor then sizes 1–12 positions. Cycles run every 4 hours during market hours; the cadence skips weekends/holidays automatically.
 
-**Losses are expected** — the experiment is whether prompt + schema discipline produces an honest Sharpe across many cycles, not whether it picks individual winners. Per-cycle LLM cost is ~$0.25, which keeps experimentation affordable.
+**Losses are expected** — the experiment is whether prompt + schema discipline produces an honest Sharpe across many cycles, not whether it picks individual winners. Per-cycle LLM cost is ~$0.30, which keeps experimentation affordable.
 
 ---
 
@@ -260,9 +269,13 @@ Fill in:
 | `ANTHROPIC_API_KEY`          | From [console.anthropic.com](https://console.anthropic.com).           |
 | `ALPACA_API_KEY` / `_SECRET` | **Paper** keys from [alpaca.markets](https://alpaca.markets) — never live. |
 | `ALPACA_BASE_URL`            | `https://paper-api.alpaca.markets` (default).                         |
+| `ALPACA_DATA_URL`            | `https://data.alpaca.markets` (default) — market-data feed.           |
 | `MODEL_*`                    | Override the per-stage model IDs if needed (defaults are Claude 4.X). |
+| `VIRTUAL_NAV_USD`            | Default `2500`. Sizing baseline (this value + realized P&L), used instead of Alpaca paper's $100k equity. If unset/malformed it falls back to a hard-coded `2500` — it does **not** read broker equity (Phase 3 removed that path so a missing var can't size ~40× too large). |
 | `PER_RUN_COST_CAP_USD`       | Default `3.00`. Per-run hard cap.                                     |
 | `DAILY_COST_CAP_USD`         | Default `12.00`. Daily hard cap (resets at 00:00 UTC).                |
+| `ORDERS_ENABLED`             | Default `false`. When `false`, the pipeline writes `portfolio.json` but never touches the broker. Flip to `true` once decisions look right. |
+| `SANITY_BLOCK_ON_FAIL`       | Default `false`. When `true`, any sanity rule with status `fail` hard-skips `stage_execute`. |
 | `LIVE_TRADING_ENABLED`       | **Leave `false`.** See [Promotion to live](./CLAUDE.md#promotion-to-live-documented-only--do-not-enable-in-code). |
 
 ### 4. Manual smoke (do this BEFORE enabling timers)
@@ -274,7 +287,7 @@ sudo -u agent tail -n 5 /opt/agent-trading/state/decisions.jsonl
 sudo -u agent tail -n 5 /opt/agent-trading/state/costs.jsonl
 ```
 
-A live run typically costs ~$0.03–$0.50 depending on candidate count, well under the $2 per-run cap.
+A live run typically costs ~$0.03–$0.50 depending on candidate count, well under the $3 per-run cap.
 
 ### 5. Start the dashboard
 
@@ -384,7 +397,7 @@ python orchestrator.py --dry-run
 ### 6. Manual run
 
 ```powershell
-# Dry-run — no LLM, no orders, exercises the full 5-stage pipeline against fixtures
+# Dry-run — no LLM, no orders, exercises the full pipeline against fixtures
 python orchestrator.py --dry-run
 
 # Live paper run — calls Anthropic + Alpaca paper
@@ -483,7 +496,7 @@ Or click **Emergency stop** on the dashboard's Settings tab.
 
 | Location                         | Contents                                                             |
 | -------------------------------- | -------------------------------------------------------------------- |
-| `state/runs/{run_id}/`           | Per-run JSON: `market_gate.json`, `signals.json`, `view.json`, `portfolio.json`, `sanity.json`, `orders.json`, `next_run.json` |
+| `state/runs/{run_id}/`           | Per-run JSON: `market_gate.json`, `signals.json`, `view.json`, `chain_lookups.json`, `portfolio.json`, `critique.json`, `sanity.json`, `orders.json`, `next_run.json` |
 | `state/decisions.jsonl`          | Append-only decision log (one row per stage, schema-validated)        |
 | `state/costs.jsonl`              | Per-LLM-call cost ledger; daily and per-run caps enforced from this file |
 | `state/current_portfolio.json`   | Latest known portfolio (consumed by `monitor.py` and the dashboard)   |
@@ -541,4 +554,4 @@ The full set of pre-conditions (≥ 4 weeks paper, Sharpe ≥ 0.5, max DD ≤ 25
 
 ## Status
 
-Active development. The 5-stage pipeline runs end-to-end on paper data; the dashboard renders against fixtures or live state. See [CLAUDE.md](./CLAUDE.md) for the full spec, [`deploy/README.md`](./deploy/README.md) for the Linux operator playbook, and the `state/` directory (when populated) for current behaviour.
+Active development. The full pipeline runs end-to-end on paper data; the dashboard renders against fixtures or live state. See [CLAUDE.md](./CLAUDE.md) for the full spec, [`deploy/README.md`](./deploy/README.md) for the Linux operator playbook, and the `state/` directory (when populated) for current behaviour.
