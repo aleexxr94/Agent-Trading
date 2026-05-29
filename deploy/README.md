@@ -1,23 +1,23 @@
-# Linux deployment (Hetzner / any Ubuntu 24.04 VPS)
+# Linux VPS operator playbook (Hetzner / any Ubuntu 24.04 VPS)
 
 > **Paper trading only.** Live trading is gated by `LIVE_TRADING_ENABLED` and a hard-coded `LIVE_VERSION` constant in `orchestrator.py`. See [CLAUDE.md §Promotion to live](../CLAUDE.md#promotion-to-live-documented-only--do-not-enable-in-code).
 
-This directory replaces the Windows Task Scheduler path under `scheduling/`. Use one or the other — not both.
+This is the canonical playbook for running Agent-Trading. **Linux VPS + systemd is the sole supported production runtime.** The pieces:
 
-| Layer | Windows path (existing) | Linux path (this) |
-|---|---|---|
-| Schedule | Windows Task Scheduler XML | systemd `*.timer` units |
-| Wrapper | `scheduling\run_orchestrator.ps1` | `deploy/run_orchestrator.sh` |
-| Halt | Touch `state\halt.flag` | Touch `state/halt.flag` |
-| Dashboard | `streamlit run` (manual) | `agent-dashboard.service` (auto-restart) |
+| Layer | Component |
+|---|---|
+| Schedule | systemd `*.timer` units + `agent-scheduler.service` (dynamic cadence from `state/next_run.json`) |
+| Wrapper | `deploy/run_orchestrator.sh`, `deploy/run_monitor.sh`, `deploy/run_scheduler.sh` |
+| Halt | Touch `state/halt.flag` |
+| Dashboard | `agent-dashboard.service` (auto-restart, binds `127.0.0.1` only) |
 
 ---
 
 ## One-time bootstrap
 
-From your Windows laptop, SSH in:
+SSH into the VPS:
 
-```powershell
+```bash
 ssh root@<your-ip>
 ```
 

@@ -4,6 +4,12 @@ name: Deploy to VPS
 # then restarts the dashboard. install.sh self-fetches origin/main, so
 # this workflow does not need to ship code — it only triggers the pull.
 #
+# Deployment flow (do not deploy by hand):
+#   - Pushing a PR branch is for human review only — it does NOT deploy.
+#   - Merging to `main` is the single trigger that syncs the VPS (below).
+#   - Claude Code / agents must not manually deploy or manually dispatch
+#     this workflow; let the merge-to-main push event drive it.
+#
 # Required repo secrets (Settings → Secrets and variables → Actions):
 #   VPS_HOST          host or IP of the VPS (e.g. 95.217.233.216)
 #   VPS_SSH_KEY       private key for the dedicated deploy keypair

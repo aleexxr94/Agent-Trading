@@ -1,6 +1,7 @@
 """Lightweight kill-condition checker.
 
-Runs more frequently than the orchestrator (Task Scheduler-driven). Reads
+Runs more frequently than the orchestrator (systemd timer-driven on the
+Linux VPS — see deploy/systemd/agent-monitor.timer). Reads
 state/current_portfolio.json, evaluates per-position kill conditions and the
 8% daily drawdown circuit breaker via lib.risk, and may flatten via the
 broker — but cannot open new positions. Halt flag is honoured.

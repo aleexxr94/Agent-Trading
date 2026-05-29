@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Linux equivalent of scheduling/run_orchestrator.ps1.
+# Orchestrator wrapper for the Linux VPS deployment.
 # Invoked by agent-orchestrator.service.
 #
-# 1. Halt-flag short-circuit BEFORE venv activation (matches Windows wrapper).
+# 1. Halt-flag short-circuit BEFORE venv activation.
 # 2. Activate .venv and run python orchestrator.py.
 #
 # Dynamic scheduling (firing the NEXT cycle from state/next_run.json) is
