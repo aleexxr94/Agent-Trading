@@ -2,7 +2,7 @@
   "run_id": "fixture",
   "generated_at": "2026-05-13T14:00:30Z",
   "regime": "trending_up",
-  "regime_rationale": "Broad equity uptrend: TQQQ momentum_30d_pct=8.4 and dist_from_50d_ma_pct=4.2; UPRO +6.2/+3.1; SOXL leading at +11.2. Vol contained (SPY HV30=0.11). Bear ETFs all negative-momentum confirming directional bias. No defensive rotation into TLT (-2.1).",
+  "regime_rationale": "Broad equity uptrend: TQQQ momentum_30d_pct=8.4 and dist_from_50d_ma_pct=4.2; UPRO +6.2/+3.1; SOXL leading at +11.2. Vol contained. Inverse ETFs all negative-momentum, confirming directional bias.",
   "candidates": [
     {
       "symbol": "TQQQ",
@@ -17,9 +17,9 @@
       "confidence": 0.68
     },
     {
-      "symbol": "SPY",
-      "instrument_kind": "option_call",
-      "thesis": "Cheap SPY call as broad-market expression: HV30=0.11 is bottom-quartile (cheap IV proxy); momentum_30d_pct=2.1 modest but positive. Defined-risk alternative to UPRO with no leverage decay.",
+      "symbol": "UPRO",
+      "instrument_kind": "etf",
+      "thesis": "Broad-market bull leg via UPRO: momentum_30d_pct=6.2 + dist_from_50d_ma_pct=3.1; complements the Nasdaq/semis legs with S&P breadth in a trending_up regime.",
       "confidence": 0.61
     }
   ]

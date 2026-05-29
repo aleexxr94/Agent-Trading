@@ -6,7 +6,7 @@ per cycle, joins against ``state/nav_history.jsonl`` to compute
 realized cycle-over-cycle NAV change, and emits a summary table.
 
 This is the v2 substitute for a full LLM-replay backtest. Real
-backtesting needs paid Alpaca historical options data; this tool just
+backtesting needs paid Alpaca historical market data; this tool just
 analyzes what actually happened on past cycles. Use it to:
 
   - Spot drift: is the strategist consistently calling `risk_on`

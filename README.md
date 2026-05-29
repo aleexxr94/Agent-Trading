@@ -1,16 +1,30 @@
 # Agent-Trading
 
-> **PAPER TRADING — Experimental autonomous AI agent. Leveraged ETFs and listed options on a small account are high-risk. Not financial advice.**
+> **PAPER TRADING — Experimental autonomous AI agent. Leveraged & inverse ETFs on a small account are high-risk. Not financial advice.**
 
-Autonomous multi-agent trading system that runs a deterministic-signals scan over a 21-ticker universe (14 leveraged ETFs + 7 option underlyings), asks a strategist agent for a regime call + ranked candidate ideas, and asks a constructor agent to build a **1–12 position portfolio (or all-cash)** that's then executed via **Alpaca paper**. Runs unattended on a Linux VPS under systemd, with a Streamlit dashboard.
+Autonomous multi-agent trading system that runs a deterministic-signals scan over a 29-ticker **leveraged/inverse ETF** universe, asks a strategist agent for a regime call + ranked candidate ideas, and asks a constructor agent to build a **1–12 position portfolio (or all-cash)** that's then executed via **Alpaca paper**. Bullish theses are expressed by holding bull ETFs; bearish theses by holding inverse ETFs — never short selling, never options. Runs unattended on a Linux VPS under systemd, with a Streamlit dashboard.
 
 The canonical build spec is [CLAUDE.md](./CLAUDE.md). This README is the operator's manual.
 
 ---
 
+## Why ETF-only (migration note)
+
+The system originally also traded listed options (long calls/puts on a set of
+underlyings). Options were **removed entirely** on 2026-05-29: the $2,500
+account size made them non-viable — the 15%-per-position cap (~$375) rarely
+cleared a single contract, and after six months of paper trading the system
+opened **zero** option positions. The strategy is now purely leveraged and
+inverse ETFs. Bearish views are expressed by **buying inverse ETFs** (SQQQ,
+SPXU, TZA, …), not by short selling and not by puts. The factors the option
+underlyings used to cover (rates, energy) now have real leveraged ETF pairs
+(TMF/TMV, ERX/ERY).
+
+---
+
 ## Mandatory risk warning
 
-> Leveraged ETFs decay path-dependently in volatile markets and are not buy-and-hold instruments. Long options can expire worthless; theta works against long premium daily. A $2,500 account cannot diversify options positions meaningfully — concentration risk is structural, not a flaw to fix. This system is an experiment in autonomous AI trading agents, not a path to reliable returns. Expect losses. Do not deploy capital you cannot afford to lose entirely. None of this is financial advice.
+> Leveraged and inverse ETFs decay path-dependently in volatile markets and are not buy-and-hold instruments — a 3x ETF held through chop bleeds value even when the underlying ends flat. A $2,500 account cannot diversify meaningfully across many such positions — concentration risk is structural, not a flaw to fix. This system is an experiment in autonomous AI trading agents, not a path to reliable returns. Expect losses. Do not deploy capital you cannot afford to lose entirely. None of this is financial advice.
 
 ---
 
@@ -22,10 +36,9 @@ systemd timer (Linux VPS) ──▶ orchestrator.py
                                                       ├─ Stage 1: signals       (deterministic Python, $0)
                                                       ├─       state context     (broker positions + PnL history)
                                                       ├─ Stage 2: strategist    (Sonnet 4.6, ~$0.05)
-                                                      ├─ Stage 2.5: chain_lookup (Alpaca options, $0)
                                                       ├─ Stage 3: construct     (Opus 4.7, ~$0.20, 1–12 or all-cash)
                                                       ├─ Stage 3.5: critic      (Sonnet 4.6 low, ~$0.03, +1 retry on reject)
-                                                      ├─ Stage 4: sanity        (deterministic Python, $0, 11 rules)
+                                                      ├─ Stage 4: sanity        (deterministic Python, $0, 9 rules)
                                                       └─ Stage 5: execute       (Alpaca paper) + write next_run.json
                                                             │
                                                             ▼
@@ -41,7 +54,7 @@ systemd timer (Linux VPS) ──▶ orchestrator.py
 
 The v1 pipeline had 5 LLM-bearing stages (screen, bull/bear research × 8 candidates, scenarios, construct, meta) costing ~$1.50–2.50/cycle. The bull/bear/scenarios stages produced qualitative text that ultimately compressed to a few numbers anyway — and they were the heaviest, least reliable parts of the system (Sonnet+adaptive-thinking empty-output failures, cost-cap overruns, recurring TLT straddles).
 
-v2 collapses screen + bull/bear + scenarios into a single **deterministic signals stage** (zero LLM cost, just yfinance features per ticker) plus a **single strategist LLM call** that produces a regime + ranked candidate list. The construct stage still owns position selection on Opus 4.7 because that IS the soft-judgement call. The v2-winrate add-on (PR after #67) layered a critic agent, chain-lookups, PnL feedback, cycle dedup, and a drawdown-adaptive cap on top.
+v2 collapses screen + bull/bear + scenarios into a single **deterministic signals stage** (zero LLM cost, just yfinance features per ticker) plus a **single strategist LLM call** that produces a regime + ranked candidate list. The construct stage still owns position selection on Opus 4.7 because that IS the soft-judgement call. The v2-winrate add-on (PR after #67) layered a critic agent, PnL feedback, cycle dedup, and a drawdown-adaptive cap on top.
 
 - LLM calls per full trade cycle: **20 → 4** (strategist + construct + critic + meta-scheduler; ~80% reduction, +1 for the critic on rejection retry = 5)
 - Typical per-cycle cost: **~$0.30** (was ~$1.50–2.50; critic adds ~$0.03, the meta-scheduler call ~$0.02)
@@ -56,9 +69,9 @@ Per-stage model assignment matches the cost/quality demand of each decision. All
 | Stage | Model | Why |
 |---|---|---|
 | **market_gate** | n/a (deterministic) | Alpaca clock query — free, zero LLM call. |
-| **signals** | n/a (deterministic) | yfinance + universe metadata. 21 ticker rows out, zero LLM cost. Replaces the v1 screener + bull/bear + scenarios chain. |
+| **signals** | n/a (deterministic) | yfinance + universe metadata. 29 ticker rows out, zero LLM cost. Replaces the v1 screener + bull/bear + scenarios chain. |
 | **strategist** | `claude-sonnet-4-6` (effort `medium`) | Reads the signals table → emits a regime call + 0–6 candidate ideas with thesis + confidence. Sonnet + medium effort caps thinking-budget allocation (PR ε lesson on the v1 scenarios stage). |
-| **construct** | `claude-opus-4-7` (effort `high`) | **The actual trade decision** — picks positions, sizing, kill conditions. On a $2,500 leveraged-ETF + options account, position-selection quality has direct PnL impact: multi-position correlation reasoning + sizing math under a 15%/position cap + per-row kill-condition tailoring. Override with `MODEL_CONSTRUCTOR=claude-sonnet-4-6` if cost dominates. |
+| **construct** | `claude-opus-4-7` (effort `high`) | **The actual trade decision** — picks positions, sizing, kill conditions. On a $2,500 leveraged/inverse-ETF account, position-selection quality has direct PnL impact: multi-position correlation reasoning + sizing math under a 15%/position cap + per-row kill-condition tailoring. Override with `MODEL_CONSTRUCTOR=claude-sonnet-4-6` if cost dominates. |
 | **orchestrator-meta** *(timing only)* | `claude-sonnet-4-6` | Decides next-run window from regime + portfolio state. Bounded 1–24h, falls back to a 4h/6h heuristic if the LLM output is unusable. Small payload, no schema — Sonnet is right-sized. |
 
 Per-run cap defaults to $3; daily cap defaults to $12.
@@ -67,56 +80,50 @@ Per-run cap defaults to $3; daily cap defaults to $12.
 
 ## What we scan & trade
 
-**Universe: 21 instruments** (trimmed from 33 to 15 in v2, expanded with gold to 18 on 2026-05-13, then to 21 with the IWM/XLF/XLE option cheapeners on 2026-05-22) across 11 factor groups. Curated; entries that fail liquidity filters at signals time still appear in the table with their numeric features, but the strategist learns to ignore low-ADV rows.
+**Universe: 29 leveraged/inverse ETFs** across 15 factor groups — 13 bull/bear
+pairs plus UVXY (solo long-vol) and BITX/BITI (crypto). Curated; entries that
+fail liquidity filters at signals time still appear in the table with their
+numeric features, but the strategist learns to ignore low-ADV rows.
 
-### Leveraged ETFs (14)
+Every position is a **long holding of a leveraged or inverse ETF**. A bullish
+thesis holds the bull ETF; a bearish thesis holds the inverse ETF. Subject to
+per-position **15% NAV cap** and **25% loss kill condition**.
 
-Direct positions in 1.5x / 2x / 3x daily-rebalancing ETFs. Subject to per-position **15% NAV cap** and **25% loss kill condition**.
-
-| Factor | Bull | Bear |
+| Factor | Bull | Inverse (bear) |
 |---|---|---|
 | Nasdaq-100 (3x) | TQQQ | SQQQ |
 | S&P 500 (3x) | UPRO | SPXU |
-| Russell 2000 (3x) | TNA | TZA |
+| Russell 2000 small-caps (3x) | TNA | TZA |
 | Semiconductors (3x) | SOXL | SOXS |
+| Technology sector (3x) | TECL | TECS |
+| Biotech (3x) | LABU | LABD |
+| FTSE China (3x) | YINN | YANG |
 | Financials, broad (3x) | FAS | FAZ |
+| Energy sector (2x) | ERX | ERY |
+| Oil & gas E&P (2x) | GUSH | DRIP |
+| Natural gas (2x) | BOIL | KOLD |
+| 20+yr Treasuries / rates (3x) | TMF | TMV |
 | Gold miners (2x) | NUGT | DUST |
 | VIX front-month (1.5x) | UVXY | — |
-| Bitcoin futures (2x) | BITX | — |
-
-### Option underlyings (7)
-
-The agent doesn't hold these as positions — only **listed calls / puts on them**. Long options only (no writes, no spreads). Subject to **100% premium kill condition**.
-
-| Symbol | Why |
-|---|---|
-| SPY | Most liquid options chain in the world; broad-market exposure |
-| QQQ | Tech-heavy options chain, very liquid |
-| TLT | 20+ Year Treasury — rates exposure, anti-correlated to equity-long (no leveraged bond ETF in v2) |
-| GLD | SPDR Gold Shares — spot-gold tracker, distinct from NUGT/DUST (which carry equity beta + operational leverage on top of gold) |
-| IWM | iShares Russell 2000 — small-cap option expressions at affordable premium; shares the small-caps factor with TNA/TZA (constructor picks ETF vs option per sizing math) |
-| XLF | Financial Select Sector SPDR — cheapest equity-sector option expression in the universe; shares the financials factor with FAS/FAZ |
-| XLE | Energy Select Sector SPDR — energy/oil-gas factor with no leveraged ETF pair; option-only path |
-
-The last three (IWM/XLF/XLE, added 2026-05-22) are **cheapeners**: on a $2,500 account the 15% per-position cap is ~$375, and SPY/QQQ contracts ($500–800 premium) don't fit. Lower-priced underlyings let the option path actually clear ≥1 contract on factors beyond TLT/GLD.
+| Bitcoin futures | BITX (2x) | BITI (1x inverse) |
 
 ### What we explicitly don't trade
 
+- **Options** — removed entirely (see the migration note above); no calls, puts, spreads, or straddles
 - **Spot single-name equities** (no AAPL, NVDA, etc.) — too much idiosyncratic risk on a $2,500 account
-- **Unleveraged broad-market ETFs as positions** — SPY/QQQ/TLT are only entered via their options
-- **Actual short-selling** — bearish theses are expressed as long bear ETFs (SQQQ, SPXU, etc.) or long puts. No margin account.
-- **Multi-leg option combos** — single-leg only (no spreads, condors, straddles as a single ticket)
+- **Unleveraged broad-market ETFs as core positions** — exposure is always via a leveraged/inverse ETF
+- **Actual short-selling** — bearish theses are expressed as long inverse ETFs (SQQQ, SPXU, etc.). Cash account, no margin.
 - **Live trading** — gate hard-disabled until §"Promotion to live" in [CLAUDE.md](./CLAUDE.md) is met
 
-### Why the v2 trim
+### Factor coverage
 
-The v1 33-ticker universe produced the same TLT-straddle outcome cycle after cycle. Too many candidates contributed to constructor decision fatigue and convergence to a "hedge with vol" default. The v2 trim drops:
-
-- Russell 2000 alts (URTY/SRTY) — TNA/TZA already cover the factor
-- Regional banks (DPST), biotech (LABU/LABD), healthcare (CURE), China (YINN/YANG), leveraged energy (ERX/ERY), nat gas (BOIL), ether (ETHU), bitcoin alts (BITU/SBIT) — lower ADV; factor-redundant or speculative
-- DIA as an option underlying — correlates ~99% with SPY
-
-(Gold miners NUGT/DUST + spot GLD were added back on 2026-05-13 for gold-factor diversification, and IWM/XLF/XLE were added as option underlyings on 2026-05-22 — see the universe tables above.)
+The 13 paired factors give the strategist a directional expression on both
+sides of each theme. Several equity factors (Nasdaq / S&P / tech / semis) are
+correlated risk-on beta — the constructor de-duplicates by `factor` so it
+doesn't load the same bet twice under different tickers. Rates (TMF/TMV) and
+gold (NUGT/DUST) are the main diversifiers against equity beta; UVXY is the
+long-vol tail hedge. Excluded as redundant/illiquid: URTY/SRTY (TNA/TZA cover
+small-caps), DPST, CURE, BITU/SBIT/ETHU, DIA.
 
 ---
 
@@ -128,20 +135,19 @@ Each cycle runs as a sequence of **schema-validated stages**. Four are LLM calls
 Queries `/v2/clock`. If markets are closed (weekend, holiday, after-hours), writes `market_gate.json` + a closed-market `next_run.json` pointing at the broker-reported next open, and exits. No LLM calls billed on a closed-market cycle.
 
 ### 1. Signals — deterministic Python, $0
-For each of the 21 universe tickers, computes from yfinance daily history:
+For each of the 29 universe tickers, computes from yfinance daily history:
 - `last_close`, `adv_30d` (liquidity)
 - `momentum_30d_pct` / `momentum_60d_pct` (trailing returns)
 - `hv_30d_annualised` / `hv_90d_annualised` (close-to-close vol)
 - `dist_from_50d_ma_pct` / `dist_from_200d_ma_pct` (trend position)
-- `is_optionable` (true for the 7 option underlyings: SPY/QQQ/TLT/GLD/IWM/XLF/XLE)
 - `upcoming_macro_events_7d` (per-ticker FOMC/CPI/NFP/PCE events within 7 days)
 
 Replaces the v1 screener + bull/bear research + scenarios chain entirely. Output: `signals.json`.
 
 ### 2. Strategist — Sonnet 4.6, ~$0.05
-One LLM call. Reads `signals.json`, emits a **regime classification** (one of `risk_on`, `risk_off`, `neutral`, `vol_elevated`, `trending_up`, `trending_down`, `choppy`) + up to **6 candidate ideas** with `instrument_kind` (`etf` / `option_call` / `option_put`), `thesis` (signal-citing), and `confidence` ∈ [0, 1].
+One LLM call. Reads `signals.json`, emits a **regime classification** (one of `risk_on`, `risk_off`, `neutral`, `vol_elevated`, `trending_up`, `trending_down`, `choppy`) + up to **6 candidate ideas** with `instrument_kind` (always `etf`), `thesis` (signal-citing), and `confidence` ∈ [0, 1].
 
-Bear theses are expressed as long bear ETFs (SQQQ, SPXU, etc.) or long puts. The system never goes broker-short.
+Bullish theses name the bull ETF; bearish theses name the inverse ETF (SQQQ, SPXU, etc.). The system never goes broker-short and never trades options.
 
 Output: `view.json`.
 
@@ -149,15 +155,13 @@ Output: `view.json`.
 Reads `signals.json` + `view.json`. Picks 1–12 positions from the strategist's candidate list — or all-cash if the strategist returned zero candidates and the regime is genuinely uninvestable.
 
 Builds the portfolio with sizing math:
-- ETFs: integer shares from `position_pct × NAV / share_price`, floored
-- Options: integer contracts from `position_pct × NAV / (premium × 100)`, floored
-- Strike: nearest available OTM at 30–45 DTE
+- Integer shares from `position_pct × NAV / share_price`, floored
+- Refuses a position where even 1 share exceeds the per-position cap
 - Hard 15% per-position NAV cap, sum of `position_pct` ≤ 100 (residual = cash buffer)
-- Explicit kill conditions per leg (max_loss_pct + at least one of price/time stop)
+- Explicit kill conditions per leg (max_loss_pct = 25 + at least one of ETF price / time stop)
 
 Bias: take a position if the strategist surfaces a candidate with confidence ≥ 0.6. **Abstaining cycle after cycle is not the goal** — the v1 system collapsed to that pattern and the v2 prompt explicitly counters it. The constructor receives:
 - Signals + view (from the upstream stages)
-- `chain_lookups.json` — real Alpaca OSI symbols + DTE for each option candidate (avoids inventing untradable strikes)
 - Current broker positions (state awareness — bias to hold winners vs churn)
 - Recent PnL history (last 5 cycles' regime + realized 4h PnL — self-correct drift)
 - Adaptive per-position cap (lower in drawdown via `risk.adaptive_position_cap_pct`)
@@ -170,23 +174,21 @@ Adversarial second-pair-of-eyes pass. Reads `view.json` + `portfolio.json`, retu
 ### 4. Sanity — deterministic Python, $0
 Post-construct rules (see [`lib/sanity.py`](./lib/sanity.py)). Each rule has a fixed severity (`warn` or `fail`); the overall sanity status is the worst per-rule status. Non-blocking by default — `SANITY_BLOCK_ON_FAIL=true` escalates `fail` into a hard skip of `stage_execute`.
 
-Rules (11 total):
+Rules (9 total):
 - `construction_rationale_meaningful` — ≥ 80 chars
 - `kill_conditions_complete` — max_loss_pct ∈ (0,100] + at least one price/time stop
-- `position_backed_by_strategist` — every position has confidence ≥ 0.5 + matching instrument_kind in `view.json`
+- `position_backed_by_strategist` — every position's symbol is endorsed at confidence ≥ 0.5 in `view.json`
 - `position_within_adaptive_cap` — position_pct ≤ drawdown-adaptive cap (15% at-peak, 7.5% at ≥10% drawdown, linear between)
-- `straddle_requires_low_iv` — call+put on same underlying must have iv_percentile ≤ 40 on every leg
-- `per_underlying_pct_cap_20` — Σ position_pct per underlying ≤ 20%
+- `per_underlying_pct_cap_20` — Σ position_pct per ticker ≤ 20%
 - `position_size_matches_confidence` — position_pct ≤ strategist confidence × 15
-- `option_premium_above_floor` — premium ≥ $0.05
 - `position_notional_above_floor` — position notional ≥ $50 (spread + fees dominate below this on a $2,500 account)
-- `position_adv_liquidity` — position notional ≤ 1% of underlying's 30-day dollar ADV
+- `position_adv_liquidity` — position notional ≤ 1% of ticker's 30-day dollar ADV
 - `reentry_cooldown` — a symbol fully exited within the last 7 days isn't re-entered unless the strategist confidence clears the override threshold (≥ 0.8); pairs with the 30%-gain harvest rule to stop churn-and-re-buy
 
 Output: `sanity.json`.
 
 ### 5. Execution + meta-scheduling
-- **execute**: diffs target portfolio vs current Alpaca positions, emits **close orders first** (free cash) then **open orders**. Single-leg market orders for ETFs and options (option symbols built via OSI: `SPY260619C00530000`). Gated behind `ORDERS_ENABLED=true`. Order safety invariant: orders never cross zero in a single ticket — a flip from long to short (or vice versa) is split into a close + an open.
+- **execute**: diffs target portfolio vs current Alpaca positions, emits **close orders first** (free cash) then **open orders**. Integer-share market orders for ETFs only; any option-shaped payload is defensively rejected before it can reach the broker. Gated behind `ORDERS_ENABLED=true`. Order safety invariant: orders never cross zero in a single ticket — a flip from long to short (or vice versa) is split into a close + an open.
 - **meta** — Sonnet 4.6: given the freshly-built portfolio + recent NAV trend + time of day + strategist regime, decides when the **next cycle fires** (bounded 1–24h, falls back to a 4h/6h heuristic if the LLM output is unusable). Writes `state/next_run.json`.
 
 ### Risk controls (always-on)
@@ -201,9 +203,9 @@ Output: `sanity.json`.
 
 ### Strategy in one paragraph
 
-On a $2,500 paper account in a leveraged-ETF + listed-options universe, **the edge isn't sector picking — it's discipline**: positive-EV only, hard 15% per-position NAV cap, 25% kill for ETFs / 100% premium kill for long options, single-leg trades only, no multi-leg combos, no broker shorts (bearish views go via bear ETFs or long puts).
+On a $2,500 paper account in a leveraged/inverse-ETF universe, **the edge isn't sector picking — it's discipline**: positive-EV only, hard 15% per-position NAV cap, 25% loss kill condition, no options, no broker shorts (bearish views go via inverse ETFs).
 
-The v2 pipeline reads deterministic signals (momentum, vol, MA distance) for 21 curated tickers and feeds them to a Sonnet strategist that picks ≤6 high-conviction ideas; an Opus constructor then sizes 1–12 positions. Cycles run every 4 hours during market hours; the cadence skips weekends/holidays automatically.
+The v2 pipeline reads deterministic signals (momentum, vol, MA distance) for 29 curated tickers and feeds them to a Sonnet strategist that picks ≤6 high-conviction ideas; an Opus constructor then sizes 1–12 positions. Cycles run every 4 hours during market hours; the cadence skips weekends/holidays automatically.
 
 **Losses are expected** — the experiment is whether prompt + schema discipline produces an honest Sharpe across many cycles, not whether it picks individual winners. Per-cycle LLM cost is ~$0.30, which keeps experimentation affordable.
 
@@ -357,7 +359,7 @@ Or click **Emergency stop** on the dashboard's Settings tab.
 
 | Location                         | Contents                                                             |
 | -------------------------------- | -------------------------------------------------------------------- |
-| `state/runs/{run_id}/`           | Per-run JSON: `market_gate.json`, `signals.json`, `view.json`, `chain_lookups.json`, `portfolio.json`, `critique.json`, `sanity.json`, `orders.json`, `next_run.json` |
+| `state/runs/{run_id}/`           | Per-run JSON: `market_gate.json`, `signals.json`, `view.json`, `portfolio.json`, `critique.json`, `sanity.json`, `orders.json`, `next_run.json` |
 | `state/decisions.jsonl`          | Append-only decision log (one row per stage, schema-validated)        |
 | `state/costs.jsonl`              | Per-LLM-call cost ledger; daily and per-run caps enforced from this file |
 | `state/current_portfolio.json`   | Latest known portfolio (consumed by `monitor.py` and the dashboard)   |

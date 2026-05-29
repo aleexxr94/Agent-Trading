@@ -18,7 +18,7 @@ Match logic:
   - FIFO per symbol. A sell consumes the oldest open buy lot first.
   - Partial closes produce one CLOSED row per matched chunk; the
     remaining qty stays open.
-  - Options keep their multiplier (×100) for gross PnL; ETFs are 1×.
+  - ETF-only: gross PnL is (sell - buy) × qty, no multiplier.
 
 Out of scope (this PR):
   - Alpaca activities sync (writing into trades.jsonl from live fills)
@@ -40,7 +40,7 @@ class Lot:
     activity_id: str
     run_id: str | None
     symbol: str
-    kind: Literal["etf", "option"]
+    kind: Literal["etf"]
     qty: float            # remaining (unmatched) qty
     fill_price: float
     fees_usd: float       # remaining fees pro-rated by remaining qty
@@ -51,7 +51,7 @@ class Lot:
 class ClosedTrade:
     """One matched (buy lot ↔ sell fill) pair — possibly a partial close.
 
-    ``gross_pnl_usd`` = (sell_price - buy_price) * qty * multiplier.
+    ``gross_pnl_usd`` = (sell_price - buy_price) * qty.
     ``fees_usd`` = buy_fees_share + sell_fees_share (real, from Alpaca).
     ``attributed_llm_cost_usd`` = sum of equal-split allocations for the
     OPENING run (we attribute only to the run that put the position on,
@@ -59,7 +59,7 @@ class ClosedTrade:
     ``net_pnl_usd`` = gross - fees - attributed_llm_cost.
     """
     symbol: str
-    kind: Literal["etf", "option"]
+    kind: Literal["etf"]
     qty: float
     buy_price: float
     sell_price: float
@@ -79,7 +79,7 @@ class OpenTradePnl:
     """Unrealised PnL on a still-open lot. Marks-derived, fees are the
     buy-side fees only (the sell hasn't happened yet)."""
     symbol: str
-    kind: Literal["etf", "option"]
+    kind: Literal["etf"]
     qty: float
     buy_price: float
     mark: float | None
@@ -104,7 +104,7 @@ class UnmatchedSell:
     the synthetic balance.
     """
     symbol: str
-    kind: Literal["etf", "option"]
+    kind: Literal["etf"]
     qty: float
     fill_price: float
     filled_at: str
@@ -132,10 +132,6 @@ class TradesPnl:
     @property
     def total_realised_net_usd(self) -> float:
         return sum(t.net_pnl_usd for t in self.closed)
-
-
-def _multiplier(kind: str) -> int:
-    return 100 if kind == "option" else 1
 
 
 def positions_opened_per_run(trades: list[dict]) -> dict[str, int]:
@@ -230,7 +226,6 @@ def compute_trades_pnl(
         run_id = t.get("run_id")
         filled_at = t.get("filled_at", "")
         activity_id = t.get("activity_id", "")
-        mult = _multiplier(kind)
 
         if side == "buy":
             open_lots[symbol].append({
@@ -258,7 +253,7 @@ def compute_trades_pnl(
                 if lot["remaining_qty"] > 0 else 0.0
             )
             sell_fees_share = sell_fees_per_unit * matched
-            gross = (price - lot["fill_price"]) * matched * mult
+            gross = (price - lot["fill_price"]) * matched
             # Equal-split allocation: each (run_id, symbol) opening event
             # carries one share. The matched chunk represents the same
             # opening event, so its full allocation = per_position_cost
@@ -323,9 +318,8 @@ def compute_trades_pnl(
     for symbol, lots in open_lots.items():
         for lot in lots:
             mark = marks.get(symbol)
-            mult = _multiplier(lot["kind"])
             gross = (
-                (mark - lot["fill_price"]) * lot["remaining_qty"] * mult
+                (mark - lot["fill_price"]) * lot["remaining_qty"]
                 if mark is not None else None
             )
             llm_alloc = per_position_cost.get(lot["run_id"], 0.0) if lot["run_id"] else 0.0
@@ -382,8 +376,8 @@ def symbols_in_cooldown(
     is a "re-entry" the cooldown is meant to discourage (overridable by
     high re-entry confidence — see ``risk.REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE``).
 
-    Keyed by the broker symbol (ETF ticker / OSI option), matching the
-    convention used by ``compute_trades_pnl`` and the rest of the system.
+    Keyed by the broker symbol (ETF ticker), matching the convention used
+    by ``compute_trades_pnl`` and the rest of the system.
     A symbol that is currently open (any remaining lot) is never in
     cooldown — that's a continuing hold, not a re-entry, so unrelated /
     still-held positions are not blocked.

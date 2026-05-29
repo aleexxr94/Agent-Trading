@@ -46,44 +46,10 @@ def _etf_position(**overrides) -> dict:
             "max_loss_pct": 25,
             "underlying_price_below": None,
             "underlying_price_above": None,
-            "iv_collapse_pct": None,
             "time_stop_utc": None,
             "notes": "",
         },
         "position_pct": 12.0,
-    }
-    base.update(overrides)
-    return base
-
-
-def _option_position(**overrides) -> dict:
-    base = {
-        "kind": "option",
-        "underlying": "SPY",
-        "type": "call",
-        "strike": 530.0,
-        "expiry": "2026-06-19",
-        "dte": 40,
-        "contracts": 1,
-        "premium_paid": 6.50,
-        "greeks": {
-            "delta": 0.45,
-            "gamma": 0.02,
-            "theta": -0.04,
-            "vega": 0.18,
-            "iv": 0.18,
-            "iv_percentile": 35,
-        },
-        "entry_thesis": "Defined-risk long delta on broad-market trend continuation.",
-        "kill_conditions": {
-            "max_loss_pct": 100,
-            "underlying_price_below": 510,
-            "underlying_price_above": None,
-            "iv_collapse_pct": 30,
-            "time_stop_utc": None,
-            "notes": "Premium-defined risk; max loss = 100% of premium.",
-        },
-        "position_pct": 5.0,
     }
     base.update(overrides)
     return base
@@ -112,14 +78,24 @@ def test_etf_position_valid(registry):
     _validator("position.schema.json", registry).validate(_etf_position())
 
 
-def test_option_position_valid(registry):
-    _validator("position.schema.json", registry).validate(_option_position())
+def test_inverse_etf_position_valid(registry):
+    """Inverse ETFs are held long; the position stores the leverage
+    magnitude (positive). BITI is 1x, the floor."""
+    _validator("position.schema.json", registry).validate(
+        _etf_position(symbol="SQQQ", leverage_factor=3.0)
+    )
+    _validator("position.schema.json", registry).validate(
+        _etf_position(symbol="BITI", leverage_factor=1.0)
+    )
 
 
-def test_position_kind_discriminator_rejects_unknown(registry):
-    bad = _etf_position(kind="future")
-    with pytest.raises(Exception):
-        _validator("position.schema.json", registry).validate(bad)
+def test_position_kind_rejects_option(registry):
+    """Options are not a supported instrument class — kind:'option' (and
+    any non-etf kind) must be rejected."""
+    for kind in ("option", "future"):
+        bad = _etf_position(kind=kind)
+        with pytest.raises(Exception):
+            _validator("position.schema.json", registry).validate(bad)
 
 
 def test_position_pct_cap_15(registry):
@@ -129,17 +105,12 @@ def test_position_pct_cap_15(registry):
 
 
 def test_etf_rejects_option_only_field(registry):
-    bad = _etf_position()
-    bad["strike"] = 100
-    with pytest.raises(Exception):
-        _validator("position.schema.json", registry).validate(bad)
-
-
-def test_option_requires_greeks(registry):
-    bad = _option_position()
-    del bad["greeks"]
-    with pytest.raises(Exception):
-        _validator("position.schema.json", registry).validate(bad)
+    """additionalProperties:false rejects any option-only field leaking in."""
+    for field in ("strike", "expiry", "contracts", "premium_paid", "greeks", "underlying"):
+        bad = _etf_position()
+        bad[field] = 100
+        with pytest.raises(Exception):
+            _validator("position.schema.json", registry).validate(bad)
 
 
 # ---------- portfolio.schema ----------
@@ -184,11 +155,23 @@ def test_portfolio_all_cash_rejects_positions(registry):
         _validator("portfolio.schema.json", registry).validate(p)
 
 
-def test_portfolio_mixed_etf_and_option(registry):
-    positions = [_etf_position(symbol=f"E{i}") for i in range(6)] + [
-        _option_position(underlying=f"O{i}") for i in range(3)
-    ]
+def test_portfolio_all_etf_positions(registry):
+    positions = [_etf_position(symbol=f"E{i}") for i in range(9)]
     _validator("portfolio.schema.json", registry).validate(_portfolio(positions))
+
+
+def test_portfolio_rejects_option_position(registry):
+    """A portfolio carrying an option-shaped position must fail validation."""
+    bad_option = {
+        "kind": "option", "underlying": "SPY", "type": "call", "strike": 530.0,
+        "expiry": "2026-06-19", "dte": 40, "contracts": 1, "premium_paid": 6.5,
+        "entry_thesis": "x" * 40, "position_pct": 5.0,
+        "kill_conditions": {"max_loss_pct": 100},
+    }
+    with pytest.raises(Exception):
+        _validator("portfolio.schema.json", registry).validate(
+            _portfolio([_etf_position(), bad_option])
+        )
 
 
 # ---------- signals.schema (v2) ----------
@@ -209,7 +192,6 @@ def _signals_row(**overrides) -> dict:
         "hv_90d_annualised": 0.38,
         "dist_from_50d_ma_pct": 4.2,
         "dist_from_200d_ma_pct": 15.7,
-        "is_optionable": False,
     }
     base.update(overrides)
     return base
@@ -305,6 +287,15 @@ def test_view_rejects_unknown_instrument_kind(registry):
         _validator("view.schema.json", registry).validate(v)
 
 
+def test_view_rejects_option_instrument_kinds(registry):
+    """option_call / option_put are no longer valid instrument kinds —
+    the strategist can only propose ETFs."""
+    for kind in ("option_call", "option_put"):
+        v = _view(candidates=[_view_candidate(instrument_kind=kind)])
+        with pytest.raises(Exception):
+            _validator("view.schema.json", registry).validate(v)
+
+
 def test_view_confidence_in_range(registry):
     v = _view(candidates=[_view_candidate(confidence=1.5)])
     with pytest.raises(Exception):
@@ -326,7 +317,7 @@ def _decision():
         "started_at": "2026-05-13T14:00:00Z",
         "ended_at": "2026-05-13T14:00:05Z",
         "status": "ok",
-        "risk_warning": "PAPER TRADING — leveraged ETFs and options are high-risk.",
+        "risk_warning": "PAPER TRADING — leveraged & inverse ETFs are high-risk.",
     }
 
 
@@ -351,10 +342,10 @@ def test_decision_log_accepts_skipped_market_closed(registry):
 
 
 def test_decision_log_rejects_v1_stage(registry):
-    """v1 stages (screen, research, chains, scenarios) are gone from
-    the enum — no historical-decision rows with these stage values can
-    be written by the v2 orchestrator."""
-    for stage in ("screen", "research", "chains", "scenarios"):
+    """v1 stages (screen, research, chains, scenarios) and the removed
+    chain_lookup stage are gone from the enum — no decision rows with
+    these stage values can be written."""
+    for stage in ("screen", "research", "chains", "scenarios", "chain_lookup"):
         d = _decision()
         d["stage"] = stage
         with pytest.raises(Exception):

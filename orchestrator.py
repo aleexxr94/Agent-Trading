@@ -1,18 +1,22 @@
 """v2 pipeline entrypoint.
 
+Leveraged/inverse ETF-only autonomous paper-trading system. Bullish theses
+hold bull ETFs; bearish theses hold inverse ETFs (no shorts, no options).
+
 Stages:
   0. market_gate → state/runs/{run_id}/market_gate.json (Alpaca clock, $0)
   1. signals     → state/runs/{run_id}/signals.json     (deterministic Python, $0)
   2. strategist  → state/runs/{run_id}/view.json        (Sonnet 4.6, ~$0.05)
   3. construct   → state/runs/{run_id}/portfolio.json   (Opus 4.7, ~$0.20)
+  3.5 critic     → state/runs/{run_id}/critique.json    (Sonnet 4.6, ~$0.03)
   4. sanity      → state/runs/{run_id}/sanity.json      (deterministic, $0)
   5. execute     → state/runs/{run_id}/orders.json + next_run.json (Alpaca paper, $0)
 
-v1 → v2 migration: the bull/bear research stages, the chains stage, and
-the scenarios stage were collapsed into a single deterministic signals
-table + a single strategist LLM call. Per-cycle LLM cost dropped from
-~$1.50–2.50 to ~$0.25. The construct stage still owns position selection
-+ sizing + kill-condition tailoring on Opus 4.7.
+v1 → v2 migration: the bull/bear research stages and the scenarios stage
+were collapsed into a single deterministic signals table + a single
+strategist LLM call. Per-cycle LLM cost dropped from ~$1.50–2.50 to ~$0.25.
+The construct stage still owns position selection + sizing + kill-condition
+tailoring on Opus 4.7.
 
 ``--dry-run`` reads from tests/fixtures/* (no LLM, no orders, no broker).
 Live mode loads AlpacaBroker, calls the market gate, then runs the
@@ -39,7 +43,7 @@ except ImportError:
     pass
 from typing import Callable
 
-from lib import llm, market_gate, options_chain, risk, sanity, signals, stages, state, trades
+from lib import llm, market_gate, risk, sanity, signals, stages, state, trades
 from lib.broker import Broker
 
 ROOT = Path(__file__).resolve().parent
@@ -49,9 +53,9 @@ FIXTURE_DIR = ROOT / "tests" / "fixtures"
 LIVE_VERSION = 0  # bump only when promoted; combined with LIVE_TRADING_ENABLED env var
 
 RISK_WARNING = (
-    "PAPER TRADING. Leveraged ETFs decay path-dependently; long options can "
-    "expire worthless. Capital preservation outweighs upside chasing on a "
-    "$2.5k experimental account. Not financial advice."
+    "PAPER TRADING. Leveraged & inverse ETFs decay path-dependently and are "
+    "not buy-and-hold instruments. Capital preservation outweighs upside "
+    "chasing on a $2.5k experimental account. Not financial advice."
 )
 
 
@@ -293,23 +297,6 @@ def stage_strategist(
     return res.payload
 
 
-def stage_chain_lookup(ctx: StageContext, signals_out: dict, view: dict) -> dict:
-    """Resolve option candidates → real tradable contracts. $0 cost.
-
-    The strategist names option candidates like ``{symbol: "SPY",
-    instrument_kind: "option_call"}``. Without this stage the
-    constructor invents OSI symbols (strike+expiry combos) from thin
-    air, and orders.py rejects them at submission time when Alpaca
-    paper doesn't list those exact contracts.
-
-    For each option candidate, query Alpaca's option-contracts
-    endpoint for the nearest-OTM contract at target DTE 37 (±14d).
-    Output ``chain_lookups.json`` keyed by candidate, so the
-    constructor can read the real strike + expiry per option position.
-    """
-    return options_chain.lookup_for_view(view, signals_out, broker=ctx.broker)
-
-
 def _cooldown_prompt_line(cooldown_symbols: dict) -> str:
     """One constructor-prompt line listing symbols in re-entry cooldown.
 
@@ -373,30 +360,26 @@ def stage_construct(
     ctx: StageContext,
     signals_out: dict,
     view: dict,
-    chain_lookups: dict | None = None,
     current_positions: list[dict] | None = None,
     pnl_history: list[dict] | None = None,
     adaptive_cap_pct: float = 15.0,
     cooldown_symbols: dict | None = None,
 ) -> dict:
-    """One LLM call — Opus 4.7, ~$0.20. Reads signals + view + chain
-    lookups + current positions + recent PnL feedback; emits the final
-    portfolio.json with positions, sizing, kill conditions."""
+    """One LLM call — Opus 4.7, ~$0.20. Reads signals + view + current
+    positions + recent PnL feedback; emits the final portfolio.json with
+    ETF positions, sizing, kill conditions."""
     if ctx.dry_run:
         out = _load_fixture("portfolio.json")
         out["run_id"] = ctx.run_id
         return out
     cfg = stages.constructor()
     nav = _account_nav(ctx)
-    chain_lookups = chain_lookups or {"lookups": []}
     current_positions = current_positions or []
     pnl_history = pnl_history or []
     cooldown_symbols = cooldown_symbols or {}
     content = (
         f"Signals: {json.dumps(signals_out, sort_keys=True)}\n"
         f"Strategist view: {json.dumps(view, sort_keys=True)}\n"
-        f"Chain lookups (real Alpaca contracts for option candidates): "
-        f"{json.dumps(chain_lookups, sort_keys=True)}\n"
         f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
         f"Recent PnL history (last cycles): {json.dumps(pnl_history, sort_keys=True)}\n"
         f"NAV (USD): {nav:.2f}\n"
@@ -404,10 +387,10 @@ def stage_construct(
         f"(reduced from 15.0% when NAV is in drawdown)\n"
         f"{_cooldown_prompt_line(cooldown_symbols)}"
         f"Run id: {ctx.run_id}\n"
-        "Return JSON conforming to portfolio.schema.json. Use the OSI "
-        "symbols + strikes from chain_lookups for option positions; do "
-        "NOT invent strikes. Prefer keeping current positions when the "
-        "strategist's view is consistent with them."
+        "Return JSON conforming to portfolio.schema.json. All positions are "
+        "leveraged/inverse ETFs (bullish → bull ETF, bearish → inverse ETF). "
+        "Prefer keeping current positions when the strategist's view is "
+        "consistent with them."
     )
     res = llm.structured_call(llm.StageCall(
         run_id=ctx.run_id,
@@ -507,8 +490,8 @@ def _broker_portfolio_summary_for_meta(ctx: StageContext) -> dict:
     decision after a review reflects what we actually hold. Passing a
     flat placeholder ({positions: [], all_cash: True, nav: 0}) would
     push meta into the "all-cash, calm" 6-12h bucket exactly when an
-    open option or risk-sensitive position actually needs near-term
-    monitoring (Codex P1 on PR #83).
+    open leveraged position actually needs near-term monitoring
+    (Codex P1 on PR #83).
 
     Returns the shape `_compute_next_run_at` reads:
       {positions, all_cash, nav_usd, cash_buffer_pct}
@@ -987,7 +970,7 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
             "total_legs": plan.total_legs,
             "closes": len(plan.closes),
             "opens": len(plan.requests),
-            "options_skipped": len(plan.skipped),
+            "skipped": len(plan.skipped),
             "results": [
                 {
                     "symbol": r.symbol,
@@ -1154,8 +1137,8 @@ def _run_pipeline_review(*, ctx: StageContext, dry_run: bool) -> dict:
     # Feed real broker holdings (not a flat placeholder) so meta's
     # cadence + intent decision reflects what we actually hold. A
     # placeholder would push meta into the "all-cash" bucket exactly
-    # when a held option / risk-sensitive position needs near-term
-    # monitoring after the reflection cycle.
+    # when a held leveraged position needs near-term monitoring after
+    # the reflection cycle.
     next_at, meta_rationale, next_intent = _compute_next_run_at(
         ctx=ctx,
         portfolio=_broker_portfolio_summary_for_meta(ctx),
@@ -1385,17 +1368,6 @@ def run_pipeline(
         model=strat_model,
     )
 
-    # ----- Stage 2.5: chain lookup (deterministic, $0) -----
-    # Resolve every option candidate to a real tradable Alpaca contract
-    # so the constructor doesn't invent OSI symbols.
-    chain_lookups = _run_stage(
-        ctx=ctx, stage_id="chain_lookup", schema="chain_lookups.schema.json",
-        output_filename="chain_lookups.json",
-        runner=lambda: stage_chain_lookup(ctx, signals_out, view),
-        inputs_hash_parts=(rid, json.dumps(view, sort_keys=True)),
-        model="local-deterministic",
-    )
-
     # Adaptive position-pct cap from current drawdown — feeds the
     # constructor prompt as a soft ceiling. Real enforcement is in
     # sanity (rule: position_within_adaptive_cap).
@@ -1413,7 +1385,6 @@ def run_pipeline(
         output_filename="portfolio.json",
         runner=lambda: stage_construct(
             ctx, signals_out, view,
-            chain_lookups=chain_lookups,
             current_positions=current_positions,
             pnl_history=pnl_history,
             adaptive_cap_pct=adaptive_cap,
@@ -1423,7 +1394,6 @@ def run_pipeline(
             rid,
             json.dumps(signals_out, sort_keys=True),
             json.dumps(view, sort_keys=True),
-            json.dumps(chain_lookups, sort_keys=True),
         ),
         model=cons_model,
     )
@@ -1452,7 +1422,6 @@ def run_pipeline(
             content = (
                 f"Signals: {json.dumps(signals_out, sort_keys=True)}\n"
                 f"Strategist view: {json.dumps(view, sort_keys=True)}\n"
-                f"Chain lookups: {json.dumps(chain_lookups, sort_keys=True)}\n"
                 f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
                 f"Recent PnL history: {json.dumps(pnl_history, sort_keys=True)}\n"
                 f"NAV (USD): {_account_nav(ctx):.2f}\n"

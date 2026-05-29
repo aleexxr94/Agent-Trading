@@ -30,7 +30,6 @@ from lib import state
 V2_DRY_RUN_ARTIFACTS = {
     "signals.json",
     "view.json",
-    "chain_lookups.json",
     "portfolio.json",
     "critique.json",
     "sanity.json",
@@ -58,13 +57,13 @@ def test_dry_run_writes_all_artifacts(tmp_state):
 def test_dry_run_emits_decision_log(tmp_state):
     orchestrator.run_pipeline(dry_run=True)
     lines = state.DECISIONS_LOG.read_text().strip().splitlines()
-    # v2 dry-run logs 6 decisions: signals + strategist + chain_lookup
-    # + construct + critic + execute (market_gate doesn't fire in
-    # dry-run; sanity doesn't go through _run_stage).
-    assert len(lines) == 6
+    # v2 dry-run logs 5 decisions: signals + strategist + construct +
+    # critic + execute (market_gate doesn't fire in dry-run; sanity
+    # doesn't go through _run_stage; chain lookup was removed with options).
+    assert len(lines) == 5
     stages = [json.loads(line)["stage"] for line in lines]
     assert stages == [
-        "signals", "strategist", "chain_lookup",
+        "signals", "strategist",
         "construct", "critic", "execute",
     ]
     for line in lines:
@@ -93,12 +92,10 @@ def test_dry_run_writes_sanity_json_with_known_status(tmp_state):
         f"status={sanity_doc['status']!r}; offenders: {sanity_doc['rules']}"
     )
     state.validate(sanity_doc, "sanity.schema.json")
-    # Rule list mirrors lib/sanity.RULES — pin the count. v2 base had 6;
-    # the winrate-improvements PR added position_within_adaptive_cap,
-    # position_size_matches_confidence, position_notional_above_floor,
-    # position_adv_liquidity → 10; the harvest/exit/cooldown PR added
-    # reentry_cooldown → 11 total.
-    assert len(sanity_doc["rules"]) == 11
+    # Rule list mirrors lib/sanity.RULES — pin the count. The two
+    # option-specific rules (straddle_requires_low_iv, option_premium_above_floor)
+    # were removed with options, leaving 9.
+    assert len(sanity_doc["rules"]) == 9
 
 
 def test_sanity_pass_path_writes_summary_into_next_run(tmp_state, monkeypatch):
@@ -527,9 +524,6 @@ def test_stage_execute_skips_opens_when_dd_halt_active(tmp_state, monkeypatch):
                 side=req.side, submitted_at="", status="accepted",
             )
 
-        def option_contract_tradable(self, symbol):
-            return True
-
     portfolio = {
         "run_id": "r-dd", "nav_usd": 2500.0, "cash_usd": 100.0, "all_cash": False,
         "positions": [{
@@ -576,9 +570,6 @@ def test_stage_execute_allows_derisking_reduction_during_dd_halt(tmp_state, monk
                 broker_order_id="1", symbol=req.symbol, qty=req.qty,
                 side=req.side, submitted_at="", status="accepted",
             )
-
-        def option_contract_tradable(self, symbol):
-            return True
 
     portfolio = {
         "run_id": "r-dd2", "nav_usd": 2500.0, "cash_usd": 100.0, "all_cash": False,

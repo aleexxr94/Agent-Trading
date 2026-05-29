@@ -108,37 +108,32 @@ def upcoming_events(
     return sorted(out, key=lambda r: r["date"])
 
 
-# Tickers in the v2 universe that are sensitive to broad-macro events.
-# Currently: SPY, QQQ, TLT directly; everything else gets the events
-# attached too because v2's universe is mostly broad-equity proxies.
+# Tickers in the ETF-only universe that are sensitive to broad-macro
+# events. Nearly the whole universe is broad-equity / sector / rates
+# proxies, so the macro calendar attaches to all of them; only the
+# crypto pair (BITX/BITI) is exempt.
 _BROAD_MACRO_SYMBOLS: frozenset[str] = frozenset({
-    "SPY", "QQQ", "TLT",
     "TQQQ", "SQQQ", "UPRO", "SPXU", "TNA", "TZA",
-    "SOXL", "SOXS", "FAS", "FAZ",
+    "SOXL", "SOXS", "TECL", "TECS", "LABU", "LABD",
+    "YINN", "YANG", "FAS", "FAZ",
     "UVXY",  # vol reacts to all macro
-    # Gold (added 2026-05-13) — extremely macro-sensitive. FOMC rate
-    # decisions move real yields → gold; CPI/PCE surprises swing
-    # inflation expectations → gold. The strategist sees the event
-    # set on these tickers per cycle.
-    "NUGT", "DUST", "GLD",
-    # Option cheapeners (added 2026-05-22) — all three react to the
-    # macro calendar. IWM: FOMC drives small-cap valuations via
-    # discount rate + NFP drives small-cap earnings via consumer
-    # spending. XLF: FOMC moves bank NIMs and yield-curve steepness.
-    # XLE: FOMC moves USD which inversely drives crude; CPI prints
-    # bracket energy inflation. Without these, the strategist would
-    # propose option_calls/option_puts on IWM/XLF/XLE blind to
-    # event timing — which is exactly why we added them to the
-    # universe in the first place.
-    "IWM", "XLF", "XLE",
+    # Rates (TMF/TMV) — FOMC rate decisions and CPI/PCE surprises move
+    # the 20+yr Treasury curve directly.
+    "TMF", "TMV",
+    # Energy / oil-gas / nat-gas — FOMC moves USD which inversely drives
+    # crude; CPI prints bracket energy inflation.
+    "ERX", "ERY", "GUSH", "DRIP", "BOIL", "KOLD",
+    # Gold miners — extremely macro-sensitive. FOMC rate decisions move
+    # real yields → gold; CPI/PCE surprises swing inflation expectations.
+    "NUGT", "DUST",
 })
 
 
 def events_for_symbol(symbol: str, *, within_days: int = 7,
                       from_date: date | None = None) -> list[dict]:
     """Per-symbol view: returns events that materially affect this
-    ticker. For now, all broad-equity / rates tickers get the full
-    macro calendar; crypto (BITX) is exempt.
+    ticker. All broad-equity / sector / rates tickers get the full
+    macro calendar; crypto (BITX/BITI) is exempt.
     """
     if symbol not in _BROAD_MACRO_SYMBOLS:
         return []

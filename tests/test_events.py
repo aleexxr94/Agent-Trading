@@ -27,13 +27,12 @@ def test_upcoming_events_sorted_ascending():
 
 
 def test_events_for_symbol_returns_macro_for_broad_symbols():
-    """SPY/QQQ/TLT and the bull/bear ETFs all get the full macro calendar.
-    Includes the 2026-05-22 option-cheapener additions (IWM/XLF/XLE) —
-    without these, the strategist would surface option candidates on
-    those underlyings with no event-timing context (Codex P2 on PR #88).
+    """The bull/bear ETF pairs, rates (TMF/TMV), energy (ERX/ERY) and
+    gold miners all get the full macro calendar so the strategist has
+    event-timing context per cycle.
     """
-    for sym in ("SPY", "QQQ", "TLT", "TQQQ", "SQQQ", "UVXY",
-                "IWM", "XLF", "XLE"):
+    for sym in ("TQQQ", "SQQQ", "UPRO", "UVXY", "TMF", "TMV",
+                "ERX", "NUGT", "TECL", "YINN"):
         ev = events.events_for_symbol(sym, within_days=60, from_date=date(2026, 5, 13))
         assert isinstance(ev, list)
         # The 2026 calendar is non-empty within a 60-day window from

@@ -21,7 +21,8 @@
         "type": "object",
         "properties": {
           "symbol": {"type": "string", "pattern": "^[A-Z][A-Z0-9.\\-]{0,9}$"},
-          "instrument_kind": {"enum": ["etf", "option_call", "option_put"]},
+          "instrument_kind": {"enum": ["etf"],
+            "description": "Always \"etf\". Bullish theses name a bull ETF; bearish theses name an inverse ETF."},
           "thesis": {"type": "string", "minLength": 1},
           "confidence": {"type": "number", "minimum": 0, "maximum": 1}
         },

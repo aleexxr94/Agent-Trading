@@ -17,13 +17,6 @@ Components modelled per round-trip:
     + SEC fee:        $0.0000278 × sale notional
     + FINRA TAF:      $0.000166/share, capped at $9.90/trade
 
-  Options (per leg):
-    + half-spread:    25 bps of premium (each side, ~50 bps RT)
-    + commission:     $0.65/contract (IBKR Pro)
-    + OCC fee:        $0.04/contract
-  Options (sell-side only, added once):
-    + SEC fee:        $0.0000278 × premium notional sold
-
 Why this matters on a $2.5k account: the $1 IBKR minimum commission dominates
 small positions. On a $250 trade, commission alone is **40 bps** — 4× the
 modelled half-spread. Ignoring it makes paper Sharpe ~0.5 too generous.
@@ -41,13 +34,8 @@ ETF_PER_SHARE_COMMISSION = 0.005     # IBKR Pro: $0.005/share
 ETF_MIN_COMMISSION_USD = 1.00        # IBKR Pro: $1 minimum per trade
 ETF_MAX_COMMISSION_PCT = 0.5         # IBKR Pro: max 0.5% of trade value
 
-# ---- Options cost model (IBKR Pro retail) ----
-OPTION_HALF_SPREAD_BPS = 25.0        # options chains are wider than equities
-OPTION_PER_CONTRACT_USD = 0.65       # IBKR Pro: $0.65/contract
-OPTION_OCC_FEE_PER_CONTRACT = 0.04   # OCC exchange clearing fee
-
 # ---- Regulatory fees (sell-side only) ----
-SEC_FEE_PER_USD_SOLD = 0.0000278     # SEC §31 fee on sales (equities + options)
+SEC_FEE_PER_USD_SOLD = 0.0000278     # SEC §31 fee on sales (equities)
 FINRA_TAF_PER_SHARE_SOLD = 0.000166  # FINRA Trading Activity Fee, equities
 FINRA_TAF_MAX_USD = 9.90             # FINRA TAF per-trade cap
 
@@ -94,32 +82,11 @@ def model_etf_cost(*, shares: float, price_usd: float) -> TradeCost:
     )
 
 
-def model_option_cost(*, contracts: int, premium_usd: float) -> TradeCost:
-    """Per-leg cost for one option position. premium_usd is per-contract
-    dollar value (already inclusive of the 100x multiplier)."""
-    notional = contracts * premium_usd
-    half_spread = notional * (OPTION_HALF_SPREAD_BPS / BPS)
-    # IBKR Pro options: $0.65/contract + OCC clearing $0.04/contract
-    commission = contracts * (OPTION_PER_CONTRACT_USD + OPTION_OCC_FEE_PER_CONTRACT)
-    sec_fee = notional * SEC_FEE_PER_USD_SOLD  # SEC §31 also applies to options sales
-    return TradeCost(
-        notional_usd=notional,
-        half_spread_usd=half_spread,
-        commission_usd=commission,
-        reg_fees_usd=sec_fee,
-    )
-
-
 def model_position_cost(position: dict) -> TradeCost:
-    """Per-leg cost for one position from the position.schema.json shape.
+    """Per-leg cost for one ETF position from the position.schema.json shape.
     Multiply by 2 (or use `.round_trip_usd`) for a full open+close round-trip
     — the round_trip_usd property already accounts for sell-side reg fees."""
-    if position["kind"] == "etf":
-        return model_etf_cost(shares=position["shares"], price_usd=position["avg_cost"])
-    return model_option_cost(
-        contracts=position["contracts"],
-        premium_usd=position["premium_paid"] * 100,
-    )
+    return model_etf_cost(shares=position["shares"], price_usd=position["avg_cost"])
 
 
 @dataclass(frozen=True)
@@ -138,39 +105,26 @@ def compute_position_pnl(
     current_mark_usd: float | None,
     actual_cost_per_unit: float | None = None,
 ) -> PnLBreakdown:
-    """Unrealised P&L for an open position. Returns gross, modelled cost, and net.
+    """Unrealised P&L for an open ETF position. Returns gross, modelled cost, and net.
 
     current_mark_usd:
-      - For ETFs: per-share price (USD).
-      - For options: per-contract premium (USD), the same units as `premium_paid`.
+      - Per-share price (USD).
       - Pass None when no mark is available — gross is 0 and modelled cost is
         still computed (entry leg already paid).
 
     actual_cost_per_unit (optional override):
-      - When provided, overrides the cost basis pulled from the position dict.
-      - For ETFs: per-share fill price (replaces position["avg_cost"]).
-      - For options: per-share premium actually paid (replaces position
-        ["premium_paid"]). Use Alpaca's reported `avg_cost` here — the
-        agent's training-data option-premium estimates are routinely 5-10×
-        off real market quotes, so trusting position["premium_paid"]
-        produces fictitious P&L (e.g. -$290 displayed on a position that
-        Alpaca reports as -$2). Pass None to keep the historical behaviour.
+      - When provided, overrides the cost basis pulled from the position dict
+        (per-share fill price, replacing position["avg_cost"]). Use Alpaca's
+        reported `avg_cost` here to compute P&L against the real fill. Pass
+        None to keep the historical behaviour.
     """
     cost = model_position_cost(position)
     if current_mark_usd is None:
         # Entry leg already paid: half-spread + commission (no sell-side fees yet).
         entry_leg_cost = cost.half_spread_usd + cost.commission_usd
         return PnLBreakdown(gross_pnl_usd=0.0, modelled_costs_usd=entry_leg_cost)
-    if position["kind"] == "etf":
-        basis = actual_cost_per_unit if actual_cost_per_unit is not None else position["avg_cost"]
-        gross = (current_mark_usd - basis) * position["shares"]
-    else:
-        basis = (
-            actual_cost_per_unit
-            if actual_cost_per_unit is not None
-            else position["premium_paid"]
-        )
-        gross = (current_mark_usd - basis) * position["contracts"] * 100
+    basis = actual_cost_per_unit if actual_cost_per_unit is not None else position["avg_cost"]
+    gross = (current_mark_usd - basis) * position["shares"]
     return PnLBreakdown(gross_pnl_usd=gross, modelled_costs_usd=cost.round_trip_usd)
 
 
@@ -180,26 +134,19 @@ def compute_portfolio_pnl(
     marks: dict[str, float] | None = None,
     costs: dict[str, float] | None = None,
 ) -> PnLBreakdown:
-    """Aggregate gross / modelled-cost / net across all open positions.
+    """Aggregate gross / modelled-cost / net across all open ETF positions.
 
-    `marks` keys: ETF symbol for ETFs; for options use
-    f"{underlying}|{strike}|{expiry}|{type}" — same convention as monitor.py.
-    `costs` (optional): same keying as marks, holds the actual per-unit
-    fill prices from the broker. When provided, P&L uses the broker's
-    cost basis rather than the agent's `premium_paid` / `avg_cost`
-    estimates — important for options where the agent's premium
-    predictions can be 5-10× off real market quotes.
+    `marks` keys: ETF symbol. `costs` (optional): same keying as marks,
+    holds the actual per-share fill prices from the broker. When provided,
+    P&L uses the broker's cost basis rather than the agent's `avg_cost`
+    estimate.
     """
     marks = marks or {}
     costs = costs or {}
     gross = 0.0
     cost_total = 0.0
-    from .marks import option_synthetic_key
     for p in portfolio.get("positions", []):
-        if p["kind"] == "etf":
-            key = p["symbol"]
-        else:
-            key = option_synthetic_key(p["underlying"], p["strike"], p["expiry"], p["type"])
+        key = p["symbol"]
         b = compute_position_pnl(
             position=p,
             current_mark_usd=marks.get(key),

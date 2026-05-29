@@ -141,27 +141,21 @@ def test_monitor_uses_broker_cost_basis_not_portfolio(tmp_state, monkeypatch):
     assert flat_log == []  # 4% broker loss, not the 52% the portfolio basis implies
 
 
-def test_monitor_option_flatten_uses_osi_symbol(tmp_state):
-    """Bug: a SPY-call kill action was emitting symbol='SPY' (the
-    underlying). broker.flatten('SPY') would try to close the ETF,
-    not the contract. Verify the action now carries the OSI symbol."""
-    option_pos = {
-        "kind": "option", "underlying": "SPY", "type": "call",
-        "strike": 530.0, "expiry": "2026-06-19", "dte": 40,
-        "contracts": 1, "premium_paid": 6.50,
-        "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04,
-                    "vega": 0.18, "iv": 0.18, "iv_percentile": 35},
-        "entry_thesis": "x",
-        "kill_conditions": {"max_loss_pct": 100},
-        "position_pct": 5.0,
+def test_monitor_etf_flatten_on_full_loss(tmp_state):
+    """An ETF position whose mark has collapsed past the 25% loss cap is
+    flattened by its own symbol."""
+    etf_pos = {
+        "kind": "etf", "symbol": "SOXL", "shares": 10, "avg_cost": 25.0,
+        "leverage_factor": 3.0, "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25},
+        "position_pct": 10.0,
     }
-    portfolio = {"nav_usd": 2500.0, "positions": [option_pos]}
-    # Kill scenario: mark is 0.0 (premium went to zero — 100% loss)
-    marks_dict = {"SPY|530.0|2026-06-19|call": 0.0}
-    actions = monitor.evaluate_portfolio(portfolio=portfolio, marks=marks_dict)
+    portfolio = {"nav_usd": 2500.0, "positions": [etf_pos]}
+    # Mark 15 vs cost 25 = 40% loss → past the 25% cap.
+    actions = monitor.evaluate_portfolio(portfolio=portfolio, marks={"SOXL": 15.0})
     assert len(actions) == 1
     assert actions[0]["action"] == "flatten"
-    assert actions[0]["symbol"] == "SPY260619C00530000"
+    assert actions[0]["symbol"] == "SOXL"
 
 
 def test_monitor_skips_position_with_no_mark(tmp_state, monkeypatch):
@@ -252,114 +246,47 @@ def test_monitor_flattens_orphan_on_loss_cap(tmp_state, monkeypatch):
     assert any("orphan" in f["reason"] for f in _read_shadow()[-1]["fired"])
 
 
-def test_monitor_enforces_option_underlying_price_stop(tmp_state):
-    """Codex P2 (#98): an option's underlying_price_below fires off the
-    underlying spot (passed in `spots`), even when the option mark shows no
-    loss. SPY spot 490 ≤ kill_below 500 → flatten the contract."""
-    option_pos = {
-        "kind": "option", "underlying": "SPY", "type": "call",
-        "strike": 530.0, "expiry": "2026-06-19", "dte": 40,
-        "contracts": 1, "premium_paid": 6.50,
-        "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04,
-                   "vega": 0.18, "iv": 0.18, "iv_percentile": 35},
-        "entry_thesis": "x",
-        "kill_conditions": {"max_loss_pct": 100, "underlying_price_below": 500.0},
-        "position_pct": 5.0,
+def test_monitor_etf_loss_cap_via_broker_value_without_mark(tmp_state):
+    """With no marks dict, the loss cap still fires off the broker's
+    market_value. An ETF at $0 market value vs $650 cost = 100% loss →
+    flatten, no price/time stop needed."""
+    etf_pos = {
+        "kind": "etf", "symbol": "SOXL", "shares": 10, "avg_cost": 65.0,
+        "leverage_factor": 3.0, "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25},  # loss cap only
+        "position_pct": 10.0,
     }
     bp = BrokerPosition(
-        symbol="SPY260619C00530000", qty=1, avg_cost=6.50, market_value=650.0,
-        unrealized_pl_usd=0.0, asset_class="us_option",
+        symbol="SOXL", qty=10, avg_cost=65.0, market_value=0.0,
+        unrealized_pl_usd=-650.0, asset_class="us_equity",
     )
     actions = monitor.evaluate_portfolio(
-        portfolio={"positions": [option_pos]},
-        marks={"SPY|530.0|2026-06-19|call": 6.50},  # mark == premium → no loss
+        portfolio={"positions": [etf_pos]},
+        marks={},  # no mark; loss cap must use broker market_value
         broker_positions=[bp],
-        spots={"SPY": 490.0},
     )
     assert len(actions) == 1
-    assert actions[0]["symbol"] == "SPY260619C00530000"
-    assert "kill_below" in actions[0]["reason"]
-
-
-def test_monitor_option_key_normalizes_integer_strike(tmp_state):
-    """Codex P2 (#98): an integer JSON strike (530) must match a float-keyed
-    mark (SPY|530.0|...) via the canonical key, so the kill loop doesn't treat
-    the position as unmarked. Premium mark 0.0 → 100% loss → flatten."""
-    option_pos = {
-        "kind": "option", "underlying": "SPY", "type": "call",
-        "strike": 530, "expiry": "2026-06-19", "dte": 40,  # integer strike
-        "contracts": 1, "premium_paid": 6.50,
-        "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04,
-                   "vega": 0.18, "iv": 0.18, "iv_percentile": 35},
-        "entry_thesis": "x",
-        "kill_conditions": {"max_loss_pct": 100},
-        "position_pct": 5.0,
-    }
-    actions = monitor.evaluate_portfolio(
-        portfolio={"positions": [option_pos]},
-        marks={"SPY|530.0|2026-06-19|call": 0.0},  # float-keyed, 100% loss
-    )
-    assert len(actions) == 1
-    assert actions[0]["symbol"] == "SPY260619C00530000"
-
-
-def test_monitor_option_loss_cap_via_broker_value_without_mark(tmp_state):
-    """Codex P2 (#98, round 3): with no premium mark (key mismatch), the loss
-    cap must still fire off the broker's market_value. A contract at $0
-    market value vs $650 cost = 100% loss → flatten, no price/time stop needed."""
-    option_pos = {
-        "kind": "option", "underlying": "SPY", "type": "call",
-        "strike": 530.0, "expiry": "2026-06-19", "dte": 40,
-        "contracts": 1, "premium_paid": 6.50,
-        "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04,
-                   "vega": 0.18, "iv": 0.18, "iv_percentile": 35},
-        "entry_thesis": "x",
-        "kill_conditions": {"max_loss_pct": 100},  # loss cap only — no price/time stop
-        "position_pct": 5.0,
-    }
-    bp = BrokerPosition(
-        symbol="SPY260619C00530000", qty=1, avg_cost=6.50, market_value=0.0,
-        unrealized_pl_usd=-650.0, asset_class="us_option",
-    )
-    actions = monitor.evaluate_portfolio(
-        portfolio={"positions": [option_pos]},
-        marks={},  # premium mark missing / key-mismatched
-        broker_positions=[bp],
-        spots={},
-    )
-    assert len(actions) == 1
-    assert actions[0]["symbol"] == "SPY260619C00530000"
+    assert actions[0]["symbol"] == "SOXL"
     assert "cap" in actions[0]["reason"]
 
 
-def test_monitor_option_price_stop_fires_without_premium_mark(tmp_state):
-    """Codex P2 (#98, round 2): an option's underlying price stop must fire
-    even when its PREMIUM mark is missing/key-mismatched, because the
-    underlying spot is fetched independently. marks={} (no premium mark),
-    spots SPY=490 ≤ kill_below 500 → flatten."""
-    option_pos = {
-        "kind": "option", "underlying": "SPY", "type": "call",
-        "strike": 530.0, "expiry": "2026-06-19", "dte": 40,
-        "contracts": 1, "premium_paid": 6.50,
-        "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04,
-                   "vega": 0.18, "iv": 0.18, "iv_percentile": 35},
-        "entry_thesis": "x",
-        "kill_conditions": {"max_loss_pct": 100, "underlying_price_below": 500.0},
-        "position_pct": 5.0,
-    }
+def test_monitor_flattens_legacy_option_orphan(tmp_state):
+    """Defensive: a stray/legacy us_option position the ETF-only target
+    doesn't name is flattened outright as an unsupported instrument
+    (close-only) — it is never traded into, only purged."""
     bp = BrokerPosition(
         symbol="SPY260619C00530000", qty=1, avg_cost=6.50, market_value=650.0,
         unrealized_pl_usd=0.0, asset_class="us_option",
     )
     actions = monitor.evaluate_portfolio(
-        portfolio={"positions": [option_pos]},
-        marks={},  # premium mark missing / key-mismatched
+        portfolio={"positions": []},
+        marks={},
         broker_positions=[bp],
-        spots={"SPY": 490.0},
     )
     assert len(actions) == 1
     assert actions[0]["symbol"] == "SPY260619C00530000"
-    assert "kill_below" in actions[0]["reason"]
+    assert actions[0]["action"] == "flatten"
+    assert "unsupported" in actions[0]["reason"]
 
 
 def test_monitor_kill_switch_disables_price_time_stops(tmp_state, monkeypatch):

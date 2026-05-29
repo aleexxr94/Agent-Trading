@@ -13,7 +13,7 @@
         "type": "object",
         "properties": {
           "symbol": {"type": "string", "pattern": "^[A-Z][A-Z0-9.\\-]{0,9}$"},
-          "kind": {"enum": ["etf", "option_underlying", "unknown"]},
+          "kind": {"enum": ["etf", "unknown"]},
           "factor": {"type": "string"},
           "leverage_factor": {"type": "number"},
           "family": {"type": "string"},
@@ -25,7 +25,6 @@
           "hv_90d_annualised": {"type": ["number", "null"]},
           "dist_from_50d_ma_pct": {"type": ["number", "null"]},
           "dist_from_200d_ma_pct": {"type": ["number", "null"]},
-          "is_optionable": {"type": "boolean"},
           "upcoming_macro_events_7d": {
             "type": "array",
             "items": {
@@ -42,7 +41,7 @@
           },
           "error": {"type": "string"}
         },
-        "required": ["symbol", "kind", "factor", "leverage_factor", "is_optionable"],
+        "required": ["symbol", "kind", "factor", "leverage_factor"],
         "additionalProperties": false
       }
     }

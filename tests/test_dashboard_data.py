@@ -37,14 +37,7 @@ def test_load_portfolio_seed_overrides_fixture(tmp_state):
 
 def test_mark_key_for_position_etf():
     assert dd.mark_key_for_position({"kind": "etf", "symbol": "TQQQ"}) == "TQQQ"
-
-
-def test_mark_key_for_position_option():
-    pos = {
-        "kind": "option", "underlying": "SPY", "strike": 530.0,
-        "expiry": "2026-06-19", "type": "call",
-    }
-    assert dd.mark_key_for_position(pos) == "SPY|530.0|2026-06-19|call"
+    assert dd.mark_key_for_position({"kind": "etf", "symbol": "SQQQ"}) == "SQQQ"
 
 
 # ---------- split_positions_by_broker_holdings ----------
@@ -71,10 +64,10 @@ def test_split_treats_empty_held_keys_as_all_closed():
     assert len(closed) == len(portfolio["positions"])
 
 
-def test_split_partitions_etf_and_option_correctly():
-    """Mixed portfolio: TQQQ + SPY 540C still open at broker; rest closed."""
+def test_split_partitions_by_held_symbols():
+    """ETF portfolio: TQQQ + SOXL still open at broker; rest closed."""
     portfolio = json.loads(FIXTURE.read_text())
-    held = frozenset({"TQQQ", "SPY|540.0|2026-06-19|call"})
+    held = frozenset({"TQQQ", "SOXL"})
     open_, closed = dd.split_positions_by_broker_holdings(
         portfolio, held_keys=held,
     )
@@ -121,8 +114,8 @@ def test_broker_view_dataclass_shape():
     filter is consistent with the cost dict used for P&L."""
     view = dd.BrokerView(
         marks={"TQQQ": 80.0},
-        costs={"TQQQ": 75.0, "SPY|540.0|2026-06-19|call": 8.10},
-        held_keys=frozenset({"TQQQ", "SPY|540.0|2026-06-19|call"}),
+        costs={"TQQQ": 75.0, "SOXL": 22.0},
+        held_keys=frozenset({"TQQQ", "SOXL"}),
         available=True,
         nav_usd=2575.5,
         captured_at="2026-05-14T13:35:00Z",
@@ -264,17 +257,15 @@ def test_try_load_broker_view_returns_raw_broker_equity(
     )
 
 
-def test_position_table_rows_etf_and_option_columns(tmp_state):
+def test_position_table_rows_etf_only_columns(tmp_state):
     portfolio = json.loads(FIXTURE.read_text())
     rows = dd.position_table_rows(portfolio)
     kinds = {r["Kind"] for r in rows}
-    assert kinds == {"ETF", "OPT"}
-    opt_row = next(r for r in rows if r["Kind"] == "OPT")
-    assert "Δ" in opt_row["Greeks"]
-    # Kill cell now folds in any underlying price / time stops alongside
-    # the max-loss %; assert on the prefix rather than full string so
-    # fixture tweaks to those guards don't ripple into the test.
-    assert opt_row["Kill"].startswith("≤100% loss")
+    assert kinds == {"ETF"}
+    # No option-only columns leak into the ETF table.
+    for r in rows:
+        assert "Greeks" not in r
+        assert "DTE" not in r
 
 
 def test_position_table_rows_without_marks_leaves_pnl_blank(tmp_state):
@@ -304,89 +295,11 @@ def test_position_table_rows_etf_pnl_with_marks(tmp_state):
     assert r["Net P&L"] < r["Gross P&L"]
 
 
-def _option_pos():
-    return {
-        "kind": "option", "underlying": "SPY", "type": "call",
-        "strike": 530.0, "expiry": "2026-06-19", "dte": 40,
-        "contracts": 1, "premium_paid": 6.50,
-        "greeks": {"delta": 0.45, "gamma": 0.02, "theta": -0.04, "vega": 0.18,
-                    "iv": 0.18, "iv_percentile": 35},
-        "entry_thesis": "x", "kill_conditions": {"max_loss_pct": 100},
-        "position_pct": 5.0,
-    }
-
-
-def test_position_table_rows_option_pnl_uses_synthetic_key(tmp_state):
-    """Option marks use 'underlying|strike|expiry|type' key, same as monitor.py."""
-    rows = dd.position_table_rows(
-        {"positions": [_option_pos()]},
-        marks={"SPY|530.0|2026-06-19|call": 8.00},
-    )
-    r = rows[0]
-    assert r["Mark"] == 8.00
-    # 1 contract × 100 × (8.00 - 6.50) = $150 gross
-    assert r["Gross P&L"] == pytest.approx(150.0)
-
-
-def test_position_table_rows_option_pnl_falls_back_to_osi_key(tmp_state):
-    """marks_from_broker currently keys options by OSI symbol. Until that
-    aligns with the synthetic key, the dashboard must accept either so live
-    option marks actually flow into the Mark / Gross / Net columns.
-
-    Regression test for the P1 Codex flagged on PR #21: without this fallback,
-    option P&L stays blank in any portfolio holding options.
-    """
-    rows = dd.position_table_rows(
-        {"positions": [_option_pos()]},
-        marks={"SPY260619C00530000": 8.00},
-    )
-    r = rows[0]
-    assert r["Mark"] == 8.00
-    assert r["Gross P&L"] == pytest.approx(150.0)
-
-
 def test_allocation_pie_includes_cash(tmp_state):
     portfolio = json.loads(FIXTURE.read_text())
     pie = dd.allocation_pie(portfolio)
     assert any(r["label"] == "Cash" for r in pie)
     assert sum(r["value"] for r in pie) == pytest.approx(100.0, abs=0.5)
-
-
-def test_position_pnl_uses_broker_cost_basis_when_provided(tmp_state):
-    """Regression for the live observation on May 12 2026:
-       Agent's portfolio.json said premium_paid=3.50 (its training-data prior)
-       Alpaca actually filled at avg_cost=0.61
-       Dashboard used to show -$290 fictional loss when truth was -$2.
-    The `costs` dict passed into position_table_rows must override
-    portfolio.json's premium_paid when computing Cost / Notional / P&L."""
-    rows = dd.position_table_rows(
-        {"positions": [_option_pos()]},  # premium_paid=6.50 in fixture
-        marks={"SPY|530.0|2026-06-19|call": 0.59},
-        costs={"SPY|530.0|2026-06-19|call": 0.61},
-    )
-    r = rows[0]
-    # Cost column shows broker's actual fill, not the agent's premium_paid
-    assert r["Entry"] == pytest.approx(0.61)
-    # Notional reflects truth: 1 contract × 100 × $0.61 = $61
-    assert r["Notional"] == pytest.approx(61.0)
-    # Gross P&L: ($0.59 - $0.61) × 1 × 100 = -$2  (NOT the -$590 we'd see
-    # if we used the fixture's premium_paid=6.50 as basis)
-    assert r["Gross P&L"] == pytest.approx(-2.0)
-
-
-def test_position_pnl_falls_back_to_portfolio_premium_when_no_broker_costs(tmp_state):
-    """When the broker is unreachable (no costs dict), keep the old
-    behaviour and use portfolio.json's premium_paid. Otherwise we'd
-    silently lose P&L for offline / no-keys configurations."""
-    rows = dd.position_table_rows(
-        {"positions": [_option_pos()]},  # premium_paid=6.50
-        marks={"SPY|530.0|2026-06-19|call": 8.00},
-        costs=None,  # broker unavailable
-    )
-    r = rows[0]
-    assert r["Entry"] == pytest.approx(6.50)
-    # ($8.00 - $6.50) × 1 × 100 = $150
-    assert r["Gross P&L"] == pytest.approx(150.0)
 
 
 def test_position_pnl_etf_uses_broker_cost_basis_when_provided(tmp_state):
@@ -441,17 +354,17 @@ def test_bias_column_etf_bear(tmp_state):
     assert rows[0]["Bias"] == "Bear"
 
 
-def test_bias_column_option_put_is_bear(tmp_state):
-    """Long puts express a bearish view on the underlying."""
-    pos = _option_pos()
-    pos["type"] = "put"
-    rows = dd.position_table_rows({"positions": [pos]})
-    assert rows[0]["Bias"] == "Bear"
-
-
-def test_bias_column_option_call_is_bull(tmp_state):
-    rows = dd.position_table_rows({"positions": [_option_pos()]})
-    assert rows[0]["Bias"] == "Bull"
+def test_bias_column_biti_is_short_crypto(tmp_state):
+    """BITI is the 1x inverse bitcoin ETF — surfaced as 'Short crypto'."""
+    portfolio = {
+        "positions": [{
+            "kind": "etf", "symbol": "BITI", "shares": 1, "avg_cost": 18.0,
+            "leverage_factor": 1.0, "entry_thesis": "x",
+            "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
+        }],
+    }
+    rows = dd.position_table_rows(portfolio)
+    assert rows[0]["Bias"] == "Short crypto"
 
 
 def test_bias_column_uvxy_is_long_vol(tmp_state):
@@ -1314,19 +1227,16 @@ def test_fees_column_populates_modelled_round_trip_cost(tmp_state):
     assert r["Gross P&L"] - r["Fees"] == pytest.approx(r["Net P&L"])
 
 
-def test_dte_column_present_for_options_dash_for_etfs(tmp_state):
-    """DTE comes straight from position.schema 'dte'; ETF rows show
-    '—' since they have no expiry."""
+def test_no_dte_or_greeks_columns_on_etf_rows(tmp_state):
+    """ETF-only system: there is no DTE or Greeks column at all."""
     etf = {
         "kind": "etf", "symbol": "TQQQ", "shares": 1, "avg_cost": 80.0,
         "leverage_factor": 3.0, "entry_thesis": "x",
         "kill_conditions": {"max_loss_pct": 25}, "position_pct": 5.0,
     }
-    rows = dd.position_table_rows({"positions": [etf, _option_pos()]})
-    etf_row = next(r for r in rows if r["Kind"] == "ETF")
-    opt_row = next(r for r in rows if r["Kind"] == "OPT")
-    assert etf_row["DTE"] == "—"
-    assert opt_row["DTE"] == 40
+    rows = dd.position_table_rows({"positions": [etf]})
+    assert "DTE" not in rows[0]
+    assert "Greeks" not in rows[0]
 
 
 def test_days_held_from_opened_at_map_for_etf(tmp_state):
@@ -2190,183 +2100,3 @@ def test_trades_pnl_view_honours_all_time_cost_reset(tmp_state):
     assert c["net_pnl_usd"] == pytest.approx(50.0 - 0.20)
 
 
-# --------------------------------------------------------------------------- #
-# Option funnel — diagnostic added 2026-05-22 after six months of paper
-# trading produced zero option positions. Surfaces where in the pipeline
-# option candidates die.
-# --------------------------------------------------------------------------- #
-
-
-def _seed_run(rid: str, *, view=None, chain=None, portfolio=None,
-              sanity=None, next_run=None):
-    """Write a minimal per-cycle run dir under state/runs/<rid>/.
-    Any artifact arg left None is simply not written — mirrors the
-    real orchestrator's behaviour when a stage is skipped or aborted.
-    """
-    run_dir = state.RUNS_DIR / rid
-    run_dir.mkdir(parents=True, exist_ok=True)
-    if view is not None:
-        state.write_json(run_dir / "view.json", view)
-    if chain is not None:
-        state.write_json(run_dir / "chain_lookups.json", chain)
-    if portfolio is not None:
-        state.write_json(run_dir / "portfolio.json", portfolio)
-    if sanity is not None:
-        state.write_json(run_dir / "sanity.json", sanity)
-    if next_run is not None:
-        state.write_json(run_dir / "next_run.json", next_run)
-
-
-def test_option_funnel_empty_when_no_runs(tmp_state):
-    assert dd.option_funnel() == []
-
-
-def test_option_funnel_counts_surfaced_and_chain_ok(tmp_state):
-    """Strategist surfaces 2 option candidates; chain resolves both."""
-    _seed_run(
-        "20260522T120000Z-aaaaaa",
-        view={
-            "regime": "trending_up",
-            "candidates": [
-                {"symbol": "SPY", "instrument_kind": "option_call", "confidence": 0.75,
-                 "thesis": "x"},
-                {"symbol": "QQQ", "instrument_kind": "option_call", "confidence": 0.70,
-                 "thesis": "x"},
-                {"symbol": "TQQQ", "instrument_kind": "etf", "confidence": 0.65,
-                 "thesis": "x"},  # ETF, not counted
-            ],
-        },
-        chain={
-            "lookups": [
-                {"candidate": {"symbol": "SPY", "instrument_kind": "option_call"},
-                 "contract": {"osi_symbol": "SPY...", "strike": 540.0},
-                 "error": None},
-                {"candidate": {"symbol": "QQQ", "instrument_kind": "option_call"},
-                 "contract": {"osi_symbol": "QQQ...", "strike": 500.0},
-                 "error": None},
-            ],
-        },
-        portfolio={"all_cash": False, "positions": [
-            {"kind": "etf", "symbol": "TQQQ", "shares": 5},
-        ]},
-    )
-    rows = dd.option_funnel()
-    assert len(rows) == 1
-    r = rows[0]
-    assert r["surfaced"] == 2
-    assert r["chain_ok"] == 2
-    assert r["taken"] == 0  # constructor took the ETF, dropped both options
-    assert r["regime"] == "trending_up"
-    assert r["took_anything"] is True
-
-
-def test_option_funnel_records_drop_when_chain_returns_null_contract(tmp_state):
-    """Strategist surfaces 1 option but Alpaca returns no tradable contract."""
-    _seed_run(
-        "20260522T130000Z-bbbbbb",
-        view={"regime": "neutral", "candidates": [
-            {"symbol": "TLT", "instrument_kind": "option_put", "confidence": 0.65,
-             "thesis": "x"},
-        ]},
-        chain={"lookups": [
-            {"candidate": {"symbol": "TLT", "instrument_kind": "option_put"},
-             "contract": None,
-             "error": "no tradable OTM contract found"},
-        ]},
-        portfolio={"all_cash": True, "positions": []},
-    )
-    r = dd.option_funnel()[0]
-    assert r["surfaced"] == 1
-    assert r["chain_ok"] == 0
-    assert r["taken"] == 0
-    assert r["all_cash"] is True
-
-
-def test_option_funnel_counts_taken_and_submitted(tmp_state):
-    """Full happy path: surfaced → chain → taken → sanity → submitted."""
-    _seed_run(
-        "20260522T140000Z-cccccc",
-        view={"candidates": [
-            {"symbol": "IWM", "instrument_kind": "option_call", "confidence": 0.80,
-             "thesis": "x"},
-        ]},
-        chain={"lookups": [
-            {"candidate": {"symbol": "IWM", "instrument_kind": "option_call"},
-             "contract": {"osi_symbol": "IWM260619C00220000"},
-             "error": None},
-        ]},
-        portfolio={"all_cash": False, "positions": [
-            {"kind": "option", "underlying": "IWM", "type": "call",
-             "strike": 220.0, "expiry": "2026-06-19", "dte": 28, "contracts": 1,
-             "premium_paid": 2.50, "position_pct": 10.0},
-        ]},
-        sanity={"status": "pass", "rules": []},
-        next_run={
-            "order_plan": {
-                "results": [
-                    {"symbol": "IWM260619C00220000", "qty": 1, "side": "buy",
-                     "status": "accepted", "broker_order_id": "ord-x"},
-                ],
-            },
-        },
-    )
-    r = dd.option_funnel()[0]
-    assert r["surfaced"] == 1
-    assert r["chain_ok"] == 1
-    assert r["taken"] == 1
-    assert r["sanity_pass"] is True
-    assert r["submitted"] == 1
-
-
-def test_option_funnel_does_not_count_skipped_orders(tmp_state):
-    """A 'skipped: option contract not tradable at broker' result is in
-    the plan but didn't actually submit — must not bump the submitted
-    count or the dashboard will overstate broker activity."""
-    _seed_run(
-        "20260522T150000Z-dddddd",
-        view={"candidates": [
-            {"symbol": "GLD", "instrument_kind": "option_call", "confidence": 0.7,
-             "thesis": "x"},
-        ]},
-        chain={"lookups": [
-            {"candidate": {"symbol": "GLD", "instrument_kind": "option_call"},
-             "contract": {"osi_symbol": "GLD260619C00250000"},
-             "error": None},
-        ]},
-        portfolio={"all_cash": False, "positions": [
-            {"kind": "option", "underlying": "GLD", "type": "call",
-             "strike": 250.0, "expiry": "2026-06-19", "dte": 28, "contracts": 1,
-             "premium_paid": 1.20, "position_pct": 5.0},
-        ]},
-        sanity={"status": "pass"},
-        next_run={
-            "order_plan": {
-                "results": [
-                    {"symbol": "GLD260619C00250000", "qty": 1, "side": "buy",
-                     "status": "skipped: option contract not tradable at broker",
-                     "broker_order_id": ""},
-                ],
-            },
-        },
-    )
-    r = dd.option_funnel()[0]
-    assert r["taken"] == 1
-    assert r["submitted"] == 0
-
-
-def test_option_funnel_orders_newest_first(tmp_state):
-    """Multiple runs come back newest-first so the dashboard renders them
-    in the order an operator scans (top = most recent)."""
-    _seed_run("20260520T120000Z-old001",
-              view={"candidates": []}, portfolio={"all_cash": True, "positions": []})
-    _seed_run("20260522T120000Z-new002",
-              view={"candidates": [
-                  {"symbol": "SPY", "instrument_kind": "option_call",
-                   "confidence": 0.8, "thesis": "x"},
-              ]}, portfolio={"all_cash": True, "positions": []})
-    rows = dd.option_funnel()
-    assert [r["run_id"] for r in rows] == [
-        "20260522T120000Z-new002", "20260520T120000Z-old001",
-    ]
-    assert rows[0]["surfaced"] == 1
-    assert rows[1]["surfaced"] == 0

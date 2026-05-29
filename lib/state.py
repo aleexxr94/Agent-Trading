@@ -562,12 +562,12 @@ def append_trade(entry: dict) -> None:
         Callers must check existing rows before calling this; the function
         does NOT dedupe internally to keep the writer fast.
       - alpaca_order_id (str)
-      - symbol (str) — ETF symbol or OSI option symbol
-      - kind ("etf" | "option")
+      - symbol (str) — ETF symbol
+      - kind ("etf")
       - side ("buy" | "sell")
       - qty (number)
-      - fill_price (number) — per-share for ETFs, per-share-premium for options
-      - fees_usd (number) — sum of OCC + SEC + any other fees from the fill
+      - fill_price (number) — per-share fill price
+      - fees_usd (number) — sum of SEC + any other regulatory fees from the fill
       - filled_at (ISO UTC)
       - run_id (str | None) — the orchestrator run that triggered this fill,
         when known. None is allowed for manual / out-of-band trades that the

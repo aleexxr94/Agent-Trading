@@ -154,7 +154,7 @@ def cagr(start_val: float, end_val: float, days: int) -> float:
 
     Special-cases a wiped-out account: if end_val <= 0 we return -1.0
     (= -100% annualised) so the dashboard's CAGR card shows -100%
-    instead of a misleading flat 0% — relevant for this options-heavy
+    instead of a misleading flat 0% — relevant for this leveraged-ETF
     $2,500 experiment where losses + logged costs could in principle
     consume the baseline (regression for codex P2). Returns 0.0 only
     for clearly invalid inputs (non-positive start_val, non-positive
