@@ -8,7 +8,7 @@
     "run_id": {"type": "string", "minLength": 1},
     "stage": {
       "enum": [
-        "market_gate", "signals", "strategist", "chain_lookup",
+        "market_gate", "signals", "strategist",
         "construct", "critic", "execute", "monitor",
         "review_complete"
       ]

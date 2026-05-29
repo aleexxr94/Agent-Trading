@@ -5,7 +5,7 @@ monitor.py (kill-condition evaluation between runs).
 
 Spec invariants:
   - Per-position cap at entry: ≤15% of portfolio NAV.
-  - Per-position kill: ≤25% loss of position NAV (or 100% premium for long options).
+  - Per-position kill: ≤25% loss of position NAV.
   - Daily portfolio drawdown circuit breaker: ≥8% in a single UTC day halts new orders.
   - Target band 1–12 positions (or all-cash) — judgement call by the agent.
 """
@@ -39,7 +39,6 @@ def parse_iso_utc(s: str | None) -> datetime | None:
 # Hard, repo-wide constants — do not parameterise without a CLAUDE.md change.
 MAX_POSITION_PCT = 15.0
 MAX_POSITION_LOSS_PCT = 25.0
-MAX_OPTION_LOSS_PCT = 100.0
 DAILY_DD_HALT_PCT = 8.0
 TARGET_POSITION_BAND = (1, 12)
 
@@ -71,7 +70,7 @@ class SizingPlan:
     symbol: str
     target_pct: float
     notional_usd: float
-    shares_or_contracts: float
+    shares: float
 
 
 def size_position(
@@ -79,13 +78,8 @@ def size_position(
     nav_usd: float,
     target_pct: float,
     unit_price_usd: float,
-    is_option: bool = False,
 ) -> SizingPlan:
-    """Return integer shares (ETF) or contracts (option) under the 15% cap.
-
-    For options, unit_price_usd is the per-contract premium in dollars (already
-    accounts for the 100x multiplier).
-    """
+    """Return integer ETF shares under the 15% per-position cap."""
     if nav_usd <= 0:
         raise RiskViolation("NAV must be positive")
     if unit_price_usd <= 0:
@@ -106,7 +100,7 @@ def size_position(
         symbol="",
         target_pct=actual_notional / nav_usd * 100.0,
         notional_usd=actual_notional,
-        shares_or_contracts=units,
+        shares=units,
     )
 
 
@@ -121,19 +115,18 @@ def should_kill_position(
     *,
     current_value_usd: float,
     cost_basis_usd: float,
-    is_option: bool,
     extra_kill: dict | None = None,
     spot_price: float | None = None,
     now_utc: datetime | None = None,
 ) -> tuple[bool, str]:
-    """Evaluate kill conditions for a single position. Returns (kill?, reason).
+    """Evaluate kill conditions for a single ETF position. Returns (kill?, reason).
 
-    Checks, in order: the hard loss cap (25% ETF / 100% option), the
-    underlying price stops (when ``spot_price`` is known), and the
+    Checks, in order: the hard 25% loss cap, the ETF price stops (when
+    ``spot_price`` — the ETF's own price — is known), and the
     ``time_stop_utc`` time stop (when set). ``now_utc`` defaults to the
     current UTC time; callers may inject it for deterministic tests.
     """
-    cap = MAX_OPTION_LOSS_PCT if is_option else MAX_POSITION_LOSS_PCT
+    cap = MAX_POSITION_LOSS_PCT
     loss = position_loss_pct(
         current_value_usd=current_value_usd, cost_basis_usd=cost_basis_usd
     )

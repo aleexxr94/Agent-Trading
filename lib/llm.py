@@ -280,8 +280,8 @@ def strip_markdown_fences(text: str) -> str:
          and let the caller's `json.loads` raise — the original behaviour.
 
     The balanced-delimiter extraction is necessary because regex can't
-    correctly handle nested objects in JSON values (e.g. a strategist
-    candidates array with nested greeks dicts).
+    correctly handle nested objects in JSON values (e.g. a portfolio
+    array with nested kill_conditions dicts).
     """
     t = text.strip()
     if not t:

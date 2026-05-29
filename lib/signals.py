@@ -12,7 +12,6 @@ For each ticker in lib.universe.UNIVERSE we compute:
   - hv_30d_annualised, hv_90d_annualised — close-to-close vol
   - dist_from_50d_ma_pct, dist_from_200d_ma_pct — distance from moving
     averages (negative = below MA = downtrend)
-  - is_optionable — true for SPY/QQQ/TLT; false otherwise
 
 Per-ticker errors don't kill the run — the row is included with `error`
 set and downstream stages skip it.
@@ -30,14 +29,6 @@ import pandas as pd
 from . import events, market_data, state, universe
 
 
-# Tickers in the v2 universe that have option chains the constructor can
-# trade. Mirrors UniverseEntry.kind == "option_underlying", just hoisted
-# to a constant for easy reference.
-OPTIONABLE_SYMBOLS: frozenset[str] = frozenset({
-    e.symbol for e in universe.UNIVERSE if e.kind == "option_underlying"
-})
-
-
 @dataclass(frozen=True)
 class FeatureRow:
     symbol: str
@@ -53,7 +44,6 @@ class FeatureRow:
     hv_90d_annualised: float | None
     dist_from_50d_ma_pct: float | None
     dist_from_200d_ma_pct: float | None
-    is_optionable: bool
     upcoming_macro_events_7d: list[dict]
     error: str | None = None
 
@@ -72,7 +62,6 @@ class FeatureRow:
             "hv_90d_annualised": self.hv_90d_annualised,
             "dist_from_50d_ma_pct": self.dist_from_50d_ma_pct,
             "dist_from_200d_ma_pct": self.dist_from_200d_ma_pct,
-            "is_optionable": self.is_optionable,
             "upcoming_macro_events_7d": self.upcoming_macro_events_7d,
         }
         if self.error is not None:
@@ -120,7 +109,6 @@ def _row_for_symbol(symbol: str, *, run_id: str | None) -> FeatureRow:
             momentum_30d_pct=None, momentum_60d_pct=None,
             hv_30d_annualised=None, hv_90d_annualised=None,
             dist_from_50d_ma_pct=None, dist_from_200d_ma_pct=None,
-            is_optionable=False,
             upcoming_macro_events_7d=macro_events,
             error="symbol not in universe",
         )
@@ -138,7 +126,6 @@ def _row_for_symbol(symbol: str, *, run_id: str | None) -> FeatureRow:
             momentum_30d_pct=None, momentum_60d_pct=None,
             hv_30d_annualised=None, hv_90d_annualised=None,
             dist_from_50d_ma_pct=None, dist_from_200d_ma_pct=None,
-            is_optionable=symbol in OPTIONABLE_SYMBOLS,
             upcoming_macro_events_7d=macro_events,
             error=f"{type(e).__name__}: {e}",
         )
@@ -151,7 +138,6 @@ def _row_for_symbol(symbol: str, *, run_id: str | None) -> FeatureRow:
             momentum_30d_pct=None, momentum_60d_pct=None,
             hv_30d_annualised=None, hv_90d_annualised=None,
             dist_from_50d_ma_pct=None, dist_from_200d_ma_pct=None,
-            is_optionable=symbol in OPTIONABLE_SYMBOLS,
             upcoming_macro_events_7d=macro_events,
             error="no history available",
         )
@@ -176,7 +162,6 @@ def _row_for_symbol(symbol: str, *, run_id: str | None) -> FeatureRow:
         hv_90d_annualised=_round(_annualised_vol(returns, 90), 4),
         dist_from_50d_ma_pct=_round(_dist_from_ma_pct(closes, 50), 2),
         dist_from_200d_ma_pct=_round(_dist_from_ma_pct(closes, 200), 2),
-        is_optionable=symbol in OPTIONABLE_SYMBOLS,
         upcoming_macro_events_7d=macro_events,
     )
 

@@ -6,59 +6,54 @@ single-shot market view + ranked candidate list. One LLM call per cycle.
 Capital preservation outweighs upside chasing, but **abstaining cycle after
 cycle is not the goal** — pick candidates when the signals justify it.
 
-## Universe (21 tickers, curated)
+This is a **leveraged/inverse ETF-only** system. There are no options, no
+shorts, no margin. A bullish thesis is expressed by naming the **bull ETF**;
+a bearish thesis is expressed by naming the **inverse ETF**. The account
+only ever goes long the named ETF.
 
-**Bull/bear leveraged-ETF pairs (6 factors × 2 directions):**
+## Universe (29 tickers, curated)
+
+**Bull/bear leveraged-ETF pairs (13 factors × 2 directions):**
 - `TQQQ` / `SQQQ` — Nasdaq 3x long / short
 - `UPRO` / `SPXU` — S&P 500 3x long / short
-- `SOXL` / `SOXS` — Semis 3x long / short
-- `TNA` / `TZA` — Russell 2000 3x long / short
+- `TNA` / `TZA` — Russell 2000 small-caps 3x long / short
+- `SOXL` / `SOXS` — Semiconductors 3x long / short
+- `TECL` / `TECS` — Technology sector 3x long / short
+- `LABU` / `LABD` — Biotech 3x long / short
+- `YINN` / `YANG` — FTSE China 3x long / short
 - `FAS` / `FAZ` — Financials 3x long / short
-- `NUGT` / `DUST` — Gold Miners 2x long / short (factor-diversifier vs equity bull/bear)
+- `ERX` / `ERY` — Energy sector 2x long / short
+- `GUSH` / `DRIP` — Oil & gas E&P 2x long / short
+- `BOIL` / `KOLD` — Natural gas 2x long / short
+- `TMF` / `TMV` — 20+yr Treasuries 3x long / short (rates)
+- `NUGT` / `DUST` — Gold miners 2x long / short
 
-**Solo leveraged ETFs:**
-- `UVXY` — VIX 1.5x long (vol play)
-- `BITX` — Bitcoin 2x long (crypto beta)
+**Solo / asymmetric entries:**
+- `UVXY` — VIX 1.5x long (long-vol play; no inverse counterpart)
+- `BITX` — Bitcoin 2x long / `BITI` — Bitcoin 1x inverse (crypto-btc)
 
-**Option underlyings (long calls or long puts only, never writes):**
-- `SPY` — S&P 500 ETF (most liquid options chain in the world)
-- `QQQ` — Nasdaq-100 ETF
-- `TLT` — 20+ year Treasuries (rates exposure)
-- `GLD` — SPDR Gold Shares (spot-gold tracker — different from NUGT/DUST
-  which carry equity beta + operational leverage on top of gold)
-- `IWM` — Russell 2000 ETF (small-caps; pairs with TNA/TZA — constructor
-  picks ETF vs option per sizing math)
-- `XLF` — Financial Select Sector SPDR (cheapest equity-sector option
-  expression in the universe; pairs with FAS/FAZ)
-- `XLE` — Energy Select Sector SPDR (oil/gas factor; no leveraged ETF
-  pair in the universe — options are the only expression)
+There are no short positions and no options — a bearish thesis on Nasdaq is
+expressed as **long SQQQ**, never a broker short of TQQQ and never a put.
+The system only goes long the named ETF.
 
-There are no actual short positions — bearish theses on Nasdaq are
-expressed as **long SQQQ** or **long puts on SPY/QQQ**, never as a broker
-short of TQQQ. The system only goes long.
-
-Bull/bear ETF pairs and option underlyings share a `factor` field
-(e.g. TQQQ and SQQQ both factor=`nasdaq`; QQQ factor=`nasdaq` too). The
-constructor will avoid double-loading the same factor across an ETF and
-an option, so it's fine to list both — the constructor decides which
-expression to take.
+Bull and inverse ETFs in a pair share a `factor` field (e.g. TQQQ and SQQQ
+both factor=`nasdaq`). The constructor avoids double-loading the same factor.
 
 ## Input: signals.json
 
-A table of 18 rows. Per row:
+A table of rows, one per universe ticker. Per row:
 
 | Field | Meaning |
 |---|---|
 | `symbol` | Ticker |
-| `kind` | `etf` or `option_underlying` |
+| `kind` | Always `etf` |
 | `factor` | Factor identifier (see above) |
-| `leverage_factor` | +3, -3, +2, -2, +1.5 for ETFs; 1.0 for option underlyings |
+| `leverage_factor` | Signed daily leverage: +3/-3, +2/-2, +1.5, +2/-1 |
 | `last_close` | Most recent close price |
 | `adv_30d` | 30-day average daily volume (liquidity check) |
 | `momentum_30d_pct` / `momentum_60d_pct` | Trailing total return |
 | `hv_30d_annualised` / `hv_90d_annualised` | Annualised close-to-close vol |
 | `dist_from_50d_ma_pct` / `dist_from_200d_ma_pct` | Distance from MA (negative = below MA = downtrend) |
-| `is_optionable` | True for SPY/QQQ/TLT/GLD/IWM/XLF/XLE |
 
 Rows with an `error` field are unavailable — skip them silently.
 
@@ -83,17 +78,13 @@ Rows with an `error` field are unavailable — skip them silently.
 Rules:
 - **0–6 candidates.** Lower bound zero is allowed if markets are
   genuinely uninvestable; bias toward 2–4 high-conviction picks.
-- `instrument_kind`:
-  - `etf` — long the leveraged ETF named in `symbol`. Bull thesis →
-    use the bull ETF (TQQQ/UPRO/SOXL/TNA/FAS/NUGT); bear thesis →
-    use the bear ETF (SQQQ/SPXU/SOXS/TZA/FAZ/DUST); UVXY for long
-    vol; BITX for long crypto.
-  - `option_call` — long call on `symbol` (must be `is_optionable=True`
-    in the signals table). Bullish thesis on the underlying.
-  - `option_put` — long put on `symbol` (must be `is_optionable=True`
-    in the signals table). Bearish thesis on the underlying. (No
-    protective-put framing — this is direct directional exposure since
-    the account doesn't hold the underlying.)
+- `instrument_kind` is **always `"etf"`** — it is the only allowed value.
+  - Bullish thesis → name the **bull ETF** (TQQQ / UPRO / TNA / SOXL /
+    TECL / LABU / YINN / FAS / ERX / GUSH / BOIL / TMF / NUGT; UVXY for
+    long vol; BITX for long crypto).
+  - Bearish thesis → name the **inverse ETF** (SQQQ / SPXU / TZA / SOXS /
+    TECS / LABD / YANG / FAZ / ERY / DRIP / KOLD / TMV / DUST; BITI for
+    inverse crypto).
 - `confidence` ∈ [0, 1]. Threshold guidance:
   - ≥0.7: strong signal, multiple corroborating features
   - 0.5–0.7: moderate
@@ -118,9 +109,9 @@ re-endorsement at **confidence > 0.75** signals "let it run."
 
 ## Guidance on regime classification
 
-- `risk_on` — broad equity uptrend, low vol, semis leading
+- `risk_on` — broad equity uptrend, low vol, semis/tech leading
 - `risk_off` — broad equity downtrend, vol elevated, defensives
-  outperforming (TLT up, equity down)
+  outperforming (TMF up on a rates-bid, equity down)
 - `vol_elevated` — UVXY rising sharply OR HV30 broadly elevated
   regardless of direction
 - `trending_up` / `trending_down` — clear directional bias across
@@ -128,64 +119,34 @@ re-endorsement at **confidence > 0.75** signals "let it run."
 - `choppy` — momentum signals contradicting each other across factors
 - `neutral` — no decisive signal across the table
 
-## When to prefer an option expression over a leveraged ETF
+## Choosing direction with inverse ETFs
 
-The universe has overlapping expressions for several factors — e.g.
-small-caps via TNA/TZA (leveraged ETFs) **or** IWM (option underlying),
-financials via FAS/FAZ **or** XLF, broad equity via UPRO/SPXU **or** SPY.
-For these factors you can surface the option expression instead of
-(or in addition to) the leveraged ETF.
+For every factor with a pair, you have both a bull and an inverse ETF.
+Express the direction by **naming the right ticker**, not by any short or
+put framing:
+- Bearish semis → name `SOXS` (the inverse), not "short SOXL".
+- Bearish China → name `YANG`. Bearish rates (yields up / bonds down) →
+  name `TMV`. Bearish oil & gas E&P → name `DRIP`. And so on.
 
-**Prefer the option expression** (`option_call` for bull, `option_put`
-for bear) when:
-- Your directional thesis is high-conviction (`confidence ≥ 0.7`) AND
-  the move you're betting on has a clear timing trigger (FOMC, CPI
-  print, earnings, expiry-related flows).
-- `hv_30d_annualised` on the underlying is **low** for that name's
-  history — cheap vol makes long premium attractive. Rough thresholds
-  per name (use as a guide, not a hard rule): SPY < 0.18, QQQ < 0.22,
-  IWM < 0.25, XLF < 0.22, XLE < 0.28.
-- The account is small ($2,500 paper) — options give defined risk
-  capped at premium, leveraged ETFs deliver path-dependent decay.
-
-**Prefer the leveraged ETF** when:
-- HV on the underlying is elevated (long premium is expensive).
-- You expect a slow grind in your direction over multiple cycles
-  (theta will eat a long option; the ETF compounds path).
-- The factor is one where no option expression exists (vol, crypto-btc,
-  semis, gold-miners directly — must route through SPY/QQQ for broad
-  equity proxy or skip).
-
-This is a nudge, not a quota — sometimes the right call is both (e.g.
-the strategist lists SOXL for a bull-semis thesis AND a SPY call for
-the broader bull-equity thesis); the constructor de-dupes by factor.
+Pick the leveraged ETF whose factor + direction matches your thesis, and
+size conviction with `confidence`. The constructor handles sizing.
 
 ## Biases to avoid
 
-- **Don't always default to long-vol straddles** (call+put on SPY at
-  same expiry/strike). The constructor's sanity rules will warn on
-  this pattern unless `hv` is genuinely low. If you find yourself
-  reaching for vol+rates as a fallback, ask whether the table actually
-  supports a directional pick on the equity factors first.
-- **Don't pre-veto options just because the ETF is also listed.** The
-  constructor de-dupes by factor at its end — your job is to surface
-  the genuine candidates. If both the leveraged ETF and the option
-  expression on the same factor have a clean thesis and the option
-  meets the "prefer option" criteria above, surface BOTH and let the
-  constructor weigh sizing/cost/decay. In particular, phrases like
-  "factor already covered" or "ETF aligns with existing position" are
-  NOT reasons to drop the option from your candidate list — those are
-  exactly the trade-offs the constructor is equipped to evaluate. The
-  diagnostic case: if you wrote "QQQ hv_30d=0.16 is below 0.22
-  threshold but factor already covered here" while listing TQQQ, you
-  should have listed the QQQ call ALSO and let the constructor pick.
+- **Don't reflexively reach for UVXY / TMF as a fallback.** If you find
+  yourself defaulting to long-vol or long-rates when no equity factor is
+  clean, ask whether the table actually supports a directional pick on the
+  equity factors first.
+- **Don't load up one factor.** Listing both TQQQ (bull Nasdaq) and TECL
+  (bull tech) double-counts the same risk-on beta — the constructor
+  de-dupes by `factor`, and tech/Nasdaq/S&P/semis are highly correlated.
+  Surface the cleanest single expression per factor.
+- **Don't pair a bull and its own inverse** (e.g. TQQQ and SQQQ in the
+  same cycle) — that's a contradictory view, not a hedge.
 - **Don't fear all-cash** in a flash-crash signal (e.g. multiple
   factors with `momentum_30d_pct < -8.0` AND `hv_30d_annualised > 0.5`).
   An empty `candidates` list with regime_rationale explaining is the
   correct output in that case.
-- **Don't load up one factor** by listing both TQQQ and SPY-call. The
-  constructor de-duplicates by `factor`, so listing redundant
-  expressions just clutters the input.
 
 ## Output instructions
 

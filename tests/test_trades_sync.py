@@ -28,10 +28,10 @@ class _Alpaca500(Exception):
 class _AlpacaInvalidActivityType400(Exception):
     """Mimics the real Alpaca paper-API response when a fee activity-type
     string isn't valid for this account/API. Observed on 2026-05-26 for
-    OCC / OCC_FEE / ORF / REG / SEC / TAF / FINRA_TAF on a paper account
-    — only ``FEE`` was accepted. The raw exception stringifies as the
-    JSON error body, so we mimic that shape too."""
-    def __init__(self, activity_type: str = "OCC"):
+    REG / SEC / TAF / FINRA_TAF on a paper account — only ``FEE`` was
+    accepted. The raw exception stringifies as the JSON error body, so we
+    mimic that shape too."""
+    def __init__(self, activity_type: str = "REG"):
         super().__init__(
             f'{{"code":40010001,"message":"invalid activity type: {activity_type}"}}'
         )
@@ -83,7 +83,7 @@ def _fill(activity_id="20260512000000::a1", *, order_id="ord-1", symbol="TQQQ",
     }
 
 
-def _fee(*, order_id, net_amount="-0.65", activity_type="OCC"):
+def _fee(*, order_id, net_amount="-0.65", activity_type="REG"):
     """Fee activities arrive with NEGATIVE net_amount (it's a debit)."""
     return {
         "id": f"fee-{order_id}-{activity_type}",
@@ -119,32 +119,32 @@ def test_sync_appends_new_fill_with_zero_fees_for_etf(tmp_state):
     assert r["run_id"] is None  # no order_id_to_run_id map passed
 
 
-def test_sync_folds_occ_fee_into_option_fill(tmp_state):
-    """OSI-shaped symbol → kind=option; fee activity with matching order_id
-    is folded into fees_usd as a POSITIVE value (Alpaca reports debits as
-    negative net_amount)."""
-    osi = "SPY260619P00510000"
+def test_sync_folds_fee_into_etf_fill(tmp_state):
+    """ETF fill; a fee activity with matching order_id is folded into
+    fees_usd as a POSITIVE value (Alpaca reports debits as negative
+    net_amount). ETF-only: kind is always 'etf'."""
     tc = _FakeTrading(responses={
         "/account/activities/FILL": [_fill(
-            activity_id="fill-1", order_id="ord-opt-1", symbol=osi,
-            qty="1", price="0.61",
+            activity_id="fill-1", order_id="ord-1", symbol="TQQQ",
+            qty="10", price="70.00",
         )],
-        "/account/activities/OCC": [_fee(order_id="ord-opt-1", net_amount="-0.65")],
+        "/account/activities/REG": [_fee(order_id="ord-1", net_amount="-0.65")],
     })
     res = trades_sync.sync_fills_from_alpaca(trading_client=tc)
     assert res.new_fills_written == 1
     assert res.fees_matched == 1
 
     r = state.read_trades()[0]
-    assert r["kind"] == "option"
+    assert r["kind"] == "etf"
     assert r["fees_usd"] == pytest.approx(0.65)  # flipped to positive
 
 
 def test_sync_sums_multiple_fee_types_for_same_order(tmp_state):
-    """OCC + REG + TAF fees on a single fill should sum into fees_usd."""
+    """SEC + REG + TAF fees on a single fill should sum into fees_usd."""
     tc = _FakeTrading(responses={
         "/account/activities/FILL": [_fill(order_id="ord-X")],
-        "/account/activities/OCC": [_fee(order_id="ord-X", net_amount="-0.05")],
+        "/account/activities/SEC": [_fee(order_id="ord-X", net_amount="-0.05",
+                                          activity_type="SEC")],
         "/account/activities/REG": [_fee(order_id="ord-X", net_amount="-0.03",
                                           activity_type="REG")],
         "/account/activities/TAF": [_fee(order_id="ord-X", net_amount="-0.02",
@@ -235,7 +235,7 @@ def test_sync_handles_unknown_fee_endpoint_gracefully(tmp_state):
     # FILL endpoint + every fee endpoint attempted (some raised, sync survived)
     paths = {c[0] for c in tc.calls}
     assert "/account/activities/FILL" in paths
-    assert "/account/activities/OCC" in paths
+    assert "/account/activities/SEC" in paths
     assert "/account/activities/REG" in paths
 
 
@@ -264,7 +264,7 @@ def test_sync_reports_unmatched_fees(tmp_state):
     operator can decide whether to wire up the reconcile pass."""
     tc = _FakeTrading(responses={
         "/account/activities/FILL": [_fill(order_id="ord-1")],
-        "/account/activities/OCC": [
+        "/account/activities/REG": [
             _fee(order_id="ord-1"),                    # matched
             _fee(order_id="ord-stale"),                # belongs to a fill not in this window
         ],
@@ -295,19 +295,18 @@ def test_sync_normalises_side(tmp_state, alpaca_side, expected):
 
 
 def test_sync_splits_order_fees_pro_rata_across_partial_fills(tmp_state):
-    """Single order, two FILL activities (partial fills 4 + 6 of 10 contracts),
-    one OCC fee activity at $1.00 for the order. Each fill must carry its
+    """Single order, two FILL activities (partial fills 4 + 6 of 10 shares),
+    one fee activity at $1.00 for the order. Each fill must carry its
     pro-rata share — NOT the full $1.00 each (the pre-fix bug Codex caught).
     """
-    osi = "SPY260619P00510000"
     tc = _FakeTrading(responses={
         "/account/activities/FILL": [
-            _fill(activity_id="fill-1", order_id="ord-X", symbol=osi,
-                  qty="4", price="0.61"),
-            _fill(activity_id="fill-2", order_id="ord-X", symbol=osi,
-                  qty="6", price="0.61"),
+            _fill(activity_id="fill-1", order_id="ord-X", symbol="TQQQ",
+                  qty="4", price="70.00"),
+            _fill(activity_id="fill-2", order_id="ord-X", symbol="TQQQ",
+                  qty="6", price="70.00"),
         ],
-        "/account/activities/OCC": [_fee(order_id="ord-X", net_amount="-1.00")],
+        "/account/activities/REG": [_fee(order_id="ord-X", net_amount="-1.00")],
     })
     res = trades_sync.sync_fills_from_alpaca(trading_client=tc)
     assert res.new_fills_written == 2
@@ -324,8 +323,8 @@ def test_sync_single_fill_receives_entire_order_fee(tmp_state):
     The pro-rata math (qty/total_qty = 1.0) must produce the same answer
     as the pre-fix code did for non-partial orders."""
     tc = _FakeTrading(responses={
-        "/account/activities/FILL": [_fill(order_id="ord-Y", symbol="SPY260619P00510000")],
-        "/account/activities/OCC": [_fee(order_id="ord-Y", net_amount="-0.65")],
+        "/account/activities/FILL": [_fill(order_id="ord-Y", symbol="TQQQ")],
+        "/account/activities/REG": [_fee(order_id="ord-Y", net_amount="-0.65")],
     })
     trades_sync.sync_fills_from_alpaca(trading_client=tc)
     r = state.read_trades()[0]
@@ -354,7 +353,7 @@ def test_sync_propagates_5xx_on_fee_endpoint(tmp_state):
     Codex P1: narrow the catch."""
     tc = _FakeTrading(
         responses={"/account/activities/FILL": [_fill()]},
-        raise_on={"/account/activities/OCC": _Alpaca500()},
+        raise_on={"/account/activities/REG": _Alpaca500()},
     )
     with pytest.raises(_Alpaca500):
         trades_sync.sync_fills_from_alpaca(trading_client=tc)
@@ -365,7 +364,7 @@ def test_sync_propagates_unexpected_exception(tmp_state):
     operator sees the failure instead of writing zero-fee fills."""
     tc = _FakeTrading(
         responses={"/account/activities/FILL": [_fill()]},
-        raise_on={"/account/activities/OCC": RuntimeError("parse error")},
+        raise_on={"/account/activities/REG": RuntimeError("parse error")},
     )
     with pytest.raises(RuntimeError):
         trades_sync.sync_fills_from_alpaca(trading_client=tc)
@@ -376,14 +375,12 @@ def test_sync_skips_400_invalid_activity_type(tmp_state):
     code 40010001 'invalid activity type: X' (probed 2026-05-26 — only
     FEE works on paper). The fee-pull loop must treat that the same as
     404: silently skip the unsupported type and continue. Without this,
-    the very first iteration (OCC) raises and kills the whole sync —
+    the very first iteration raises and kills the whole sync —
     the bug that caused multi-week silent sync blackout on the VPS.
     """
     tc = _FakeTrading(
         responses={"/account/activities/FILL": [_fill()]},
         raise_on={
-            "/account/activities/OCC": _AlpacaInvalidActivityType400("OCC"),
-            "/account/activities/ORF": _AlpacaInvalidActivityType400("ORF"),
             "/account/activities/REG": _AlpacaInvalidActivityType400("REG"),
             "/account/activities/SEC": _AlpacaInvalidActivityType400("SEC"),
             "/account/activities/TAF": _AlpacaInvalidActivityType400("TAF"),
@@ -407,7 +404,7 @@ def test_sync_propagates_400_with_other_codes(tmp_state):
             self.status_code = 400
     tc = _FakeTrading(
         responses={"/account/activities/FILL": [_fill()]},
-        raise_on={"/account/activities/OCC": _Alpaca400OtherCode()},
+        raise_on={"/account/activities/REG": _Alpaca400OtherCode()},
     )
     with pytest.raises(_Alpaca400OtherCode):
         trades_sync.sync_fills_from_alpaca(trading_client=tc)
@@ -431,7 +428,7 @@ def test_sync_skips_invalid_activity_type_without_status_code_attr(tmp_state):
         """Mimics an alpaca-py APIError that doesn't expose status_code
         on the instance (or via .response). Same JSON body as the real
         paper-API response."""
-        def __init__(self, activity_type: str = "OCC"):
+        def __init__(self, activity_type: str = "REG"):
             super().__init__(
                 f'{{"code":40010001,"message":"invalid activity type: {activity_type}"}}'
             )
@@ -448,7 +445,7 @@ def test_sync_skips_invalid_activity_type_without_status_code_attr(tmp_state):
         },
         raise_on={
             f"/account/activities/{t}": _Alpaca400NoStatusAttr(t)
-            for t in ("OCC", "ORF", "REG", "SEC", "TAF", "FINRA_TAF")
+            for t in ("REG", "SEC", "TAF", "FINRA_TAF")
         },
     )
     # No status_code on the exception, but the message body identifies
@@ -474,7 +471,7 @@ def test_sync_propagates_400_with_40010001_but_unrelated_message(tmp_state):
             self.status_code = 400
     tc = _FakeTrading(
         responses={"/account/activities/FILL": [_fill()]},
-        raise_on={"/account/activities/OCC": _Alpaca400ValidationDate()},
+        raise_on={"/account/activities/REG": _Alpaca400ValidationDate()},
     )
     with pytest.raises(_Alpaca400ValidationDate):
         trades_sync.sync_fills_from_alpaca(trading_client=tc)
@@ -496,11 +493,11 @@ def test_sync_queries_FEE_activity_type(tmp_state):
             )],
         },
         # Every category-specific type returns 400 on paper, mimicking
-        # the real probe output: OCC/OCC_FEE/ORF/REG/SEC/TAF/FINRA_TAF
-        # all error with invalid-activity-type.
+        # the real probe output: REG/SEC/TAF/FINRA_TAF all error with
+        # invalid-activity-type.
         raise_on={
             f"/account/activities/{t}": _AlpacaInvalidActivityType400(t)
-            for t in ("OCC", "ORF", "REG", "SEC", "TAF", "FINRA_TAF")
+            for t in ("REG", "SEC", "TAF", "FINRA_TAF")
         },
     )
     res = trades_sync.sync_fills_from_alpaca(trading_client=tc)
@@ -521,7 +518,7 @@ def test_sync_uses_status_via_response_attribute(tmp_state):
             self.response = type("R", (), {"status_code": 404})()
     tc = _FakeTrading(
         responses={"/account/activities/FILL": [_fill()]},
-        raise_on={"/account/activities/OCC": _HTTPXLikeError()},
+        raise_on={"/account/activities/REG": _HTTPXLikeError()},
     )
     # 404 detected via .response.status_code → skipped silently
     res = trades_sync.sync_fills_from_alpaca(trading_client=tc)

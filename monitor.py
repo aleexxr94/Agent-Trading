@@ -91,91 +91,63 @@ def evaluate_portfolio(
 ) -> list[dict]:
     """Return flatten action dicts: {symbol, action, reason}.
 
-    Broker-truth mode (``broker_positions`` provided): a position's value
-    and cost basis come from ACTUAL broker holdings — this handles partial
-    fills and uses the real ``avg_entry_price`` rather than the agent's
-    intended ``avg_cost``/``premium_paid`` (which can be 5-10× off for
-    options). Broker positions the target portfolio doesn't name
-    ('orphans') get loss-cap coverage so nothing held goes unmonitored.
+    ETF-only system. Broker-truth mode (``broker_positions`` provided): a
+    position's value and cost basis come from ACTUAL broker holdings — this
+    handles partial fills and uses the real ``avg_entry_price`` rather than
+    the agent's intended ``avg_cost``. Broker positions the target portfolio
+    doesn't name ('orphans') get loss-cap coverage so nothing held goes
+    unmonitored; a stray/legacy option position (unsupported instrument) is
+    flattened outright.
 
     Legacy mode (``broker_positions is None``): falls back to the target
     portfolio's stored shares/avg_cost. Kept for direct callers/tests.
 
     ``enforce_stops`` gates the Phase 1 additions (price stops, time stops,
     orphan coverage); the hard loss cap always applies. ``now_utc`` is
-    injectable for deterministic time-stop tests.
+    injectable for deterministic time-stop tests. ``spots`` is accepted for
+    backwards compatibility but ETF price stops use the ETF's own mark.
     """
-    from lib.orders import osi_symbol
     cost_basis = cost_basis or {}
-    spots = spots or {}
     actions: list[dict] = []
     broker_truth = broker_positions is not None
     broker_by_key = {bp.symbol: bp for bp in (broker_positions or [])}
     covered: set[str] = set()
 
     for pos in portfolio.get("positions", []):
-        is_option = pos["kind"] == "option"
-        symbol = pos.get("underlying") if is_option else pos["symbol"]
-        mark_key = (
-            marks_lib.option_synthetic_key(symbol, pos.get("strike"), pos.get("expiry"), pos.get("type"))
-            if is_option else symbol
-        )
-        mult = 100 if is_option else 1
-        if is_option:
-            try:
-                bkey = osi_symbol(
-                    underlying=pos["underlying"], expiry=pos["expiry"],
-                    type=pos["type"], strike=pos["strike"],
-                )
-            except (KeyError, ValueError):
-                bkey = None
-        else:
-            bkey = symbol
-        mark = marks.get(mark_key)
+        symbol = pos["symbol"]
+        mark = marks.get(symbol)
 
         if broker_truth:
-            bp = broker_by_key.get(bkey) if bkey else None
+            bp = broker_by_key.get(symbol)
             if bp is None or abs(bp.qty) == 0:
                 continue  # not held at broker — nothing to flatten
-            covered.add(bkey)
+            covered.add(symbol)
             qty = abs(bp.qty)
-            basis_per_unit = cost_basis.get(mark_key)
+            basis_per_unit = cost_basis.get(symbol)
             if basis_per_unit is None:
                 basis_per_unit = bp.avg_cost
-            cost_basis_usd = basis_per_unit * qty * mult
-            # Value from the broker's own market_value — robust to marks-dict
-            # key mismatches (e.g. strike 530 vs 530.0) that would otherwise
-            # neutralise the loss cap and let a -100% option stay open
-            # (Codex P2 on PR #98, round 3).
+            cost_basis_usd = basis_per_unit * qty
+            # Value from the broker's own market_value.
             current_value_usd = abs(bp.market_value)
         else:
-            qty = pos["contracts"] if is_option else pos["shares"]
-            cost_basis_usd = (
-                pos["premium_paid"] * qty * mult if is_option else pos["avg_cost"] * qty
-            )
+            qty = pos["shares"]
+            cost_basis_usd = pos["avg_cost"] * qty
             if mark is None:
                 continue  # legacy: can't value an unmarked position
-            current_value_usd = mark * qty * mult
+            current_value_usd = mark * qty
 
-        # Spot for price stops is independent of the option's premium mark:
-        # ETFs use their own mark as the spot; options use the fetched
-        # underlying spot — so the underlying stop fires regardless of whether
-        # the premium mark resolved.
-        spot = (spots.get(symbol) if is_option else mark) if enforce_stops else None
+        # ETF price stops use the ETF's own mark as the spot.
+        spot = mark if enforce_stops else None
 
         kill, reason = risk.should_kill_position(
             current_value_usd=current_value_usd,
             cost_basis_usd=cost_basis_usd,
-            is_option=is_option,
             extra_kill=pos.get("kill_conditions") if enforce_stops else None,
             spot_price=spot,
             now_utc=now_utc,
         )
         if kill:
-            # Options flatten by OCC OSI symbol — broker.flatten('SPY') would
-            # close the ETF, not the contract.
-            flatten_sym = bkey if (is_option and bkey) else symbol
-            actions.append({"symbol": flatten_sym, "action": "flatten", "reason": reason})
+            actions.append({"symbol": symbol, "action": "flatten", "reason": reason})
 
     # Orphan coverage: a broker position the target doesn't name still gets
     # the hard loss cap so nothing held goes unmonitored (Finding 5).
@@ -183,12 +155,18 @@ def evaluate_portfolio(
         for bkey, bp in broker_by_key.items():
             if bkey in covered or abs(bp.qty) == 0:
                 continue
-            is_option = bp.asset_class == "us_option"
+            # Unsupported instrument (e.g. a legacy option position): the
+            # system is ETF-only, so flatten it outright (close-only).
+            if bp.asset_class == "us_option":
+                actions.append({
+                    "symbol": bkey, "action": "flatten",
+                    "reason": "unsupported instrument (options removed) — flattening",
+                })
+                continue
             qty = abs(bp.qty)
             kill, reason = risk.should_kill_position(
                 current_value_usd=abs(bp.market_value),
-                cost_basis_usd=bp.avg_cost * qty * (100 if is_option else 1),
-                is_option=is_option,
+                cost_basis_usd=bp.avg_cost * qty,
                 extra_kill=None,
                 spot_price=None,
                 now_utc=now_utc,
@@ -226,33 +204,19 @@ def audit_report(
     ``broker_positions`` so it adds no extra broker round trip. Observability
     only — nothing reads this to gate orders.
     """
-    from lib.orders import osi_symbol
     positions = portfolio.get("positions") or []
     broker_syms = {p.symbol for p in broker_positions}
 
     expected: set[str] = set()
     for pos in positions:
-        if pos.get("kind") == "option":
-            try:
-                expected.add(osi_symbol(
-                    underlying=pos["underlying"], expiry=pos["expiry"],
-                    type=pos["type"], strike=pos["strike"],
-                ))
-            except Exception:
-                pass
-        elif pos.get("symbol"):
+        if pos.get("symbol"):
             expected.add(pos["symbol"])
 
     unmarked: list[dict] = []
     for pos in positions:
-        is_option = pos.get("kind") == "option"
-        symbol = pos.get("underlying") if is_option else pos.get("symbol")
-        mark_key = (
-            marks_lib.option_synthetic_key(symbol, pos.get("strike"), pos.get("expiry"), pos.get("type"))
-            if is_option else symbol
-        )
-        if marks.get(mark_key) is None:
-            unmarked.append({"symbol": symbol, "kind": pos.get("kind"), "mark_key": mark_key})
+        symbol = pos.get("symbol")
+        if marks.get(symbol) is None:
+            unmarked.append({"symbol": symbol, "kind": pos.get("kind"), "mark_key": symbol})
 
     # Prefer the live (Phase 2) breaker state when the caller computed it;
     # fall back to a nav_history (cycle-granularity) proxy otherwise.
@@ -340,28 +304,12 @@ def main(argv: list[str] | None = None) -> int:
     marks = marks_lib.marks_from_positions(positions)
     cost_basis = marks_lib.cost_basis_from_positions(positions)
     enforce = _enforce_stops_enabled()
-    # Fresh underlying spots for option price stops (Codex P2 on PR #98): an
-    # option's underlying_price_below/above references the underlying (e.g.
-    # SPY), not the option mark, so fetch the live underlying price per held
-    # option. Best-effort — None just skips that option's price stop.
-    spots: dict[str, float] = {}
-    if broker is not None and enforce:
-        underlyings = {
-            p["underlying"] for p in portfolio.get("positions", [])
-            if p.get("kind") == "option" and p.get("underlying")
-        }
-        for u in underlyings:
-            try:
-                px = broker.get_underlying_price(u)
-            except Exception:
-                px = None
-            if px is not None:
-                spots[u] = px
+    # ETF price stops use the ETF's own mark as the spot — no separate
+    # underlying-price fetch is needed.
     actions = evaluate_portfolio(
         portfolio=portfolio,
         marks=marks,
         cost_basis=cost_basis,
-        spots=spots,
         broker_positions=(positions if broker is not None else None),
         enforce_stops=enforce,
     )

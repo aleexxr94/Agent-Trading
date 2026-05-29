@@ -6,33 +6,44 @@ and only submits orders when the env flag is on; default-off until the
 operator opts in.
 
 Scope:
-  - ETF orders: integer-share market orders (Phase 10c).
-  - Option orders: OSI-symbol market orders for opening + closing legs
-    (Phase 10d). Single legs only — no multi-leg combos yet (spreads,
-    straddles etc. would need a separate request shape).
+  - ETF orders: integer-share market orders.
 
-OSI symbol convention used (matches Alpaca paper):
-    {UNDERLYING}{YYMMDD}{C|P}{STRIKE*1000:08d}
-  e.g.  SPY  call, $530 strike, 2026-06-19  →  SPY260619C00530000
+The system is ETF-only. Any option-shaped target (kind="option", an OSI
+symbol, or option-only fields like contracts/strike/expiry/premium_paid) is
+rejected defensively before it can reach the broker — it is never submitted.
 """
 from __future__ import annotations
 
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
 
 from .broker import Broker, BrokerPosition, OrderRequest, OrderResult
 
 # OCC OSI option-symbol shape: 1-6 char underlying + YYMMDD + C/P + strike*1000
-# zero-padded to 8 digits. Used to detect option legs in submit_plan without
-# threading kind="option" through OrderRequest (which would muddle the ETF path).
+# zero-padded to 8 digits. Retained ONLY as a defensive detector so an option
+# symbol can never be submitted as an order. The system does not build these.
 _OSI_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+
+# Position fields that only exist on options — their presence flags a payload
+# that must be rejected before reaching the broker.
+_OPTION_ONLY_FIELDS = ("contracts", "strike", "expiry", "premium_paid", "greeks", "underlying")
 
 
 def is_osi_symbol(symbol: str) -> bool:
     """True iff ``symbol`` matches the OCC OSI option-symbol shape."""
-    return bool(_OSI_RE.match(symbol))
+    return bool(_OSI_RE.match(symbol or ""))
+
+
+def _is_option_like(position: dict) -> bool:
+    """Defensive: detect an option-shaped target position so the order layer
+    can refuse it. ETF-only system — this should never fire in normal
+    operation, but it fails closed if an option payload ever slips through."""
+    if position.get("kind") == "option":
+        return True
+    if is_osi_symbol(position.get("symbol") or ""):
+        return True
+    return any(position.get(f) is not None for f in _OPTION_ONLY_FIELDS)
 
 
 def is_enabled() -> bool:
@@ -51,47 +62,9 @@ class OrderPlan:
         return len(self.requests) + len(self.closes)
 
 
-def osi_symbol(*, underlying: str, expiry: str, type: str, strike: float) -> str:
-    """Build an OCC OSI-format option symbol that Alpaca accepts.
-
-    Args:
-        underlying: e.g. "SPY"
-        expiry: ISO date "YYYY-MM-DD"
-        type: "call" or "put"
-        strike: strike price in USD, e.g. 530.0 or 437.5
-
-    Returns: e.g. "SPY260619C00530000"
-    """
-    if type not in ("call", "put"):
-        raise ValueError(f"option type must be 'call' or 'put', got {type!r}")
-    yymmdd = datetime.strptime(expiry, "%Y-%m-%d").strftime("%y%m%d")
-    cp = "C" if type == "call" else "P"
-    # Strike encoding: strike × 1000, zero-padded to 8 digits. $530.00 → 530000.
-    strike_int = int(round(strike * 1000))
-    if strike_int < 0 or strike_int > 99_999_999:
-        raise ValueError(f"strike {strike} out of OSI range")
-    return f"{underlying}{yymmdd}{cp}{strike_int:08d}"
-
-
-def _osi_for_target_option(option_pos: dict) -> str:
-    return osi_symbol(
-        underlying=option_pos["underlying"],
-        expiry=option_pos["expiry"],
-        type=option_pos["type"],
-        strike=option_pos["strike"],
-    )
-
-
 def _current_etf_qty(positions: list[BrokerPosition]) -> dict[str, float]:
     return {
         p.symbol: p.qty for p in positions if p.asset_class == "us_equity"
-    }
-
-
-def _current_option_qty(positions: list[BrokerPosition]) -> dict[str, float]:
-    """Map OSI-symbol → contract qty for option holdings."""
-    return {
-        p.symbol: p.qty for p in positions if p.asset_class == "us_option"
     }
 
 
@@ -175,11 +148,19 @@ def diff_portfolio(target_portfolio: dict, broker_positions: list[BrokerPosition
     skipped: list[dict] = []
 
     # ---- ETFs ----
-    target_etfs = {
-        p["symbol"]: p["shares"]
-        for p in target_portfolio.get("positions", [])
-        if p["kind"] == "etf"
-    }
+    target_etfs: dict[str, float] = {}
+    for p in target_portfolio.get("positions", []):
+        # Defensive reject: options are not a supported instrument class.
+        # Any option-shaped payload is dropped here and never submitted.
+        if _is_option_like(p):
+            skipped.append({
+                "symbol": p.get("symbol") or p.get("underlying"),
+                "kind": p.get("kind"),
+                "reason": "option payloads are not supported (ETF-only system)",
+            })
+            continue
+        target_etfs[p["symbol"]] = p["shares"]
+
     current_etfs = _current_etf_qty(broker_positions)
 
     for sym in sorted(set(target_etfs) | set(current_etfs)):
@@ -190,34 +171,6 @@ def diff_portfolio(target_portfolio: dict, broker_positions: list[BrokerPosition
         )
         closes.extend(sym_closes)
         requests.extend(sym_opens)
-
-    # ---- Options ----
-    target_options: dict[str, int] = {}
-    for p in target_portfolio.get("positions", []):
-        if p["kind"] != "option":
-            continue
-        try:
-            osi = _osi_for_target_option(p)
-        except (KeyError, ValueError) as e:
-            skipped.append({
-                "underlying": p.get("underlying"), "type": p.get("type"),
-                "strike": p.get("strike"), "expiry": p.get("expiry"),
-                "contracts": p.get("contracts"),
-                "reason": f"could not build OSI symbol: {e}",
-            })
-            continue
-        target_options[osi] = p["contracts"]
-
-    current_options = _current_option_qty(broker_positions)
-
-    for osi in sorted(set(target_options) | set(current_options)):
-        target_qty = target_options.get(osi, 0)
-        current_qty = current_options.get(osi, 0)
-        osi_closes, osi_opens = _plan_for_symbol(
-            symbol=osi, current_qty=current_qty, target_qty=target_qty,
-        )
-        closes.extend(osi_closes)
-        requests.extend(osi_opens)
 
     return OrderPlan(requests=requests, skipped=skipped, closes=closes)
 
@@ -249,26 +202,22 @@ def submit_plan(plan: OrderPlan, *, broker: Broker) -> list[OrderResult]:
     order (frees cash before sizing new positions). Returns the result list
     so the orchestrator can log broker order IDs into the decision log.
 
-    Option-open guard: before submitting a BUY for an OSI-shaped symbol,
-    ask the broker whether the contract exists and is tradable. If not,
-    skip with a clear status string instead of submitting an order that
-    will fail with Alpaca's generic error[42210000] 'asset not found'.
-    Closes (sells) are never gated — if we hold the position the contract
-    obviously exists at the broker.
+    Defensive option guard (fail-closed): the system is ETF-only and never
+    builds option symbols, but if an OSI-shaped symbol ever reaches here it
+    is refused outright rather than submitted to the broker.
     """
     results: list[OrderResult] = []
     for req in plan.closes + plan.requests:
-        if req.side == "buy" and is_osi_symbol(req.symbol):
-            if not broker.option_contract_tradable(req.symbol):
-                results.append(OrderResult(
-                    broker_order_id="",
-                    symbol=req.symbol,
-                    qty=req.qty,
-                    side=req.side,
-                    submitted_at="",
-                    status="skipped: option contract not tradable at broker",
-                ))
-                continue
+        if is_osi_symbol(req.symbol):
+            results.append(OrderResult(
+                broker_order_id="",
+                symbol=req.symbol,
+                qty=req.qty,
+                side=req.side,
+                submitted_at="",
+                status="skipped: option symbols are not supported (ETF-only system)",
+            ))
+            continue
         try:
             results.append(broker.submit_order(req))
         except Exception as e:

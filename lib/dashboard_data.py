@@ -13,7 +13,6 @@ from typing import Any
 from . import pnl as pnl_lib
 from . import state
 from . import universe as universe_lib
-from .orders import osi_symbol
 
 ROOT = Path(__file__).resolve().parent.parent
 SEED_PORTFOLIO_FALLBACK = ROOT / "tests" / "fixtures" / "portfolio.json"
@@ -206,8 +205,8 @@ class SyntheticBalance:
           − trading_fees_total_usd  # hybrid: real (closed) + modelled (open)
 
     Field conventions:
-      - ``closed_gross_pnl_usd``: sum of ``(sell_price − buy_price) × qty
-        × multiplier`` across FIFO-matched closes from trades.jsonl.
+      - ``closed_gross_pnl_usd``: sum of ``(sell_price − buy_price) × qty``
+        across FIFO-matched closes from trades.jsonl.
         Trading fees + attributed LLM costs are deducted SEPARATELY via
         the dedicated fields below; this is purely gross.
       - ``open_gross_pnl_usd``: sum of ``(mark − buy_price) × qty
@@ -238,8 +237,8 @@ class SyntheticBalance:
         and its real fees land in the realised side).
 
       - ``real_trading_fees_usd``: sum of ``fees_usd`` across EVERY fill
-        in trades.jsonl. On paper ETFs this is \$0; on options +
-        live trading it populates from OCC/SEC/TAF schedules.
+        in trades.jsonl. On paper ETFs this is \$0; on live trading it
+        populates from the SEC/TAF schedules.
       - ``modelled_open_fees_usd``: sum of
         ``compute_position_pnl(...).modelled_costs_usd`` across the
         broker-held subset of positions (same source the positions
@@ -337,8 +336,7 @@ def compute_synthetic_balance(
         positions via ``compute_portfolio_pnl``.
       ``broker_costs``: broker-reported cost basis per symbol (Alpaca's
         avg_cost). Preferred over the agent's intended ``avg_cost``
-        for option positions where the agent's premium estimates can
-        be 5-10× off the actual fill.
+        when computing P&L against the real fill.
       ``held_keys``: broker's currently-held position keys (from
         ``BrokerView.held_keys``). Used to filter stale portfolio.json
         rows the broker no longer carries.
@@ -362,32 +360,7 @@ def compute_synthetic_balance(
         for p in open_subset:
             key = mark_key_for_position(p)
             mark = marks.get(key)
-            if mark is None and p["kind"] == "option":
-                # Option marks may be keyed by OSI in some BrokerView
-                # constructions — fall back to that resolution so a
-                # rename doesn't silently zero out the position.
-                try:
-                    osi = osi_symbol(
-                        underlying=p["underlying"], expiry=p["expiry"],
-                        type=p["type"], strike=p["strike"],
-                    )
-                    mark = marks.get(osi)
-                except (ValueError, KeyError):
-                    osi = None
             broker_cost_for_pos = (broker_costs or {}).get(key)
-            if (
-                broker_cost_for_pos is None
-                and p["kind"] == "option"
-                and (broker_costs or {})
-            ):
-                try:
-                    osi = osi_symbol(
-                        underlying=p["underlying"], expiry=p["expiry"],
-                        type=p["type"], strike=p["strike"],
-                    )
-                    broker_cost_for_pos = broker_costs.get(osi)
-                except (ValueError, KeyError):
-                    pass
             # Modelled round-trip fee is computed even when no mark is
             # available (pnl_lib accepts current_mark_usd=None and
             # returns gross_pnl_usd=0 with modelled_costs_usd still
@@ -1060,7 +1033,7 @@ def fees_running_total() -> list[dict]:
 
     Powers the cumulative-fees line on the Performance tab. Cumulative
     sum makes it easy to spot a fee spike on a busy day vs slow drift
-    from per-contract OCC fees. Returns [] when no fills.
+    from per-share regulatory fees. Returns [] when no fills.
     """
     rows = load_trades()
     out: list[dict] = []
@@ -1102,12 +1075,11 @@ def try_load_broker_marks_and_costs() -> tuple[dict[str, float], dict[str, float
     """Best-effort fetch of marks AND actual cost-basis dicts from the broker.
 
     Returns ({}, {}) on any failure path. The two dicts share the same
-    key shape (ETF symbol or synthetic `UNDERLYING|STRIKE|EXPIRY|TYPE`),
-    so consumers can look up both with a single key per position.
+    key shape (ETF symbol), so consumers can look up both with a single
+    key per position.
 
     Use cost-basis to compute P&L that matches Alpaca's reported numbers
-    — the agent's `premium_paid` in portfolio.json is an estimate that's
-    often 5-10× off real option premiums.
+    — the broker's reported fill is the source of truth.
 
     Kept for backwards-compatibility. New callers should prefer
     ``try_load_broker_view()`` because this 2-tuple cannot distinguish
@@ -1131,8 +1103,8 @@ class BrokerView:
     "broker unreachable" (``available=False``) from "broker says zero
     positions" (``available=True, held_keys=set()``).
 
-    ``marks`` and ``costs`` are keyed by the same shape used throughout
-    the codebase (ETF symbol or ``UNDERLYING|STRIKE|EXPIRY|TYPE``).
+    ``marks`` and ``costs`` are keyed by ETF symbol (the shape used
+    throughout the codebase).
     ``held_keys`` is exactly ``set(costs)`` precomputed; ``cost_basis_from_broker``
     already filters qty == 0 so it's the truth about what's still open
     on the broker.
@@ -1165,7 +1137,7 @@ def try_load_broker_view() -> BrokerView:
     On success ``available=True`` and ``held_keys`` reflects what's
     currently open at the broker. Dashboards should hide portfolio.json
     rows that aren't in ``held_keys`` to avoid showing stale positions
-    after a manual close / kill-condition exit / expiry.
+    after a manual close or kill-condition exit.
 
     Codex P1 (PR #51): we must call ``broker.get_positions()`` directly
     here, NOT through ``marks_from_broker`` / ``cost_basis_from_broker``
@@ -1211,12 +1183,10 @@ def mark_key_for_position(pos: dict) -> str:
     """Return the key the broker would use for this portfolio position.
 
     Must match lib.marks._key_for_broker_position so that membership tests
-    against ``BrokerView.held_keys`` work both ways round.
+    against ``BrokerView.held_keys`` work both ways round. ETF-only system:
+    the key is the position symbol.
     """
-    if pos["kind"] == "etf":
-        return pos["symbol"]
-    from .marks import option_synthetic_key
-    return option_synthetic_key(pos["underlying"], pos["strike"], pos["expiry"], pos["type"])
+    return pos["symbol"]
 
 
 def split_positions_by_broker_holdings(
@@ -1429,192 +1399,34 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
     return summaries
 
 
-def option_funnel(limit: int = 20) -> list[dict]:
-    """Per-cycle option funnel: surfaced → chain_ok → taken → sanity_pass → submitted.
-
-    Diagnoses why options aren't being traded by surfacing where in the
-    pipeline option candidates die. Each row corresponds to one
-    orchestrator cycle (newest first) and reads the run-dir artifacts:
-
-      - view.json / review.json — strategist's candidate list. Count
-        entries with `instrument_kind in ("option_call","option_put")`.
-      - chain_lookups.json — Alpaca's nearest-OTM lookup. Count entries
-        whose `contract` is non-null.
-      - portfolio.json — constructor's final picks. Count positions
-        with `kind == "option"`.
-      - sanity.json — overall status. Treated as "pass" unless the run
-        failed and the failure cites an option position.
-      - next_run.json["order_plan"]["results"] — actual submitted
-        orders. Count results whose `symbol` is an OSI option symbol
-        and status doesn't start with "error" or "skipped".
-
-    Returns a list of dicts (newest first):
-      {run_id, generated_at, surfaced, chain_ok, taken, sanity_pass,
-       submitted, regime, all_cash, took_anything}
-
-    Where `took_anything` is True if the portfolio has any position
-    (ETF or option) — useful for distinguishing "all-cash cycle" from
-    "took ETFs but dropped options".
-
-    Empty list when no runs exist. Returns the most recent `limit`
-    cycles, mirroring load_run_summaries.
-    """
-    if not state.RUNS_DIR.exists():
-        return []
-    run_dirs = sorted(
-        [p for p in state.RUNS_DIR.iterdir() if p.is_dir()],
-        key=lambda p: p.name,
-        reverse=True,
-    )[:limit]
-
-    out: list[dict] = []
-    for run_dir in run_dirs:
-        rid = run_dir.name
-        row: dict = {
-            "run_id": rid,
-            "generated_at": "",
-            "surfaced": 0,
-            "chain_ok": 0,
-            "taken": 0,
-            "sanity_pass": None,
-            "submitted": 0,
-            "regime": "",
-            "all_cash": None,
-            "took_anything": False,
-        }
-        # generated_at from rid prefix as a fallback.
-        if len(rid) >= 16 and rid[8] == "T" and rid[15] == "Z":
-            row["generated_at"] = (
-                f"{rid[0:4]}-{rid[4:6]}-{rid[6:8]}T"
-                f"{rid[9:11]}:{rid[11:13]}:{rid[13:15]}Z"
-            )
-
-        # view.json — option candidates surfaced.
-        view_path = run_dir / "view.json"
-        if not view_path.exists():
-            review_path = run_dir / "review.json"
-            if review_path.exists():
-                view_path = review_path
-        if view_path.exists():
-            try:
-                v = json.loads(view_path.read_text())
-                if isinstance(v, dict):
-                    row["regime"] = v.get("regime", "") or ""
-                    cands = v.get("candidates") or []
-                    row["surfaced"] = sum(
-                        1 for c in cands
-                        if isinstance(c, dict) and c.get("instrument_kind") in (
-                            "option_call", "option_put",
-                        )
-                    )
-            except (json.JSONDecodeError, OSError, TypeError):
-                pass
-
-        # chain_lookups.json — how many candidates Alpaca could resolve
-        # to a real OTM contract.
-        cl_path = run_dir / "chain_lookups.json"
-        if cl_path.exists():
-            try:
-                cl = json.loads(cl_path.read_text())
-                if isinstance(cl, dict):
-                    lookups = cl.get("lookups") or []
-                    row["chain_ok"] = sum(
-                        1 for l in lookups
-                        if isinstance(l, dict) and l.get("contract") is not None
-                    )
-            except (json.JSONDecodeError, OSError, TypeError):
-                pass
-
-        # portfolio.json — option positions the constructor took.
-        port_path = run_dir / "portfolio.json"
-        if port_path.exists():
-            try:
-                p = json.loads(port_path.read_text())
-                if isinstance(p, dict):
-                    row["all_cash"] = p.get("all_cash")
-                    positions = p.get("positions") or []
-                    row["took_anything"] = len(positions) > 0
-                    row["taken"] = sum(
-                        1 for pos in positions
-                        if isinstance(pos, dict) and pos.get("kind") == "option"
-                    )
-            except (json.JSONDecodeError, OSError, TypeError):
-                pass
-
-        # sanity.json — pass/warn/fail. Only meaningful when the
-        # constructor took options.
-        if row["taken"] > 0:
-            san_path = run_dir / "sanity.json"
-            if san_path.exists():
-                try:
-                    san = json.loads(san_path.read_text())
-                    if isinstance(san, dict):
-                        status = (san.get("status") or "").lower()
-                        # pass and warn both let the run continue; only
-                        # fail (with SANITY_BLOCK_ON_FAIL=true) stops it.
-                        row["sanity_pass"] = status in ("pass", "warn", "ok")
-                except (json.JSONDecodeError, OSError, TypeError):
-                    pass
-            else:
-                row["sanity_pass"] = None
-
-        # next_run.json["order_plan"]["results"] — submitted orders.
-        # OSI option symbols match _OSI_RE (6-letter underlying + YYMMDD
-        # + C|P + 8-digit strike). Skip "error..." and "skipped..."
-        # statuses since those didn't actually submit.
-        nr_path = run_dir / "next_run.json"
-        if nr_path.exists():
-            try:
-                nr = json.loads(nr_path.read_text())
-                if isinstance(nr, dict):
-                    plan = nr.get("order_plan") or {}
-                    results = plan.get("results") or []
-                    # Lazy import to avoid pulling lib.orders' side effects.
-                    from . import orders as orders_lib
-                    row["submitted"] = sum(
-                        1 for r in results
-                        if isinstance(r, dict)
-                        and orders_lib.is_osi_symbol(r.get("symbol") or "")
-                        and r.get("side") == "buy"
-                        and not (r.get("status") or "").startswith(("error", "skipped"))
-                    )
-            except (json.JSONDecodeError, OSError, TypeError):
-                pass
-
-        out.append(row)
-    return out
-
-
 def _bias_for_position(pos: dict) -> str:
     """Bull / Bear / — classification for the positions-table Bias column.
 
-    The system is long-only, but a bear thesis is expressed via either a
-    long inverse-leveraged ETF (SQQQ, SPXU, TZA, SOXS, FAZ, DUST) or a
-    long put. Surfacing the direction at a glance saves the reader from
-    decoding the leverage_factor sign and the option type by hand.
+    The system is long-only and ETF-only: a bearish thesis is expressed by
+    holding a long inverse-leveraged ETF (SQQQ, SPXU, TZA, SOXS, FAZ, DUST,
+    …), never a short or a put. Surfacing the direction at a glance saves
+    the reader from decoding the leverage_factor sign by hand.
 
     Returns 'Bull' / 'Bear' / '—' (the dash for cases we can't classify
-    cleanly, e.g. UVXY/BITX which are bullish on vol or crypto but don't
-    map cleanly onto an equity bull/bear axis).
+    cleanly, e.g. UVXY/BITX/BITI which map onto vol or crypto rather than
+    an equity bull/bear axis — they get their own labels).
     """
-    if pos["kind"] == "etf":
-        entry = universe_lib.by_symbol(pos["symbol"])
-        if entry is None:
-            return "—"
-        # UVXY (vol) and BITX (crypto) carry positive leverage but are not
-        # equity-bull instruments — show their own labels so the reader
-        # isn't misled into thinking UVXY long = bullish equities.
-        if pos["symbol"] == "UVXY":
-            return "Long vol"
-        if pos["symbol"] == "BITX":
-            return "Long crypto"
-        if entry.leverage_factor > 0:
-            return "Bull"
-        if entry.leverage_factor < 0:
-            return "Bear"
+    entry = universe_lib.by_symbol(pos["symbol"])
+    if entry is None:
         return "—"
-    # Options: call = bullish on the underlying, put = bearish.
-    return "Bull" if pos["type"] == "call" else "Bear"
+    # Vol / crypto carry their own labels so the reader isn't misled into
+    # reading UVXY long as bullish equities.
+    if pos["symbol"] == "UVXY":
+        return "Long vol"
+    if pos["symbol"] == "BITX":
+        return "Long crypto"
+    if pos["symbol"] == "BITI":
+        return "Short crypto"
+    if entry.leverage_factor > 0:
+        return "Bull"
+    if entry.leverage_factor < 0:
+        return "Bear"
+    return "—"
 
 
 def _opened_at_map_from_trades(trade_rows: list[dict]) -> dict[str, str]:
@@ -1631,8 +1443,8 @@ def _opened_at_map_from_trades(trade_rows: list[dict]) -> dict[str, str]:
     Reuses the FIFO matcher in ``lib.trades.compute_trades_pnl`` — the same
     engine that drives realised/unrealised PnL — so days-held and PnL agree
     on what "the current open instance" is. Keyed by the broker symbol (ETF
-    ticker, OSI for options), the same convention the positions table uses
-    for its `costs`/`marks` lookups.
+    ticker), the same convention the positions table uses for its
+    `costs`/`marks` lookups.
 
     Defensive: any failure (malformed log, out-of-order rows) falls back to
     an empty map so the positions table renders "—" rather than breaking.
@@ -1701,24 +1513,18 @@ def position_table_rows(
     held_keys: frozenset[str] | set[str] | None = None,
     opened_at_by_symbol: dict[str, str] | None = None,
 ) -> list[dict]:
-    """Flatten ETF + option rows into uniform columns for st.dataframe.
+    """Flatten ETF position rows into uniform columns for st.dataframe.
 
-    `marks` and `costs` are both keyed by the same convention (ETF symbol,
-    or `f"{underlying}|{strike}|{expiry}|{type}"` for options — same shape
-    used by monitor.py / compute_portfolio_pnl / marks_from_broker /
-    cost_basis_from_broker).
+    `marks` and `costs` are both keyed by ETF symbol — the same shape used
+    by monitor.py / compute_portfolio_pnl / marks_from_broker /
+    cost_basis_from_broker.
 
     Per-row precedence:
       - **Cost / Notional**: prefer broker's actual `avg_cost` (`costs`)
-        when present, otherwise fall back to the agent's `avg_cost` /
-        `premium_paid` from portfolio.json. This matters for options
-        because the agent's premium estimates are often 5-10× off real
-        market premiums — the broker fill is the truth.
+        when present, otherwise fall back to the agent's `avg_cost` from
+        portfolio.json — the broker fill is the truth.
       - **Mark / P&L**: same — prefer live broker mark, fall back to
         portfolio.json values.
-      - When `costs` provides a real fill price, P&L is computed against
-        THAT, not the agent's intended premium. Otherwise we'd show a
-        fictional -$290 loss on a position that's actually -$2.
     """
     marks = marks or {}
     costs = costs or {}
@@ -1727,80 +1533,33 @@ def position_table_rows(
     for p in portfolio.get("positions", []):
         # Stale-position filter: when the broker is reachable and reports
         # which keys it still holds, hide portfolio.json rows the broker
-        # no longer carries (manual close, kill-condition exit, expiry).
+        # no longer carries (manual close or kill-condition exit).
         # held_keys=None means "broker unreachable, don't filter" — we
         # render everything in that case rather than blank the dashboard.
         if held_keys is not None and mark_key_for_position(p) not in held_keys:
             continue
         bias = _bias_for_position(p)
         kill_cell = _kill_summary(p["kill_conditions"])
-        if p["kind"] == "etf":
-            key = p["symbol"]
-            mark = marks.get(key)
-            broker_cost = costs.get(key)
-            cost_per_unit = broker_cost if broker_cost is not None else p["avg_cost"]
-            shares = p["shares"]
-            opened_at = opened_at_by_symbol.get(key)
-            row = {
-                "Symbol": p["symbol"],
-                "Kind": "ETF",
-                "Bias": bias,
-                "Leverage": f"{p.get('leverage_factor', 1):g}x",
-                "DTE": "—",
-                "Qty": shares,
-                "Entry": cost_per_unit,
-                "Notional": shares * cost_per_unit,
-                "% NAV": p["position_pct"],
-                "Days held": _days_held(opened_at),
-                "Greeks": "—",
-                "Kill": kill_cell,
-            }
-        else:
-            contracts = p["contracts"]
-            g = p["greeks"]
-            # Look up via the canonical synthetic key (strike-normalised so an
-            # integer JSON strike matches the broker's float); fall back to OSI.
-            from .marks import option_synthetic_key
-            synth_key = option_synthetic_key(p["underlying"], p["strike"], p["expiry"], p["type"])
-            mark = marks.get(synth_key)
-            broker_cost = costs.get(synth_key)
-            opened_at = None
-            try:
-                osi = osi_symbol(
-                    underlying=p["underlying"], expiry=p["expiry"],
-                    type=p["type"], strike=p["strike"],
-                )
-            except (ValueError, KeyError):
-                osi = None
-            if mark is None and osi is not None:
-                mark = marks.get(osi)
-            if broker_cost is None and osi is not None:
-                broker_cost = costs.get(osi)
-            # Trade history stores option symbols as OSI; that's our only
-            # lookup key for the opened-at map.
-            if osi is not None:
-                opened_at = opened_at_by_symbol.get(osi)
-            cost_per_unit = broker_cost if broker_cost is not None else p["premium_paid"]
-            premium_usd = cost_per_unit * 100 * contracts
-            row = {
-                "Symbol": f"{p['underlying']} {p['type'].upper()} {p['strike']} {p['expiry']}",
-                "Kind": "OPT",
-                "Bias": bias,
-                "Leverage": "—",
-                "DTE": p.get("dte", "—"),
-                "Qty": contracts,
-                "Entry": cost_per_unit,
-                "Notional": premium_usd,
-                "% NAV": p["position_pct"],
-                "Days held": _days_held(opened_at),
-                "Greeks": (
-                    f"Δ{g['delta']:.2f} Θ{g['theta']:.2f} "
-                    f"IV {g['iv']*100:.0f}% (p{int(g['iv_percentile'])})"
-                ),
-                "Kill": kill_cell,
-            }
-        # Pass the broker-truth cost basis into the P&L helper so option
-        # P&L reflects actual fill, not the agent's premium estimate.
+        key = p["symbol"]
+        mark = marks.get(key)
+        broker_cost = costs.get(key)
+        cost_per_unit = broker_cost if broker_cost is not None else p["avg_cost"]
+        shares = p["shares"]
+        opened_at = opened_at_by_symbol.get(key)
+        row = {
+            "Symbol": p["symbol"],
+            "Kind": "ETF",
+            "Bias": bias,
+            "Leverage": f"{p.get('leverage_factor', 1):g}x",
+            "Qty": shares,
+            "Entry": cost_per_unit,
+            "Notional": shares * cost_per_unit,
+            "% NAV": p["position_pct"],
+            "Days held": _days_held(opened_at),
+            "Kill": kill_cell,
+        }
+        # Pass the broker-truth cost basis into the P&L helper so P&L
+        # reflects the actual fill, not the agent's estimate.
         breakdown = pnl_lib.compute_position_pnl(
             position=p,
             current_mark_usd=mark,
@@ -1809,8 +1568,7 @@ def position_table_rows(
         row["Mark"] = mark if mark is not None else None
         # Δ% (move since entry, gross) — surfaces the percent move
         # independent of position size, complementing the dollar P&L
-        # columns. Computed off the per-unit prices so it works for both
-        # ETF shares and option per-contract premiums.
+        # columns. Computed off the per-share prices.
         if mark is not None and cost_per_unit:
             row["Δ%"] = (mark - cost_per_unit) / cost_per_unit * 100.0
         else:
@@ -1830,8 +1588,7 @@ def position_table_rows(
 def allocation_pie(portfolio: dict) -> list[dict]:
     rows = []
     for p in portfolio.get("positions", []):
-        symbol = p["symbol"] if p["kind"] == "etf" else f"{p['underlying']} {p['type']}"
-        rows.append({"label": symbol, "value": p["position_pct"]})
+        rows.append({"label": p["symbol"], "value": p["position_pct"]})
     cash_pct = max(0.0, 100.0 - sum(r["value"] for r in rows))
     if cash_pct > 0:
         rows.append({"label": "Cash", "value": cash_pct})

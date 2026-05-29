@@ -16,7 +16,6 @@
       "hv_90d_annualised": 0.38,
       "dist_from_50d_ma_pct": 4.2,
       "dist_from_200d_ma_pct": 15.7,
-      "is_optionable": false,
       "upcoming_macro_events_7d": []
     },
     {
@@ -33,7 +32,6 @@
       "hv_90d_annualised": 0.37,
       "dist_from_50d_ma_pct": -4.1,
       "dist_from_200d_ma_pct": -14.8,
-      "is_optionable": false,
       "upcoming_macro_events_7d": []
     },
     {
@@ -50,7 +48,6 @@
       "hv_90d_annualised": 0.28,
       "dist_from_50d_ma_pct": 3.1,
       "dist_from_200d_ma_pct": 12.3,
-      "is_optionable": false,
       "upcoming_macro_events_7d": []
     },
     {
@@ -67,7 +64,6 @@
       "hv_90d_annualised": 0.27,
       "dist_from_50d_ma_pct": -3.0,
       "dist_from_200d_ma_pct": -11.4,
-      "is_optionable": false,
       "upcoming_macro_events_7d": []
     },
     {
@@ -84,7 +80,6 @@
       "hv_90d_annualised": 0.48,
       "dist_from_50d_ma_pct": 6.8,
       "dist_from_200d_ma_pct": 22.1,
-      "is_optionable": false,
       "upcoming_macro_events_7d": []
     },
     {
@@ -101,41 +96,38 @@
       "hv_90d_annualised": 0.47,
       "dist_from_50d_ma_pct": -6.5,
       "dist_from_200d_ma_pct": -21.0,
-      "is_optionable": false,
       "upcoming_macro_events_7d": []
     },
     {
-      "symbol": "TNA",
+      "symbol": "TECL",
       "kind": "etf",
-      "factor": "small-caps",
+      "factor": "technology",
       "leverage_factor": 3.0,
-      "family": "Russell 2000 3x long",
-      "last_close": 42.15,
-      "adv_30d": 25000000,
-      "momentum_30d_pct": 3.4,
-      "momentum_60d_pct": 1.2,
-      "hv_30d_annualised": 0.45,
-      "hv_90d_annualised": 0.4,
-      "dist_from_50d_ma_pct": 1.5,
-      "dist_from_200d_ma_pct": 4.8,
-      "is_optionable": false,
+      "family": "Technology 3x long",
+      "last_close": 88.6,
+      "adv_30d": 9000000,
+      "momentum_30d_pct": 7.6,
+      "momentum_60d_pct": 13.2,
+      "hv_30d_annualised": 0.4,
+      "hv_90d_annualised": 0.36,
+      "dist_from_50d_ma_pct": 4.0,
+      "dist_from_200d_ma_pct": 16.5,
       "upcoming_macro_events_7d": []
     },
     {
-      "symbol": "TZA",
+      "symbol": "TECS",
       "kind": "etf",
-      "factor": "small-caps",
+      "factor": "technology",
       "leverage_factor": -3.0,
-      "family": "Russell 2000 3x short",
-      "last_close": 19.85,
-      "adv_30d": 35000000,
-      "momentum_30d_pct": -3.2,
-      "momentum_60d_pct": -1.1,
-      "hv_30d_annualised": 0.44,
-      "hv_90d_annualised": 0.39,
-      "dist_from_50d_ma_pct": -1.4,
-      "dist_from_200d_ma_pct": -4.5,
-      "is_optionable": false,
+      "family": "Technology 3x short",
+      "last_close": 9.4,
+      "adv_30d": 5000000,
+      "momentum_30d_pct": -7.2,
+      "momentum_60d_pct": -12.6,
+      "hv_30d_annualised": 0.39,
+      "hv_90d_annualised": 0.35,
+      "dist_from_50d_ma_pct": -3.9,
+      "dist_from_200d_ma_pct": -15.7,
       "upcoming_macro_events_7d": []
     },
     {
@@ -152,7 +144,6 @@
       "hv_90d_annualised": 0.32,
       "dist_from_50d_ma_pct": 2.3,
       "dist_from_200d_ma_pct": 8.1,
-      "is_optionable": false,
       "upcoming_macro_events_7d": []
     },
     {
@@ -169,7 +160,38 @@
       "hv_90d_annualised": 0.31,
       "dist_from_50d_ma_pct": -2.2,
       "dist_from_200d_ma_pct": -7.7,
-      "is_optionable": false,
+      "upcoming_macro_events_7d": []
+    },
+    {
+      "symbol": "TMF",
+      "kind": "etf",
+      "factor": "rates",
+      "leverage_factor": 3.0,
+      "family": "20+yr Treasury 3x long",
+      "last_close": 42.8,
+      "adv_30d": 12000000,
+      "momentum_30d_pct": -3.1,
+      "momentum_60d_pct": -6.4,
+      "hv_30d_annualised": 0.34,
+      "hv_90d_annualised": 0.3,
+      "dist_from_50d_ma_pct": -1.5,
+      "dist_from_200d_ma_pct": -5.7,
+      "upcoming_macro_events_7d": []
+    },
+    {
+      "symbol": "TMV",
+      "kind": "etf",
+      "factor": "rates",
+      "leverage_factor": -3.0,
+      "family": "20+yr Treasury 3x short",
+      "last_close": 58.6,
+      "adv_30d": 3500000,
+      "momentum_30d_pct": 3.0,
+      "momentum_60d_pct": 6.1,
+      "hv_30d_annualised": 0.33,
+      "hv_90d_annualised": 0.29,
+      "dist_from_50d_ma_pct": 1.4,
+      "dist_from_200d_ma_pct": 5.4,
       "upcoming_macro_events_7d": []
     },
     {
@@ -186,7 +208,6 @@
       "hv_90d_annualised": 0.7,
       "dist_from_50d_ma_pct": -5.1,
       "dist_from_200d_ma_pct": -18.5,
-      "is_optionable": false,
       "upcoming_macro_events_7d": []
     },
     {
@@ -203,58 +224,22 @@
       "hv_90d_annualised": 0.65,
       "dist_from_50d_ma_pct": 9.4,
       "dist_from_200d_ma_pct": 28.6,
-      "is_optionable": false,
       "upcoming_macro_events_7d": []
     },
     {
-      "symbol": "SPY",
-      "kind": "option_underlying",
-      "factor": "sp500",
-      "leverage_factor": 1.0,
-      "family": "S&P 500 ETF",
-      "last_close": 538.45,
-      "adv_30d": 75000000,
-      "momentum_30d_pct": 2.1,
-      "momentum_60d_pct": 3.1,
-      "hv_30d_annualised": 0.11,
-      "hv_90d_annualised": 0.1,
-      "dist_from_50d_ma_pct": 1.0,
-      "dist_from_200d_ma_pct": 4.1,
-      "is_optionable": true,
-      "upcoming_macro_events_7d": []
-    },
-    {
-      "symbol": "QQQ",
-      "kind": "option_underlying",
-      "factor": "nasdaq",
-      "leverage_factor": 1.0,
-      "family": "Nasdaq-100 ETF",
-      "last_close": 478.9,
-      "adv_30d": 35000000,
-      "momentum_30d_pct": 2.8,
-      "momentum_60d_pct": 4.0,
-      "hv_30d_annualised": 0.14,
-      "hv_90d_annualised": 0.13,
-      "dist_from_50d_ma_pct": 1.4,
-      "dist_from_200d_ma_pct": 5.2,
-      "is_optionable": true,
-      "upcoming_macro_events_7d": []
-    },
-    {
-      "symbol": "TLT",
-      "kind": "option_underlying",
-      "factor": "rates",
-      "leverage_factor": 1.0,
-      "family": "20+ Year Treasury Bond ETF",
-      "last_close": 86.2,
-      "adv_30d": 40000000,
-      "momentum_30d_pct": -2.1,
-      "momentum_60d_pct": -4.3,
-      "hv_30d_annualised": 0.13,
-      "hv_90d_annualised": 0.12,
-      "dist_from_50d_ma_pct": -1.0,
-      "dist_from_200d_ma_pct": -3.8,
-      "is_optionable": true,
+      "symbol": "BITI",
+      "kind": "etf",
+      "factor": "crypto-btc",
+      "leverage_factor": -1.0,
+      "family": "Bitcoin 1x short",
+      "last_close": 18.4,
+      "adv_30d": 1500000,
+      "momentum_30d_pct": -9.1,
+      "momentum_60d_pct": -14.0,
+      "hv_30d_annualised": 0.36,
+      "hv_90d_annualised": 0.33,
+      "dist_from_50d_ma_pct": -4.7,
+      "dist_from_200d_ma_pct": -13.2,
       "upcoming_macro_events_7d": []
     },
     {
@@ -271,7 +256,6 @@
       "hv_90d_annualised": 0.45,
       "dist_from_50d_ma_pct": 3.4,
       "dist_from_200d_ma_pct": 11.2,
-      "is_optionable": false,
       "upcoming_macro_events_7d": []
     },
     {
@@ -288,24 +272,6 @@
       "hv_90d_annualised": 0.44,
       "dist_from_50d_ma_pct": -3.2,
       "dist_from_200d_ma_pct": -10.5,
-      "is_optionable": false,
-      "upcoming_macro_events_7d": []
-    },
-    {
-      "symbol": "GLD",
-      "kind": "option_underlying",
-      "factor": "gold-spot",
-      "leverage_factor": 1.0,
-      "family": "SPDR Gold Shares",
-      "last_close": 245.3,
-      "adv_30d": 8500000,
-      "momentum_30d_pct": 3.4,
-      "momentum_60d_pct": 5.1,
-      "hv_30d_annualised": 0.14,
-      "hv_90d_annualised": 0.13,
-      "dist_from_50d_ma_pct": 1.7,
-      "dist_from_200d_ma_pct": 6.2,
-      "is_optionable": true,
       "upcoming_macro_events_7d": []
     }
   ]

@@ -7,7 +7,7 @@ from lib import risk
 
 def test_size_position_basic():
     plan = risk.size_position(nav_usd=2500, target_pct=10, unit_price_usd=50)
-    assert plan.shares_or_contracts == 5
+    assert plan.shares == 5
     assert plan.notional_usd == 250
     assert plan.target_pct == pytest.approx(10.0)
 
@@ -25,33 +25,21 @@ def test_size_position_rejects_unaffordable():
 
 def test_kill_etf_at_25_pct_loss():
     kill, why = risk.should_kill_position(
-        current_value_usd=75, cost_basis_usd=100, is_option=False
+        current_value_usd=75, cost_basis_usd=100
     )
     assert kill and "25%" in why
 
 
 def test_etf_does_not_kill_at_24_pct_loss():
     kill, _ = risk.should_kill_position(
-        current_value_usd=76, cost_basis_usd=100, is_option=False
+        current_value_usd=76, cost_basis_usd=100
     )
     assert not kill
 
 
-def test_option_kill_only_at_full_premium_loss():
-    # 50% drawdown on a long option does not trip; spec uses 100% for options
-    kill, _ = risk.should_kill_position(
-        current_value_usd=50, cost_basis_usd=100, is_option=True
-    )
-    assert not kill
-    kill, _ = risk.should_kill_position(
-        current_value_usd=0, cost_basis_usd=100, is_option=True
-    )
-    assert kill
-
-
-def test_extra_kill_underlying_below():
+def test_extra_kill_etf_price_below():
     kill, why = risk.should_kill_position(
-        current_value_usd=90, cost_basis_usd=100, is_option=False,
+        current_value_usd=90, cost_basis_usd=100,
         extra_kill={"underlying_price_below": 50}, spot_price=49,
     )
     assert kill and "kill_below" in why

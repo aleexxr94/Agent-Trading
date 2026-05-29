@@ -6,9 +6,9 @@ strategist view, where useful) and emits ``sanity.json`` alongside.
 
 Why deterministic? The CLAUDE.md spec already has cost caps, a halt
 flag, and prompt-level guardrails. What it was missing was a cheap
-fast way to catch *patterns* — "the agent is constructing a long
-straddle on TLT and the iv_percentile is 65" — that no single LLM
-agent has the shape to notice. Sanity rules are zero-cost (no API
+fast way to catch *patterns* — "the agent is concentrating >20% NAV on
+one ticker" or "a position has no enforceable stop" — that no single
+LLM agent has the shape to notice. Sanity rules are zero-cost (no API
 calls) and surface those patterns in the Agent Logs tab.
 
 Non-blocking by default. Each rule has a fixed ``severity`` (``warn``
@@ -31,10 +31,8 @@ upstream agents didn't endorse) but the upstream signal is now
 Rule list (see docstrings on each ``_r_*`` for full rationale):
 
   - ``per_underlying_pct_cap_20``        (warn)
-  - ``straddle_requires_low_iv``         (fail)
   - ``kill_conditions_complete``         (fail)
   - ``position_backed_by_strategist``    (fail) — v2
-  - ``option_premium_above_floor``       (warn)
   - ``construction_rationale_meaningful`` (fail)
 """
 from __future__ import annotations
@@ -48,8 +46,8 @@ Status = Literal["pass", "warn", "fail", "skip"]
 
 
 # Overall sanity status is the worst rule status seen. "skip" doesn't
-# affect overall (rule didn't apply to this portfolio — e.g. straddle
-# rule on a portfolio with no option pairs).
+# affect overall (rule didn't apply to this portfolio — e.g. the
+# re-entry-cooldown rule when no symbols are in cooldown).
 _STATUS_RANK: dict[Status, int] = {"skip": 0, "pass": 1, "warn": 2, "fail": 3}
 
 
@@ -63,26 +61,18 @@ class RuleResult:
 
 
 def _position_underlying(p: dict) -> str | None:
-    """ETF positions key on ``symbol``; option positions key on
-    ``underlying``. The sanity rules treat both uniformly as "the ticker
-    this position is exposed to."
-    """
-    if p.get("kind") == "option":
-        return p.get("underlying")
+    """The ticker a position is exposed to. ETF-only system, so this is
+    simply the position ``symbol``."""
     return p.get("symbol")
 
 
 def _r_per_underlying_pct_cap_20(portfolio: dict, view: dict | None) -> RuleResult:
-    """Σ position_pct per underlying ≤ 20%.
+    """Σ position_pct per ticker ≤ 20%.
 
     The 15%-per-position cap (enforced by portfolio.schema.json) doesn't
-    stop two same-underlying legs (call + put, or call + ETF on same
-    factor) from concentrating NAV. The TLT-straddle outcome on
-    2026-05-13 had 26.6% NAV on TLT despite each leg being inside the
-    per-position rail. 20% is the soft warning threshold — not a hard
-    block, because there's a legitimate world where the agent has
-    extremely high conviction on one underlying and structures the bet
-    as a directional pair. But the operator should see it.
+    stop the same ticker appearing twice from concentrating NAV. 20% is a
+    soft warning threshold — not a hard block — so the operator sees
+    outsized single-ticker concentration without it being forbidden.
     """
     name = "per_underlying_pct_cap_20"
     severity: Severity = "warn"
@@ -107,82 +97,6 @@ def _r_per_underlying_pct_cap_20(portfolio: dict, view: dict | None) -> RuleResu
     return RuleResult(
         name, severity, "pass",
         meta={"pct_by_underlying": {s: round(v, 4) for s, v in pct_by_underlying.items()}},
-    )
-
-
-def _r_straddle_requires_low_iv(portfolio: dict, view: dict | None) -> RuleResult:
-    """Long-straddle pattern requires cheap vol on every leg.
-
-    Pattern detection: an underlying that has BOTH a long call and a
-    long put position in the portfolio. (Schema currently has no short
-    options, so "long call + long put" is the only call+put combination
-    that can fire — but the rule reads ``type`` defensively in case
-    the schema gains shorts later.)
-
-    A long straddle is a pure long-vol bet. Theta works against it
-    daily; it only pays if realised vol exceeds implied vol over the
-    holding horizon. The cheapest version of that bet is when implied
-    vol is currently low relative to its own history — i.e.
-    ``iv_percentile`` is in the low quartile. Anything above ~40
-    means the agent is buying vol that isn't statistically cheap, and
-    the position is more likely the "I don't know which direction
-    so I'll buy both" failure mode than a real vol thesis.
-
-    Threshold 40 is deliberately not 30 — leaves the agent some room
-    to express moderate-vol theses on near-term catalysts without
-    every straddle tripping the rule.
-    """
-    name = "straddle_requires_low_iv"
-    severity: Severity = "fail"
-    positions = portfolio.get("positions") or []
-
-    # Group option positions by underlying, separated by type.
-    by_und: dict[str, dict[str, list[dict]]] = {}
-    for p in positions:
-        if p.get("kind") != "option":
-            continue
-        und = p.get("underlying")
-        if not und:
-            continue
-        by_und.setdefault(und, {"call": [], "put": []})
-        leg_type = p.get("type")
-        if leg_type in ("call", "put"):
-            by_und[und][leg_type].append(p)
-
-    straddle_underlyings = [u for u, legs in by_und.items() if legs["call"] and legs["put"]]
-    if not straddle_underlyings:
-        return RuleResult(name, severity, "skip", "no call+put pair on the same underlying")
-
-    offenders: list[dict] = []
-    iv_summary: dict[str, list[dict]] = {}
-    for und in straddle_underlyings:
-        legs = by_und[und]["call"] + by_und[und]["put"]
-        for leg in legs:
-            ivp = (leg.get("greeks") or {}).get("iv_percentile")
-            iv_summary.setdefault(und, []).append({"type": leg.get("type"), "iv_percentile": ivp})
-            if ivp is None:
-                offenders.append({"underlying": und, "type": leg.get("type"), "issue": "iv_percentile missing"})
-            elif ivp > 40:
-                offenders.append({
-                    "underlying": und,
-                    "type": leg.get("type"),
-                    "strike": leg.get("strike"),
-                    "iv_percentile": ivp,
-                })
-
-    if offenders:
-        return RuleResult(
-            name, severity, severity,
-            detail=(
-                f"long-straddle pattern requires iv_percentile ≤ 40 on every leg; "
-                f"{len(offenders)} leg(s) above threshold or missing IV data"
-            ),
-            meta={"straddle_underlyings": straddle_underlyings, "iv_summary": iv_summary, "offenders": offenders},
-        )
-    return RuleResult(
-        name, severity, "pass",
-        detail=f"{len(straddle_underlyings)} straddle pattern(s) on legs all at iv_percentile ≤ 40",
-        meta={"straddle_underlyings": straddle_underlyings, "iv_summary": iv_summary},
     )
 
 
@@ -242,12 +156,8 @@ def _r_position_backed_by_strategist(portfolio: dict, view: dict | None) -> Rule
     confidence ≥ 0.5 means "endorsed enough to surface this idea."
 
     Constructor.md says it should be taking strategist picks, not
-    inventing positions out of band. This rule asserts that:
-      - Every ETF position's symbol appears in view.candidates with
-        confidence ≥ 0.5
-      - Every option position's underlying appears in view.candidates
-        with matching instrument_kind (option_call or option_put) AND
-        confidence ≥ 0.5
+    inventing positions out of band. This rule asserts that every ETF
+    position's symbol appears in view.candidates with confidence ≥ 0.5.
 
     Skip if view payload isn't available (e.g. dry-run path without
     fixture view).
@@ -260,9 +170,8 @@ def _r_position_backed_by_strategist(portfolio: dict, view: dict | None) -> Rule
     if not view or not view.get("candidates"):
         return RuleResult(name, severity, "skip", "view payload unavailable")
 
-    # Build endorsement index keyed by (symbol, instrument_kind). For
-    # ETFs the kind tag is "etf"; for options it's "option_call" or
-    # "option_put".
+    # Build endorsement index keyed by (symbol, instrument_kind). ETF-only,
+    # so the kind tag is always "etf".
     endorsed: dict[tuple[str, str], float] = {}
     for c in view["candidates"]:
         sym = c.get("symbol")
@@ -273,15 +182,9 @@ def _r_position_backed_by_strategist(portfolio: dict, view: dict | None) -> Rule
 
     bad: list[dict] = []
     for p in positions:
-        if p.get("kind") == "etf":
-            key = (p.get("symbol", ""), "etf")
-        elif p.get("kind") == "option":
-            key = (
-                p.get("underlying", ""),
-                "option_call" if p.get("type") == "call" else "option_put",
-            )
-        else:
+        if p.get("kind") != "etf":
             continue
+        key = (p.get("symbol", ""), "etf")
         conf = endorsed.get(key)
         if conf is None:
             bad.append({
@@ -299,42 +202,6 @@ def _r_position_backed_by_strategist(portfolio: dict, view: dict | None) -> Rule
         return RuleResult(
             name, severity, severity,
             detail=f"{len(bad)} position(s) not endorsed by strategist with confidence ≥ 0.5",
-            meta={"offenders": bad},
-        )
-    return RuleResult(name, severity, "pass")
-
-
-def _r_option_premium_above_floor(portfolio: dict, view: dict | None) -> RuleResult:
-    """Option positions priced above the penny-illiquid floor.
-
-    Long options below $0.05 premium tend to be deep OTM and illiquid;
-    Alpaca paper often won't fill them cleanly and even if it does the
-    bid-ask spread eats the position. Warn rather than fail — there
-    might be a legitimate lottery-ticket trade, but the operator
-    should know about it.
-    """
-    name = "option_premium_above_floor"
-    severity: Severity = "warn"
-    positions = portfolio.get("positions") or []
-    options = [p for p in positions if p.get("kind") == "option"]
-    if not options:
-        return RuleResult(name, severity, "skip", "no option positions")
-
-    bad: list[dict] = []
-    for p in options:
-        prem = p.get("premium_paid")
-        if not isinstance(prem, (int, float)) or prem < 0.05:
-            bad.append({
-                "underlying": p.get("underlying"),
-                "type": p.get("type"),
-                "strike": p.get("strike"),
-                "premium_paid": prem,
-            })
-
-    if bad:
-        return RuleResult(
-            name, severity, severity,
-            detail=f"{len(bad)} option(s) priced below the $0.05 illiquid-floor",
             meta={"offenders": bad},
         )
     return RuleResult(name, severity, "pass")
@@ -392,15 +259,9 @@ def _r_position_size_matches_confidence(portfolio: dict, view: dict | None) -> R
 
     bad: list[dict] = []
     for p in positions:
-        if p.get("kind") == "etf":
-            key = (p.get("symbol", ""), "etf")
-        elif p.get("kind") == "option":
-            key = (
-                p.get("underlying", ""),
-                "option_call" if p.get("type") == "call" else "option_put",
-            )
-        else:
+        if p.get("kind") != "etf":
             continue
+        key = (p.get("symbol", ""), "etf")
         conf = confidence_by_key.get(key)
         if conf is None:
             continue  # `position_backed_by_strategist` covers this case
@@ -582,25 +443,13 @@ def _r_reentry_cooldown(portfolio: dict, view: dict | None) -> RuleResult:
     overrides: list[dict] = []
     for p in positions:
         # The cooldown map is keyed by the broker symbol exactly as
-        # trades.jsonl stores it: ETF ticker, or the OSI option symbol.
-        # `match_key` is what we test for cooldown membership; `conf_key`
-        # is how view.candidates indexes confidence (underlying for options).
-        if p.get("kind") == "etf":
-            match_key = p.get("symbol", "")
-            conf_key = (match_key, "etf")
-        elif p.get("kind") == "option":
-            kind = "option_call" if p.get("type") == "call" else "option_put"
-            conf_key = (p.get("underlying", ""), kind)
-            try:
-                from .orders import osi_symbol
-                match_key = osi_symbol(
-                    underlying=p.get("underlying"), expiry=p.get("expiry"),
-                    type=p.get("type"), strike=p.get("strike"),
-                )
-            except (ValueError, KeyError, TypeError):
-                match_key = p.get("symbol") or ""
-        else:
+        # trades.jsonl stores it: the ETF ticker. `match_key` is what we
+        # test for cooldown membership; `conf_key` is how view.candidates
+        # indexes confidence.
+        if p.get("kind") != "etf":
             continue
+        match_key = p.get("symbol", "")
+        conf_key = (match_key, "etf")
         if match_key not in cooldown:
             continue
         sym = conf_key[0]
@@ -644,10 +493,8 @@ RULES: list[Callable[[dict, dict | None], RuleResult]] = [
     _r_kill_conditions_complete,
     _r_position_backed_by_strategist,
     _r_position_within_adaptive_cap,
-    _r_straddle_requires_low_iv,
     _r_per_underlying_pct_cap_20,
     _r_position_size_matches_confidence,
-    _r_option_premium_above_floor,
     _r_position_notional_above_floor,
     _r_position_adv_liquidity,
     _r_reentry_cooldown,

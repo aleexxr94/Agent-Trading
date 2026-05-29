@@ -25,13 +25,10 @@ PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 def _normalize_asset_class(raw) -> str:
     """Map whatever Alpaca returns into our internal canonical values.
 
-    Per Alpaca docs (2026-Q2 reference): REST asset_class can be
-    'us_equity', 'option', or 'crypto'. The alpaca-py SDK enum
-    AssetClass.US_OPTION evaluates to 'us_option' (str-Enum mixin).
-    Both forms — bare 'option' and 'us_option' — show up in the wild
-    depending on whether we're consuming the SDK object or a raw dict.
-    Normalise both to 'us_option' so downstream code (lib.marks,
-    lib.orders, monitor) only has to check one value.
+    The system is ETF-only and never opens options. A stray/legacy option
+    position is still normalised to 'us_option' so monitor.py can recognise
+    it as an unsupported instrument and flatten it (close-only) — it is
+    never traded into. Everything else maps to 'us_equity'.
     """
     s = str(raw).lower()
     if "option" in s:
@@ -185,113 +182,6 @@ class AlpacaBroker(Broker):
             submitted_at=str(r.submitted_at),
             status=str(r.status),
         )
-
-    def get_option_quote(self, osi_symbol: str) -> tuple[float, float] | None:
-        """Return (bid, ask) for an OSI option symbol via Alpaca's options
-        market-data feed. Lazy-constructs OptionHistoricalDataClient on
-        first use and caches it on the instance.
-
-        Alpaca's free paper plan uses the `indicative` feed; paying
-        subscribers get `opra`. The SDK auto-selects, so we don't pass
-        a feed arg. Returns None on any failure — never raises.
-
-        Used by lib/options_chain after picking the nearest-OTM contract,
-        so the constructor can size against a real mid premium instead
-        of estimating from HV. When this returns None the constructor
-        falls back to its HV-based estimate (no regression vs the
-        pre-quote behaviour).
-        """
-        try:
-            from alpaca.data.historical.option import OptionHistoricalDataClient  # noqa: WPS433
-            from alpaca.data.requests import OptionLatestQuoteRequest  # noqa: WPS433
-        except ImportError:
-            return None
-        client = getattr(self, "_options_data_client", None)
-        if client is None:
-            try:
-                client = OptionHistoricalDataClient(self._api_key, self._api_secret)
-            except Exception:
-                return None
-            self._options_data_client = client
-        try:
-            req = OptionLatestQuoteRequest(symbol_or_symbols=osi_symbol)
-            resp = client.get_option_latest_quote(req)
-        except Exception:
-            return None
-        # alpaca-py returns a {symbol: OptionQuote} dict.
-        quote = resp.get(osi_symbol) if hasattr(resp, "get") else None
-        if quote is None:
-            return None
-        try:
-            bid = float(getattr(quote, "bid_price", None) or 0.0)
-            ask = float(getattr(quote, "ask_price", None) or 0.0)
-        except (TypeError, ValueError):
-            return None
-        # Reject zero/negative quotes — happens pre-market or on illiquid
-        # strikes; constructor's HV-based estimate is better than a 0 mid.
-        if bid <= 0 or ask <= 0 or ask < bid:
-            return None
-        return bid, ask
-
-    def get_underlying_price(self, symbol: str) -> float | None:
-        """Latest trade price for an equity/ETF underlying via Alpaca's stock
-        data feed, used by monitor.py for option underlying price stops.
-
-        Lazy-constructs StockHistoricalDataClient on first use and caches it.
-        Returns None on any failure — never raises — so a missing quote just
-        skips the option's price stop (loss cap + time stop still apply).
-        """
-        try:
-            from alpaca.data.historical.stock import StockHistoricalDataClient  # noqa: WPS433
-            from alpaca.data.requests import StockLatestTradeRequest  # noqa: WPS433
-        except ImportError:
-            return None
-        client = getattr(self, "_stock_data_client", None)
-        if client is None:
-            try:
-                client = StockHistoricalDataClient(self._api_key, self._api_secret)
-            except Exception:
-                return None
-            self._stock_data_client = client
-        try:
-            resp = client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))
-        except Exception:
-            return None
-        trade = resp.get(symbol) if hasattr(resp, "get") else None
-        if trade is None:
-            return None
-        try:
-            px = float(getattr(trade, "price", None) or 0.0)
-        except (TypeError, ValueError):
-            return None
-        return px if px > 0 else None
-
-    def option_contract_tradable(self, symbol: str) -> bool:
-        """Query Alpaca for a single option contract by OSI symbol.
-
-        Uses TradingClient.get_option_contract(symbol_or_id), which accepts
-        the full OSI string and returns the OptionContract or raises a 404.
-        Direct lookup bypasses the 50-row pagination of get_option_contracts
-        — useful because the constructor sometimes picks an expiry that
-        isn't on the first page of the chain listing.
-
-        Returns False on:
-          - any exception (404 'asset not found', auth, network)
-          - status != 'active'
-          - tradable == False
-        True only when the contract is present AND marked tradable.
-        """
-        try:
-            c = self._client.get_option_contract(symbol)
-        except Exception:
-            return False
-        status = getattr(c, "status", None)
-        tradable = getattr(c, "tradable", None)
-        if tradable is False:
-            return False
-        if status is not None and str(status).lower() != "active":
-            return False
-        return True
 
     def cancel_all(self) -> int:
         return len(self._client.cancel_orders())

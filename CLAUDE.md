@@ -14,12 +14,29 @@ You are a senior quant systems engineer. Build a complete, **paper-trading-only*
 6. If anything below is ambiguous, bundle all clarifying questions into one message before starting. Do not guess on capital allocation, position counts, kill switches, or broker behaviour.
 
 ## System scope
-- Universe (v2 + gold + option cheapeners 2026-05-22, 21 tickers): bull/bear leveraged-ETF pairs (TQQQ/SQQQ, UPRO/SPXU, SOXL/SOXS, TNA/TZA, FAS/FAZ, NUGT/DUST), solo leveraged ETFs (UVXY, BITX), and option underlyings (SPY, QQQ, TLT, GLD, IWM, XLF, XLE). Trimmed from v1's 33, then NUGT/DUST/GLD added back for gold-factor diversification (2026-05-13), then IWM/XLF/XLE added as option underlyings (2026-05-22) so the $2,500 account's 15% per-position cap = $375 can actually fit a single contract on something other than TLT/GLD.
-- **No spot single-name equities. No unleveraged broad-market ETFs as core positions** (SPY/QQQ/TLT/GLD/IWM/XLF/XLE only via options).
-- **No broker shorts.** Bear theses are expressed as long bear ETFs (SQQQ, SPXU, etc.) or long puts. Cash account only.
+
+> **ETF-only migration (2026-05-29):** Listed options were removed entirely.
+> The $2,500 account made them non-viable (the 15% per-position cap rarely
+> cleared a single contract; six months of paper trading opened zero option
+> positions). The system now trades **only leveraged/inverse ETFs**. Bearish
+> views are expressed by buying inverse ETFs — never short selling, never
+> puts. The factors the option underlyings covered (rates, energy) now have
+> real leveraged ETF pairs (TMF/TMV, ERX/ERY). This section supersedes the
+> earlier options-bearing spec.
+
+- Universe (ETF-only, 29 tickers): 13 bull/bear leveraged-ETF pairs —
+  TQQQ/SQQQ (nasdaq), UPRO/SPXU (sp500), TNA/TZA (small-caps), SOXL/SOXS
+  (semis), TECL/TECS (technology), LABU/LABD (biotech), YINN/YANG (china),
+  FAS/FAZ (financials-broad), ERX/ERY (energy), GUSH/DRIP (oil-gas-ep),
+  BOIL/KOLD (natural-gas), TMF/TMV (rates), NUGT/DUST (gold-miners) — plus
+  UVXY (solo long-vol) and BITX (2x bull) / BITI (1x inverse) on crypto-btc.
+- **No options. No spot single-name equities. No unleveraged broad-market
+  ETFs as core positions.** Every position is a long leveraged/inverse ETF.
+- **No broker shorts.** Bear theses are expressed as long inverse ETFs
+  (SQQQ, SPXU, etc.). Cash account only.
 - Portfolio target: **1–12 open positions** at the end of each cycle (or all-cash if conviction is genuinely absent). The 1-position floor lets a single strong-conviction thesis fire even when broader diversification isn't available. Concentration risk is bounded by the per-position 15% NAV cap and kill conditions.
 - Per-position cap at entry: **≤15% of portfolio NAV**.
-- Per-position kill condition: **≤25% loss of position NAV** (or 100% premium for long options). Each position must also carry at least one of `underlying_price_below`, `underlying_price_above`, or `time_stop_utc` (sanity rule fail otherwise).
+- Per-position kill condition: **≤25% loss of position NAV**. Each position must also carry at least one of `underlying_price_below`, `underlying_price_above`, or `time_stop_utc` (sanity rule fail otherwise). The price thresholds reference the ETF's own price.
 - Daily portfolio drawdown circuit breaker: **≥8% in a single UTC day** halts new orders and triggers monitor-only mode until next manual review.
 - Cycle cadence: **every 4 hours during market hours, weekdays only**. The market_gate stage queries Alpaca's clock and short-circuits weekends/holidays/after-hours without LLM cost. Within market hours, the orchestrator-meta agent picks the actual next-run timestamp (bounded 1–24h).
 
@@ -59,13 +76,12 @@ Sub-agents are separate Anthropic API calls with role-specific system prompts an
 Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-failed LLM outputs are retried once with the validation error fed back; second failure aborts the run and logs.
 
 0. **Market Gate** (Python, $0) — Alpaca `/v2/clock` query. If markets are closed → write `market_gate.json` + closed-market `next_run.json` and exit. No LLM calls billed on closed-market cycles.
-1. **Signals** (Python, $0) — For each of the 21 universe tickers, compute deterministic features from yfinance daily history: momentum (30/60d), HV (30/90d), distance from 50/200d MAs, ADV, last close, is_optionable. Includes per-ticker `upcoming_macro_events_7d` (FOMC/CPI/NFP/PCE within 7 days). Output: `signals.json`. Replaces the v1 screener + bull/bear research + scenarios chain entirely.
+1. **Signals** (Python, $0) — For each of the 29 universe tickers, compute deterministic features from yfinance daily history: momentum (30/60d), HV (30/90d), distance from 50/200d MAs, ADV, last close. Includes per-ticker `upcoming_macro_events_7d` (FOMC/CPI/NFP/PCE within 7 days). Output: `signals.json`. Replaces the v1 screener + bull/bear research + scenarios chain entirely.
 1b. **Cycle dedup** (Python, $0) — If the signals fingerprint AND broker-position fingerprint both match the prior cycle's, skip strategist + construct + execute and reuse the cached portfolio. Stored in `state/last_cycle_hash.json`.
-2. **Strategist** (Sonnet 4.6 medium effort, ~$0.05) — Reads `signals.json` + current broker positions + recent PnL history (last 5 cycles); emits a regime classification + up to 6 candidate ideas with `instrument_kind` (etf / option_call / option_put), `thesis` (signal-citing), `confidence` ∈ [0, 1]. Bear theses are long bear ETFs or long puts. Output: `view.json`.
-2.5. **Chain lookup** (Python, $0) — For each option candidate in `view.json`, queries Alpaca for the nearest-OTM tradable contract at target DTE 37 (±14d). Output: `chain_lookups.json` — gives the constructor real OSI symbols so it doesn't invent untradable strikes.
-3. **Portfolio Construction** (Opus 4.7 high effort, ~$0.20) — Converge on 1–12 positions (or all-cash). Reads signals + view + chain_lookups + current positions + PnL history + adaptive per-position cap. Output: `portfolio.json`.
+2. **Strategist** (Sonnet 4.6 medium effort, ~$0.05) — Reads `signals.json` + current broker positions + recent PnL history (last 5 cycles); emits a regime classification + up to 6 candidate ideas with `instrument_kind` (always `etf`), `thesis` (signal-citing), `confidence` ∈ [0, 1]. Bullish theses name the bull ETF; bearish theses name the inverse ETF. Output: `view.json`.
+3. **Portfolio Construction** (Opus 4.7 high effort, ~$0.20) — Converge on 1–12 positions (or all-cash). Reads signals + view + current positions + PnL history + adaptive per-position cap. Output: `portfolio.json`.
 3.5. **Critic** (Sonnet 4.6 low effort, ~$0.03) — Adversarial review. Returns `{accept, critique, suggested_changes}`. On reject, the constructor reruns ONCE with the critique fed back. Output: `critique.json`.
-4. **Sanity** (Python, $0) — 11 deterministic post-construct rules covering concentration, IV-aware straddle gating, kill_conditions, strategist endorsement, adaptive-cap enforcement (lower in drawdown), confidence-weighted sizing, notional floor ($50), ADV liquidity (≤1% of dollar ADV), and re-entry cooldown (no re-entry of a symbol exited within 7 days unless strategist confidence ≥ 0.8). Non-blocking by default; `SANITY_BLOCK_ON_FAIL=true` escalates `fail` to a hard skip of stage_execute. Output: `sanity.json`.
+4. **Sanity** (Python, $0) — 9 deterministic post-construct rules covering concentration, kill_conditions, strategist endorsement, adaptive-cap enforcement (lower in drawdown), confidence-weighted sizing, notional floor ($50), ADV liquidity (≤1% of dollar ADV), and re-entry cooldown (no re-entry of a symbol exited within 7 days unless strategist confidence ≥ 0.8). Non-blocking by default; `SANITY_BLOCK_ON_FAIL=true` escalates `fail` to a hard skip of stage_execute. Output: `sanity.json`.
 5. **Execution + Monitoring** — submit paper orders via Alpaca (close before open; no-cross-zero invariant); orchestrator-meta picks next-run window in 1–24h and writes `next_run.json`. A lightweight `monitor.py` runs more frequently and only checks kill conditions; it can flatten a position but cannot open new ones.
 
 ## Repo structure
@@ -86,11 +102,10 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
 │   ├── constructor.md          # v2 stage 3 — single LLM call producing the portfolio
 │   └── critic.md               # v2 stage 3.5 — adversarial review of the portfolio
 ├── schemas/                    # all validated on write
-│   ├── position.schema.json    # discriminated union: ETF | option
+│   ├── position.schema.json    # single ETF position object (options removed)
 │   ├── portfolio.schema.json
 │   ├── signals.schema.json     # v2 stage 1 output
 │   ├── view.schema.json        # v2 stage 2 output
-│   ├── chain_lookups.schema.json # v2 stage 2.5 output
 │   ├── critique.schema.json    # v2 stage 3.5 output
 │   ├── sanity.schema.json
 │   └── decision_log.schema.json
@@ -101,15 +116,13 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
 │   ├── signals.py              # v2 stage 1 — deterministic feature generator
 │   ├── market_data.py          # yfinance wrappers (history, ADV, HV)
 │   ├── events.py               # macro calendar (FOMC/CPI/NFP/PCE) for signals
-│   ├── options.py              # Greeks, IV helpers (single-leg only)
-│   ├── options_chain.py        # v2 stage 2.5 — nearest-OTM contract lookup via Alpaca
-│   ├── orders.py               # diff_portfolio + no-cross-zero invariant
+│   ├── orders.py               # diff_portfolio + no-cross-zero invariant (ETF-only; rejects option payloads)
 │   ├── sanity.py               # v2 stage 4 — deterministic post-construct rules
 │   ├── stages.py               # StageConfig per LLM stage
 │   ├── llm.py                  # Anthropic client + prompt caching + cost tracking
 │   ├── risk.py                 # sizing, caps, kill checks, circuit breakers, cooldown
-│   ├── universe.py             # 21-ticker universe metadata (v2 + gold + cheapeners)
-│   ├── marks.py                # mark-price helpers (options + ETFs)
+│   ├── universe.py             # 29-ticker leveraged/inverse ETF universe metadata
+│   ├── marks.py                # mark-price helpers (ETF symbols)
 │   ├── pnl.py                  # portfolio P&L computation
 │   ├── trades.py               # trade-log reader + re-entry cooldown state
 │   ├── trades_sync.py          # pulls filled orders from Alpaca into state
@@ -125,7 +138,6 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
 │   └── analyze_runs.py         # offline run-log analysis
 ├── tests/                      # ~30 files, ~800 tests (representative below)
 │   ├── test_risk.py            # + test_risk_adaptive_cap.py
-│   ├── test_options.py         # + test_options_chain.py
 │   ├── test_sanity.py
 │   ├── test_orders.py
 │   ├── test_monitor.py
@@ -144,9 +156,9 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
 ```
 
 ## Schemas (write these first; validate every agent output)
-- `position.schema.json`: discriminated union.
+- `position.schema.json`: a single ETF position object (no option branch).
   - `{ kind: "etf", symbol, shares, avg_cost, leverage_factor, entry_thesis, kill_conditions, position_pct }`
-  - `{ kind: "option", underlying, type: "call"|"put", strike, expiry, dte, contracts, premium_paid, greeks: { delta, gamma, theta, vega, iv, iv_percentile }, entry_thesis, kill_conditions, position_pct }`
+  - `kill_conditions`: `{ max_loss_pct, underlying_price_below?, underlying_price_above?, time_stop_utc?, notes? }` — price thresholds reference the ETF's own price.
 - `portfolio.schema.json`: array of 1–12 positions (or all-cash); sum of `position_pct` ≤ 100; cash buffer field; total NAV at write time.
 - `decision_log.schema.json`: `run_id`, stage, model, inputs_hash, output_ref, prompt_cache_hit_pct, cost_usd, started_at, ended_at.
 
@@ -158,10 +170,10 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
 
 ## Dashboard (Streamlit, dark mode, mobile-friendly)
 Top banner, red, every tab:
-> **PAPER TRADING — Experimental autonomous AI agent. Leveraged ETFs and options on a small account are high-risk. Not financial advice.**
+> **PAPER TRADING — Experimental autonomous AI agent. Leveraged & inverse ETFs on a small account are high-risk. Not financial advice.**
 
 Tabs:
-1. **Portfolio** — NAV, cash, 10 positions. ETF rows show leverage factor + shares. Option rows show strike, expiry, DTE, Greeks, IV, premium paid, current mark. Allocation pie. Day P&L, total P&L.
+1. **Portfolio** — NAV, cash, up to 12 positions. ETF rows show leverage factor + shares, bull/bear direction, factor, notional, entry cost, current mark, P&L, kill conditions. Allocation pie. Day P&L, total P&L.
 2. **Trades & Rationales** — chronological decisions: full agent reasoning, "why this instrument", "why now", kill conditions, horizon chosen.
 3. **Performance** — equity curve, drawdown, vs SPY benchmark (Plotly).
 4. **Agent Logs** — sanity-report panel + latest stage artifacts (market_gate, signals, view, portfolio, sanity, orders, next_run), current orchestrator-set next-run time, last 20 decision-log entries.
@@ -174,7 +186,7 @@ Each prompt under `prompts/` must include:
 - Role and scope.
 - Reference to the JSON output schema it must conform to.
 - Explicit bias-mitigation: bull must list its strongest counterarguments; bear must steel-man bull first.
-- Risk reminders specific to leverage and options (decay, theta, gap risk, IV crush around earnings, liquidity in legs).
+- Risk reminders specific to leveraged/inverse ETFs (daily-rebalance decay, path dependence in chop, gap risk, liquidity/ADV on the smaller sector ETFs).
 - "If uncertain, abstain" rule — outputs may be empty if conviction is low.
 
 Orchestrator prompt must state explicitly:
@@ -215,17 +227,14 @@ checkout — the triple lock is designed to fail closed at every layer.
    - Implement the 6 abstract members: the `name` property plus `get_account`, `get_positions`,
      `submit_order`, `cancel_all`, `flatten` — omitting any one (incl. `name`) leaves the class
      abstract and un-instantiable behind `_try_load_broker()`.
-   - Override the 4 optional methods used by market_gate / options_chain / monitor:
-     `get_clock`, `option_contract_tradable`, `get_option_quote`, `get_underlying_price`
-     (defaults return `None`/`True`, which silently degrade live behaviour — must be real).
-   - Rewrite the Alpaca-coupled option-chain seam: `lib/options_chain.py:lookup_nearest_otm`
-     (≈ lines 103-148) returns `None` unless the broker exposes an Alpaca-style `_client` and
-     builds Alpaca `GetOptionContractsRequest` objects. Without an IBKR contract-lookup path here,
-     every live option candidate is dropped at stage 2.5 and the system silently becomes ETF-only.
+   - Override the optional `get_clock` method used by market_gate (default returns `None`, which
+     silently degrades the market gate — must be real). (The former option-data methods —
+     `option_contract_tradable`, `get_option_quote`, `get_underlying_price` — were removed with
+     options; ETF price stops use the ETF's own mark, so no underlying-price fetch is needed.)
    - Map IBKR responses onto the existing dataclasses (`Account`, `BrokerPosition`,
      `OrderRequest`, `OrderResult`, `MarketClock`); keep `is_paper=False`.
-   - Point `_try_load_broker()` (`orchestrator.py:1616`) at `IBKRBroker` (a ~5-line glue change),
-     and add the live credential env vars to `.env.example`.
+   - Point `_try_load_broker()` at `IBKRBroker` (a ~5-line glue change), and add the live
+     credential env vars to `.env.example`.
 
 3. **Sizing — replace the synthetic NAV pin (code change, not config).** Paper sizing is pinned to
    a synthetic balance (`VIRTUAL_NAV_USD=2500` + realized P&L, never the broker's $100k paper
@@ -241,7 +250,7 @@ checkout — the triple lock is designed to fail closed at every layer.
    `getattr(ctx.broker, "_client", None)`. With an `IBKRBroker` that attribute is `None`, so it
    constructs an **Alpaca** client instead; the caught failure means **live fills/fees never reach
    `trades.jsonl`**, silently breaking cooldown, P&L, and the Sharpe gate. A live swap must add an
-   IBKR fill-sync path here. Live also needs the broker's real commission / OCC / regulatory fee
+   IBKR fill-sync path here. Live also needs the broker's real commission / SEC / regulatory fee
    schedule, or P&L and Sharpe will be overstated.
 
 5. **Order gate.** `ORDERS_ENABLED=true` must already have been validated on paper (it is the
@@ -252,7 +261,7 @@ checkout — the triple lock is designed to fail closed at every layer.
    live cycle with the smallest possible sizing and the halt flag within reach.
 
 ## Mandatory risk warnings (in README, dashboard banner, and every decision log)
-> Leveraged ETFs decay path-dependently in volatile markets and are not buy-and-hold instruments. Long options can expire worthless; theta works against long premium daily. A $2,500 account cannot diversify options positions meaningfully — concentration risk is structural, not a flaw to fix. This system is an experiment in autonomous AI trading agents, not a path to reliable returns. Expect losses. Do not deploy capital you cannot afford to lose entirely. None of this is financial advice.
+> Leveraged and inverse ETFs decay path-dependently in volatile markets and are not buy-and-hold instruments — a 3x ETF held through chop bleeds value even when the underlying ends flat. A $2,500 account cannot diversify meaningfully across many such positions — concentration risk is structural, not a flaw to fix. This system is an experiment in autonomous AI trading agents, not a path to reliable returns. Expect losses. Do not deploy capital you cannot afford to lose entirely. None of this is financial advice.
 
 ## Working style
 - Conventional commits. Open a draft PR against `main`; do not push to `main` directly.
@@ -265,7 +274,7 @@ checkout — the triple lock is designed to fail closed at every layer.
 Bundle all clarifying questions into one message. Likely topics:
 - Repo URL and whether it is empty or has any starter content.
 - Confirmed location of Alpaca paper keys (env var names you should expect).
-- ETF-only for the first 2 weeks before enabling options, or options enabled from day one?
+- (Resolved 2026-05-29: ETF-only — options were removed entirely.)
 - Are overnight and weekend positions allowed, or must the agent flatten before close?
 - Preferred Anthropic model for the orchestrator vs sub-agents (default: sonnet for orchestrator, haiku for screening, sonnet for adversarial research).
 

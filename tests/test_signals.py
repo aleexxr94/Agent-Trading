@@ -84,15 +84,16 @@ def test_row_for_symbol_trending_history_produces_positive_momentum(monkeypatch)
     assert row.dist_from_200d_ma_pct is not None and row.dist_from_200d_ma_pct > 0
 
 
-def test_row_marks_option_underlyings_correctly(monkeypatch):
+def test_rows_are_etf_only(monkeypatch):
     monkeypatch.setattr(
         signals.market_data, "history",
         lambda req, **kw: _flat_history(req.symbol),
     )
-    spy = signals._row_for_symbol("SPY", run_id=None)
     tqqq = signals._row_for_symbol("TQQQ", run_id=None)
-    assert spy.is_optionable is True
-    assert tqqq.is_optionable is False
+    assert tqqq.kind == "etf"
+    # No option metadata is carried on signal rows anymore.
+    assert not hasattr(tqqq, "is_optionable")
+    assert "is_optionable" not in tqqq.to_dict()
 
 
 def test_compute_signals_iterates_full_universe_by_default(monkeypatch):
@@ -113,9 +114,9 @@ def test_compute_signals_respects_symbols_argument(monkeypatch):
         signals.market_data, "history",
         lambda req, **kw: _flat_history(req.symbol),
     )
-    out = signals.compute_signals(run_id="rid", symbols=["TQQQ", "SPY"])
+    out = signals.compute_signals(run_id="rid", symbols=["TQQQ", "SQQQ"])
     assert len(out["tickers"]) == 2
-    assert {t["symbol"] for t in out["tickers"]} == {"TQQQ", "SPY"}
+    assert {t["symbol"] for t in out["tickers"]} == {"TQQQ", "SQQQ"}
 
 
 def test_compute_signals_output_validates_against_schema(monkeypatch, tmp_state):
@@ -129,12 +130,13 @@ def test_compute_signals_output_validates_against_schema(monkeypatch, tmp_state)
     state.validate(out, "signals.schema.json")
 
 
-def test_optionable_symbols_matches_universe_option_underlyings():
-    """signals.OPTIONABLE_SYMBOLS is derived from the universe metadata
-    — if a new option underlying is added/removed, both should update
-    together. This guard catches the case where one is updated and not
-    the other."""
-    universe_optionables = {
-        e.symbol for e in universe.UNIVERSE if e.kind == "option_underlying"
-    }
-    assert signals.OPTIONABLE_SYMBOLS == universe_optionables
+def test_no_optionable_metadata_emitted(monkeypatch):
+    """ETF-only: signal rows carry no `is_optionable` field and the module
+    exposes no OPTIONABLE_SYMBOLS constant."""
+    monkeypatch.setattr(
+        signals.market_data, "history",
+        lambda req, **kw: _flat_history(req.symbol),
+    )
+    assert not hasattr(signals, "OPTIONABLE_SYMBOLS")
+    out = signals.compute_signals(run_id="rid", symbols=["TQQQ"])
+    assert "is_optionable" not in out["tickers"][0]

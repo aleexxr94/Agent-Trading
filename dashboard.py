@@ -206,8 +206,8 @@ def _render_balance_chart(*, xs, ys, hover_texts, yaxis_title: str, caption: str
 
 
 RISK_WARNING_TEXT = (
-    "PAPER TRADING — experimental autonomous AI agent. Leveraged ETFs and "
-    "options on a small account are high-risk. Not financial advice."
+    "PAPER TRADING — experimental autonomous AI agent. Leveraged & inverse "
+    "ETFs on a small account are high-risk. Not financial advice."
 )
 
 # Per-run + per-day cost caps come from .env so the meters reflect what
@@ -796,14 +796,7 @@ with tabs[0]:
         portfolio, held_keys=filter_keys,
     )
     if closed_positions:
-        closed_labels = []
-        for p in closed_positions:
-            if p["kind"] == "etf":
-                closed_labels.append(p["symbol"])
-            else:
-                closed_labels.append(
-                    f"{p['underlying']} {p['type'].upper()} {p['strike']:g} {p['expiry']}"
-                )
+        closed_labels = [p["symbol"] for p in closed_positions]
         st.warning(
             "Closed since last orchestrator run — "
             "broker no longer reports: **"
@@ -832,17 +825,10 @@ with tabs[0]:
 
         # Coerce mixed-type columns to consistent dtypes — Streamlit
         # serialises dataframes through pyarrow, which rejects "object"
-        # columns that mix int + str ("DTE" is int for options / "—"
-        # for ETFs) or int + None ("Days held" is None when no trade
-        # history covers the symbol). Map sentinels to pandas's
-        # nullable Int64 so the column renders as a number where data
-        # exists and blank where it doesn't.
-        if "DTE" in df_pos.columns:
-            df_pos["DTE"] = (
-                df_pos["DTE"]
-                .apply(lambda v: v if isinstance(v, (int, float)) else None)
-                .astype("Int64")
-            )
+        # columns that mix int + None ("Days held" is None when no trade
+        # history covers the symbol). Map sentinels to pandas's nullable
+        # Int64 so the column renders as a number where data exists and
+        # blank where it doesn't.
         if "Days held" in df_pos.columns:
             df_pos["Days held"] = df_pos["Days held"].astype("Int64")
 
@@ -940,8 +926,8 @@ with tabs[0]:
         # na_rep="—" turns every NaN / pd.NA cell into an em-dash
         # (matches the existing "no data" sentinel used in row builds).
         # Without this, Pandas Styler renders pd.NA as the literal
-        # string "None" — which is what shows up on ETF rows for DTE /
-        # Days held when marks aren't wired. `precision=None` keeps
+        # string "None" — which is what shows up for Days held when
+        # marks aren't wired. `precision=None` keeps
         # column_config's per-column NumberColumn(format=...) rules
         # in charge of numeric rendering for the non-NA cells.
         styled = (
@@ -982,10 +968,6 @@ with tabs[0]:
                          "Entry cap is 15%; cap drops to 7.5% in ≥10% "
                          "drawdown. Drift past the cap after entry is OK.",
                 ),
-                "DTE":       st.column_config.Column(
-                    "DTE",
-                    help="Days to expiry for options. '—' on ETF rows.",
-                ),
                 "Days held": st.column_config.NumberColumn(
                     "Days held",
                     format="%d",
@@ -996,14 +978,14 @@ with tabs[0]:
                 "Bias":      st.column_config.Column(
                     "Bias",
                     help="Direction expressed by the position: Bull (bull "
-                         "ETF or long call), Bear (inverse ETF or long "
-                         "put), Long vol (UVXY), Long crypto (BITX).",
+                         "ETF), Bear (inverse ETF), Long vol (UVXY), "
+                         "Long crypto (BITX), Short crypto (BITI).",
                 ),
                 "Kill":      st.column_config.Column(
                     "Kill",
                     help="Trigger conditions monitor.py uses to flatten "
-                         "the position: max-loss %, underlying price "
-                         "thresholds, and time stop (date).",
+                         "the position: max-loss %, ETF price thresholds, "
+                         "and time stop (date).",
                 ),
                 "Fees":      st.column_config.NumberColumn(
                     "Fees",
@@ -1160,107 +1142,6 @@ with tabs[1]:
     if not summaries:
         st.info("No runs yet — fire the orchestrator (manually or via the timer) to populate this view.")
     else:
-        # ---- Option funnel diagnostic ----
-        # Shows where in the strategist → chain → constructor → sanity →
-        # broker pipeline option candidates die. Added 2026-05-22 after
-        # six months of paper trading produced zero option positions.
-        # Read-only — reads per-cycle artifacts the orchestrator already
-        # writes; no schema changes.
-        funnel_rows = dd.option_funnel(limit=20)
-        # Aggregate counts across the visible window so the operator can
-        # see the big picture before drilling into per-cycle rows.
-        agg = {
-            "surfaced": sum(r["surfaced"] for r in funnel_rows),
-            "chain_ok": sum(r["chain_ok"] for r in funnel_rows),
-            "taken": sum(r["taken"] for r in funnel_rows),
-            "submitted": sum(r["submitted"] for r in funnel_rows),
-        }
-        cycles_with_options_surfaced = sum(1 for r in funnel_rows if r["surfaced"] > 0)
-        cycles_with_options_taken = sum(1 for r in funnel_rows if r["taken"] > 0)
-
-        st.markdown(
-            '<div class="at-section-label">Option funnel — last 20 cycles</div>',
-            unsafe_allow_html=True,
-        )
-        st.caption(
-            "Where do option candidates die between proposal and submission? "
-            "**surfaced** = strategist named an option_call / option_put. "
-            "**chain_ok** = Alpaca returned a tradable OTM contract. "
-            "**taken** = constructor put it in portfolio.json. "
-            "**submitted** = the execute stage actually sent an order. "
-            "A large surfaced→taken gap usually means sizing failed "
-            "(premium > 15% NAV cap); a large chain_ok→taken gap means "
-            "the constructor preferred ETFs."
-        )
-        fcols = st.columns(4)
-        fcols[0].markdown(
-            _stat_card(
-                "Surfaced",
-                f"{agg['surfaced']}",
-                sub=f"in {cycles_with_options_surfaced} of {len(funnel_rows)} cycles",
-            ),
-            unsafe_allow_html=True,
-        )
-        fcols[1].markdown(
-            _stat_card(
-                "Chain OK",
-                f"{agg['chain_ok']}",
-                sub=(
-                    f"{agg['chain_ok']}/{agg['surfaced']} resolved"
-                    if agg["surfaced"] else "no surfaced"
-                ),
-            ),
-            unsafe_allow_html=True,
-        )
-        fcols[2].markdown(
-            _stat_card(
-                "Taken",
-                f"{agg['taken']}",
-                tone="pos" if agg["taken"] else "neg" if agg["chain_ok"] else "",
-                sub=f"in {cycles_with_options_taken} cycles",
-            ),
-            unsafe_allow_html=True,
-        )
-        fcols[3].markdown(
-            _stat_card(
-                "Submitted",
-                f"{agg['submitted']}",
-                tone="pos" if agg["submitted"] else "neg" if agg["taken"] else "",
-                sub="actual broker orders",
-            ),
-            unsafe_allow_html=True,
-        )
-
-        if funnel_rows and any(r["surfaced"] or r["taken"] for r in funnel_rows):
-            df_funnel = pd.DataFrame([
-                {
-                    "Cycle": _fmt_ts(r["generated_at"]) if r["generated_at"] else "—",
-                    "Regime": r["regime"] or "—",
-                    "Surfaced": r["surfaced"],
-                    "Chain OK": r["chain_ok"],
-                    "Taken": r["taken"],
-                    "Sanity": "—" if r["sanity_pass"] is None else (
-                        "✅" if r["sanity_pass"] else "❌"
-                    ),
-                    "Submitted": r["submitted"],
-                    "Cycle outcome": (
-                        "all-cash" if r["all_cash"] else
-                        "took positions" if r["took_anything"] else
-                        "—"
-                    ),
-                }
-                for r in funnel_rows
-            ])
-            st.dataframe(df_funnel, width="stretch", hide_index=True)
-        else:
-            st.info(
-                "No option activity in the last 20 cycles — strategist "
-                "didn't surface any option candidates. If this persists "
-                "across multiple weeks, the prompt nudges in "
-                "prompts/strategist.md may need stronger framing toward "
-                "the option expression of high-conviction directional theses."
-            )
-
         st.markdown(
             f'<div class="at-section-label">Last {len(summaries)} cycles — newest first, all expanded</div>',
             unsafe_allow_html=True,
@@ -1367,7 +1248,6 @@ with tabs[2]:
                 "market_gate": "🕰️",
                 "signals": "📊",
                 "strategist": "🧠",
-                "chain_lookup": "🔗",
                 "construct": "🧩",
                 "critic": "⚖️",
                 "execute": "📤",
@@ -2371,7 +2251,6 @@ with tabs[6]:
             "market_gate.json":   "🕰️",
             "signals.json":       "📊",
             "view.json":          "🧠",
-            "chain_lookups.json": "🔗",
             "portfolio.json":     "🧩",
             "critique.json":      "⚖️",
             "sanity.json":        "🛡️",

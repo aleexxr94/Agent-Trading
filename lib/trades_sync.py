@@ -9,7 +9,7 @@ Alpaca; before writing we check ``state.read_trade_activity_ids()`` and
 skip anything already on disk. Safe to call repeatedly (e.g. after
 every orchestrator cycle).
 
-Fee handling: Alpaca returns fees (OCC, REG, TAF, etc.) as SEPARATE
+Fee handling: Alpaca returns fees (REG, TAF, etc.) as SEPARATE
 activities from their parent fills. We pull both pools in one sync,
 match fees to fills by ``order_id``, and SPLIT each order's total fee
 proportionally by qty across the (possibly multiple) FILL activities
@@ -18,7 +18,7 @@ sharing that order_id — Alpaca emits one FILL per execution
 several FILL rows that must each carry their share of the fee. Codex
 P1 on PR #55 caught the pre-fix bug where every partial fill received
 the FULL order fee. For paper equity trading Alpaca currently reports
-$0 fees; option contracts pick up the OCC/SEC schedule.
+$0 fees; live USD-funded accounts pick up the SEC/TAF schedule.
 
 Run-id attribution: the optional ``order_id_to_run_id`` map lets the
 caller stamp the run_id of the orchestrator cycle that submitted each
@@ -26,10 +26,9 @@ parent order. Fills with no map entry land with ``run_id=None`` so
 ``lib.trades.compute_trades_pnl`` correctly assigns them zero LLM
 attribution (manual / out-of-band trades).
 
-This is the only module besides ``lib.alpaca_client`` and
-``lib.options_chain`` that imports alpaca-py — the IBKR swap path
-(CLAUDE.md §Critical preconditions #2) stays a one-file change with
-analogous helpers behind the same signature.
+This is the only module besides ``lib.alpaca_client`` that imports
+alpaca-py — the IBKR swap path (CLAUDE.md §Critical preconditions #2)
+stays a one-file change with analogous helpers behind the same signature.
 """
 from __future__ import annotations
 
@@ -51,13 +50,12 @@ _MAX_PAGES = 200   # 20k rows; far above any plausible single-sync volume
 
 # Alpaca activity types that represent fees we want to fold into a fill's
 # fees_usd. Per the public docs (2026-Q2 snapshot):
-#   OCC — Option Clearing Corporation fee (~$0.05/contract)
-#   ORF — Options Regulatory Fee
 #   REG / SEC — SEC fee on sells
 #   TAF — Trading Activity Fee (FINRA)
 #   FINRA_TAF — FINRA TAF on sells
 #   FEE — generic Alpaca fee bucket
-# Equities paper has no commission; options paper charges OCC/REG schedule.
+# Equities paper has no commission; the regulatory schedule (SEC/TAF) still
+# applies on live USD-funded accounts.
 #
 # Empirical probe (2026-05-26, paper account): Alpaca paper rejects every
 # category-specific type with HTTP 400 code 40010001 "invalid activity
@@ -71,7 +69,7 @@ _MAX_PAGES = 200   # 20k rows; far above any plausible single-sync volume
 # bookkeeping should still flow through the same code path.
 _FEE_ACTIVITY_TYPES: tuple[str, ...] = (
     "FEE",
-    "OCC", "ORF", "REG", "SEC", "TAF", "FINRA_TAF",
+    "REG", "SEC", "TAF", "FINRA_TAF",
 )
 
 
@@ -92,25 +90,19 @@ def _to_float(v: Any) -> float:
 
 
 def _normalize_kind(symbol: str) -> str:
-    """Return 'option' for OSI-shaped symbols, 'etf' otherwise.
+    """Return 'etf' for every fill — the system is ETF-only.
 
-    We can't ask Alpaca activities directly — the response only carries
-    the OCC OSI string. ETF symbols are 1-5 uppercase letters with no
-    digits; an OSI is ≥ 16 chars containing the date+strike encoding.
-    The 15-char floor is conservative (shortest 1-char underlying OSI is
-    1 + 6 + 1 + 8 = 16 chars).
+    The ``kind`` field is retained on trade rows for schema/back-compat,
+    but it is always ``etf``: there is no option instrument class.
     """
-    if len(symbol) >= 16 and any(c.isdigit() for c in symbol):
-        return "option"
     return "etf"
 
 
 def _normalize_side(side: Any) -> str:
     """Map Alpaca side values to our 'buy'/'sell' canonical form.
 
-    Alpaca returns 'buy' or 'sell' on FILL activities. Option fill activities
-    can also return 'sell_short' for opening a short (not in scope on this
-    long-only paper account); we map them all to 'sell' for safety.
+    Alpaca returns 'buy' or 'sell' on FILL activities. We map anything
+    that isn't 'buy' to 'sell' for safety on this long-only paper account.
     """
     s = str(side).lower()
     return "buy" if s == "buy" else "sell"
@@ -129,8 +121,8 @@ def _is_unsupported_activity_type_error(exc: BaseException) -> bool:
         traded equities). Documented in alpaca-py.
       - **Code 40010001 "invalid activity type: X"** — the newer
         contract: the paper API rejects every fee category except `FEE`.
-        Observed verbatim for OCC, OCC_FEE, ORF, REG, SEC, TAF,
-        FINRA_TAF on a fresh paper account.
+        Observed verbatim for REG, SEC, TAF, FINRA_TAF on a fresh paper
+        account.
 
     Without the 40010001 branch, the very first iteration of the fee-pull
     loop raises and kills `sync_fills_from_alpaca` entirely — no fills
@@ -220,8 +212,7 @@ def _build_fee_index(fee_rows: list[dict]) -> dict[str, float]:
 
     Alpaca reports fees as DEBITS — negative ``net_amount``. We flip to
     positive USD so the downstream ``fees_usd`` column reads as a positive
-    cost. Fees on a single order are added together so a 2-leg option
-    spread with two OCC fees lands as one summed value.
+    cost. Multiple fee activities on a single order are summed into one value.
     """
     out: dict[str, float] = defaultdict(float)
     for row in fee_rows:

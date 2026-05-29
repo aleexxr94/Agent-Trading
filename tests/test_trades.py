@@ -158,20 +158,20 @@ def test_simple_etf_round_trip_realised_pnl():
     assert res.open == []
 
 
-def test_option_round_trip_uses_100x_multiplier():
-    """Buy 1 SPY put @ $0.61 (= $61 premium), sell @ $1.00 (= $100). Gross
-    = ($1.00 - $0.61) * 1 * 100 = $39. Fees are real ($0.65 OCC each side)."""
+def test_inverse_etf_round_trip_no_multiplier():
+    """ETF-only: gross = (sell - buy) × qty with no multiplier. Inverse
+    ETFs (e.g. SQQQ) are held long like any other ETF."""
     rows = [
-        _trade(activity_id="b", symbol="SPY260619P00510000", kind="option",
-               side="buy", qty=1, fill_price=0.61, fees_usd=0.65, run_id="r1"),
-        _trade(activity_id="s", symbol="SPY260619P00510000", kind="option",
-               side="sell", qty=1, fill_price=1.00, fees_usd=0.65, run_id="r2"),
+        _trade(activity_id="b", symbol="SQQQ", kind="etf",
+               side="buy", qty=10, fill_price=8.0, fees_usd=1.0, run_id="r1"),
+        _trade(activity_id="s", symbol="SQQQ", kind="etf",
+               side="sell", qty=10, fill_price=9.0, fees_usd=1.0, run_id="r2"),
     ]
     res = trades.compute_trades_pnl(rows)
     c = res.closed[0]
-    assert c.gross_pnl_usd == pytest.approx(39.0)
-    assert c.fees_usd == pytest.approx(1.30)
-    assert c.net_pnl_usd == pytest.approx(37.70)
+    assert c.gross_pnl_usd == pytest.approx(10.0)  # (9-8) × 10, no ×100
+    assert c.fees_usd == pytest.approx(2.0)
+    assert c.net_pnl_usd == pytest.approx(8.0)
 
 
 def test_fifo_partial_close_emits_one_closed_row_per_chunk():

@@ -34,6 +34,9 @@ class BrokerPosition:
     avg_cost: float
     market_value: float
     unrealized_pl_usd: float
+    # The system trades ETFs only. ``us_option`` is retained solely so a
+    # stray/legacy option position at the broker can still be ingested and
+    # safely flattened (close-only) by monitor.py — it is never opened.
     asset_class: Literal["us_equity", "us_option"]
     # Optional Alpaca-derived fields — present when the broker reports them,
     # None for stub / test fixtures that don't bother. See lib/marks.py for
@@ -104,48 +107,5 @@ class Broker(ABC):
         Used by lib/market_gate to short-circuit the orchestrator pipeline
         when markets are closed (weekends, holidays, after-hours). The
         default returns None — concrete brokers must override.
-        """
-        return None
-
-    def option_contract_tradable(self, symbol: str) -> bool:
-        """Return True iff the OSI option contract exists and is tradable.
-
-        Default implementation returns True — i.e. no validation. Concrete
-        brokers should override to actually query their contract catalog so
-        we can skip orders for non-existent / non-tradable contracts before
-        the request hits the API. Phase 10d guard: the constructor agent
-        sometimes invents OSI symbols whose expiry/strike combo isn't in
-        the broker's book (observed May 12 2026: TLT 2026-06-19 P88 returned
-        Alpaca error[42210000] 'asset not found'). Pre-validating gives the
-        operator a clearer skip reason than the raw broker error and avoids
-        burning an order attempt on a doomed contract.
-        """
-        return True
-
-    def get_option_quote(self, osi_symbol: str) -> tuple[float, float] | None:
-        """Return (bid, ask) for an OSI option symbol, or None on any failure.
-
-        Used by lib/options_chain after the nearest-OTM contract is picked
-        so the constructor can size against the real mid premium instead
-        of priors. Returning None must be safe — the constructor falls
-        back to estimating from underlying HV when the quote is missing.
-
-        Default implementation returns None — concrete brokers override.
-        Failure modes that should return None (never raise):
-          - any HTTP / auth / network error
-          - the symbol exists but the feed returned no quote (rare; can
-            happen pre-market on illiquid strikes)
-          - non-numeric bid/ask in the response
-        """
-        return None
-
-    def get_underlying_price(self, symbol: str) -> float | None:
-        """Return the latest price for an equity/ETF underlying, or None.
-
-        Used by monitor.py to evaluate option positions' underlying price
-        stops (underlying_price_below/above), which reference the underlying
-        (e.g. SPY), not the option mark. Returning None is safe — the monitor
-        simply skips the price stop for that option (its loss cap + time stop
-        still apply). Default returns None; concrete brokers override.
         """
         return None
