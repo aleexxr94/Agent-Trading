@@ -2,7 +2,7 @@
 
 > **PAPER TRADING — Experimental autonomous AI agent. Leveraged ETFs and listed options on a small account are high-risk. Not financial advice.**
 
-Autonomous multi-agent trading system that runs a deterministic-signals scan over a 21-ticker universe (14 leveraged ETFs + 7 option underlyings), asks a strategist agent for a regime call + ranked candidate ideas, and asks a constructor agent to build a **1–12 position portfolio (or all-cash)** that's then executed via **Alpaca paper**. Runs unattended on a Linux VPS (or on Windows under Task Scheduler) with a Streamlit dashboard.
+Autonomous multi-agent trading system that runs a deterministic-signals scan over a 21-ticker universe (14 leveraged ETFs + 7 option underlyings), asks a strategist agent for a regime call + ranked candidate ideas, and asks a constructor agent to build a **1–12 position portfolio (or all-cash)** that's then executed via **Alpaca paper**. Runs unattended on a Linux VPS under systemd, with a Streamlit dashboard.
 
 The canonical build spec is [CLAUDE.md](./CLAUDE.md). This README is the operator's manual.
 
@@ -17,7 +17,7 @@ The canonical build spec is [CLAUDE.md](./CLAUDE.md). This README is the operato
 ## Architecture at a glance
 
 ```
-systemd timer (Linux) / Task Scheduler (Windows) ──▶ orchestrator.py
+systemd timer (Linux VPS) ──▶ orchestrator.py
                                                       ├─ Stage 0: market_gate   (Alpaca clock, $0)
                                                       ├─ Stage 1: signals       (deterministic Python, $0)
                                                       ├─       state context     (broker positions + PnL history)
@@ -209,23 +209,15 @@ The v2 pipeline reads deterministic signals (momentum, vol, MA distance) for 21 
 
 ---
 
-## Pick your deployment
+## Supported runtime: Linux VPS only
 
-| | **Linux VPS** *(recommended)* | **Windows 10/11** |
-|---|---|---|
-| **When to use** | Unattended autonomous running. Box doesn't sleep. Best for the spec's "let the agent run for weeks" model. | Manual / interactive use on a desktop. Laptop must stay awake when the timer fires. |
-| **Cost** | ~$5/mo (Hetzner CX23, 2 vCPU / 4 GB) | Already-owned hardware |
-| **Scheduler** | systemd timers | Windows Task Scheduler |
-| **Dashboard reach** | Tailscale Serve (HTTPS, no public ports) or SSH tunnel | localhost or LAN with Defender Firewall rule |
-| **Setup section below** | [Linux VPS setup](#linux-vps-setup-recommended) | [Windows setup](#windows-setup-alternative) |
+**Linux VPS + systemd is the sole supported production runtime.** The system is designed to run unattended for weeks on a box that doesn't sleep, with systemd timers driving the orchestrator and monitor and a `127.0.0.1`-bound Streamlit dashboard reached over Tailscale or an SSH tunnel. Windows is not a supported runtime.
 
-Both paths share the same `orchestrator.py` / `monitor.py` / `dashboard.py` — only the wrapper scripts and scheduling layer differ.
+Setup below: [Linux VPS setup](#linux-vps-setup). The full operator playbook is [`deploy/README.md`](./deploy/README.md).
 
 ---
 
-# Linux VPS setup (recommended)
-
-The full operator playbook for Linux is [`deploy/README.md`](./deploy/README.md), including Tailscale phone access ([`deploy/tailscale.md`](./deploy/tailscale.md)). The summary below is enough to get from a fresh Hetzner Ubuntu 24.04 box to a running dashboard in ~10 minutes.
+# Linux VPS setup
 
 ### 1. Provision a VPS
 
@@ -307,7 +299,7 @@ tailscale serve status   # prints the https://<host>.<tailnet>.ts.net URL
 Open that URL in your laptop browser. See [`deploy/tailscale.md`](./deploy/tailscale.md) for the full setup.
 
 **SSH local port forward** (no Tailscale needed). On your laptop:
-```powershell
+```bash
 ssh -L 8501:127.0.0.1:8501 root@<your-server-ip>
 ```
 Then `http://localhost:8501`.
@@ -326,7 +318,9 @@ The orchestrator timer has a daily 13:30 UTC fallback and self-reschedules from 
 
 ### Update the deployment
 
-When new code lands on `main`:
+Changes land via PR: open a PR, get it reviewed, and merge to `main`. Merging to `main` triggers `.github/workflows/deploy.yml`, which SSHes into the VPS, runs `install.sh`, and restarts the dashboard — no manual deploy needed.
+
+Manual fallback (operator-only, if the Action is disabled or failing):
 ```bash
 ssh root@<your-server-ip>
 bash /opt/agent-trading/deploy/install.sh
@@ -346,146 +340,13 @@ rm /etc/logrotate.d/agent-trading
 
 ---
 
-# Windows setup (alternative)
+## Halt procedure
 
-For users who prefer to run on a personal Windows 10/11 PC. Note the laptop must stay on and awake when the orchestrator timer fires (or the run is missed) — see CLAUDE.md §Critical preconditions for the spec rationale.
+The halt flag is checked before every LLM API call and before any order. The orchestrator and monitor wrappers (`deploy/run_orchestrator.sh`, `deploy/run_monitor.sh`) short-circuit before activating the venv when it's present, and the systemd units refuse to start while the flag exists.
 
-### 1. Clone and enter the repo
-
-```powershell
-git clone <repo-url> Agent-Trading
-cd Agent-Trading
-```
-
-### 2. Create + activate the virtualenv
-
-Python 3.11+ is required. The `py` launcher comes with the official Python installer.
-
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-If activation fails with an execution-policy error:
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-```
-
-### 3. Install dependencies
-
-```powershell
-pip install -r requirements.txt
-```
-
-### 4. Configure secrets
-
-```powershell
-Copy-Item .env.example .env
-notepad .env
-```
-
-(Same env-var table as Linux above.)
-
-### 5. Verify the install
-
-```powershell
-pytest
-python orchestrator.py --dry-run
-```
-
-### 6. Manual run
-
-```powershell
-# Dry-run — no LLM, no orders, exercises the full pipeline against fixtures
-python orchestrator.py --dry-run
-
-# Live paper run — calls Anthropic + Alpaca paper
-python orchestrator.py
-```
-
-### 7. Dashboard
-
-```powershell
-# Local only (recommended)
-streamlit run dashboard.py
-
-# Phone access on the same Wi-Fi (no auth — see firewall note below)
-streamlit run dashboard.py --server.address 0.0.0.0
-```
-
-To pin a specific known-good portfolio for dashboard development, drop it at `state\seed_portfolio.json`:
-```powershell
-Copy-Item tests\fixtures\portfolio.json state\seed_portfolio.json
-```
-
-#### Phone access (Windows Defender Firewall)
-
-`--server.address 0.0.0.0` binds Streamlit to every network interface but **adds no authentication**. Only enable on a trusted home network and add a firewall rule restricted to your local subnet:
-
-```powershell
-# Run from an elevated PowerShell session
-New-NetFirewallRule `
-    -DisplayName "Agent-Trading Streamlit (LAN only)" `
-    -Direction Inbound `
-    -Action Allow `
-    -Protocol TCP `
-    -LocalPort 8501 `
-    -Profile Private `
-    -RemoteAddress LocalSubnet
-```
-
-Remove later with `Remove-NetFirewallRule -DisplayName "Agent-Trading Streamlit (LAN only)"`.
-
-> Do not enable `--server.address 0.0.0.0` on public Wi-Fi or expose port 8501 outside your LAN. The dashboard has no auth and can write `state/halt.flag`.
-
-### 8. Windows Task Scheduler (orchestrator + monitor)
-
-```powershell
-.\scheduling\register_task.ps1
-```
-
-Registers two tasks under `\Agent-Trading\`:
-
-| Task                              | What it runs                            | Cadence                                                   |
-| --------------------------------- | --------------------------------------- | --------------------------------------------------------- |
-| `\Agent-Trading\Orchestrator`     | `scheduling\run_orchestrator.ps1`       | Daily 13:30 UTC fallback + login trigger; **the orchestrator overwrites the next-run trigger after each run** based on `state\next_run.json`. |
-| `\Agent-Trading\Monitor`          | `scheduling\run_monitor.ps1`            | Every 15 minutes for an 8-hour window starting 13:30 UTC. |
-
-Useful inspections:
-
-```powershell
-Get-ScheduledTask     -TaskPath '\Agent-Trading\'
-Get-ScheduledTaskInfo -TaskPath '\Agent-Trading\' -TaskName 'Orchestrator'
-Start-ScheduledTask   -TaskPath '\Agent-Trading\' -TaskName 'Orchestrator'   # run on demand
-```
-
-Update / uninstall / dry-run:
-```powershell
-.\scheduling\register_task.ps1                    # update existing registration
-.\scheduling\unregister_task.ps1                  # remove
-.\scheduling\register_task.ps1 -SkipMonitor       # orchestrator task only
-.\scheduling\register_task.ps1 -WhatIf            # show what would change
-```
-
-> **Heads-up on laptops**: with `WakeToRun=false` (the bundled default) plus `DisallowStartIfOnBatteries=true`, a closed-lid laptop on battery will miss runs. Either change the lid behaviour to "Do nothing" while plugged in, or move to the [Linux VPS path](#linux-vps-setup-recommended) for true autonomy.
-
----
-
-## Halt procedure (both platforms)
-
-The halt flag is checked before every LLM API call and before any order. Both wrappers (`run_orchestrator.{sh,ps1}`) short-circuit before activating the venv when it's present.
-
-**Linux:**
 ```bash
 sudo -u agent touch /opt/agent-trading/state/halt.flag    # halt
 sudo -u agent rm    /opt/agent-trading/state/halt.flag    # resume
-```
-
-**Windows:**
-```powershell
-New-Item -Path state\halt.flag -ItemType File -Force      # halt
-Remove-Item state\halt.flag                               # resume
 ```
 
 Or click **Emergency stop** on the dashboard's Settings tab.
@@ -505,25 +366,11 @@ Or click **Emergency stop** on the dashboard's Settings tab.
 
 Quick inspection:
 
-**Linux:**
 ```bash
 sudo -u agent tail -n 20 /opt/agent-trading/state/decisions.jsonl
 sudo -u agent tail -n 20 /opt/agent-trading/state/costs.jsonl
 journalctl -u agent-orchestrator.service -n 200 --no-pager
 journalctl -u agent-dashboard.service    -n 200 --no-pager
-```
-
-**Windows:**
-```powershell
-Get-Content state\decisions.jsonl -Tail 20 | ForEach-Object { ConvertFrom-Json $_ }
-
-# Cost today
-$today = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
-Get-Content state\costs.jsonl |
-    ForEach-Object { ConvertFrom-Json $_ } |
-    Where-Object { $_.at -like "$today*" } |
-    Measure-Object cost_usd -Sum |
-    Select-Object -ExpandProperty Sum
 ```
 
 The dashboard's Performance and Settings tabs surface the same numbers without the JSON wrangling.

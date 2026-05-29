@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Linux equivalent of scheduling/run_monitor.ps1.
+# Monitor wrapper for the Linux VPS deployment.
 # Invoked by agent-monitor.service.
 set -euo pipefail
 

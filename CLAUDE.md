@@ -9,8 +9,8 @@ You are a senior quant systems engineer. Build a complete, **paper-trading-only*
 1. **Paper trading only** until I explicitly promote it via the criteria in §11. Live mode must be gated behind both an env var and a hard-coded version flag. Do not build a UI button that toggles live.
 2. **I am UK-based.** Alpaca **paper** is fine. Alpaca **live** brokerage is not available to UK retail. Do not assume live USD funding via Alpaca will ever happen. Add a TODO and an interface seam in `lib/broker.py` so the broker can be swapped to IBKR later without rewriting the orchestrator.
 3. **Account size:** $2,500 paper (all sizing in USD). Every sizing calculation must respect this. The orchestrator must be willing to hold cash if conviction is insufficient — do not force-fill 10 slots.
-4. **Environment:** Windows 10/11 on a personal PC. Schedule the orchestrator with **Windows Task Scheduler** (provide an importable `.xml` task definition and a `register_task.ps1` PowerShell script). Do not use Claude Code Routines for production runtime. Assume Python 3.11+ installed via the official installer (`py` launcher available); use a project-local `.venv`. **Update (post-build):** a **Linux VPS + systemd** deployment path now exists under `deploy/` (idempotent `install.sh`, service+timer units, Tailscale phone access) and is the recommended path for true unattended running — the box doesn't sleep. Both paths share the same `orchestrator.py` / `monitor.py` / `dashboard.py`; only the scheduling layer differs.
-5. **Runtime architecture:** local Python service calling the **Anthropic API directly** with prompt caching. Claude Code is for development only. Pro-plan usage limits make routine-driven production execution unreliable.
+4. **Environment / runtime:** **Linux VPS + systemd is the sole supported production runtime.** Schedule the orchestrator and monitor with the systemd services/timers under `deploy/` (idempotent `install.sh`, service+timer units, the `agent-scheduler.service` dynamic-cadence daemon, Tailscale phone access) on an Ubuntu 24.04 box that doesn't sleep. Use a project-local `.venv` (Python 3.11+; 3.12 on Ubuntu 24.04). Do not use Claude Code Routines for production runtime. **Windows 10/11 + Windows Task Scheduler is no longer a supported runtime** — do not add or maintain Windows Task Scheduler XML, PowerShell wrappers, or Windows runtime docs unless I explicitly request Windows support in the future. Any lingering Windows references are obsolete history, not setup guidance. (Historical note: the original build targeted Windows Task Scheduler; that path was removed in favour of the Linux VPS path.)
+5. **Runtime architecture:** local Python service on the VPS calling the **Anthropic API directly** with prompt caching. **Claude Code is for development only, not runtime execution.** Pro-plan usage limits make routine-driven production execution unreliable.
 6. If anything below is ambiguous, bundle all clarifying questions into one message before starting. Do not guess on capital allocation, position counts, kill switches, or broker behaviour.
 
 ## System scope
@@ -27,7 +27,7 @@ You are a senior quant systems engineer. Build a complete, **paper-trading-only*
 
 ```
 ┌─────────────────────┐    ┌──────────────────────────────┐
-│ Windows Task Schedr │───▶│ orchestrator.py              │
+│ systemd timer/svc   │───▶│ orchestrator.py              │
 │ (next-run set by AI)│    │  Stage 0: Market Gate        │
 └─────────────────────┘    │  Stage 1: Signals (Python)   │
                            │  Stage 2: Strategist (LLM)   │
@@ -116,14 +116,7 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
 │   ├── benchmark.py            # SPY benchmark + backtest/Monte-Carlo helpers
 │   ├── dashboard_data.py       # dashboard aggregation (synthetic NAV, timelines)
 │   └── state.py                # JSON read/write, run_id, halt-flag
-├── scheduling/                 # Windows Task Scheduler
-│   ├── orchestrator_task.xml   # orchestrator task import
-│   ├── monitor_task.xml        # monitor task import
-│   ├── run_orchestrator.ps1    # venv-activating wrapper + next-run rescheduler
-│   ├── run_monitor.ps1
-│   ├── register_task.ps1       # creates/updates the tasks
-│   └── unregister_task.ps1     # removes the tasks
-├── deploy/                     # Linux VPS path (recommended) — see deploy/README.md
+├── deploy/                     # Linux VPS runtime (the only supported path) — see deploy/README.md
 │   ├── install.sh              # idempotent installer (venv, user, systemd units)
 │   ├── run_orchestrator.sh / run_monitor.sh / run_scheduler.sh
 │   ├── systemd/                # orchestrator/monitor service+timer, dashboard, scheduler
@@ -193,7 +186,7 @@ Orchestrator prompt must state explicitly:
 3. `streamlit run dashboard.py` launches and renders every tab against a `state/seed_portfolio.json` fixture without errors.
 4. Emergency stop flag halts the orchestrator within one cycle; dashboard reflects halted state.
 5. Per-run and daily cost caps are enforced — include a test that stubs a high-cost LLM call and asserts the abort path.
-6. README covers: setup (PowerShell-based, including `py -m venv .venv` and activation), env vars, manual run, Task Scheduler install/uninstall via the provided PowerShell scripts, dashboard launch, halt procedure, log inspection, repo hygiene (no committed secrets). Include a note that the dashboard's `--server.address 0.0.0.0` mode requires a Windows Defender Firewall inbound rule for local Wi-Fi access from a phone.
+6. README is Linux VPS-focused and covers: Ubuntu 24.04 VPS setup (`deploy/install.sh`, project-local `.venv`), env vars, manual smoke runs, systemd timer/service install + uninstall, dashboard launch (bound to `127.0.0.1`, reached via Tailscale or an SSH tunnel), halt procedure, log inspection (`journalctl` + `state/*.jsonl`), and repo hygiene (no committed secrets). The dashboard must never bind `0.0.0.0`; phone access goes through Tailscale or an SSH tunnel, not a public port.
 
 ## Promotion to live (documented only — do not enable in code)
 All of:
