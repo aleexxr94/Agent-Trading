@@ -715,6 +715,46 @@ def test_publishable_portfolio_strips_non_universe_and_option_positions():
     assert orchestrator._publishable_portfolio(clean) is clean
 
 
+def test_nav_row_reflects_publishable_subset_when_universe_guard_skips(tmp_state, monkeypatch):
+    """Codex P2: when the universe guard drops a non-universe target, the NAV
+    row must reflect only the tradable positions actually submitted/held, not
+    the untradable target the constructor emitted."""
+    from lib.broker import OrderResult
+
+    monkeypatch.setenv("ORDERS_ENABLED", "true")
+    monkeypatch.setattr(
+        orchestrator, "_compute_next_run_at",
+        lambda *, ctx, portfolio, view: ("2026-05-28T20:00:00Z", "stub", "trade"),
+    )
+
+    class _FakeBroker:
+        def get_positions(self): return []
+        def submit_order(self, req):
+            return OrderResult(
+                broker_order_id="1", symbol=req.symbol, qty=req.qty,
+                side=req.side, submitted_at="", status="accepted",
+            )
+
+    portfolio = {
+        "run_id": "r-uni", "nav_usd": 2500.0, "cash_usd": 100.0, "all_cash": False,
+        "positions": [
+            {"kind": "etf", "symbol": "TQQQ", "shares": 4, "avg_cost": 70.0,
+             "leverage_factor": 3.0, "entry_thesis": "x",
+             "kill_conditions": {"max_loss_pct": 25}, "position_pct": 11.0},
+            {"kind": "etf", "symbol": "SPY", "shares": 5, "avg_cost": 50.0,
+             "leverage_factor": 1.0, "entry_thesis": "x",
+             "kill_conditions": {"max_loss_pct": 25}, "position_pct": 10.0},
+        ],
+    }
+    ctx = orchestrator.StageContext(run_id="r-uni", dry_run=False, broker=_FakeBroker())
+    orchestrator.stage_execute(ctx, portfolio, {"candidates": []})
+
+    rows = state.read_nav_history()
+    assert len(rows) == 1
+    # Only TQQQ is tradable; SPY (non-universe) was skipped and must not count.
+    assert rows[0]["positions_count"] == 1
+
+
 def test_fail_closed_positions_read_preserves_current_portfolio(tmp_state, monkeypatch):
     """Codex P1: when broker.get_positions() raises during execution, the
     pipeline must NOT overwrite current_portfolio.json with the unexecuted

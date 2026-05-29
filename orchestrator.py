@@ -1087,19 +1087,25 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
     if not ctx.dry_run and not next_run.get("current_portfolio_unreconciled"):
         from lib import dashboard_data as _dd
         from lib import pnl as pnl_lib
-        breakdown = pnl_lib.compute_portfolio_pnl(portfolio=portfolio, marks=None)
+        # Base the row on the publishable subset — positions the order layer
+        # refused (option-shaped / non-universe) were never submitted or held,
+        # so their positions_count / cash / modelled PnL must not be recorded
+        # as if held (matches what _publishable_portfolio writes to
+        # current_portfolio.json).
+        nav_portfolio = _publishable_portfolio(portfolio)
+        breakdown = pnl_lib.compute_portfolio_pnl(portfolio=nav_portfolio, marks=None)
         try:
             synthetic_nav = _dd.realized_synthetic_nav()
         except Exception:
-            synthetic_nav = portfolio.get("nav_usd", 0.0)
+            synthetic_nav = nav_portfolio.get("nav_usd", 0.0)
         state.append_nav({
             "run_id": ctx.run_id,
             "at": state.utcnow_iso(),
             "nav_usd": synthetic_nav,
             "nav_source": "virtual",
-            "cash_usd": portfolio.get("cash_usd", 0.0),
-            "positions_count": len(portfolio.get("positions", [])),
-            "all_cash": portfolio.get("all_cash", False),
+            "cash_usd": nav_portfolio.get("cash_usd", 0.0),
+            "positions_count": len(nav_portfolio.get("positions", [])),
+            "all_cash": nav_portfolio.get("all_cash", False),
             "gross_pnl_usd": breakdown.gross_pnl_usd,
             "modelled_costs_usd": breakdown.modelled_costs_usd,
             "net_pnl_usd": breakdown.net_pnl_usd,
