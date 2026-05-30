@@ -365,6 +365,7 @@ def stage_construct(
     current_positions: list[dict] | None = None,
     pnl_history: list[dict] | None = None,
     adaptive_cap_pct: float = 15.0,
+    hold_ceiling_pct: float = 25.0,
     cooldown_symbols: dict | None = None,
 ) -> dict:
     """One LLM call — Opus 4.7, ~$0.20. Reads signals + view + current
@@ -385,8 +386,13 @@ def stage_construct(
         f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
         f"Recent PnL history (last cycles): {json.dumps(pnl_history, sort_keys=True)}\n"
         f"NAV (USD): {nav:.2f}\n"
-        f"Adaptive per-position cap %: {adaptive_cap_pct:.2f} "
-        f"(reduced from 15.0% when NAV is in drawdown)\n"
+        f"Entry/add cap %: {adaptive_cap_pct:.2f} (max weight to OPEN or ADD to "
+        f"a position; reduced from 15.0% when NAV is in drawdown)\n"
+        f"Hold ceiling %: {hold_ceiling_pct:.2f} (an already-open position that "
+        f"has appreciated may be KEPT up to this; reduced from 25.0% in "
+        f"drawdown). Do NOT trim a winner back to the entry cap just because it "
+        f"drifted above it — only trim weight above the hold ceiling. Never open "
+        f"or add a position above the entry cap.\n"
         f"{_cooldown_prompt_line(cooldown_symbols)}"
         f"Run id: {ctx.run_id}\n"
         "Return JSON conforming to portfolio.schema.json. All positions are "
@@ -1455,12 +1461,17 @@ def run_pipeline(
         model=strat_model,
     )
 
-    # Adaptive position-pct cap from current drawdown — feeds the
-    # constructor prompt as a soft ceiling. Real enforcement is in
-    # sanity (rule: position_within_adaptive_cap).
+    # Two-tier per-position bounds from current drawdown, fed to the
+    # constructor as soft guidance. Real enforcement is in sanity:
+    #   entry/add cap  → rule: entry_cap_on_adds
+    #   hold ceiling   → rule: position_within_adaptive_cap
+    _nav_now = _account_nav(ctx)
+    _peak_now = _peak_nav_30d()
     adaptive_cap = risk.adaptive_position_cap_pct(
-        current_nav=_account_nav(ctx),
-        peak_nav_30d=_peak_nav_30d(),
+        current_nav=_nav_now, peak_nav_30d=_peak_now,
+    )
+    hold_ceiling = risk.adaptive_hold_ceiling_pct(
+        current_nav=_nav_now, peak_nav_30d=_peak_now,
     )
 
     # ----- Stage 3: construct (1 LLM call) -----
@@ -1475,6 +1486,7 @@ def run_pipeline(
             current_positions=current_positions,
             pnl_history=pnl_history,
             adaptive_cap_pct=adaptive_cap,
+            hold_ceiling_pct=hold_ceiling,
             cooldown_symbols=cooldown_symbols,
         ),
         inputs_hash_parts=(
@@ -1512,7 +1524,9 @@ def run_pipeline(
                 f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
                 f"Recent PnL history: {json.dumps(pnl_history, sort_keys=True)}\n"
                 f"NAV (USD): {_account_nav(ctx):.2f}\n"
-                f"Adaptive per-position cap %: {adaptive_cap:.2f}\n"
+                f"Entry/add cap %: {adaptive_cap:.2f} (open/add limit); "
+                f"hold ceiling %: {hold_ceiling:.2f} (a drifted winner may be "
+                f"kept up to this; don't trim back to the entry cap)\n"
                 f"{_cooldown_prompt_line(cooldown_symbols)}"
                 f"Run id: {ctx.run_id}\n"
                 f"Critic rejected your first attempt: {critique.get('critique')}. "
@@ -1553,7 +1567,9 @@ def run_pipeline(
         signals=signals_out,
         nav_usd=_account_nav(ctx),
         adaptive_cap_pct=adaptive_cap,
+        hold_ceiling_pct=hold_ceiling,
         cooldown_symbols=cooldown_symbols,
+        current_positions=current_positions,
     )
     sanity_report["run_id"] = rid
     sanity_report["generated_at"] = state.utcnow_iso()
@@ -1563,17 +1579,38 @@ def run_pipeline(
     sanity_blocked = (
         sanity.block_on_fail_enabled() and sanity_report["status"] == "fail"
     )
+    # The entry/add cap is a HARD risk invariant, NOT an advisory check. It used
+    # to be enforced by the schema's flat 15% `position_pct` maximum; we raised
+    # that to 25 so an already-open winner can be represented at its drifted
+    # weight, which means the schema no longer rejects a fresh 16–25% open. A
+    # failed `entry_cap_on_adds` means the constructor tried to OPEN or ADD above
+    # the entry cap — never submit that, regardless of SANITY_BLOCK_ON_FAIL.
+    entry_cap_breached = any(
+        r["name"] == "entry_cap_on_adds" and r["status"] == "fail"
+        for r in sanity_report["rules"]
+    )
+    sanity_blocked = sanity_blocked or entry_cap_breached
 
     if sanity_blocked:
-        next_run = {
-            "run_id": rid,
-            "next_run_at": _default_next_run_at(portfolio),
-            "rationale": (
+        if entry_cap_breached:
+            block_rationale = (
+                "stage_execute skipped: entry_cap_on_adds failed — the "
+                "constructor opened or added to a position above the entry cap, "
+                "a hard risk invariant enforced independently of "
+                "SANITY_BLOCK_ON_FAIL. Cadence preserved via heuristic so the "
+                "scheduler keeps firing; see sanity.json for offender details."
+            )
+        else:
+            block_rationale = (
                 "stage_execute skipped: SANITY_BLOCK_ON_FAIL=true and sanity "
                 f"report status=fail ({sanity_report['summary']['fail']} rule "
                 "failure(s)). Cadence preserved via heuristic so the scheduler "
                 "keeps firing; see sanity.json for offender details."
-            ),
+            )
+        next_run = {
+            "run_id": rid,
+            "next_run_at": _default_next_run_at(portfolio),
+            "rationale": block_rationale,
             "sanity_block": {
                 "status": sanity_report["status"],
                 "failed_rules": [
@@ -1612,7 +1649,18 @@ def run_pipeline(
     # unfilled targets as current holdings and real prior holdings as orphans,
     # dropping their tailored kill conditions. Preserve the previous state so
     # the next cycle reconciles cleanly once positions can be read again.
-    if not dry_run and not next_run.get("current_portfolio_unreconciled"):
+    #
+    # The same applies when sanity_blocked: stage_execute was skipped entirely,
+    # so the target was never submitted. Publishing it would record an
+    # unexecuted target as a live holding, and advancing the dedup fingerprint
+    # would let the next identical cycle short-circuit against that false state
+    # and never re-attempt construction. Skip publish + dedup on the blocked
+    # path so the next cycle reconstructs from real broker state.
+    if (
+        not dry_run
+        and not sanity_blocked
+        and not next_run.get("current_portfolio_unreconciled")
+    ):
         # Publish only the tradable subset — never record an option-shaped or
         # non-universe position the order layer refused (it was never held).
         state.write_json(state.CURRENT_PORTFOLIO, _publishable_portfolio(portfolio))

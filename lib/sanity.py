@@ -30,12 +30,17 @@ upstream agents didn't endorse) but the upstream signal is now
 
 Rule list (see docstrings on each ``_r_*`` for full rationale):
 
-  - ``per_underlying_pct_cap_20``        (warn)
+  - ``per_underlying_pct_cap_30``        (warn)
   - ``kill_conditions_complete``         (fail)
   - ``position_backed_by_strategist``    (fail) — v2
   - ``construction_rationale_meaningful`` (fail)
   - ``symbol_in_universe``               (fail) — defense-in-depth mirror of
     the hard order-layer universe guard in lib/orders.py
+  - ``position_within_adaptive_cap``     (fail) — hold ceiling (adaptive 25%),
+    the per-position bound (25% hard via schema; the drawdown-tightened
+    value is advisory by default)
+  - ``entry_cap_on_adds``                (fail) — entry/add cap (adaptive 15%);
+    held winners may drift past it, new opens/adds may not
 """
 from __future__ import annotations
 
@@ -68,15 +73,16 @@ def _position_underlying(p: dict) -> str | None:
     return p.get("symbol")
 
 
-def _r_per_underlying_pct_cap_20(portfolio: dict, view: dict | None) -> RuleResult:
-    """Σ position_pct per ticker ≤ 20%.
+def _r_per_underlying_pct_cap_30(portfolio: dict, view: dict | None) -> RuleResult:
+    """Σ position_pct per ticker ≤ 30%.
 
-    The 15%-per-position cap (enforced by portfolio.schema.json) doesn't
-    stop the same ticker appearing twice from concentrating NAV. 20% is a
-    soft warning threshold — not a hard block — so the operator sees
-    outsized single-ticker concentration without it being forbidden.
+    The per-position caps (entry 15%, hold ceiling 25%) don't stop the same
+    ticker appearing twice from concentrating NAV. 30% is a soft warning
+    threshold — not a hard block — chosen to leave headroom above a single
+    25% holding sitting at the hold ceiling while still catching genuine
+    double-loading of one ticker.
     """
-    name = "per_underlying_pct_cap_20"
+    name = "per_underlying_pct_cap_30"
     severity: Severity = "warn"
     positions = portfolio.get("positions") or []
     if not positions:
@@ -89,11 +95,11 @@ def _r_per_underlying_pct_cap_20(portfolio: dict, view: dict | None) -> RuleResu
             continue
         pct_by_underlying[und] = pct_by_underlying.get(und, 0.0) + float(p.get("position_pct") or 0.0)
 
-    breaches = {s: round(v, 2) for s, v in pct_by_underlying.items() if v > 20.0}
+    breaches = {s: round(v, 2) for s, v in pct_by_underlying.items() if v > 30.0}
     if breaches:
         return RuleResult(
             name, severity, severity,
-            detail=f"sum(position_pct) > 20% on: {breaches}",
+            detail=f"sum(position_pct) > 30% on: {breaches}",
             meta={"pct_by_underlying": {s: round(v, 4) for s, v in pct_by_underlying.items()}},
         )
     return RuleResult(
@@ -291,6 +297,7 @@ def _r_position_size_matches_confidence(portfolio: dict, view: dict | None) -> R
         if sym and kind and isinstance(conf, (int, float)):
             confidence_by_key[(sym, kind)] = float(conf)
 
+    held: dict = portfolio.get("_current_positions") or {}
     bad: list[dict] = []
     for p in positions:
         if p.get("kind") != "etf":
@@ -301,6 +308,13 @@ def _r_position_size_matches_confidence(portfolio: dict, view: dict | None) -> R
             continue  # `position_backed_by_strategist` covers this case
         ceiling = round(conf * 15.0, 2)
         pct = float(p.get("position_pct") or 0.0)
+        # A held winner that merely drifted above the confidence-weighted
+        # ceiling isn't a sizing mistake — don't spam the warning. Only flag
+        # when the position is sized above the ceiling AND above what we
+        # already held (i.e. a fresh open / deliberate add was oversized).
+        held_weight = float(held.get(key[0], 0.0) or 0.0)
+        if pct <= held_weight + 0.01:
+            continue
         if pct > ceiling + 0.01:  # tiny float-tolerance
             bad.append({
                 "symbol": key[0], "instrument_kind": key[1],
@@ -319,39 +333,128 @@ def _r_position_size_matches_confidence(portfolio: dict, view: dict | None) -> R
 
 
 def _r_position_within_adaptive_cap(portfolio: dict, view: dict | None) -> RuleResult:
-    """Per-position % cap enforcement against the drawdown-adaptive
-    ceiling computed by risk.adaptive_position_cap_pct.
+    """Per-position % enforcement against the drawdown-adaptive HOLD CEILING
+    computed by risk.adaptive_hold_ceiling_pct.
 
-    Reads ``ctx.adaptive_cap_pct`` injected by run_sanity_checks (via
-    the ``view`` slot is awkward; we hang it on portfolio for now —
-    see run_sanity_checks ``adaptive_cap_pct`` argument). If absent,
-    falls back to the base 15.0 cap so the rule is a no-op when not
-    in drawdown.
+    The upper bound on ANY position's weight, held or new: a winner may drift
+    up to the hold ceiling (25% at peak, tightening toward 12.5% in drawdown)
+    but no further. Opening/adding above the lower *entry* cap is a separate
+    rule (``_r_entry_cap_on_adds``).
+
+    Two enforcement tiers, by design (see CLAUDE.md §System scope):
+      - The 25% BASE ceiling is a HARD bound — ``position.schema.json`` caps
+        ``position_pct`` at 25, so a portfolio above it fails validation on
+        write and the run aborts. This rule is the readable mirror of that.
+      - The DRAWDOWN-TIGHTENED ceiling (down to 12.5%) is ADVISORY by default:
+        it is fed to the constructor as soft guidance and surfaces here as a
+        ``fail`` that only hard-skips execute when ``SANITY_BLOCK_ON_FAIL`` is
+        set. A held winner that drifted above the tightened ceiling is not
+        force-trimmed on the default path — the 25% schema cap, the 25%
+        per-position loss-kill, and the 8% daily circuit breaker remain the
+        hard backstops. (Unlike ``entry_cap_on_adds``, this rule is NOT
+        promoted to an unconditional block.)
+
+    Reads ``_adaptive_hold_ceiling_pct`` injected by run_sanity_checks. If
+    absent, falls back to the base 25.0 ceiling so the rule still bounds
+    concentration when the ceiling wasn't supplied.
     """
     name = "position_within_adaptive_cap"
     severity: Severity = "fail"
     positions = portfolio.get("positions") or []
     if not positions:
         return RuleResult(name, severity, "skip", "all-cash portfolio")
-    cap = float(portfolio.get("_adaptive_cap_pct", 15.0))
-    if cap >= 15.0:
-        return RuleResult(name, severity, "skip", "no drawdown — base cap applies")
+    ceiling = float(portfolio.get("_adaptive_hold_ceiling_pct", 25.0))
     bad = [
         {"sym": p.get("symbol") or p.get("underlying"), "position_pct": p.get("position_pct"),
-         "adaptive_cap_pct": cap}
+         "hold_ceiling_pct": ceiling}
         for p in positions
-        if float(p.get("position_pct") or 0.0) > cap + 0.01
+        if float(p.get("position_pct") or 0.0) > ceiling + 0.01
     ]
     if bad:
         return RuleResult(
             name, severity, severity,
             detail=(
-                f"NAV in drawdown; per-position cap reduced to "
-                f"{cap:.2f}% but {len(bad)} position(s) exceed it"
+                f"{len(bad)} position(s) exceed the hold ceiling "
+                f"{ceiling:.2f}% (the absolute per-position bound)"
             ),
-            meta={"offenders": bad, "adaptive_cap_pct": cap},
+            meta={"offenders": bad, "hold_ceiling_pct": ceiling},
         )
-    return RuleResult(name, severity, "pass", meta={"adaptive_cap_pct": cap})
+    return RuleResult(name, severity, "pass", meta={"hold_ceiling_pct": ceiling})
+
+
+def _r_entry_cap_on_adds(portfolio: dict, view: dict | None) -> RuleResult:
+    """The 15% entry/add cap, enforced deterministically.
+
+    A position may sit above the (drawdown-adaptive) entry cap ONLY as drift
+    of an already-open holding — i.e. it appreciated there, we didn't buy it
+    there. So a position is an offender when BOTH:
+
+      - ``position_pct`` exceeds the adaptive entry cap (15% at peak,
+        tightening in drawdown), AND
+      - it exceeds the weight we already held coming into this cycle
+        (a fresh open, or an *add* that pushes weight past the entry cap).
+
+    A held winner that drifted above the entry cap but is being kept at/below
+    its current weight is allowed (it's the hold-ceiling rule's job to bound
+    that). ``_current_positions`` is an injected ``{symbol: held_weight_pct}``
+    map; a symbol absent from it is treated as a fresh open (held_weight 0).
+
+    Drift is detected by BOTH weight and SHARES. The order layer
+    (``diff_portfolio``) buys/sells by ``shares``, not ``position_pct``, and the
+    schema doesn't tie the two together — so a held winner left at the same
+    ``position_pct`` while its ``shares`` increase is an *add* (a buy above the
+    entry cap) that a weight-only check would miss. ``_current_position_shares``
+    is an injected ``{symbol: held_shares}`` map; when present, an increase in
+    target shares over held shares (while over the entry cap) also fails.
+    """
+    name = "entry_cap_on_adds"
+    severity: Severity = "fail"
+    positions = portfolio.get("positions") or []
+    if not positions:
+        return RuleResult(name, severity, "skip", "all-cash portfolio")
+    entry_cap = float(portfolio.get("_adaptive_cap_pct", 15.0))
+    held: dict = portfolio.get("_current_positions") or {}
+    held_shares: dict = portfolio.get("_current_position_shares") or {}
+    tol = 0.01
+    bad: list[dict] = []
+    for p in positions:
+        sym = p.get("symbol") or p.get("underlying")
+        pct = float(p.get("position_pct") or 0.0)
+        held_weight = float(held.get(sym, 0.0) or 0.0)
+        # Within the entry cap → always fine.
+        if pct <= entry_cap + tol:
+            continue
+        # Above the entry cap — only allowed as pure drift of an existing
+        # holding: neither the weight nor the share count may increase.
+        weight_increased = pct > held_weight + tol
+        shares_increased = False
+        if sym in held_shares and p.get("shares") is not None:
+            shares_increased = float(p.get("shares")) > float(held_shares[sym]) + tol
+        if not weight_increased and not shares_increased:
+            continue
+        bad.append({
+            "sym": sym, "position_pct": pct,
+            "entry_cap_pct": entry_cap, "held_weight_pct": held_weight,
+            "issue": (
+                "opened/added above the entry cap"
+                if held_weight <= tol else
+                "added beyond the entry cap "
+                + ("(share count increased past held drift)"
+                   if shares_increased and not weight_increased
+                   else "(weight increased past held drift)")
+            ),
+        })
+    if bad:
+        return RuleResult(
+            name, severity, severity,
+            detail=(
+                f"{len(bad)} position(s) opened or added above the entry cap "
+                f"{entry_cap:.2f}% (held winners may drift past it, but new "
+                f"entries/adds may not)"
+            ),
+            meta={"offenders": bad, "entry_cap_pct": entry_cap},
+        )
+    return RuleResult(name, severity, "pass", meta={"entry_cap_pct": entry_cap})
 
 
 def _r_position_notional_above_floor(portfolio: dict, view: dict | None) -> RuleResult:
@@ -528,7 +631,8 @@ RULES: list[Callable[[dict, dict | None], RuleResult]] = [
     _r_kill_conditions_complete,
     _r_position_backed_by_strategist,
     _r_position_within_adaptive_cap,
-    _r_per_underlying_pct_cap_20,
+    _r_entry_cap_on_adds,
+    _r_per_underlying_pct_cap_30,
     _r_position_size_matches_confidence,
     _r_position_notional_above_floor,
     _r_position_adv_liquidity,
@@ -543,7 +647,9 @@ def run_sanity_checks(
     signals: dict | None = None,
     nav_usd: float | None = None,
     adaptive_cap_pct: float | None = None,
+    hold_ceiling_pct: float | None = None,
     cooldown_symbols: dict | None = None,
+    current_positions: list[dict] | None = None,
 ) -> dict:
     """Run all registered rules. Return a sanity-report dict ready to
     write to ``sanity.json`` (run_id + generated_at are filled in by
@@ -552,21 +658,53 @@ def run_sanity_checks(
     Overall status is the worst per-rule status seen. Skips don't
     degrade the overall status.
 
-    The keyword args (signals, nav_usd, adaptive_cap_pct,
-    cooldown_symbols) are injected into the portfolio dict on
-    under-prefixed keys so the rule functions can access them without
+    The keyword args (signals, nav_usd, adaptive_cap_pct, hold_ceiling_pct,
+    cooldown_symbols, current_positions) are injected into the portfolio dict
+    on under-prefixed keys so the rule functions can access them without
     changing the (portfolio, view) signature. ``cooldown_symbols`` is a
     ``{symbol: last_exit_iso}`` map of recently fully-exited symbols (see
     ``trades.symbols_in_cooldown``) consumed by ``_r_reentry_cooldown``.
-    ``portfolio`` itself is NOT mutated — we operate on a shallow copy.
+    ``adaptive_cap_pct`` is the entry/add cap and ``hold_ceiling_pct`` the
+    drift ceiling (both drawdown-adaptive); ``current_positions`` is the
+    broker-position summary list (rows carry ``symbol`` + ``position_pct`` or
+    ``market_value``) used to tell drift of a held winner apart from a fresh
+    open. ``portfolio`` itself is NOT mutated — we operate on a shallow copy.
     """
     enriched = dict(portfolio)
     if nav_usd is not None:
         enriched["_nav_usd"] = nav_usd
     if adaptive_cap_pct is not None:
         enriched["_adaptive_cap_pct"] = adaptive_cap_pct
+    if hold_ceiling_pct is not None:
+        enriched["_adaptive_hold_ceiling_pct"] = hold_ceiling_pct
     if cooldown_symbols is not None:
         enriched["_cooldown_symbols"] = cooldown_symbols
+    if current_positions is not None:
+        # Build a {symbol: held_weight_pct} map so the entry-cap and
+        # confidence rules can tell drift of an existing holding apart from a
+        # fresh open/add. Prefer an explicit ``position_pct`` on the row;
+        # otherwise derive weight from market_value / NAV when NAV is known.
+        held_weights: dict[str, float] = {}
+        held_shares: dict[str, float] = {}
+        for row in current_positions:
+            sym = row.get("symbol")
+            if not sym:
+                continue
+            pct = row.get("position_pct")
+            if pct is None and nav_usd:
+                mv = row.get("market_value")
+                if mv is not None and float(nav_usd) > 0:
+                    pct = abs(float(mv)) / float(nav_usd) * 100.0
+            if pct is not None:
+                held_weights[sym] = float(pct)
+            # Share count drives the order layer (diff_portfolio), so the
+            # entry-cap rule also compares shares to catch an add that leaves
+            # position_pct unchanged. Rows use `qty` (broker) or `shares`.
+            qty = row.get("shares", row.get("qty"))
+            if qty is not None:
+                held_shares[sym] = abs(float(qty))
+        enriched["_current_positions"] = held_weights
+        enriched["_current_position_shares"] = held_shares
     if signals is not None:
         # adv_30d expressed in dollars (volume × last_close). The rule
         # consumes ADV-in-dollars so it compares directly to position

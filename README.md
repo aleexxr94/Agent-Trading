@@ -174,13 +174,14 @@ Adversarial second-pair-of-eyes pass. Reads `view.json` + `portfolio.json`, retu
 ### 4. Sanity — deterministic Python, $0
 Post-construct rules (see [`lib/sanity.py`](./lib/sanity.py)). Each rule has a fixed severity (`warn` or `fail`); the overall sanity status is the worst per-rule status. Non-blocking by default — `SANITY_BLOCK_ON_FAIL=true` escalates `fail` into a hard skip of `stage_execute`.
 
-Rules (9 total):
+Rules (10 total):
 - `construction_rationale_meaningful` — ≥ 80 chars
 - `kill_conditions_complete` — max_loss_pct ∈ (0,100] + at least one price/time stop
 - `position_backed_by_strategist` — every position's symbol is endorsed at confidence ≥ 0.5 in `view.json`
-- `position_within_adaptive_cap` — position_pct ≤ drawdown-adaptive cap (15% at-peak, 7.5% at ≥10% drawdown, linear between)
-- `per_underlying_pct_cap_20` — Σ position_pct per ticker ≤ 20%
-- `position_size_matches_confidence` — position_pct ≤ strategist confidence × 15
+- `position_within_adaptive_cap` — position_pct ≤ the drawdown-adaptive **hold ceiling** (25% at-peak, 12.5% at ≥10% drawdown, linear between). The 25% base is a hard bound (the schema rejects any position above 25%); the drawdown-tightened value is advisory by default (constructor-guided + non-blocking unless `SANITY_BLOCK_ON_FAIL`), so a held winner is not force-trimmed mid-drawdown — the 25% loss-kill and 8% daily breaker remain the hard backstops
+- `entry_cap_on_adds` — a position above the drawdown-adaptive **entry cap** (15% at-peak, 7.5% at ≥10% drawdown) is allowed only as drift of an existing holding; opening or adding above the entry cap fails. (Entry-cap discipline + hold-ceiling drift = winners may run without being force-trimmed back to entry weight every cycle.)
+- `per_underlying_pct_cap_30` — Σ position_pct per ticker ≤ 30%
+- `position_size_matches_confidence` — position_pct ≤ strategist confidence × 15 (skipped for a held winner that merely drifted above the ceiling)
 - `position_notional_above_floor` — position notional ≥ $50 (spread + fees dominate below this on a $2,500 account)
 - `position_adv_liquidity` — position notional ≤ 1% of ticker's 30-day dollar ADV
 - `reentry_cooldown` — a symbol fully exited within the last 7 days isn't re-entered unless the strategist confidence clears the override threshold (≥ 0.8); pairs with the 30%-gain harvest rule to stop churn-and-re-buy

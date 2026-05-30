@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 import orchestrator
-from lib import state
+from lib import sanity, state
 
 
 # Expected artifact set written by a v2 dry-run cycle. market_gate.json
@@ -95,8 +95,9 @@ def test_dry_run_writes_sanity_json_with_known_status(tmp_state):
     # Rule list mirrors lib/sanity.RULES — pin the count. The two
     # option-specific rules (straddle_requires_low_iv, option_premium_above_floor)
     # were removed with options; the ETF safety hardening added
-    # symbol_in_universe, bringing the total to 10.
-    assert len(sanity_doc["rules"]) == 10
+    # symbol_in_universe (→10), and the entry-cap/hold-ceiling split added
+    # entry_cap_on_adds, bringing the total to 11.
+    assert len(sanity_doc["rules"]) == 11
 
 
 def test_sanity_pass_path_writes_summary_into_next_run(tmp_state, monkeypatch):
@@ -112,6 +113,40 @@ def test_sanity_pass_path_writes_summary_into_next_run(tmp_state, monkeypatch):
     assert next_run["sanity"]["status"] in ("pass", "warn", "fail")
     assert set(next_run["sanity"]["summary"].keys()) == {"pass", "warn", "fail", "skip"}
     assert "sanity_block" not in next_run
+
+
+def test_entry_cap_breach_hard_blocks_execute_even_without_block_on_fail(
+    tmp_state, monkeypatch
+):
+    """A failed `entry_cap_on_adds` must skip stage_execute regardless of
+    SANITY_BLOCK_ON_FAIL. The 15% entry cap is a hard risk invariant — it used
+    to be enforced by the schema's flat 15% `position_pct` maximum, which we
+    raised to 25 so held winners can drift. Without this hard block, a fresh
+    16–25% open would pass the schema and execute on the default (non-blocking)
+    sanity path.
+    """
+    monkeypatch.delenv("SANITY_BLOCK_ON_FAIL", raising=False)
+    real = sanity.run_sanity_checks
+
+    def forced_entry_cap_fail(*args, **kwargs):
+        report = real(*args, **kwargs)
+        for r in report["rules"]:
+            if r["name"] == "entry_cap_on_adds":
+                r["status"] = "fail"
+                r["detail"] = "forced for test: fresh open above entry cap"
+        report["status"] = "fail"
+        report["summary"]["fail"] = report["summary"].get("fail", 0) + 1
+        return report
+
+    monkeypatch.setattr(orchestrator.sanity, "run_sanity_checks", forced_entry_cap_fail)
+    result = orchestrator.run_pipeline(dry_run=True)
+    rid = result["run_id"]
+    next_run = json.loads((state.RUNS_DIR / rid / "next_run.json").read_text())
+    # Execute was skipped → block metadata present, post-execute rollup absent.
+    assert "sanity_block" in next_run
+    assert "entry_cap_on_adds" in next_run["sanity_block"]["failed_rules"]
+    assert "entry cap" in next_run["rationale"]
+    assert "sanity" not in next_run
 
 
 def test_halt_flag_blocks_pipeline_start(tmp_state):

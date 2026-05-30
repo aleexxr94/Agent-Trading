@@ -13,7 +13,8 @@
                          "description": "Magnitude of the ETF's daily leverage (e.g. 3 for TQQQ/SQQQ, 2 for ERX, 1.5 for UVXY, 1 for BITI). Direction (bull vs inverse) is a property of the ticker, not this field."},
     "entry_thesis": {"type": "string", "minLength": 1},
     "kill_conditions": {"$ref": "#/$defs/killConditions"},
-    "position_pct": {"type": "number", "minimum": 0, "maximum": 15}
+    "position_pct": {"type": "number", "minimum": 0, "maximum": 25,
+                       "description": "Position notional as % of NAV. New entries/adds are capped at 15% (the entry cap, enforced in sanity); an already-open position may drift up to 25% (the hold ceiling) before a forced trim. Both tighten in drawdown."}
   },
   "required": ["kind", "symbol", "shares", "avg_cost", "leverage_factor",
                "entry_thesis", "kill_conditions", "position_pct"],

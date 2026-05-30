@@ -84,16 +84,24 @@ def _view_for(symbols_confidences: dict[str, float]) -> dict:
 # ---- per-underlying concentration ----
 
 
-def test_per_underlying_warn_fires_above_20():
-    # Two TQQQ legs at 13% + 14% = 27% on one ticker.
+def test_per_underlying_warn_fires_above_30():
+    # Two TQQQ legs at 16% + 16% = 32% on one ticker.
     p = _portfolio([
-        _etf("TQQQ", position_pct=13.0),
-        _etf("TQQQ", position_pct=14.0),
+        _etf("TQQQ", position_pct=16.0),
+        _etf("TQQQ", position_pct=16.0),
     ])
-    r = sanity._r_per_underlying_pct_cap_20(p, None)
+    r = sanity._r_per_underlying_pct_cap_30(p, None)
     assert r.status == "warn"
     assert r.severity == "warn"
     assert "TQQQ" in r.detail
+
+
+def test_per_underlying_passes_single_holding_at_hold_ceiling():
+    """A single ticker sitting at the 25% hold ceiling is within the 30%
+    per-underlying threshold → no warn."""
+    p = _portfolio([_etf("TQQQ", position_pct=25.0)])
+    r = sanity._r_per_underlying_pct_cap_30(p, None)
+    assert r.status == "pass"
 
 
 def test_per_underlying_passes_when_split_across_tickers():
@@ -101,13 +109,13 @@ def test_per_underlying_passes_when_split_across_tickers():
         _etf("TQQQ", position_pct=14.0),
         _etf("SOXL", position_pct=14.0),
     ])
-    r = sanity._r_per_underlying_pct_cap_20(p, None)
+    r = sanity._r_per_underlying_pct_cap_30(p, None)
     assert r.status == "pass"
 
 
 def test_per_underlying_skips_on_all_cash():
     p = _portfolio([])
-    r = sanity._r_per_underlying_pct_cap_20(p, None)
+    r = sanity._r_per_underlying_pct_cap_30(p, None)
     assert r.status == "skip"
 
 
@@ -200,14 +208,13 @@ def test_rationale_pass_at_threshold():
 
 def test_overall_status_is_worst_per_rule():
     # SOXL has incomplete kill_conditions → kill_conditions_complete fails;
-    # two TQQQ legs at 13%+14% → per-underlying warn. Strategist endorses
-    # both; rationale long → meaningful passes. Worst status = fail.
+    # TQQQ sized at 12% on 0.6 confidence (ceiling 9%) → size-vs-confidence
+    # warn. Both within the 15% entry cap. Worst status = fail.
     p = _portfolio([
-        _etf("TQQQ", position_pct=13.0),
-        _etf("TQQQ", position_pct=14.0),
+        _etf("TQQQ", position_pct=12.0),
         _etf("SOXL", position_pct=10.0, kill_conditions={"max_loss_pct": 25.0}),
     ])
-    v = _view_for({"TQQQ": 0.95, "SOXL": 0.95})
+    v = _view_for({"TQQQ": 0.6, "SOXL": 0.95})
     report = sanity.run_sanity_checks(p, v)
     assert report["status"] == "fail"
     assert report["summary"]["fail"] >= 1
@@ -215,12 +222,10 @@ def test_overall_status_is_worst_per_rule():
 
 
 def test_overall_status_warn_when_no_fails():
-    # Single warn (per-underlying 27% on TQQQ), everything else passes.
-    p = _portfolio([
-        _etf("TQQQ", position_pct=13.0),
-        _etf("TQQQ", position_pct=14.0),
-    ])
-    v = _view_for({"TQQQ": 0.95})  # high enough that size-vs-confidence passes
+    # Single warn: TQQQ at 12% with 0.6 confidence (ceiling 9%) trips
+    # size-vs-confidence; within the 15% entry cap so nothing fails.
+    p = _portfolio([_etf("TQQQ", position_pct=12.0)])
+    v = _view_for({"TQQQ": 0.6})
     report = sanity.run_sanity_checks(p, v)
     assert report["status"] == "warn"
 
@@ -285,28 +290,124 @@ def test_size_matches_confidence_passes_when_sized_under_ceiling():
     assert r.status == "pass"
 
 
-# ---- v2 winrate rules: adaptive cap ----
+def test_size_matches_confidence_skips_held_winner_that_drifted():
+    """A held winner that merely drifted above the confidence ceiling isn't a
+    sizing mistake — don't warn (it would just spam Agent Logs)."""
+    p = _portfolio([_etf("TQQQ", position_pct=20.0)])
+    p["_current_positions"] = {"TQQQ": 20.0}  # we already held it here
+    v = _view_for({"TQQQ": 0.6})  # ceiling = 9%, but it drifted to 20%
+    r = sanity._r_position_size_matches_confidence(p, v)
+    assert r.status == "pass"
 
 
-def test_adaptive_cap_skips_when_no_drawdown():
-    p = _portfolio([_etf("TQQQ", position_pct=14.0)])
-    p["_adaptive_cap_pct"] = 15.0
+# ---- per-position bounds: hold ceiling (position_within_adaptive_cap) ----
+
+
+def test_hold_ceiling_passes_within_base_ceiling():
+    """A held winner drifted to 23% is within the 25% hold ceiling → pass."""
+    p = _portfolio([_etf("TQQQ", position_pct=23.0)])
+    p["_adaptive_hold_ceiling_pct"] = 25.0
     r = sanity._r_position_within_adaptive_cap(p, None)
-    assert r.status == "skip"
+    assert r.status == "pass"
 
 
-def test_adaptive_cap_fails_when_position_exceeds_dd_cap():
-    """In drawdown the cap is 7.5%; a 12% position should fail."""
-    p = _portfolio([_etf("TQQQ", position_pct=12.0)])
-    p["_adaptive_cap_pct"] = 7.5
+def test_hold_ceiling_fails_above_base_ceiling():
+    """No position may exceed the hold ceiling, even a drifted winner."""
+    p = _portfolio([_etf("TQQQ", position_pct=25.5)])
+    p["_adaptive_hold_ceiling_pct"] = 25.0
+    r = sanity._r_position_within_adaptive_cap(p, None)
+    assert r.status == "fail"
+    assert r.meta["offenders"][0]["sym"] == "TQQQ"
+
+
+def test_hold_ceiling_tightens_in_drawdown():
+    """In ≥10% drawdown the hold ceiling halves to 12.5%; a 13% held position
+    must be trimmed back under it."""
+    p = _portfolio([_etf("TQQQ", position_pct=13.0)])
+    p["_adaptive_hold_ceiling_pct"] = 12.5
     r = sanity._r_position_within_adaptive_cap(p, None)
     assert r.status == "fail"
 
 
-def test_adaptive_cap_passes_when_position_within_dd_cap():
-    p = _portfolio([_etf("TQQQ", position_pct=7.0)])
-    p["_adaptive_cap_pct"] = 7.5
+def test_hold_ceiling_defaults_to_25_when_unset():
+    """Absent the injected ceiling, the rule still bounds at the base 25%."""
+    p = _portfolio([_etf("TQQQ", position_pct=24.0)])
     r = sanity._r_position_within_adaptive_cap(p, None)
+    assert r.status == "pass"
+    p2 = _portfolio([_etf("TQQQ", position_pct=26.0)])
+    assert sanity._r_position_within_adaptive_cap(p2, None).status == "fail"
+
+
+# ---- per-position bounds: entry cap on opens/adds ----
+
+
+def test_entry_cap_passes_when_all_within_entry_cap():
+    p = _portfolio([_etf("TQQQ", position_pct=14.0)])
+    p["_adaptive_cap_pct"] = 15.0
+    r = sanity._r_entry_cap_on_adds(p, None)
+    assert r.status == "pass"
+
+
+def test_entry_cap_fails_on_fresh_open_above_cap():
+    """A brand-new position (not in _current_positions) sized at 18% > 15%
+    entry cap is an over-cap open → fail."""
+    p = _portfolio([_etf("TQQQ", position_pct=18.0)])
+    p["_adaptive_cap_pct"] = 15.0
+    p["_current_positions"] = {}  # nothing held → fresh open
+    r = sanity._r_entry_cap_on_adds(p, None)
+    assert r.status == "fail"
+    assert r.meta["offenders"][0]["sym"] == "TQQQ"
+
+
+def test_entry_cap_allows_drift_of_held_winner():
+    """A position held at 20% that we keep at 20% is allowed drift — the
+    entry-cap rule doesn't fire (the hold-ceiling rule bounds it instead)."""
+    p = _portfolio([_etf("TQQQ", position_pct=20.0)])
+    p["_adaptive_cap_pct"] = 15.0
+    p["_current_positions"] = {"TQQQ": 20.0}
+    r = sanity._r_entry_cap_on_adds(p, None)
+    assert r.status == "pass"
+
+
+def test_entry_cap_fails_on_add_beyond_held_drift():
+    """Held at 12% but the target bumps it to 17% (an ADD) above the 15%
+    entry cap → fail: you may not add past the entry cap."""
+    p = _portfolio([_etf("TQQQ", position_pct=17.0)])
+    p["_adaptive_cap_pct"] = 15.0
+    p["_current_positions"] = {"TQQQ": 12.0}
+    r = sanity._r_entry_cap_on_adds(p, None)
+    assert r.status == "fail"
+
+
+def test_entry_cap_tightens_in_drawdown():
+    """In drawdown the entry cap is 7.5%; a fresh 10% open fails."""
+    p = _portfolio([_etf("TQQQ", position_pct=10.0)])
+    p["_adaptive_cap_pct"] = 7.5
+    p["_current_positions"] = {}
+    r = sanity._r_entry_cap_on_adds(p, None)
+    assert r.status == "fail"
+
+
+def test_entry_cap_detects_add_via_shares_when_weight_unchanged():
+    """diff_portfolio trades by shares, not position_pct. A held winner left at
+    20% weight whose share count increases is an add above the entry cap that a
+    weight-only check would miss → fail."""
+    p = _portfolio([_etf("TQQQ", position_pct=20.0, shares=15)])
+    p["_adaptive_cap_pct"] = 15.0
+    p["_current_positions"] = {"TQQQ": 20.0}      # same weight as held
+    p["_current_position_shares"] = {"TQQQ": 10}  # but fewer shares held → it's a buy
+    r = sanity._r_entry_cap_on_adds(p, None)
+    assert r.status == "fail"
+    assert "share count" in r.meta["offenders"][0]["issue"]
+
+
+def test_entry_cap_allows_pure_drift_when_shares_unchanged():
+    """Same weight AND same shares as held = genuine drift → pass."""
+    p = _portfolio([_etf("TQQQ", position_pct=20.0, shares=10)])
+    p["_adaptive_cap_pct"] = 15.0
+    p["_current_positions"] = {"TQQQ": 20.0}
+    p["_current_position_shares"] = {"TQQQ": 10}
+    r = sanity._r_entry_cap_on_adds(p, None)
     assert r.status == "pass"
 
 
@@ -361,8 +462,8 @@ def test_adv_liquidity_skips_when_no_signals():
 
 
 def test_run_sanity_checks_injects_extra_context_into_rules():
-    """nav_usd + adaptive_cap_pct + signals → flow through to the rules
-    that consume them."""
+    """nav_usd + adaptive_cap_pct + hold_ceiling_pct + current_positions +
+    signals → flow through to the rules that consume them."""
     p = _portfolio([_etf("TQQQ", position_pct=12.0)])
     v = _view_for({"TQQQ": 0.7})
     signals = {"tickers": [{"symbol": "TQQQ", "adv_30d": 1_000_000, "last_close": 70.0}]}
@@ -371,12 +472,33 @@ def test_run_sanity_checks_injects_extra_context_into_rules():
         signals=signals,
         nav_usd=2500.0,
         adaptive_cap_pct=7.5,
+        hold_ceiling_pct=12.5,
+        current_positions=[],  # nothing held → TQQQ at 12% is a fresh open
     )
-    # adaptive_cap rule should fail (12% > 7.5%); notional rule should
-    # pass (12% × $2500 = $300 > $50).
     rules_by_name = {r["name"]: r for r in report["rules"]}
-    assert rules_by_name["position_within_adaptive_cap"]["status"] == "fail"
+    # entry-cap rule fails (fresh 12% open > 7.5% drawdown entry cap)...
+    assert rules_by_name["entry_cap_on_adds"]["status"] == "fail"
+    # ...and the hold-ceiling rule passes (12% < 12.5% drawdown hold ceiling).
+    assert rules_by_name["position_within_adaptive_cap"]["status"] == "pass"
+    # notional rule passes (12% × $2500 = $300 > $50).
     assert rules_by_name["position_notional_above_floor"]["status"] == "pass"
+
+
+def test_run_sanity_checks_allows_held_winner_drift():
+    """A held winner that drifted to 20% passes both per-position rules when
+    current_positions reports it was already held there."""
+    p = _portfolio([_etf("TQQQ", position_pct=20.0)])
+    v = _view_for({"TQQQ": 0.7})
+    report = sanity.run_sanity_checks(
+        p, v,
+        nav_usd=2500.0,
+        adaptive_cap_pct=15.0,
+        hold_ceiling_pct=25.0,
+        current_positions=[{"symbol": "TQQQ", "market_value": 500.0}],  # 20% of 2500
+    )
+    rules_by_name = {r["name"]: r for r in report["rules"]}
+    assert rules_by_name["entry_cap_on_adds"]["status"] == "pass"
+    assert rules_by_name["position_within_adaptive_cap"]["status"] == "pass"
 
 
 # ---- reentry cooldown ----

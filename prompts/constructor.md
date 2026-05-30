@@ -30,7 +30,15 @@ the goal. The standard is:
 
 - **1–12 positions**, OR `all_cash: true` with a non-empty
   `all_cash_rationale` and zero positions.
-- Per-position `position_pct` ≤ 15.0.
+- **Entry/add cap = 15.0% NAV.** Never *open* a new position, or *add* to an
+  existing one, above 15% (lower when the prompt says NAV is in drawdown). This
+  is the deliberate-risk gate.
+- **Hold ceiling = 25.0% NAV.** A position you *already hold* that has
+  appreciated past the entry cap may be **kept** up to 25% (lower in drawdown)
+  — do not trim it back to 15% merely because it drifted above the entry cap.
+  Only the weight *above the hold ceiling* must be trimmed. The schema permits
+  `position_pct` up to 25; the entry-cap-on-adds rule enforces the 15% open/add
+  discipline.
 - Sum of `position_pct` ≤ 100. Cash buffer is the residual.
 - Every position is `kind: "etf"` with a `symbol` from the universe,
   integer `shares`, `avg_cost`, `leverage_factor` (the ETF's leverage
@@ -96,7 +104,11 @@ and choose one of:
   > 0.75** AND the original entry thesis is still intact — a
   high-conviction, intact-thesis winner does not need to be sold or
   trimmed just because it crossed +30%. Banking a compounding winner
-  early is itself a cost.
+  early is itself a cost. A winner that has drifted above the 15% entry
+  cap may be carried at its current weight up to the **25% hold ceiling**
+  — set `position_pct` to its actual drifted weight (don't shave it back
+  to 15%). Only weight *above* the hold ceiling must be trimmed off. The
+  hold ceiling is a bound, not a target.
 
 Always document the harvest decision (full / partial / hold) and the
 reasoning in `construction_rationale` (e.g. "trimmed SOXL from 12%→6%
