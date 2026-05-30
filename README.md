@@ -178,7 +178,7 @@ Rules (10 total):
 - `construction_rationale_meaningful` — ≥ 80 chars
 - `kill_conditions_complete` — max_loss_pct ∈ (0,100] + at least one price/time stop
 - `position_backed_by_strategist` — every position's symbol is endorsed at confidence ≥ 0.5 in `view.json`
-- `position_within_adaptive_cap` — position_pct ≤ the drawdown-adaptive **hold ceiling** (25% at-peak, 12.5% at ≥10% drawdown, linear between); the absolute per-position bound
+- `position_within_adaptive_cap` — position_pct ≤ the drawdown-adaptive **hold ceiling** (25% at-peak, 12.5% at ≥10% drawdown, linear between). The 25% base is a hard bound (the schema rejects any position above 25%); the drawdown-tightened value is advisory by default (constructor-guided + non-blocking unless `SANITY_BLOCK_ON_FAIL`), so a held winner is not force-trimmed mid-drawdown — the 25% loss-kill and 8% daily breaker remain the hard backstops
 - `entry_cap_on_adds` — a position above the drawdown-adaptive **entry cap** (15% at-peak, 7.5% at ≥10% drawdown) is allowed only as drift of an existing holding; opening or adding above the entry cap fails. (Entry-cap discipline + hold-ceiling drift = winners may run without being force-trimmed back to entry weight every cycle.)
 - `per_underlying_pct_cap_30` — Σ position_pct per ticker ≤ 30%
 - `position_size_matches_confidence` — position_pct ≤ strategist confidence × 15 (skipped for a held winner that merely drifted above the ceiling)
