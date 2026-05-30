@@ -1649,7 +1649,18 @@ def run_pipeline(
     # unfilled targets as current holdings and real prior holdings as orphans,
     # dropping their tailored kill conditions. Preserve the previous state so
     # the next cycle reconciles cleanly once positions can be read again.
-    if not dry_run and not next_run.get("current_portfolio_unreconciled"):
+    #
+    # The same applies when sanity_blocked: stage_execute was skipped entirely,
+    # so the target was never submitted. Publishing it would record an
+    # unexecuted target as a live holding, and advancing the dedup fingerprint
+    # would let the next identical cycle short-circuit against that false state
+    # and never re-attempt construction. Skip publish + dedup on the blocked
+    # path so the next cycle reconstructs from real broker state.
+    if (
+        not dry_run
+        and not sanity_blocked
+        and not next_run.get("current_portfolio_unreconciled")
+    ):
         # Publish only the tradable subset — never record an option-shaped or
         # non-universe position the order layer refused (it was never held).
         state.write_json(state.CURRENT_PORTFOLIO, _publishable_portfolio(portfolio))

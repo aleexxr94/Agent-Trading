@@ -388,6 +388,29 @@ def test_entry_cap_tightens_in_drawdown():
     assert r.status == "fail"
 
 
+def test_entry_cap_detects_add_via_shares_when_weight_unchanged():
+    """diff_portfolio trades by shares, not position_pct. A held winner left at
+    20% weight whose share count increases is an add above the entry cap that a
+    weight-only check would miss → fail."""
+    p = _portfolio([_etf("TQQQ", position_pct=20.0, shares=15)])
+    p["_adaptive_cap_pct"] = 15.0
+    p["_current_positions"] = {"TQQQ": 20.0}      # same weight as held
+    p["_current_position_shares"] = {"TQQQ": 10}  # but fewer shares held → it's a buy
+    r = sanity._r_entry_cap_on_adds(p, None)
+    assert r.status == "fail"
+    assert "share count" in r.meta["offenders"][0]["issue"]
+
+
+def test_entry_cap_allows_pure_drift_when_shares_unchanged():
+    """Same weight AND same shares as held = genuine drift → pass."""
+    p = _portfolio([_etf("TQQQ", position_pct=20.0, shares=10)])
+    p["_adaptive_cap_pct"] = 15.0
+    p["_current_positions"] = {"TQQQ": 20.0}
+    p["_current_position_shares"] = {"TQQQ": 10}
+    r = sanity._r_entry_cap_on_adds(p, None)
+    assert r.status == "pass"
+
+
 # ---- v2 winrate rules: notional floor ----
 
 

@@ -654,6 +654,7 @@ def run_sanity_checks(
         # fresh open/add. Prefer an explicit ``position_pct`` on the row;
         # otherwise derive weight from market_value / NAV when NAV is known.
         held_weights: dict[str, float] = {}
+        held_shares: dict[str, float] = {}
         for row in current_positions:
             sym = row.get("symbol")
             if not sym:
@@ -665,7 +666,14 @@ def run_sanity_checks(
                     pct = abs(float(mv)) / float(nav_usd) * 100.0
             if pct is not None:
                 held_weights[sym] = float(pct)
+            # Share count drives the order layer (diff_portfolio), so the
+            # entry-cap rule also compares shares to catch an add that leaves
+            # position_pct unchanged. Rows use `qty` (broker) or `shares`.
+            qty = row.get("shares", row.get("qty"))
+            if qty is not None:
+                held_shares[sym] = abs(float(qty))
         enriched["_current_positions"] = held_weights
+        enriched["_current_position_shares"] = held_shares
     if signals is not None:
         # adv_30d expressed in dollars (volume × last_close). The rule
         # consumes ADV-in-dollars so it compares directly to position
