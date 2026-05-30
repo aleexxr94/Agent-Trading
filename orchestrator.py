@@ -1579,17 +1579,38 @@ def run_pipeline(
     sanity_blocked = (
         sanity.block_on_fail_enabled() and sanity_report["status"] == "fail"
     )
+    # The entry/add cap is a HARD risk invariant, NOT an advisory check. It used
+    # to be enforced by the schema's flat 15% `position_pct` maximum; we raised
+    # that to 25 so an already-open winner can be represented at its drifted
+    # weight, which means the schema no longer rejects a fresh 16–25% open. A
+    # failed `entry_cap_on_adds` means the constructor tried to OPEN or ADD above
+    # the entry cap — never submit that, regardless of SANITY_BLOCK_ON_FAIL.
+    entry_cap_breached = any(
+        r["name"] == "entry_cap_on_adds" and r["status"] == "fail"
+        for r in sanity_report["rules"]
+    )
+    sanity_blocked = sanity_blocked or entry_cap_breached
 
     if sanity_blocked:
-        next_run = {
-            "run_id": rid,
-            "next_run_at": _default_next_run_at(portfolio),
-            "rationale": (
+        if entry_cap_breached:
+            block_rationale = (
+                "stage_execute skipped: entry_cap_on_adds failed — the "
+                "constructor opened or added to a position above the entry cap, "
+                "a hard risk invariant enforced independently of "
+                "SANITY_BLOCK_ON_FAIL. Cadence preserved via heuristic so the "
+                "scheduler keeps firing; see sanity.json for offender details."
+            )
+        else:
+            block_rationale = (
                 "stage_execute skipped: SANITY_BLOCK_ON_FAIL=true and sanity "
                 f"report status=fail ({sanity_report['summary']['fail']} rule "
                 "failure(s)). Cadence preserved via heuristic so the scheduler "
                 "keeps firing; see sanity.json for offender details."
-            ),
+            )
+        next_run = {
+            "run_id": rid,
+            "next_run_at": _default_next_run_at(portfolio),
+            "rationale": block_rationale,
             "sanity_block": {
                 "status": sanity_report["status"],
                 "failed_rules": [
