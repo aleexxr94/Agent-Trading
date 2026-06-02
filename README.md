@@ -110,7 +110,7 @@ long-vol tail hedge.
 Each cycle runs as the sequence of stages below. The LLM agents read role-specific system prompts under [`prompts/`](./prompts/). Anthropic prompt caching keeps the static system block cheap across calls. Each stage emits a schema-validated JSON artifact under `state/runs/{run_id}/`; a schema-failed agent output is retried once with the validation error fed back, and a second failure aborts the run.
 
 ### 0. Market gate — Alpaca clock, $0
-Queries `/v2/clock`. If markets are closed (weekend, holiday, after-hours), writes `market_gate.json` + a closed-market `next_run.json` pointing at the broker-reported next open, and exits. No LLM calls billed on a closed-market cycle.
+Queries `/v2/clock`. If markets are closed (weekend, holiday, after-hours), writes `market_gate.json` + a closed-market `next_run.json` pointing at the broker-reported next open, and exits. No LLM calls billed on a closed-market **trade** cycle. (A **review** cycle deliberately skips this stage — it's designed to run after close — so an after-hours review still runs signals + strategist + meta and bills ~$0.05; it just never opens orders. See "Cycle intents" below.)
 
 ### 1. Signals — deterministic Python, $0
 For each of the 29 universe tickers, computes from yfinance daily history:
@@ -182,9 +182,9 @@ Most cycles run the full pipeline (a **trade** cycle). The meta-scheduler can in
 - **`monitor.py`** (every 15 min during US market hours): re-evaluates kill conditions on every open position. Flattens via the broker. **Cannot open new positions** — it's a stop-loss daemon, not a trader.
 - **Halt flag (`state/halt.flag`)**: presence stops both orchestrator and monitor *before any API call*. Toggled from the dashboard, or `sudo -u agent touch /opt/agent-trading/state/halt.flag`.
 - **Cost caps**: per-run **$3**, daily **$12**. Cleanly aborts between stages if hit.
-- **Market gate**: the orchestrator queries Alpaca's clock at the start of every cycle. Closed market → no LLM calls billed, no orders submitted, exits cleanly with a `next_run_at` pointing at the broker-reported next open.
+- **Market gate**: a **trade** cycle queries Alpaca's clock before any LLM work. Closed market → no LLM calls billed, no orders submitted, exits cleanly with a `next_run_at` pointing at the broker-reported next open. (A **review** cycle deliberately skips the gate — it's meant to run after close — so it still bills ~$0.05 for signals + strategist + meta, but never submits orders.)
 - **Post-construct sanity rules** (`lib/sanity.py`, runs after every cycle, zero LLM cost). **Non-blocking by default** — set `SANITY_BLOCK_ON_FAIL=true` to hard-skip `stage_execute` on `fail` status (the `entry_cap_on_adds` rule hard-skips regardless).
-- **Modelled trading costs** (`lib/pnl.py`): every fill is charged IBKR-Pro-calibrated costs — half-spread, commission, SEC fee, FINRA TAF — so reported P&L and the paper Sharpe are honest rather than frictionless.
+- **Modelled trading costs** (`lib/pnl.py`): an IBKR-Pro-calibrated cost estimate — half-spread, commission, SEC fee, FINRA TAF — is computed each cycle and logged to `nav_history.jsonl` as `modelled_costs_usd`. **Caveat (not yet wired into the displayed performance):** the equity curve and the SPY/Sharpe comparison use `realized_balance_series()` (`lib/dashboard_data.py`), which subtracts only realized Alpaca fill fees (≈$0 on paper) and LLM cost — not the modelled IBKR costs. So the paper Sharpe shown today is **not** friction-adjusted for the live-broker cost model; the modelled figure is captured in state but still needs to be plumbed into the promote-to-live Sharpe before that gate can be trusted as friction-adjusted.
 - **Order safety invariant** (`lib/orders._plan_for_symbol`): orders never cross zero in a single ticket. Going from long to short on a symbol is split into close + open. The long-only schema never triggers it today, but the invariant is defensive against future short-enabling changes.
 
 ### Strategy in one paragraph
@@ -304,11 +304,12 @@ Once the smoke run looks clean and the dashboard renders:
 
 ```bash
 systemctl enable --now agent-orchestrator.timer agent-monitor.timer
+systemctl enable --now agent-scheduler.service
 systemctl list-timers --all 'agent-*'
 journalctl -u agent-orchestrator.service -f
 ```
 
-The orchestrator timer has a daily 13:30 UTC fallback and self-reschedules from `state/next_run.json` after each run. The monitor fires every 15 minutes during US market hours.
+Enable `agent-scheduler.service` alongside the timers — it's the dynamic-cadence daemon that reads `state/next_run.json` and fires the orchestrator at the meta-scheduler-chosen time. Without it, the only trigger is the orchestrator timer's daily 13:30 UTC safety-net fallback and the 1–24h cadence is ignored. (`install.sh` auto-enables the scheduler only if `agent-orchestrator.timer` was already enabled at install time, so on a fresh setup you must enable it explicitly here.) The monitor fires every 15 minutes during US market hours.
 
 ### Update the deployment
 
@@ -325,12 +326,15 @@ systemctl restart agent-dashboard.service
 ### Uninstall
 
 ```bash
-systemctl disable --now agent-orchestrator.timer agent-monitor.timer agent-dashboard.service
+systemctl disable --now agent-orchestrator.timer agent-monitor.timer agent-dashboard.service agent-scheduler.service
 rm /etc/systemd/system/agent-{orchestrator,monitor,dashboard}.{service,timer}
+rm /etc/systemd/system/agent-scheduler.service
 systemctl daemon-reload
 rm /etc/logrotate.d/agent-trading
 # Keep /opt/agent-trading/state — that's your run history.
 ```
+
+Note the scheduler is a bare `.service` (no `.timer`); disabling it is what stops the dynamic cadence from continuing to poll `state/next_run.json` and trying to start the orchestrator after the rest of the system is removed.
 
 ---
 
