@@ -182,9 +182,9 @@ Most cycles run the full pipeline (a **trade** cycle). The meta-scheduler can in
 - **`monitor.py`** (every 15 min during US market hours): re-evaluates kill conditions on every open position. Flattens via the broker. **Cannot open new positions** — it's a stop-loss daemon, not a trader.
 - **Halt flag (`state/halt.flag`)**: presence stops both orchestrator and monitor *before any API call*. Toggled from the dashboard, or `sudo -u agent touch /opt/agent-trading/state/halt.flag`.
 - **Cost caps**: per-run **$3**, daily **$12**. Cleanly aborts between stages if hit.
-- **Market gate**: the orchestrator queries Alpaca's clock at the start of every cycle. Closed market → no LLM calls billed, no orders submitted, exits cleanly with a `next_run_at` pointing at the broker-reported next open.
+- **Market gate**: a **trade** cycle queries Alpaca's clock before any LLM work. Closed market → no LLM calls billed, no orders submitted, exits cleanly with a `next_run_at` pointing at the broker-reported next open. (A **review** cycle deliberately skips the gate — it's meant to run after close — so it still bills ~$0.05 for signals + strategist + meta, but never submits orders.)
 - **Post-construct sanity rules** (`lib/sanity.py`, runs after every cycle, zero LLM cost). **Non-blocking by default** — set `SANITY_BLOCK_ON_FAIL=true` to hard-skip `stage_execute` on `fail` status (the `entry_cap_on_adds` rule hard-skips regardless).
-- **Modelled trading costs** (`lib/pnl.py`): every fill is charged IBKR-Pro-calibrated costs — half-spread, commission, SEC fee, FINRA TAF — so reported P&L and the paper Sharpe are honest rather than frictionless.
+- **Modelled trading costs** (`lib/pnl.py`): the equity curve and NAV rows are charged IBKR-Pro-calibrated costs — half-spread, commission, SEC fee, FINRA TAF — so the friction-adjusted Sharpe used for the promote-to-live decision isn't built on frictionless paper fills. Note this is an *estimate* applied to open-position/NAV accounting; realized closed-trade P&L in `lib/trades.py` uses the real fees from Alpaca fills, which are ~$0 on paper — so a closed-trade-only view is not the friction-adjusted one.
 - **Order safety invariant** (`lib/orders._plan_for_symbol`): orders never cross zero in a single ticket. Going from long to short on a symbol is split into close + open. The long-only schema never triggers it today, but the invariant is defensive against future short-enabling changes.
 
 ### Strategy in one paragraph
@@ -304,11 +304,12 @@ Once the smoke run looks clean and the dashboard renders:
 
 ```bash
 systemctl enable --now agent-orchestrator.timer agent-monitor.timer
+systemctl enable --now agent-scheduler.service
 systemctl list-timers --all 'agent-*'
 journalctl -u agent-orchestrator.service -f
 ```
 
-The orchestrator timer has a daily 13:30 UTC fallback and self-reschedules from `state/next_run.json` after each run. The monitor fires every 15 minutes during US market hours.
+Enable `agent-scheduler.service` alongside the timers — it's the dynamic-cadence daemon that reads `state/next_run.json` and fires the orchestrator at the meta-scheduler-chosen time. Without it, the only trigger is the orchestrator timer's daily 13:30 UTC safety-net fallback and the 1–24h cadence is ignored. (`install.sh` auto-enables the scheduler only if `agent-orchestrator.timer` was already enabled at install time, so on a fresh setup you must enable it explicitly here.) The monitor fires every 15 minutes during US market hours.
 
 ### Update the deployment
 
