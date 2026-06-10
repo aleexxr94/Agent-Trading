@@ -2100,3 +2100,67 @@ def test_trades_pnl_view_honours_all_time_cost_reset(tmp_state):
     assert c["net_pnl_usd"] == pytest.approx(50.0 - 0.20)
 
 
+
+
+# ---------- trade_stats ----------
+
+
+def _closed_row(symbol: str, net: float, opened: str, closed: str) -> dict:
+    return {
+        "symbol": symbol,
+        "net_pnl_usd": net,
+        "opened_at": opened,
+        "closed_at": closed,
+    }
+
+
+def test_trade_stats_basic():
+    closed = [
+        _closed_row("SOXL", 100.0, "2026-06-01T14:00:00Z", "2026-06-01T20:00:00Z"),
+        _closed_row("TQQQ", 50.0, "2026-06-02T14:00:00Z", "2026-06-03T14:00:00Z"),
+        _closed_row("TMV", -75.0, "2026-06-03T14:00:00Z", "2026-06-03T20:00:00Z"),
+    ]
+    s = dd.trade_stats(closed)
+    assert s is not None
+    assert s["win_rate_pct"] == pytest.approx(100.0 * 2 / 3)
+    assert s["wins"] == 2 and s["losses"] == 1
+    assert s["profit_factor"] == pytest.approx(150.0 / 75.0)
+    assert s["avg_win_usd"] == pytest.approx(75.0)
+    assert s["avg_loss_usd"] == pytest.approx(-75.0)
+    # Holds: 6h + 24h + 6h → mean 12h.
+    assert s["avg_hold_hours"] == pytest.approx(12.0)
+    assert s["best"] == {"symbol": "SOXL", "net_pnl_usd": 100.0}
+    assert s["worst"] == {"symbol": "TMV", "net_pnl_usd": -75.0}
+
+
+def test_trade_stats_empty_returns_none():
+    assert dd.trade_stats([]) is None
+    assert dd.trade_stats(None) is None
+    # Rows without a numeric net_pnl_usd are ignored entirely.
+    assert dd.trade_stats([{"symbol": "TQQQ", "net_pnl_usd": "bad"}]) is None
+
+
+def test_trade_stats_no_losses_profit_factor_none():
+    closed = [
+        _closed_row("SOXL", 10.0, "2026-06-01T14:00:00Z", "2026-06-01T15:00:00Z"),
+        _closed_row("TQQQ", 20.0, "2026-06-01T14:00:00Z", "2026-06-01T16:00:00Z"),
+    ]
+    s = dd.trade_stats(closed)
+    assert s["profit_factor"] is None
+    assert s["avg_loss_usd"] is None
+    assert s["win_rate_pct"] == pytest.approx(100.0)
+
+
+def test_trade_stats_bad_timestamps_hold_none():
+    closed = [
+        _closed_row("SOXL", 10.0, "not-a-date", ""),
+        _closed_row("TQQQ", -5.0, None, "2026-06-01T16:00:00Z"),
+    ]
+    s = dd.trade_stats(closed)
+    assert s is not None
+    assert s["avg_hold_hours"] is None
+    # Zero-net trades count as non-wins.
+    s2 = dd.trade_stats([_closed_row("UVXY", 0.0, "x", "y")])
+    assert s2["win_rate_pct"] == pytest.approx(0.0)
+    assert s2["wins"] == 0 and s2["losses"] == 0
+    assert s2["profit_factor"] is None

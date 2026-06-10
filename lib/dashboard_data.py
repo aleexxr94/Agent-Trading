@@ -1028,6 +1028,69 @@ def trades_pnl_view(marks: dict[str, float] | None = None) -> dict:
     }
 
 
+def trade_stats(closed: list[dict]) -> dict | None:
+    """Aggregate statistics over closed-trade rows from
+    ``trades_pnl_view()["closed"]``.
+
+    Win/loss classification uses NET P&L (gross − fees − attributed LLM
+    cost), consistent with the Trades tab's "Realised net" headline; a
+    $0.00 net trade counts as a non-win. Returns None when there are no
+    closed trades. Keys:
+      - ``win_rate_pct``, ``wins``, ``losses``
+      - ``profit_factor`` — gross win sum / |loss sum|; None when no
+        losing trades exist (undefined, not infinite-good)
+      - ``avg_win_usd`` / ``avg_loss_usd`` — None when the side is empty
+      - ``avg_hold_hours`` — None when no row has parseable
+        ``opened_at``/``closed_at`` timestamps
+      - ``best`` / ``worst`` — ``{symbol, net_pnl_usd}`` dicts
+    """
+    from . import trades as trades_lib
+
+    rows = [
+        r for r in (closed or [])
+        if isinstance(r.get("net_pnl_usd"), (int, float))
+    ]
+    if not rows:
+        return None
+
+    nets = [float(r["net_pnl_usd"]) for r in rows]
+    wins = [n for n in nets if n > 0]
+    losses = [n for n in nets if n < 0]
+
+    profit_factor: float | None = None
+    if losses:
+        profit_factor = sum(wins) / abs(sum(losses))
+
+    hold_hours: list[float] = []
+    for r in rows:
+        opened = trades_lib._parse_iso_utc(r.get("opened_at"))
+        closed_dt = trades_lib._parse_iso_utc(r.get("closed_at"))
+        if opened is None or closed_dt is None or closed_dt < opened:
+            continue
+        hold_hours.append((closed_dt - opened).total_seconds() / 3600.0)
+
+    best_row = max(rows, key=lambda r: float(r["net_pnl_usd"]))
+    worst_row = min(rows, key=lambda r: float(r["net_pnl_usd"]))
+
+    return {
+        "win_rate_pct": 100.0 * len(wins) / len(rows),
+        "wins": len(wins),
+        "losses": len(losses),
+        "profit_factor": profit_factor,
+        "avg_win_usd": (sum(wins) / len(wins)) if wins else None,
+        "avg_loss_usd": (sum(losses) / len(losses)) if losses else None,
+        "avg_hold_hours": (sum(hold_hours) / len(hold_hours)) if hold_hours else None,
+        "best": {
+            "symbol": best_row.get("symbol", "?"),
+            "net_pnl_usd": float(best_row["net_pnl_usd"]),
+        },
+        "worst": {
+            "symbol": worst_row.get("symbol", "?"),
+            "net_pnl_usd": float(worst_row["net_pnl_usd"]),
+        },
+    }
+
+
 def fees_running_total() -> list[dict]:
     """Return ``[{at, fees_usd, cum_fees_usd}]`` ordered by fill time.
 

@@ -2129,6 +2129,88 @@ with tabs[5]:
                 unsafe_allow_html=True,
             )
 
+    # ---- Trade statistics (closed trades, net P&L methodology) ----
+    _tstats = dd.trade_stats(view["closed"])
+    if _tstats is not None:
+        st.markdown(
+            '<div class="at-section-label">Trade statistics (closed trades)</div>',
+            unsafe_allow_html=True,
+        )
+
+        def _fmt_hold(hours: float | None) -> str:
+            if hours is None:
+                return "—"
+            return f"{hours / 24.0:.1f} d" if hours >= 48.0 else f"{hours:.1f} h"
+
+        _pf = _tstats["profit_factor"]
+        _aw, _al = _tstats["avg_win_usd"], _tstats["avg_loss_usd"]
+        srow1 = st.columns(3)
+        srow1[0].markdown(
+            _stat_card(
+                "Win rate (net)",
+                f"{_tstats['win_rate_pct']:.0f}%",
+                sub=f"{_tstats['wins']} wins · {_tstats['losses']} losses",
+                tone="pos" if _tstats["win_rate_pct"] >= 50.0 else "neg",
+                help_text=(
+                    "Share of closed trades with positive NET P&L "
+                    "(gross − fees − attributed LLM cost). $0 nets "
+                    "count as non-wins."
+                ),
+            ),
+            unsafe_allow_html=True,
+        )
+        srow1[1].markdown(
+            _stat_card(
+                "Profit factor",
+                f"{_pf:.2f}" if _pf is not None else "—",
+                sub="win $ / loss $" if _pf is not None else "no losing trades yet",
+                tone=("pos" if _pf >= 1.0 else "neg") if _pf is not None else "",
+                help_text=(
+                    "Sum of winning trades' net P&L divided by the "
+                    "absolute sum of losing trades'. >1 means winners "
+                    "outweigh losers."
+                ),
+            ),
+            unsafe_allow_html=True,
+        )
+        srow1[2].markdown(
+            _stat_card(
+                "Avg win / avg loss",
+                (f"${_aw:,.2f}" if _aw is not None else "—")
+                + " / "
+                + (f"${_al:,.2f}" if _al is not None else "—"),
+                sub="per closed trade, net",
+            ),
+            unsafe_allow_html=True,
+        )
+        srow2 = st.columns(3)
+        srow2[0].markdown(
+            _stat_card(
+                "Avg hold time",
+                _fmt_hold(_tstats["avg_hold_hours"]),
+                sub="open fill → closing fill",
+            ),
+            unsafe_allow_html=True,
+        )
+        srow2[1].markdown(
+            _stat_card(
+                "Best trade",
+                f"${_tstats['best']['net_pnl_usd']:+,.2f}",
+                sub=_tstats["best"]["symbol"],
+                tone="pos" if _tstats["best"]["net_pnl_usd"] > 0 else "neg",
+            ),
+            unsafe_allow_html=True,
+        )
+        srow2[2].markdown(
+            _stat_card(
+                "Worst trade",
+                f"${_tstats['worst']['net_pnl_usd']:+,.2f}",
+                sub=_tstats["worst"]["symbol"],
+                tone="pos" if _tstats["worst"]["net_pnl_usd"] > 0 else "neg",
+            ),
+            unsafe_allow_html=True,
+        )
+
     # Shared color formatter for Gross / Net columns on both the closed
     # and open tables. Codex P1 caught a previous version that defined
     # this inside the `if view["closed"]:` branch — when the closed list
