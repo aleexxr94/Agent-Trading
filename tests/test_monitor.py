@@ -436,7 +436,11 @@ def test_trailing_stop_ratchets_peak_and_fires():
     assert actions == []
     assert peaks["TQQQ"]["peak_mark"] == 120.0
 
-    # Pullback to -10% from peak: fires.
+    # Pullback to -10% from peak: fires, and the peak is dropped so a
+    # later re-entry starts a fresh ratchet (Codex P2, PR #109: peaks
+    # are persisted before the flatten executes, so a surviving peak
+    # would instantly stop out a re-entered position against the prior
+    # trade's high-water mark).
     peaks, actions = monitor.update_trailing_stops(
         portfolio=portfolio, marks={"TQQQ": 108.0},
         broker_positions=bp, position_peaks=peaks,
@@ -444,6 +448,16 @@ def test_trailing_stop_ratchets_peak_and_fires():
     assert len(actions) == 1
     assert actions[0]["symbol"] == "TQQQ"
     assert "trailing stop" in actions[0]["reason"]
+    assert "TQQQ" not in peaks
+
+    # Re-entry at a price below the old 120 peak: fresh ratchet seeds at
+    # the current mark — must NOT fire against the prior trade's peak.
+    peaks, actions = monitor.update_trailing_stops(
+        portfolio=portfolio, marks={"TQQQ": 105.0},
+        broker_positions=bp, position_peaks=peaks,
+    )
+    assert actions == []
+    assert peaks["TQQQ"]["peak_mark"] == 105.0
 
 
 def test_trailing_stop_ignored_when_not_configured():
@@ -501,6 +515,8 @@ def test_monitor_main_enforces_trailing_stop_end_to_end(tmp_state, monkeypatch):
     assert len(events) == 1
     assert events[0]["symbol"] == "TQQQ"
     assert events[0]["exit_kind"] == "trailing_stop"
+    # The fired symbol's peak must not survive in the persisted file.
+    assert "TQQQ" not in state.read_position_peaks()
 
 
 def test_monitor_flatten_appends_kill_event(tmp_state, monkeypatch):

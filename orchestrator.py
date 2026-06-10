@@ -689,6 +689,11 @@ def _signals_fingerprint(signals_out: dict) -> str:
 
     Excludes generated_at + run_id so the same data on two different
     cycles produces the same hash.
+
+    Codex P2 on PR #109: every feature the LLM stages can see via
+    ``compact_for_llm`` must be fingerprinted, or dedup will reuse a
+    cached portfolio exactly when the unhashed evidence (RSI, relative
+    strength, trend quality, factor correlations) is what changed.
     """
     rows = []
     for t in signals_out.get("tickers", []):
@@ -707,10 +712,21 @@ def _signals_fingerprint(signals_out: dict) -> str:
             "hv90": round(t.get("hv_90d_annualised") or 0.0, 4),
             "d50": round(t.get("dist_from_50d_ma_pct") or 0.0, 2),
             "d200": round(t.get("dist_from_200d_ma_pct") or 0.0, 2),
+            "rsi14": round(t.get("rsi_14") or 0.0, 1),
+            "rs_spy30": round(t.get("rel_strength_spy_30d") or 0.0, 2),
+            "trend_r2": round(t.get("trend_r2") or 0.0, 3),
             "events": events_summary,
         })
     rows.sort(key=lambda r: r["sym"] or "")
-    return _hash_inputs(json.dumps(rows, sort_keys=True))
+    corr_summary = sorted(
+        (
+            (c.get("factor_a"), c.get("factor_b"), round(c.get("corr_30d") or 0.0, 2))
+            for c in (signals_out.get("factor_correlations") or [])
+        ),
+        key=lambda p: (p[0] or "", p[1] or ""),
+    )
+    payload = {"rows": rows, "factor_correlations": corr_summary}
+    return _hash_inputs(json.dumps(payload, sort_keys=True))
 
 
 def _positions_fingerprint(positions: list[dict]) -> str:

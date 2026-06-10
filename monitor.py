@@ -202,8 +202,15 @@ def update_trailing_stops(
       - the stop fires when ``mark <= peak * (1 - pct/100)``
 
     Symbols absent from the returned peaks map (position closed, trailing
-    stop removed by the constructor, or not currently held) are dropped
-    from the peak file so a later re-entry starts a fresh ratchet.
+    stop removed by the constructor, not currently held, or stop fired
+    this pass) are dropped from the peak file so a later re-entry starts
+    a fresh ratchet. Dropping at fire time (Codex P2, PR #109) matters:
+    the peaks are persisted before the flatten executes, so a surviving
+    peak could instantly stop out a re-entry against the PRIOR trade's
+    high-water mark. Trade-off: if the flatten itself fails, the next
+    pass re-seeds the ratchet at the current mark instead of re-firing —
+    the hard 25% loss cap (computed from cost basis, not peaks) remains
+    the backstop.
 
     This enforces only what the agent itself chose per position — exactly
     the same contract as the fixed price/time stops.
@@ -236,6 +243,7 @@ def update_trailing_stops(
         new_peaks[symbol] = {"peak_mark": peak, "updated_at": now_iso}
         threshold = peak * (1.0 - float(pct) / 100.0)
         if mark <= threshold and peak > mark:
+            new_peaks.pop(symbol, None)
             actions.append({
                 "symbol": symbol,
                 "action": "flatten",

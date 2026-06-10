@@ -482,6 +482,44 @@ def test_signals_fingerprint_stable_when_events_reordered(tmp_state):
     assert orchestrator._signals_fingerprint(a) == orchestrator._signals_fingerprint(b)
 
 
+def test_signals_fingerprint_differs_when_new_llm_visible_features_move(tmp_state):
+    """Codex P2 regression (PR #109): every feature compact_for_llm exposes
+    must be fingerprinted. Before the fix, a cycle where only RSI, SPY
+    relative strength, or trend R² changed would dedup-skip the LLM stages
+    even though the evidence they'd read had changed."""
+    base = {"symbol": "TQQQ", "last_close": 72.0,
+            "rsi_14": 55.0, "rel_strength_spy_30d": 3.2, "trend_r2": 0.81}
+    for field, moved in [("rsi_14", 71.0),
+                         ("rel_strength_spy_30d", -4.0),
+                         ("trend_r2", 0.22)]:
+        a = {"tickers": [dict(base)]}
+        b = {"tickers": [dict(base, **{field: moved})]}
+        assert orchestrator._signals_fingerprint(a) != orchestrator._signals_fingerprint(b), (
+            f"dedup hash must invalidate when {field} changes — the LLM stages see it"
+        )
+
+
+def test_signals_fingerprint_differs_when_factor_correlations_change(tmp_state):
+    """The universe-level factor_correlations block is LLM-visible and must
+    bump the hash; row order must not."""
+    tickers = [{"symbol": "TQQQ", "last_close": 72.0}]
+    quiet = {"tickers": tickers, "factor_correlations": []}
+    corr = {"tickers": tickers, "factor_correlations": [
+        {"factor_a": "nasdaq", "factor_b": "semis", "corr_30d": 0.91},
+    ]}
+    assert orchestrator._signals_fingerprint(quiet) != orchestrator._signals_fingerprint(corr)
+
+    reordered = {"tickers": tickers, "factor_correlations": [
+        {"factor_a": "sp500", "factor_b": "tech", "corr_30d": 0.84},
+        {"factor_a": "nasdaq", "factor_b": "semis", "corr_30d": 0.91},
+    ]}
+    canonical = {"tickers": tickers, "factor_correlations": [
+        {"factor_a": "nasdaq", "factor_b": "semis", "corr_30d": 0.91},
+        {"factor_a": "sp500", "factor_b": "tech", "corr_30d": 0.84},
+    ]}
+    assert orchestrator._signals_fingerprint(reordered) == orchestrator._signals_fingerprint(canonical)
+
+
 def test_positions_fingerprint_changes_when_qty_changes(tmp_state):
     a = [{"symbol": "TQQQ", "qty": 4.0}]
     b = [{"symbol": "TQQQ", "qty": 5.0}]
