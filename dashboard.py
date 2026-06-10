@@ -148,6 +148,38 @@ def _tight_yrange(ys, min_pad: float = 5.0, frac: float = 0.08):
     return [lo - pad, hi + pad]
 
 
+def _style_fig(
+    fig,
+    *,
+    height: int = 380,
+    yaxis_title: str = "",
+    yrange=None,
+    legend: bool = False,
+    right_margin: int = 10,
+) -> None:
+    """Apply the shared light-theme Plotly layout in one place: white
+    template on transparent backgrounds, slate gridlines, zoom disabled
+    (pairs with NO_ZOOM_CONFIG), tight margins, unified hover style."""
+    fig.update_layout(
+        template="plotly_white",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=height,
+        yaxis_title=yaxis_title,
+        xaxis_title="",
+        yaxis=dict(gridcolor="#e2e8f0", fixedrange=True, range=yrange),
+        xaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
+        margin=dict(l=10, r=right_margin, t=20 if legend else 10, b=10),
+        hoverlabel=dict(bgcolor="white", bordercolor="#e2e8f0", font_size=13),
+        dragmode=False,
+        showlegend=legend,
+    )
+    if legend:
+        fig.update_layout(
+            legend=dict(orientation="h", y=1.1, font=dict(size=12)),
+        )
+
+
 def _render_balance_chart(*, xs, ys, hover_texts, yaxis_title: str, caption: str) -> None:
     """CoinGecko-style balance chart: one smooth area line that flows into
     the current value at a labelled end dot. Direction-aware colour (green
@@ -372,13 +404,27 @@ st.markdown(
         border-radius: 12px;
         padding: 1rem 1.15rem;
         box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+        transition: box-shadow 0.15s ease;
+        min-width: 0;
+        overflow-wrap: break-word;
       }
+      .at-stat:hover { box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08); }
       .at-stat-label { color: var(--text-1); font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; }
       .at-stat-value { color: var(--text-0); font-size: 1.7rem; font-weight: 700; margin-top: 0.2rem; letter-spacing: -0.01em; }
       .at-stat-sub { color: var(--text-1); font-size: 0.85rem; margin-top: 0.25rem; font-weight: 500; }
       .at-stat-value.pos { color: var(--green); }
       .at-stat-value.neg { color: var(--red); }
       .at-stat-value.warn { color: var(--amber); }
+      /* small delta chip rendered beside a stat value */
+      .at-stat-delta {
+        display: inline-block; vertical-align: middle;
+        font-size: 0.85rem; font-weight: 700;
+        padding: 0.1rem 0.45rem; margin-left: 0.45rem;
+        border-radius: 999px; border: 1px solid var(--border);
+        background: var(--bg-2); color: var(--text-1);
+      }
+      .at-stat-delta.pos { background: var(--green-soft); color: var(--green-text); border-color: #a7f3d0; }
+      .at-stat-delta.neg { background: var(--red-soft);   color: var(--red-text);   border-color: #fecaca; }
 
       /* cost meter bar */
       .at-meter { height: 7px; background: var(--bg-2); border-radius: 999px; overflow: hidden; margin-top: 0.5rem; }
@@ -389,6 +435,7 @@ st.markdown(
       /* tabs */
       .stTabs [data-baseweb="tab-list"] { gap: 0.3rem; border-bottom: 1px solid var(--border); }
       .stTabs [data-baseweb="tab"] { padding: 0.65rem 1.2rem; font-size: 0.95rem; font-weight: 600; }
+      .stTabs [data-baseweb="tab-highlight"] { background-color: var(--green); height: 3px; border-radius: 3px 3px 0 0; }
 
       /* dataframe */
       [data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
@@ -411,6 +458,8 @@ st.markdown(
         color: var(--text-1); font-size: 0.88rem; text-transform: uppercase;
         letter-spacing: 0.08em; font-weight: 700;
         margin: 1rem 0 0.5rem 0;
+        border-left: 3px solid var(--green);
+        padding-left: 0.5rem;
       }
 
       /* small-muted text */
@@ -698,6 +747,7 @@ def _stat_card(
     sub: str = "",
     tone: str = "",
     help_text: str = "",
+    delta: str = "",
 ) -> str:
     cls = f"at-stat-value {tone}".strip()
     sub_html = f'<div class="at-stat-sub">{sub}</div>' if sub else ""
@@ -705,10 +755,20 @@ def _stat_card(
         f'<span class="at-help-icon" title="{html.escape(help_text)}">ⓘ</span>'
         if help_text else ""
     )
+    delta_html = ""
+    if delta:
+        # Signed string like "+1.2%" / "-0.8%" — arrow + tone from the sign.
+        negative = delta.lstrip().startswith(("-", "−"))
+        arrow = "▼" if negative else "▲"
+        dcls = "neg" if negative else "pos"
+        delta_html = (
+            f'<span class="at-stat-delta {dcls}">{arrow} '
+            f'{html.escape(delta.lstrip("+-− "))}</span>'
+        )
     return (
         f'<div class="at-stat">'
         f'<div class="at-stat-label">{label}{help_html}</div>'
-        f'<div class="{cls}">{value}</div>'
+        f'<div class="{cls}">{value}{delta_html}</div>'
         f'{sub_html}'
         f'</div>'
     )
@@ -1572,18 +1632,12 @@ with tabs[3]:
             name="Cumulative LLM cost",
             line=dict(color="#2563eb", width=2.5),
             fill="tozeroy",
-            fillcolor="rgba(37, 99, 235, 0.12)",
+            fillgradient=dict(type="vertical", colorscale=[
+                [0.0, _rgba("#2563eb", 0.0)],
+                [1.0, _rgba("#2563eb", 0.22)],
+            ]),
         ))
-        fig.update_layout(
-            template="plotly_white",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            height=320, yaxis_title="USD",
-            yaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
-            xaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
-            margin=dict(l=10, r=10, t=10, b=10),
-            showlegend=False, dragmode=False,
-        )
+        _style_fig(fig, height=320, yaxis_title="USD")
         st.plotly_chart(fig, width="stretch", config=NO_ZOOM_CONFIG)
     else:
         st.info("No LLM cost history yet — run the orchestrator (live mode) to populate.")
@@ -1601,18 +1655,12 @@ with tabs[3]:
             name="Cumulative trading fees",
             line=dict(color="#d97706", width=2.5),  # amber to distinguish from blue LLM line
             fill="tozeroy",
-            fillcolor="rgba(217, 119, 6, 0.12)",
+            fillgradient=dict(type="vertical", colorscale=[
+                [0.0, _rgba("#d97706", 0.0)],
+                [1.0, _rgba("#d97706", 0.22)],
+            ]),
         ))
-        fig_fees.update_layout(
-            template="plotly_white",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            height=320, yaxis_title="USD (fees)",
-            yaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
-            xaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
-            margin=dict(l=10, r=10, t=10, b=10),
-            showlegend=False, dragmode=False,
-        )
+        _style_fig(fig_fees, height=320, yaxis_title="USD (fees)")
         st.plotly_chart(fig_fees, width="stretch", config=NO_ZOOM_CONFIG)
         total_fees = dd.total_trading_fees_usd()
         st.caption(
@@ -1838,18 +1886,13 @@ with tabs[4]:
         _bench_yrange = _tight_yrange(
             list(strat_df["nav"]) + list(spy_df["nav"]), min_pad=10.0
         )
-        fig_bench.update_layout(
-            template="plotly_white",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
+        _style_fig(
+            fig_bench,
             height=380,
             yaxis_title="Portfolio value (USD)",
-            xaxis_title="",
-            yaxis=dict(gridcolor="#e2e8f0", fixedrange=True, range=_bench_yrange),
-            xaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
-            margin=dict(l=10, r=80, t=20, b=10),
-            legend=dict(orientation="h", y=1.1, font=dict(size=12)),
-            dragmode=False,
+            yrange=_bench_yrange,
+            legend=True,
+            right_margin=80,
         )
         st.plotly_chart(fig_bench, width="stretch", config=NO_ZOOM_CONFIG)
         st.caption(
