@@ -1747,9 +1747,11 @@ with tabs[4]:
         )
     else:
         # ---- (b) Headline 3-column stat cards ----
-        strat_end = float(bundle.strategy_curve["nav"].iloc[-1])
-        spy_end = float(bundle.spy_curve["nav"].iloc[-1])
-        delta_tone = "pos" if bundle.delta_usd >= 0 else "neg"
+        # _fnum keeps a stray NaN (e.g. an un-scrubbed SPY tip) from
+        # rendering as a literal "$nan" in the cards.
+        strat_end = _fnum(bundle.strategy_curve["nav"].iloc[-1])
+        spy_end = _fnum(bundle.spy_curve["nav"].iloc[-1])
+        delta_tone = "pos" if _fnum(bundle.delta_usd) >= 0 else "neg"
         cols = st.columns(3)
         cols[0].markdown(
             _stat_card(
@@ -1762,8 +1764,8 @@ with tabs[4]:
         cols[1].markdown(
             _stat_card(
                 "Delta vs SPY",
-                f"${bundle.delta_usd:+,.2f}",
-                sub=f"{bundle.delta_pct:+.2f} pp on total return",
+                f"${_fnum(bundle.delta_usd):+,.2f}",
+                sub=f"{_fnum(bundle.delta_pct):+.2f} pp on total return",
                 tone=delta_tone,
                 help_text=(
                     "Dollar and percentage-point gap between the strategy "
@@ -1772,12 +1774,14 @@ with tabs[4]:
             ),
             unsafe_allow_html=True,
         )
-        beating = bundle.strategy_total_return_pct >= bundle.spy_total_return_pct
+        beating = _fnum(bundle.strategy_total_return_pct) >= _fnum(
+            bundle.spy_total_return_pct
+        )
         cols[2].markdown(
             _stat_card(
                 "Total return",
-                f"{bundle.strategy_total_return_pct:+.2f}%",
-                sub=f"SPY {bundle.spy_total_return_pct:+.2f}%",
+                f"{_fnum(bundle.strategy_total_return_pct):+.2f}%",
+                sub=f"SPY {_fnum(bundle.spy_total_return_pct):+.2f}%",
                 tone="pos" if beating else "neg",
             ),
             unsafe_allow_html=True,

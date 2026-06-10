@@ -139,6 +139,11 @@ def fetch_spy_total_return(start: date, end: date) -> "pd.DataFrame":
         return pd.DataFrame(columns=["close"]).rename_axis("date")
     out.index = pd.to_datetime(out.index, utc=True).date
     out.index.name = "date"
+    # yfinance can return a partial row for the current day with a NaN
+    # close (pre-market / mid-session), and run-dir parquet caches can
+    # persist it. A NaN close would propagate into the SPY-equivalent
+    # curve and render "$nan" in the dashboard's delta card.
+    out = out.dropna(subset=["close"])
     out = out[~out.index.duplicated(keep="last")]
     return out.sort_index()
 
@@ -376,6 +381,10 @@ def build_comparison(
     # Saturday and leave Monday as NaN → dropped → joined len 1 →
     # benchmark returns None (regression for codex P2).
     spy_in_range = spy[spy.index >= strategy_eod.index[0]]
+    # Scrub NaN closes (partial current-day rows survive in un-scrubbed
+    # frames / older parquet caches) — a NaN here would flow straight
+    # into spy_equiv and surface as "$nan" in the dashboard.
+    spy_in_range = spy_in_range[spy_in_range["close"].notna()]
     if spy_in_range.empty:
         return None
     union_idx = strategy_eod.index.union(spy_in_range.index)
@@ -411,9 +420,12 @@ def build_comparison(
             # carrying spy_curve.iloc[-1] forward would compare today's
             # live strategy value against yesterday's SPY close
             # (regression for codex P2).
-            spy_idx_le_today = spy.index[spy.index <= today]
-            if len(spy_idx_le_today) > 0:
-                latest_spy_close = float(spy.loc[spy_idx_le_today[-1], "close"])
+            # .dropna() guards against an un-scrubbed frame whose
+            # trailing (partial-day) close is NaN — walk back to the
+            # last VALID close rather than poisoning the live tip.
+            spy_closes_le_today = spy.loc[spy.index <= today, "close"].dropna()
+            if len(spy_closes_le_today) > 0:
+                latest_spy_close = float(spy_closes_le_today.iloc[-1])
                 spy_curve.loc[today] = (
                     float(starting_balance_usd) * latest_spy_close / spy_anchor
                 )
