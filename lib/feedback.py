@@ -148,12 +148,22 @@ def build_performance_memo(
     if trade_rows is None:
         trade_rows = state.read_trades()
     if cost_rows is None:
-        cost_rows = state.filter_costs_post_reset([
-            json.loads(line) for line in (
-                state.COSTS_LOG.read_text(encoding="utf-8").splitlines()
-                if state.COSTS_LOG.exists() else []
-            ) if line.strip()
-        ])
+        # RAW cost log — deliberately NOT state.filter_costs_post_reset.
+        # That filter implements the dashboard's display-only "reset all
+        # LLM costs" button; this memo is pipeline-facing calibration
+        # evidence, and hiding historical costs in the UI must not make
+        # past trades look more profitable to the agents (same principle
+        # as lib.dashboard_data._raw_llm_cost_total_usd for sizing NAV;
+        # Codex P2, PR #109). Corrupt lines are skipped, not fatal.
+        cost_rows = []
+        if state.COSTS_LOG.exists():
+            for line in state.COSTS_LOG.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    cost_rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
     if kill_events is None:
         kill_events = state.read_kill_events(limit=200)
 

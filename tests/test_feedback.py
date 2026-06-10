@@ -105,6 +105,45 @@ def test_memo_attributes_llm_cost_via_equal_split(tmp_state):
     assert memo["overall"]["net_pnl_usd"] == 3.0  # +4 gross − 1.0 LLM
 
 
+def test_memo_uses_raw_costs_ignoring_dashboard_reset(tmp_state):
+    """Codex P2 regression (PR #109): the dashboard's "reset all LLM
+    costs" marker is display-only. The memo is pipeline-facing
+    calibration evidence — a UI reset must not make past trades look
+    more profitable to the agents (same principle as the raw-cost
+    sizing NAV in lib.dashboard_data)."""
+    state.append_trade(_fill(
+        "TQQQ", "buy", 4, 70.0, run_id="r1", at="2026-06-01T14:00:00Z", aid="a1",
+    ))
+    state.append_trade(_fill(
+        "TQQQ", "sell", 4, 71.0, at="2026-06-03T14:00:00Z", aid="a2",
+    ))
+    state.COSTS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    state.COSTS_LOG.write_text(json.dumps(
+        {"run_id": "r1", "cost_usd": 1.0, "at": "2026-06-01T14:05:00Z"},
+    ) + "\n")
+    state.set_all_time_cost_reset()  # operator resets AFTER the trade closed
+    memo = feedback.build_performance_memo()
+    assert memo["overall"]["net_pnl_usd"] == 3.0  # +4 gross − 1.0 LLM, reset ignored
+
+
+def test_memo_skips_corrupt_cost_lines(tmp_state):
+    """One garbage line in costs.jsonl degrades that row, not the memo."""
+    state.append_trade(_fill(
+        "TQQQ", "buy", 4, 70.0, run_id="r1", at="2026-06-01T14:00:00Z", aid="a1",
+    ))
+    state.append_trade(_fill(
+        "TQQQ", "sell", 4, 71.0, at="2026-06-03T14:00:00Z", aid="a2",
+    ))
+    state.COSTS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    state.COSTS_LOG.write_text(
+        "{not json}\n"
+        + json.dumps({"run_id": "r1", "cost_usd": 1.0, "at": "2026-06-01T14:05:00Z"})
+        + "\n"
+    )
+    memo = feedback.build_performance_memo()
+    assert memo["overall"]["net_pnl_usd"] == 3.0
+
+
 def test_memo_reads_live_state_by_default(tmp_state):
     state.append_trade(_fill(
         "TQQQ", "buy", 4, 70.0, run_id="r1", at="2026-06-01T14:00:00Z", aid="a1",

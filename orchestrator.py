@@ -802,10 +802,31 @@ def _cooldown_fingerprint(cooldown_symbols: dict | None) -> str:
     return _hash_inputs(json.dumps(syms, sort_keys=True))
 
 
+def _memo_fingerprint(performance_memo: dict | None) -> str:
+    """Stable hash of the performance memo, used as a dedup key.
+
+    Codex P2 on PR #109: the memo is LLM-visible evidence that can change
+    while signals, broker positions, and cooldown membership all stay
+    fixed — e.g. trade-sync backfills a fill/fee, or a monitor kill event
+    re-tags a recent exit. Without this key, dedup would reuse the cached
+    portfolio exactly when the agent's track record gained new
+    information. The memo is cheap to build ($0, pure Python over state),
+    so it is computed before the dedup check.
+
+    Deliberately NOT included: pnl_history (_recent_pnl_history). Every
+    completed cycle appends its own row, so fingerprinting it would make
+    consecutive cycles always differ and disable dedup outright; its
+    inputs (fills, marks, regime) are already covered by the signals,
+    positions, and memo fingerprints.
+    """
+    return _hash_inputs(json.dumps(performance_memo, sort_keys=True, default=str))
+
+
 def _check_cycle_dedup(
     signals_out: dict,
     current_positions: list[dict],
     cooldown_symbols: dict | None = None,
+    memo_fp: str | None = None,
 ) -> dict | None:
     """Return the cached portfolio dict if dedup applies; None otherwise.
 
@@ -814,6 +835,9 @@ def _check_cycle_dedup(
       - signals_fingerprint matches the prior cycle's
       - positions_fingerprint matches the prior cycle's
       - cooldown_fingerprint matches the prior cycle's
+      - memo_fingerprint matches the prior cycle's (when provided; a hash
+        file written before this key existed fails the match, which just
+        costs one fresh cycle)
       - state/current_portfolio.json exists (the cached portfolio
         to reuse)
     """
@@ -830,6 +854,7 @@ def _check_cycle_dedup(
         last.get("signals_fingerprint") != signals_fp
         or last.get("positions_fingerprint") != positions_fp
         or last.get("cooldown_fingerprint") != cooldown_fp
+        or last.get("memo_fingerprint") != memo_fp
     ):
         return None
     try:
@@ -850,9 +875,9 @@ def _write_dedup_next_run(rid: str, *, portfolio: dict, ctx: StageContext) -> di
         "run_id": rid,
         "next_run_at": next_at,
         "rationale": (
-            "cycle dedup: signals fingerprint and broker positions both "
-            "unchanged from prior cycle. Skipped strategist + "
-            "construct + execute; cached portfolio retained."
+            "cycle dedup: signals, broker positions, cooldown set, and "
+            "performance memo all unchanged from prior cycle. Skipped "
+            "strategist + construct + execute; cached portfolio retained."
         ),
         "dedup_skipped": True,
         "cycle_intent": "trade",
@@ -882,14 +907,19 @@ def _update_cycle_dedup_hash(
     signals_out: dict,
     current_positions: list[dict],
     cooldown_symbols: dict | None = None,
+    memo_fp: str | None = None,
 ) -> None:
     """Called at the END of a successful cycle to record the fingerprints
-    for the NEXT cycle's dedup check. Failures here are non-fatal."""
+    for the NEXT cycle's dedup check. ``memo_fp`` is the fingerprint of
+    the memo THIS cycle's LLM stages actually read (computed pre-dedup),
+    so the next cycle's freshly built memo is compared against the
+    evidence that produced the cached portfolio. Failures are non-fatal."""
     try:
         state.write_json(state.LAST_CYCLE_HASH, {
             "signals_fingerprint": _signals_fingerprint(signals_out),
             "positions_fingerprint": _positions_fingerprint(current_positions),
             "cooldown_fingerprint": _cooldown_fingerprint(cooldown_symbols),
+            "memo_fingerprint": memo_fp,
             "updated_at": state.utcnow_iso(),
         })
     except Exception:
@@ -1575,13 +1605,25 @@ def run_pipeline(
     # then reused for the constructor prompt + sanity guardrail below.
     cooldown_symbols = _cooldown_symbols_now()
 
+    # Track-record memo (factor win/loss record, confidence calibration,
+    # recent exits) — fed to strategist + constructor + critic as
+    # calibration evidence. $0; guarded so corrupt state can't kill a run.
+    # Built BEFORE dedup (after the fill sync above) so its fingerprint
+    # participates in the dedup check: a backfilled fill or fresh kill
+    # event changes the evidence the LLM stages would read even when
+    # signals/positions/cooldown are unchanged.
+    performance_memo = feedback.build_performance_memo_safe()
+    memo_fp = _memo_fingerprint(performance_memo)
+
     # ----- Cycle dedup -----
-    # If the signals fingerprint matches the prior cycle AND the broker
-    # position set is unchanged AND the cooldown set is unchanged, skip
-    # strategist + construct + execute and reuse the last portfolio. Saves
-    # ~$0.25 on a quiet 4h window where nothing has moved meaningfully.
+    # Skip strategist + construct + execute and reuse the last portfolio
+    # when the signals fingerprint, broker position set, cooldown set, AND
+    # performance memo all match the prior cycle. Saves ~$0.25 on a quiet
+    # 4h window where nothing has moved meaningfully.
     if not dry_run:
-        dedup = _check_cycle_dedup(signals_out, current_positions, cooldown_symbols)
+        dedup = _check_cycle_dedup(
+            signals_out, current_positions, cooldown_symbols, memo_fp,
+        )
         if dedup is not None:
             next_run = _write_dedup_next_run(rid, portfolio=dedup["portfolio"], ctx=ctx)
             return {
@@ -1592,13 +1634,9 @@ def run_pipeline(
             }
 
     # Recent PnL feedback — last 5 cycles' regime + realized 4h PnL
-    # so the strategist can self-correct drift across cycles.
+    # so the strategist can self-correct drift across cycles. NOT part of
+    # the dedup fingerprint — see _memo_fingerprint for why.
     pnl_history = _recent_pnl_history(limit=5)
-
-    # Track-record memo (factor win/loss record, confidence calibration,
-    # recent exits) — fed to strategist + constructor + critic as
-    # calibration evidence. $0; guarded so corrupt state can't kill a run.
-    performance_memo = feedback.build_performance_memo_safe()
 
     # ----- Stage 2: strategist (1 LLM call) -----
     view = _run_stage(
@@ -1873,8 +1911,13 @@ def run_pipeline(
         # non-universe position the order layer refused (it was never held).
         state.write_json(state.CURRENT_PORTFOLIO, _publishable_portfolio(portfolio))
         # Update the cycle-dedup fingerprints so the next cycle can
-        # short-circuit cleanly if nothing material changed.
-        _update_cycle_dedup_hash(signals_out, current_positions, cooldown_symbols)
+        # short-circuit cleanly if nothing material changed. memo_fp is the
+        # pre-dedup fingerprint — the memo this cycle's LLM stages read; a
+        # fill or kill event recorded since (e.g. by this cycle's execute)
+        # changes the next cycle's freshly built memo and invalidates dedup.
+        _update_cycle_dedup_hash(
+            signals_out, current_positions, cooldown_symbols, memo_fp,
+        )
 
     return {
         "run_id": rid,

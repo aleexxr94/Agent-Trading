@@ -26,9 +26,10 @@ def _bp(symbol, qty, market_value, asset_class="us_equity", avg_cost=None) -> Br
 
 
 class _FakeBroker:
-    def __init__(self, positions, flatten_log=None):
+    def __init__(self, positions, flatten_log=None, flatten_fails=False):
         self._positions = positions
         self._flatten_log = flatten_log if flatten_log is not None else []
+        self._flatten_fails = flatten_fails
 
     @property
     def name(self):
@@ -48,7 +49,9 @@ class _FakeBroker:
 
     def flatten(self, symbol):
         self._flatten_log.append(symbol)
-        return None
+        if self._flatten_fails:
+            return None  # Broker contract: None = close rejected/failed
+        return {"symbol": symbol, "status": "accepted"}
 
 
 def _write_portfolio(positions, **over):
@@ -436,11 +439,10 @@ def test_trailing_stop_ratchets_peak_and_fires():
     assert actions == []
     assert peaks["TQQQ"]["peak_mark"] == 120.0
 
-    # Pullback to -10% from peak: fires, and the peak is dropped so a
-    # later re-entry starts a fresh ratchet (Codex P2, PR #109: peaks
-    # are persisted before the flatten executes, so a surviving peak
-    # would instantly stop out a re-entered position against the prior
-    # trade's high-water mark).
+    # Pullback to -10% from peak: fires. The peak is RETAINED by the pure
+    # function — main() drops it only after the broker ACCEPTS the
+    # flatten, so a rejected close re-fires from the same high-water mark
+    # next pass instead of re-seeding lower (Codex P2 rounds, PR #109).
     peaks, actions = monitor.update_trailing_stops(
         portfolio=portfolio, marks={"TQQQ": 108.0},
         broker_positions=bp, position_peaks=peaks,
@@ -448,16 +450,7 @@ def test_trailing_stop_ratchets_peak_and_fires():
     assert len(actions) == 1
     assert actions[0]["symbol"] == "TQQQ"
     assert "trailing stop" in actions[0]["reason"]
-    assert "TQQQ" not in peaks
-
-    # Re-entry at a price below the old 120 peak: fresh ratchet seeds at
-    # the current mark — must NOT fire against the prior trade's peak.
-    peaks, actions = monitor.update_trailing_stops(
-        portfolio=portfolio, marks={"TQQQ": 105.0},
-        broker_positions=bp, position_peaks=peaks,
-    )
-    assert actions == []
-    assert peaks["TQQQ"]["peak_mark"] == 105.0
+    assert peaks["TQQQ"]["peak_mark"] == 120.0
 
 
 def test_trailing_stop_ignored_when_not_configured():
@@ -537,6 +530,66 @@ def test_non_trailing_flatten_clears_persisted_peak(tmp_state, monkeypatch):
     monitor.main([])
     assert flat_log == ["TQQQ"]
     assert "TQQQ" not in state.read_position_peaks()
+
+
+def test_failed_flatten_keeps_peak_and_records_no_kill_event(tmp_state, monkeypatch):
+    """Codex P2 regression (PR #109): a REJECTED/FAILED close (flatten →
+    None) must not record a kill event (the position is still open; a
+    phantom event could mis-attribute a later unrelated close in the
+    memo's match window) and must keep the trailing-stop peak so the stop
+    re-fires from the same high-water mark next pass."""
+    _write_portfolio([_etf_pos(
+        kill_conditions={"max_loss_pct": 25, "trailing_stop_pct": 10},
+    )])
+    state.write_position_peaks({"TQQQ": {"peak_mark": 100.0, "updated_at": "x"}})
+    flat_log: list = []
+    # Mark 85 = 15% below the 100 peak → trailing stop fires; gain vs
+    # avg_cost 70, so the loss cap stays quiet.
+    fake = _FakeBroker(
+        [_bp("TQQQ", 4, 4 * 85.0, avg_cost=70.0)],
+        flatten_log=flat_log, flatten_fails=True,
+    )
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
+    monitor.main([])
+    assert flat_log == ["TQQQ"]  # close was attempted...
+    assert state.read_kill_events() == []  # ...but not recorded as an exit
+    assert state.read_position_peaks()["TQQQ"]["peak_mark"] == 100.0
+
+
+def test_positions_fetch_failure_leaves_peaks_untouched(tmp_state, monkeypatch):
+    """Codex P2 regression (PR #109): a broker outage (get_positions
+    raises) yields an empty positions list indistinguishable from a
+    closed-out account — the peak file must be left as-is, not wiped."""
+    _write_portfolio([_etf_pos(
+        kill_conditions={"max_loss_pct": 25, "trailing_stop_pct": 10},
+    )])
+    prior = {"TQQQ": {"peak_mark": 150.0, "updated_at": "x"}}
+    state.write_position_peaks(prior)
+
+    class _OutageBroker(_FakeBroker):
+        def get_positions(self):
+            raise ConnectionError("broker unreachable")
+
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: _OutageBroker([]))
+    monitor.main([])
+    assert state.read_position_peaks() == prior
+
+
+def test_execute_actions_returns_accepted_flattens_only(tmp_state):
+    """execute_actions reports the symbols whose close the broker
+    accepted; rejected closes are excluded and unlogged."""
+    actions = [
+        {"symbol": "TQQQ", "action": "flatten", "reason": "loss 26% ≥ 25% cap"},
+        {"symbol": "TMF", "action": "flatten", "reason": "loss 27% ≥ 25% cap"},
+    ]
+    ok = _FakeBroker([])
+    assert monitor.execute_actions(actions, broker=ok) == {"TQQQ", "TMF"}
+    assert len(state.read_kill_events()) == 2
+
+    state.KILL_EVENTS_LOG.unlink()
+    bad = _FakeBroker([], flatten_fails=True)
+    assert monitor.execute_actions(actions, broker=bad) == set()
+    assert state.read_kill_events() == []
 
 
 def test_monitor_flatten_appends_kill_event(tmp_state, monkeypatch):

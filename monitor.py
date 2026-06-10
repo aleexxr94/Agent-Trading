@@ -202,15 +202,13 @@ def update_trailing_stops(
       - the stop fires when ``mark <= peak * (1 - pct/100)``
 
     Symbols absent from the returned peaks map (position closed, trailing
-    stop removed by the constructor, not currently held, or stop fired
-    this pass) are dropped from the peak file so a later re-entry starts
-    a fresh ratchet. Dropping at fire time (Codex P2, PR #109) matters:
-    the peaks are persisted before the flatten executes, so a surviving
-    peak could instantly stop out a re-entry against the PRIOR trade's
-    high-water mark. Trade-off: if the flatten itself fails, the next
-    pass re-seeds the ratchet at the current mark instead of re-firing —
-    the hard 25% loss cap (computed from cost basis, not peaks) remains
-    the backstop.
+    stop removed by the constructor, or not currently held) are dropped
+    from the peak file so a later re-entry starts a fresh ratchet. A
+    FIRING stop keeps its peak here: main() drops a peak only after the
+    broker ACCEPTS the flatten, so a rejected/failed close re-fires from
+    the same high-water mark on the next pass instead of re-seeding at a
+    lower mark, while a successful close clears it so a re-entry can't
+    be stopped against the prior trade's peak (Codex P2 rounds, PR #109).
 
     This enforces only what the agent itself chose per position — exactly
     the same contract as the fixed price/time stops.
@@ -243,7 +241,6 @@ def update_trailing_stops(
         new_peaks[symbol] = {"peak_mark": peak, "updated_at": now_iso}
         threshold = peak * (1.0 - float(pct) / 100.0)
         if mark <= threshold and peak > mark:
-            new_peaks.pop(symbol, None)
             actions.append({
                 "symbol": symbol,
                 "action": "flatten",
@@ -272,12 +269,29 @@ def _exit_kind_from_reason(reason: str) -> str:
     return "other"
 
 
-def execute_actions(actions: list[dict], *, broker: Broker | None) -> None:
+def execute_actions(actions: list[dict], *, broker: Broker | None) -> set[str]:
+    """Submit the flatten actions. Returns the symbols whose close the
+    broker ACCEPTED (Broker.flatten contract: OrderResult on acceptance,
+    None on rejection/failure).
+
+    A failed flatten records NO kill event (Codex P2, PR #109): the
+    position is still open, and a phantom event could mis-attribute an
+    unrelated later close inside the performance memo's 6h match window.
+    It is also excluded from the returned set, so main() keeps its
+    trailing-stop peak and the stop re-fires on the next pass."""
+    flattened: set[str] = set()
     if state.is_halted():
-        return
+        return flattened
     for a in actions:
         if a["action"] == "flatten" and broker is not None:
-            broker.flatten(a["symbol"])
+            result = broker.flatten(a["symbol"])
+            if result is None:
+                print(
+                    f"monitor: flatten {a['symbol']} rejected/failed; "
+                    "no kill event recorded, will re-evaluate next pass"
+                )
+                continue
+            flattened.add(a["symbol"])
             # Exit-outcome audit: record WHY this position died so the
             # performance memo can show the agent its stop-out history.
             # Guarded — telemetry must never break the kill loop.
@@ -291,6 +305,7 @@ def execute_actions(actions: list[dict], *, broker: Broker | None) -> None:
                 })
             except Exception:
                 pass
+    return flattened
 
 
 def audit_report(
@@ -406,12 +421,14 @@ def main(argv: list[str] | None = None) -> int:
     # One broker round trip; reuse the positions for marks, cost basis,
     # evaluation, and the audit so we never fetch twice.
     positions: list = []
+    positions_ok = True
     if broker is not None:
         try:
             positions = broker.get_positions()
         except Exception as e:
             print(f"monitor: get_positions failed ({type(e).__name__}: {e}); evaluating with no marks")
             positions = []
+            positions_ok = False
     marks = marks_lib.marks_from_positions(positions)
     cost_basis = marks_lib.cost_basis_from_positions(positions)
     enforce = _enforce_stops_enabled()
@@ -426,8 +443,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     # Trailing stops the constructor chose (ratchet from peak mark).
     # Guarded like the other telemetry: a peak-file problem degrades the
-    # ratchet, it never breaks the hard loss-cap loop above.
-    if enforce:
+    # ratchet, it never breaks the hard loss-cap loop above. Skipped
+    # entirely when the positions fetch FAILED (Codex P2, PR #109): a
+    # broker outage yields an empty positions list that is
+    # indistinguishable from a closed-out account inside
+    # update_trailing_stops, and persisting its output would wipe every
+    # peak — leave the file untouched and re-evaluate next pass.
+    new_peaks: dict | None = None
+    if enforce and positions_ok:
         try:
             new_peaks, trailing_actions = update_trailing_stops(
                 portfolio=portfolio,
@@ -439,27 +462,32 @@ def main(argv: list[str] | None = None) -> int:
             actions.extend(
                 a for a in trailing_actions if a["symbol"] not in already
             )
-            # ANY flatten this pass (loss cap, price/time stop, orphan,
-            # or trailing) invalidates the symbol's ratchet — peaks are
-            # persisted before execute_actions() runs, so a surviving
-            # peak could stop a re-entry against the prior trade's
-            # high-water mark (Codex P2 follow-up, PR #109: the
-            # fire-time drop inside update_trailing_stops only covers
-            # trailing-stop exits, not the other flatten rules).
-            for a in actions:
-                if a.get("action") == "flatten":
-                    new_peaks.pop(a.get("symbol"), None)
-            if not args.dry_run:
-                state.write_position_peaks(new_peaks)
         except Exception as e:
+            new_peaks = None
             print(f"monitor: trailing-stop error ({type(e).__name__}: {e}); ignored")
+    elif enforce:
+        print("monitor: positions fetch failed; trailing-stop peaks left untouched")
     print(
         f"monitor: {len(marks)} marks, {len(actions)} actions "
         f"(dry_run={args.dry_run}, broker={'on' if broker else 'off'}, "
         f"enforce_stops={enforce})"
     )
+    flattened: set[str] = set()
     if not args.dry_run:
-        execute_actions(actions, broker=broker)
+        flattened = execute_actions(actions, broker=broker)
+    # Persist the ratchet AFTER execution, dropping only the symbols whose
+    # flatten the broker actually ACCEPTED — any rule (loss cap, price/time
+    # stop, orphan, trailing) invalidates the peak once the close is real.
+    # A rejected close keeps its peak (the stop re-fires next pass from the
+    # same high-water mark); an accepted close clears it (a re-entry can't
+    # be stopped against the prior trade's peak). Codex P2 rounds, PR #109.
+    if new_peaks is not None and not args.dry_run:
+        for s in flattened:
+            new_peaks.pop(s, None)
+        try:
+            state.write_position_peaks(new_peaks)
+        except Exception as e:
+            print(f"monitor: peak persistence error ({type(e).__name__}: {e}); ignored")
     # Phase 2: 8% daily-drawdown breaker. Computes live synthetic equity from
     # the positions already fetched, manages the start-of-day baseline, and
     # writes the auto-expiring dd_halt flag the orchestrator reads to skip new

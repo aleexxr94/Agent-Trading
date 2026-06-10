@@ -392,6 +392,40 @@ def test_cycle_dedup_does_not_skip_when_cooldown_expires(tmp_state):
     assert result is None
 
 
+def test_cycle_dedup_does_not_skip_when_memo_changes(tmp_state):
+    """Codex P2 regression (PR #109): the performance memo is LLM-visible
+    evidence that can change while signals, positions, and cooldown all
+    stay fixed (a backfilled fill, a new kill event re-tagging an exit).
+    A changed memo fingerprint must invalidate dedup; a pre-upgrade hash
+    file without the key must also fail the match (costs one fresh
+    cycle, then dedup resumes with the new key)."""
+    signals_out = {"tickers": [{"symbol": "TQQQ", "last_close": 72.0}]}
+    positions = [{"symbol": "TQQQ", "qty": 4.0}]
+    memo_a = orchestrator._memo_fingerprint({"closed_trades": 3})
+    memo_b = orchestrator._memo_fingerprint({"closed_trades": 4})
+    state.write_json(state.CURRENT_PORTFOLIO, {"positions": [], "all_cash": True})
+    base_hash = {
+        "signals_fingerprint": orchestrator._signals_fingerprint(signals_out),
+        "positions_fingerprint": orchestrator._positions_fingerprint(positions),
+        "cooldown_fingerprint": orchestrator._cooldown_fingerprint(None),
+        "updated_at": state.utcnow_iso(),
+    }
+    state.write_json(state.LAST_CYCLE_HASH, {**base_hash, "memo_fingerprint": memo_a})
+    assert orchestrator._check_cycle_dedup(signals_out, positions, None, memo_a) is not None
+    assert orchestrator._check_cycle_dedup(signals_out, positions, None, memo_b) is None
+    # Legacy hash file (written before the memo key existed) vs a real fp.
+    state.write_json(state.LAST_CYCLE_HASH, base_hash)
+    assert orchestrator._check_cycle_dedup(signals_out, positions, None, memo_a) is None
+
+
+def test_memo_fingerprint_stable_and_distinct(tmp_state):
+    assert (orchestrator._memo_fingerprint({"a": 1, "b": 2})
+            == orchestrator._memo_fingerprint({"b": 2, "a": 1}))
+    assert (orchestrator._memo_fingerprint({"closed_trades": 1})
+            != orchestrator._memo_fingerprint({"closed_trades": 2}))
+    assert isinstance(orchestrator._memo_fingerprint(None), str)
+
+
 def test_cycle_dedup_does_not_skip_when_signals_change(tmp_state):
     """Different signals fingerprint → dedup must NOT fire."""
     state.write_json(state.LAST_CYCLE_HASH, {
