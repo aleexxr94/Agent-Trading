@@ -2164,3 +2164,74 @@ def test_trade_stats_bad_timestamps_hold_none():
     assert s2["win_rate_pct"] == pytest.approx(0.0)
     assert s2["wins"] == 0 and s2["losses"] == 0
     assert s2["profit_factor"] is None
+
+
+# ---------- cost_by_stage / cache_hit_trend ----------
+
+
+def test_cost_by_stage_groups_and_computes_cache_pct(tmp_state):
+    state.append_cost({
+        "run_id": "r1", "stage": "construct", "model": "m",
+        "cost_usd": 0.20, "at": "2026-06-01T12:00:00Z",
+        "input_tokens": 100, "output_tokens": 50,
+        "cache_creation_input_tokens": 100, "cache_read_input_tokens": 800,
+    })
+    state.append_cost({
+        "run_id": "r2", "stage": "construct", "model": "m",
+        "cost_usd": 0.10, "at": "2026-06-02T12:00:00Z",
+        "input_tokens": 100, "output_tokens": 50,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+    })
+    state.append_cost({
+        "run_id": "r1", "stage": "strategist", "model": "m",
+        "cost_usd": 0.05, "at": "2026-06-01T12:01:00Z",
+        "input_tokens": 200, "output_tokens": 20,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 200,
+    })
+    out = dd.cost_by_stage()
+    assert [r["stage"] for r in out] == ["construct", "strategist"]  # cost desc
+    construct = out[0]
+    assert construct["calls"] == 2
+    assert construct["cost_usd"] == pytest.approx(0.30)
+    # tokens: (100+100+800+50) + (100+0+0+50) = 1200
+    assert construct["total_tokens"] == 1200
+    # cache hit: 800 / (200 + 100 + 800) = 72.7%
+    assert construct["cache_hit_pct"] == pytest.approx(100.0 * 800 / 1100)
+    strategist = out[1]
+    assert strategist["cache_hit_pct"] == pytest.approx(50.0)
+
+
+def test_cost_by_stage_empty_state_returns_empty(tmp_state):
+    assert dd.cost_by_stage() == []
+    # Rows with no token fields don't divide by zero.
+    state.append_cost({
+        "run_id": "r1", "stage": "meta", "model": "m",
+        "cost_usd": 0.01, "at": "2026-06-01T12:00:00Z",
+    })
+    out = dd.cost_by_stage()
+    assert out[0]["cache_hit_pct"] == 0.0
+    assert out[0]["total_tokens"] == 0
+
+
+def test_cache_hit_trend_averages_per_run(tmp_state):
+    rows = [
+        {"run_id": "20260601T120000Z-a", "stage": "strategist",
+         "prompt_cache_hit_pct": 80.0, "started_at": "2026-06-01T12:00:00Z"},
+        {"run_id": "20260601T120000Z-a", "stage": "construct",
+         "prompt_cache_hit_pct": 60.0, "started_at": "2026-06-01T12:05:00Z"},
+        {"run_id": "20260602T120000Z-b", "stage": "strategist",
+         "prompt_cache_hit_pct": 90.0, "started_at": "2026-06-02T12:00:00Z"},
+        # Row without the field is ignored; run with no usable rows is skipped.
+        {"run_id": "20260603T120000Z-c", "stage": "market_gate",
+         "started_at": "2026-06-03T12:00:00Z"},
+    ]
+    with state.DECISIONS_LOG.open("a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    out = dd.cache_hit_trend()
+    assert [r["run_id"] for r in out] == [
+        "20260601T120000Z-a", "20260602T120000Z-b",
+    ]
+    assert out[0]["cache_hit_pct"] == pytest.approx(70.0)
+    assert out[0]["at"] == "2026-06-01T12:00:00Z"  # earliest started_at
+    assert out[1]["cache_hit_pct"] == pytest.approx(90.0)

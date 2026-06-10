@@ -103,6 +103,16 @@ def _cached_cost_by_month(_mtimes: tuple) -> list:
 
 
 @st.cache_data(ttl=15, show_spinner=False)
+def _cached_cost_by_stage(_mtimes: tuple) -> list:
+    return dd.cost_by_stage()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _cached_cache_hit_trend(_mtimes: tuple) -> list:
+    return dd.cache_hit_trend()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
 def _cached_nav_history(_mtimes: tuple) -> list:
     return dd.load_nav_history()
 
@@ -545,6 +555,30 @@ def _fmt_ts(iso: str) -> str:
         return iso[:16].replace("T", " ")
 
 
+def _fmt_countdown(iso: str) -> str:
+    """'in 3h 12m' / 'in 14m' / 'overdue 22m' relative to now; '' on bad
+    input. Accurate as of page render — Streamlit doesn't tick live."""
+    if not iso:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        secs = (dt - datetime.now(timezone.utc)).total_seconds()
+    except Exception:
+        return ""
+    prefix, secs = ("in", secs) if secs >= 0 else ("overdue", -secs)
+    mins = int(secs // 60)
+    hours, mins = divmod(mins, 60)
+    days, hours = divmod(hours, 24)
+    if days > 0:
+        return f"{prefix} {days}d {hours}h"
+    if hours > 0:
+        return f"{prefix} {hours}h {mins}m"
+    return f"{prefix} {mins}m"
+
+
 # ---------- halt banner (sticky, top) ----------
 
 
@@ -653,7 +687,10 @@ st.markdown(
           </div>
           <div class="at-hero-sub" style="opacity:0.75; font-size:0.85rem;">
             Last cycle: <strong>{_fmt_ts(last_run_at)}</strong>
-            &nbsp;•&nbsp; Next: <strong>{_fmt_ts(next_run_at)}</strong>
+            &nbsp;•&nbsp; Next: <strong>{_fmt_ts(next_run_at)}</strong>{
+                f' <span style="color:var(--text-2);">({_fmt_countdown(next_run_at)})</span>'
+                if _fmt_countdown(next_run_at) else ""
+            }
             &nbsp;•&nbsp; Source: <strong>{source}</strong>
           </div>{extra_lines}
         </div>
@@ -1728,6 +1765,63 @@ with tabs[3]:
         )
     else:
         st.info("No monthly cost data yet.")
+
+    st.markdown(
+        '<div class="at-section-label">Cost by pipeline stage</div>',
+        unsafe_allow_html=True,
+    )
+    by_stage = _cached_cost_by_stage(_state_mtimes())
+    if by_stage:
+        st.dataframe(
+            pd.DataFrame(by_stage).rename(columns={
+                "stage": "Stage",
+                "calls": "Calls",
+                "cost_usd": "Cost (USD)",
+                "total_tokens": "Tokens",
+                "cache_hit_pct": "Cache hit",
+            }),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Cost (USD)": st.column_config.NumberColumn(format="$%.4f"),
+                "Tokens": st.column_config.NumberColumn(format="%d"),
+                "Cache hit": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+        st.caption(
+            "Where the LLM budget actually goes — calls, spend, and "
+            "prompt-cache efficiency per pipeline stage, all time "
+            "(reset-aware)."
+        )
+    else:
+        st.info("No per-stage cost data yet.")
+
+    st.markdown(
+        '<div class="at-section-label">Prompt-cache hit rate by run</div>',
+        unsafe_allow_html=True,
+    )
+    cache_trend = _cached_cache_hit_trend(_state_mtimes())
+    if cache_trend:
+        df_ct = pd.DataFrame(cache_trend)
+        fig_ct = go.Figure()
+        fig_ct.add_trace(go.Scatter(
+            x=df_ct["at"], y=df_ct["cache_hit_pct"],
+            mode="lines+markers", name="Cache hit %",
+            line=dict(color="#2563eb", width=2),
+            marker=dict(size=5),
+            customdata=[[r] for r in df_ct["run_id"]],
+            hovertemplate="%{customdata[0]}<br>%{y:.1f}%<extra></extra>",
+        ))
+        _style_fig(fig_ct, height=240, yaxis_title="Cache hit (%)",
+                   yrange=[0, 105])
+        st.plotly_chart(fig_ct, width="stretch", config=NO_ZOOM_CONFIG)
+        st.caption(
+            "Mean prompt-cache hit rate per orchestrator run. Sustained "
+            "high values mean the static system prompts are caching as "
+            "designed; a sudden drop usually means a prompt was edited."
+        )
+    else:
+        st.info("No cache-hit history yet.")
 
 
 # ===== Tab 5: vs S&P 500 =====

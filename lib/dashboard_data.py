@@ -807,6 +807,77 @@ def cost_by_month() -> list[dict]:
     return sorted(by_month.values(), key=lambda x: x["month"])
 
 
+def cost_by_stage() -> list[dict]:
+    """Per-pipeline-stage LLM cost rollup from state/costs.jsonl.
+
+    Returns ``[{stage, calls, cost_usd, total_tokens, cache_hit_pct}]``
+    sorted by cost descending. ``cache_hit_pct`` is
+    ``100 * cache_read / (input + cache_creation + cache_read)`` over the
+    stage's summed token counts (0.0 when the denominator is 0).
+    Reset-aware via load_costs(); [] when no cost history exists.
+    """
+    rows = load_costs(limit=10**9)
+    by_stage: dict[str, dict] = {}
+    for r in rows:
+        stage = str(r.get("stage") or "unknown")
+        b = by_stage.setdefault(stage, {
+            "stage": stage, "calls": 0, "cost_usd": 0.0,
+            "_input": 0, "_creation": 0, "_read": 0, "_output": 0,
+        })
+        b["calls"] += 1
+        b["cost_usd"] += r.get("cost_usd", 0.0) or 0
+        b["_input"] += r.get("input_tokens") or 0
+        b["_creation"] += r.get("cache_creation_input_tokens") or 0
+        b["_read"] += r.get("cache_read_input_tokens") or 0
+        b["_output"] += r.get("output_tokens") or 0
+    out = []
+    for b in by_stage.values():
+        denom = b["_input"] + b["_creation"] + b["_read"]
+        out.append({
+            "stage": b["stage"],
+            "calls": b["calls"],
+            "cost_usd": b["cost_usd"],
+            "total_tokens": denom + b["_output"],
+            "cache_hit_pct": (100.0 * b["_read"] / denom) if denom > 0 else 0.0,
+        })
+    return sorted(out, key=lambda x: x["cost_usd"], reverse=True)
+
+
+def cache_hit_trend(limit: int = 200) -> list[dict]:
+    """Per-run mean prompt-cache hit rate from the decision log.
+
+    Returns ``[{run_id, at, cache_hit_pct}]`` oldest→newest, one row per
+    run (mean of that run's decision rows that carry a numeric
+    ``prompt_cache_hit_pct``). Runs whose rows all lack the field are
+    skipped. ``at`` is the run's earliest ``started_at``.
+    """
+    rows = load_decisions(limit=10**9)
+    by_run: dict[str, dict] = {}
+    for r in rows:
+        rid = str(r.get("run_id") or "")
+        pct = r.get("prompt_cache_hit_pct")
+        if not rid or not isinstance(pct, (int, float)):
+            continue
+        b = by_run.setdefault(rid, {"run_id": rid, "at": "", "_sum": 0.0, "_n": 0})
+        b["_sum"] += float(pct)
+        b["_n"] += 1
+        at = str(r.get("started_at") or r.get("ended_at") or "")
+        if at and (not b["at"] or at < b["at"]):
+            b["at"] = at
+    out = [
+        {
+            "run_id": b["run_id"],
+            "at": b["at"],
+            "cache_hit_pct": b["_sum"] / b["_n"],
+        }
+        for b in by_run.values()
+        if b["_n"] > 0
+    ]
+    # run_ids are timestamp-prefixed, so sorting by run_id is chronological.
+    out.sort(key=lambda x: x["run_id"])
+    return out[-limit:]
+
+
 def load_nav_history(limit: int | None = None) -> list[dict]:
     return state.read_nav_history(limit=limit)
 
