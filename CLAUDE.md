@@ -24,21 +24,28 @@ You are a senior quant systems engineer. Build a complete, **paper-trading-only*
 > real leveraged ETF pairs (TMF/TMV, ERX/ERY). This section supersedes the
 > earlier options-bearing spec.
 
-- Universe (ETF-only, 49 tickers; widened from 29 on 2026-06-10 with explicit
-  user authorization, for diversification + more tradeable factors): 21
+- Universe (ETF-only, 57 tickers; widened from 29 on 2026-06-10 with explicit
+  user authorization, for diversification + more tradeable factors): 25
   bull/bear leveraged-ETF pairs — TQQQ/SQQQ (nasdaq), UPRO/SPXU (sp500),
   UDOW/SDOW (dow), TNA/TZA (small-caps), HIBL/HIBS (high-beta), SOXL/SOXS
   (semis), TECL/TECS (technology), WEBL/WEBS (internet), LABU/LABD (biotech),
   YINN/YANG (china), EDC/EDZ (emerging-markets), FAS/FAZ (financials-broad),
   ERX/ERY (energy), GUSH/DRIP (oil-gas-ep), BOIL/KOLD (natural-gas), UCO/SCO
   (crude-oil), TMF/TMV (rates), NUGT/DUST (gold-miners), UGL/GLL
-  (gold-bullion), AGQ/ZSL (silver), ETHU/ETHD (crypto-eth) — plus UVXY (solo
-  long-vol), BITX (2x bull) / BITI (1x inverse) on crypto-btc, and 4 solo
-  bull 3x sector ETFs with no liquid inverse counterpart: NAIL
-  (homebuilders), DFEN (defense), CURE (healthcare), DPST (regional-banks).
-  Bearish views on solo-bull factors are expressed by not holding them.
+  (gold-bullion), AGQ/ZSL (silver), ETHU/ETHD (crypto-eth), UVXY/SVIX (vol),
+  and leveraged single-stock lines NVDL/NVD (nvda), TSLL/TSLZ (tsla),
+  MSTU/MSTZ (mstr) — plus BITX (2x bull) / BITI (1x inverse) on crypto-btc,
+  and 5 solo bull ETFs with no liquid inverse counterpart: NAIL
+  (homebuilders), DFEN (defense), CURE (healthcare), DPST (regional-banks),
+  CONL (coin, 2x Coinbase). Bearish views on solo-bull factors are expressed
+  by not holding them.
 - **No options. No spot single-name equities. No unleveraged broad-market
   ETFs as core positions.** Every position is a long leveraged/inverse ETF.
+  (Clarified 2026-06-10, user decision: liquid **leveraged single-stock
+  ETFs** — NVDL/NVD, TSLL/TSLZ, MSTU/MSTZ, CONL — are allowed; they are
+  listed ETFs riding the same caps and kill rails. Direct spot equities
+  remain banned. Single-stock lines carry idiosyncratic event risk
+  (earnings, guidance) outside the macro calendar — the prompts flag this.)
 - **No broker shorts.** Bear theses are expressed as long inverse ETFs
   (SQQQ, SPXU, etc.). Cash account only.
 - Portfolio target: **1–12 open positions** at the end of each cycle (or all-cash if conviction is genuinely absent). The 1-position floor lets a single strong-conviction thesis fire even when broader diversification isn't available. Concentration risk is bounded by the per-position entry cap (15% NAV) / hold ceiling (25% NAV) and kill conditions.
@@ -83,7 +90,7 @@ Sub-agents are separate Anthropic API calls with role-specific system prompts an
 Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-failed LLM outputs are retried once with the validation error fed back; second failure aborts the run and logs.
 
 0. **Market Gate** (Python, $0) — Alpaca `/v2/clock` query. If markets are closed → write `market_gate.json` + closed-market `next_run.json` and exit. No LLM calls billed on closed-market cycles.
-1. **Signals** (Python, $0) — For each of the 49 universe tickers, compute deterministic features from yfinance daily history: momentum (30/60d), HV (30/90d), distance from 50/200d MAs, ADV, last close, RSI-14, relative strength vs SPY (30d), trend-quality R² (trend vs chop — the leveraged-ETF decay axis), plus a universe-level `factor_correlations` block (pairs of factors whose bull ETFs' 30d returns correlate ≥ |0.7|, so the LLM stages can see which factors are currently one bet). Includes per-ticker `upcoming_macro_events_7d` (FOMC/CPI/NFP/PCE within 7 days). Output: `signals.json`. The LLM stages read a compact factor-grouped rendering (`lib.signals.compact_for_llm`) rather than the raw table — the compaction pays for the wider universe + the performance memo, keeping per-cycle cost at or below the prior baseline. Replaces the v1 screener + bull/bear research + scenarios chain entirely.
+1. **Signals** (Python, $0) — For each of the 57 universe tickers, compute deterministic features from yfinance daily history: momentum (30/60d), HV (30/90d), distance from 50/200d MAs, ADV, last close, RSI-14, relative strength vs SPY (30d), trend-quality R² (trend vs chop — the leveraged-ETF decay axis), plus a universe-level `factor_correlations` block (pairs of factors whose bull ETFs' 30d returns correlate ≥ |0.7|, so the LLM stages can see which factors are currently one bet). Includes per-ticker `upcoming_macro_events_7d` (FOMC/CPI/NFP/PCE within 7 days). Output: `signals.json`. The LLM stages read a compact factor-grouped rendering (`lib.signals.compact_for_llm`) rather than the raw table — the compaction pays for the wider universe + the performance memo, keeping per-cycle cost at or below the prior baseline. Replaces the v1 screener + bull/bear research + scenarios chain entirely.
 1b. **Cycle dedup** (Python, $0) — If the signals fingerprint AND broker-position fingerprint both match the prior cycle's, skip strategist + construct + execute and reuse the cached portfolio. Stored in `state/last_cycle_hash.json`.
 2. **Strategist** (Sonnet 4.6 medium effort, ~$0.05) — Reads compact signals + current broker positions (with unrealized P&L %) + recent PnL history (last 5 cycles) + the **performance memo** (`lib/feedback.py`, $0: the agent's own realized win/loss record by factor, confidence-bucket calibration joined from each opening run's `view.json`, and recent exits tagged with what killed them via `state/kill_events.jsonl`); emits a regime classification + up to 6 candidate ideas with `instrument_kind` (always `etf`), `thesis` (signal-citing), `confidence` ∈ [0, 1]. The memo is framed in the prompts as calibration EVIDENCE for the agent's judgment — explicitly not an instruction to trade less. Bullish theses name the bull ETF; bearish theses name the inverse ETF. Output: `view.json`.
 3. **Portfolio Construction** (Opus 4.7 high effort, ~$0.20) — Converge on 1–12 positions (or all-cash). Reads compact signals + view + current positions + PnL history + performance memo + adaptive per-position cap + universe-median HV30 context. May choose `trailing_stop_pct` per position as an alternative/complement to fixed stops. Output: `portfolio.json`.

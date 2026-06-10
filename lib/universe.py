@@ -1,4 +1,4 @@
-"""Static universe of tradeable instruments — ETF-only (49 tickers).
+"""Static universe of tradeable instruments — ETF-only (57 tickers).
 
 The system trades **only** leveraged and inverse ETFs. Bullish theses are
 expressed by holding a bull (positively-leveraged) ETF; bearish theses are
@@ -24,18 +24,27 @@ crypto factor (ether). Every addition is a listed leveraged/inverse ETF
 whose dollar ADV comfortably clears the ≤1%-of-ADV sanity rule at this
 account's position sizes (~$200-600 notional).
 
-Universe composition (49):
-  - 21 bull/bear leveraged-ETF pairs (42): Nasdaq, S&P 500, Dow,
+Single-stock note (2026-06-10, user-authorized): liquid LEVERAGED
+single-stock ETFs were added — NVDL/NVD (NVDA), TSLL/TSLZ (TSLA),
+MSTU/MSTZ (MSTR), CONL (COIN, solo bull). The CLAUDE.md ban on *spot*
+single-name equities stands; these are listed leveraged ETFs and ride
+the same caps/kill rails as every other position. They carry
+single-company event risk (earnings, guidance) that the macro calendar
+does not cover — the prompts call this out.
+
+Universe composition (57):
+  - 25 bull/bear leveraged-ETF pairs (50): Nasdaq, S&P 500, Dow,
     small-caps, high-beta, semis, technology, internet, biotech, China,
     emerging markets, financials, energy, oil & gas E&P, natural gas,
-    crude oil, rates, gold miners, gold bullion, silver, ether. Each
-    pair covers one factor in both directions.
-  - 7 solo/asymmetric entries: UVXY (long vol — no inverse counterpart);
-    BITX (+2x bull) paired with BITI (-1x inverse) on crypto-btc; and
-    4 solo bull 3x sector ETFs with no liquid inverse counterpart
-    (NAIL homebuilders, DFEN defense, CURE healthcare, DPST regional
-    banks) — bearish views on those factors are expressed by not
-    holding them (or via a correlated inverse, the agent's call).
+    crude oil, rates, gold miners, gold bullion, silver, ether, vol
+    (UVXY/SVIX), NVDA, TSLA, MSTR. Each pair covers one factor in both
+    directions.
+  - 7 solo/asymmetric entries: BITX (+2x bull) paired with BITI (-1x
+    inverse) on crypto-btc; and 5 solo bull ETFs with no liquid inverse
+    counterpart (NAIL homebuilders, DFEN defense, CURE healthcare,
+    DPST regional banks, CONL coin) — bearish views on those factors
+    are expressed by not holding them (or via a correlated inverse,
+    the agent's call).
 
 `factor` is the short factor identifier, shared across bull/bear pairs
 (e.g. TQQQ + SQQQ both → "nasdaq"). Used by:
@@ -95,6 +104,12 @@ F_HOMEBUILDERS = "homebuilders"
 F_DEFENSE      = "defense"
 F_HEALTHCARE   = "healthcare"
 F_REGIONAL_BANKS = "regional-banks"
+# 2026-06-10 single-stock leveraged ETFs (user-authorized; the CLAUDE.md ban
+# on SPOT single-name equities stands — these are listed leveraged ETFs).
+F_NVDA         = "nvda"
+F_TSLA         = "tsla"
+F_MSTR         = "mstr"
+F_COIN         = "coin"
 
 
 def _e(symbol: str, kind: InstrumentKind, lev: float, family: str,
@@ -171,9 +186,11 @@ _LEVERAGED_ETFS: tuple[UniverseEntry, ...] = (
        "Direxion Daily Gold Miners Bull 2x — 2x daily long NYSE Arca Gold Miners", F_GOLD_MINERS),
     _e("DUST", "etf", -2.0, "Gold Miners 2x short",
        "Direxion Daily Gold Miners Bear 2x — 2x daily inverse NYSE Arca Gold Miners", F_GOLD_MINERS),
-    # ---- Vol / commodity (solo — no inverse counterpart) ----
+    # ---- Vol (UVXY long + SVIX short — paired as of 2026-06-10) ----
     _e("UVXY", "etf",  1.5, "VIX 1.5x long",
        "ProShares Ultra VIX Short-Term Futures — 1.5x daily long VIX front-month", F_VOL),
+    _e("SVIX", "etf", -1.0, "VIX 1x short",
+       "Volatility Shares -1x Short VIX Futures — 1x daily inverse VIX front-month", F_VOL),
     # ---- Crypto (bull BITX + inverse BITI) ----
     _e("BITX", "etf",  2.0, "Bitcoin 2x long",
        "Volatility Shares 2x Bitcoin Strategy ETF — 2x daily long BTC futures", F_CRYPTO_BTC),
@@ -230,6 +247,25 @@ _LEVERAGED_ETFS: tuple[UniverseEntry, ...] = (
        "Direxion Daily Healthcare Bull 3x — 3x daily long Health Care Select Sector", F_HEALTHCARE),
     _e("DPST", "etf",  3.0, "Regional Banks 3x long",
        "Direxion Daily Regional Banks Bull 3x — 3x daily long S&P Regional Banks Select", F_REGIONAL_BANKS),
+
+    # ==== 2026-06-10 single-stock leveraged ETFs (user-authorized) ====
+    # Single-COMPANY risk: idiosyncratic event exposure (earnings, guidance,
+    # litigation) that the macro calendar does not cover. The per-position
+    # entry cap / hold ceiling / kill conditions bound the blast radius.
+    _e("NVDL", "etf",  2.0, "NVDA 2x long",
+       "GraniteShares 2x Long NVDA Daily ETF — 2x daily long NVIDIA", F_NVDA),
+    _e("NVD",  "etf", -2.0, "NVDA 2x short",
+       "GraniteShares 2x Short NVDA Daily ETF — 2x daily inverse NVIDIA", F_NVDA),
+    _e("TSLL", "etf",  2.0, "TSLA 2x long",
+       "Direxion Daily TSLA Bull 2x — 2x daily long Tesla", F_TSLA),
+    _e("TSLZ", "etf", -2.0, "TSLA 2x short",
+       "T-Rex 2x Inverse Tesla Daily Target ETF — 2x daily inverse Tesla", F_TSLA),
+    _e("MSTU", "etf",  2.0, "MSTR 2x long",
+       "T-Rex 2x Long MSTR Daily Target ETF — 2x daily long MicroStrategy", F_MSTR),
+    _e("MSTZ", "etf", -2.0, "MSTR 2x short",
+       "T-Rex 2x Inverse MSTR Daily Target ETF — 2x daily inverse MicroStrategy", F_MSTR),
+    _e("CONL", "etf",  2.0, "COIN 2x long",
+       "GraniteShares 2x Long COIN Daily ETF — 2x daily long Coinbase (solo; no liquid inverse)", F_COIN),
 )
 
 

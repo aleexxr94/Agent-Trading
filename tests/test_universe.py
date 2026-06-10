@@ -1,10 +1,10 @@
-"""Invariants on the static universe (lib.universe) — ETF-only (49 tickers).
+"""Invariants on the static universe (lib.universe) — ETF-only (57 tickers).
 
 The universe is leveraged/inverse ETFs only (options were removed). After
-the 2026-06-10 expansion it has 21 bull/bear pairs + UVXY (solo vol) +
-BITX/BITI (crypto) + 4 solo bull sector ETFs = 49 tickers spanning 27
-distinct factors. Bullish theses hold the bull ETF; bearish theses hold
-the inverse ETF.
+the 2026-06-10 expansion it has 25 bull/bear pairs (incl. UVXY/SVIX on vol
+and the leveraged single-stock lines NVDA/TSLA/MSTR) + BITX/BITI (crypto)
++ 5 solo bull ETFs = 57 tickers spanning 31 distinct factors. Bullish
+theses hold the bull ETF; bearish theses hold the inverse ETF.
 """
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import pytest
 
 from lib import universe
 
-# Every bull/bear pair in the universe. Solo entries (UVXY, NAIL, DFEN,
-# CURE, DPST) are intentionally absent here.
+# Every bull/bear pair in the universe. Solo entries (NAIL, DFEN, CURE,
+# DPST, CONL) are intentionally absent here.
 PAIRS = [
     ("TQQQ", "SQQQ"),
     ("UPRO", "SPXU"),
@@ -37,18 +37,23 @@ PAIRS = [
     ("AGQ",  "ZSL"),
     ("UGL",  "GLL"),
     ("ETHU", "ETHD"),
+    ("UVXY", "SVIX"),
+    # Leveraged single-stock lines (2026-06-10, user-authorized).
+    ("NVDL", "NVD"),
+    ("TSLL", "TSLZ"),
+    ("MSTU", "MSTZ"),
 ]
 
-SOLO_BULLS = ["UVXY", "NAIL", "DFEN", "CURE", "DPST"]
+SOLO_BULLS = ["NAIL", "DFEN", "CURE", "DPST", "CONL"]
 
 
-def test_universe_size_is_49():
-    """ETF-only universe has exactly 49 tickers: 21 bull/bear leveraged
-    pairs (42) + UVXY (solo vol) + BITX/BITI (crypto) + 4 solo bull
-    sector ETFs. If you change this, update the factor-count floor below
-    and the strategist prompt's universe section."""
-    assert len(universe.UNIVERSE) == 49, (
-        f"universe size {len(universe.UNIVERSE)} != 49 (ETF-only)."
+def test_universe_size_is_57():
+    """ETF-only universe has exactly 57 tickers: 25 bull/bear leveraged
+    pairs (50) + BITX/BITI (crypto) + 5 solo bull ETFs. If you change
+    this, update the factor-count floor below and the strategist
+    prompt's universe section."""
+    assert len(universe.UNIVERSE) == 57, (
+        f"universe size {len(universe.UNIVERSE)} != 57 (ETF-only)."
     )
 
 
@@ -68,13 +73,14 @@ def test_no_option_underlyings_present():
 
 
 def test_universe_covers_multiple_uncorrelated_factors():
-    """Universe must span ≥25 distinct factors after the 2026-06-10
-    expansion (commodities, geographies, style, sectors, second crypto).
-    Several equity factors are correlated risk-on beta — the constructor
-    de-dupes by factor and now sees live factor correlations in
-    signals.json — but the factor *labels* stay distinct."""
+    """Universe must span ≥29 distinct factors after the 2026-06-10
+    expansion (commodities, geographies, style, sectors, second crypto,
+    leveraged single-stock lines). Several equity factors are correlated
+    risk-on beta — the constructor de-dupes by factor and now sees live
+    factor correlations in signals.json — but the factor *labels* stay
+    distinct."""
     factors = {e.factor for e in universe.UNIVERSE}
-    assert len(factors) >= 25, (
+    assert len(factors) >= 29, (
         f"universe spans only {len(factors)} factors: {sorted(factors)}."
     )
 
@@ -160,15 +166,18 @@ def test_metadata_block_shape():
 
 
 def test_factor_pair_returns_bull_and_bear_for_paired_factors():
-    """factor_pair("TQQQ") returns (TQQQ, SQQQ); factor_pair("UVXY")
-    returns (UVXY, None) since vol has no inverse pair; crypto pairs the
-    2x bull BITX with the 1x inverse BITI."""
+    """factor_pair("TQQQ") returns (TQQQ, SQQQ); vol pairs UVXY with
+    SVIX as of 2026-06-10; crypto pairs the 2x bull BITX with the 1x
+    inverse BITI; the solo bulls return (sym, None)."""
     assert universe.factor_pair("TQQQ") == ("TQQQ", "SQQQ")
     assert universe.factor_pair("SOXS") == ("SOXL", "SOXS")
     assert universe.factor_pair("TMV") == ("TMF", "TMV")
     assert universe.factor_pair("BITX") == ("BITX", "BITI")
     assert universe.factor_pair("SCO") == ("UCO", "SCO")
     assert universe.factor_pair("ETHU") == ("ETHU", "ETHD")
+    assert universe.factor_pair("UVXY") == ("UVXY", "SVIX")
+    assert universe.factor_pair("NVD") == ("NVDL", "NVD")
+    assert universe.factor_pair("TSLL") == ("TSLL", "TSLZ")
     for sym in SOLO_BULLS:
         bull, bear = universe.factor_pair(sym)
         assert bull == sym

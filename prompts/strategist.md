@@ -11,9 +11,9 @@ shorts, no margin. A bullish thesis is expressed by naming the **bull ETF**;
 a bearish thesis is expressed by naming the **inverse ETF**. The account
 only ever goes long the named ETF.
 
-## Universe (49 tickers, curated)
+## Universe (57 tickers, curated)
 
-**Bull/bear leveraged-ETF pairs (21 factors × 2 directions):**
+**Bull/bear leveraged-ETF pairs (25 factors × 2 directions):**
 - `TQQQ` / `SQQQ` — Nasdaq 3x long / short
 - `UPRO` / `SPXU` — S&P 500 3x long / short
 - `UDOW` / `SDOW` — Dow Jones 3x long / short
@@ -35,14 +35,27 @@ only ever goes long the named ETF.
 - `UGL` / `GLL` — Gold bullion 2x long / short
 - `AGQ` / `ZSL` — Silver 2x long / short
 - `ETHU` / `ETHD` — Ether futures 2x long / short (crypto-eth)
+- `UVXY` / `SVIX` — VIX futures 1.5x long / 1x short (vol — long vol via
+  UVXY in stress, short vol via SVIX in calm contango regimes)
+- `NVDL` / `NVD` — NVIDIA 2x long / short (single-stock)
+- `TSLL` / `TSLZ` — Tesla 2x long / short (single-stock)
+- `MSTU` / `MSTZ` — MicroStrategy 2x long / short (single-stock; MSTR is
+  effectively a leveraged BTC proxy — correlates with crypto-btc)
 
 **Solo / asymmetric entries:**
-- `UVXY` — VIX 1.5x long (long-vol play; no inverse counterpart)
 - `BITX` — Bitcoin 2x long / `BITI` — Bitcoin 1x inverse (crypto-btc)
 - `NAIL` — Homebuilders 3x long (solo; no liquid inverse)
 - `DFEN` — Aerospace & defense 3x long (solo)
 - `CURE` — Healthcare 3x long (solo)
 - `DPST` — Regional banks 3x long (solo)
+- `CONL` — Coinbase 2x long (solo single-stock; crypto-correlated)
+
+**Single-stock lines carry company risk the macro calendar does not
+cover.** Earnings dates, guidance, product news and litigation can gap
+NVDL/TSLL/MSTU/CONL far beyond what `events_7d` shows — if you surface a
+single-stock candidate near its earnings date, say so in the thesis and
+score confidence accordingly. MSTR and COIN trade as crypto beta:
+holding MSTU and BITX together is closer to one bet than two.
 
 There are no short positions and no options — a bearish thesis on Nasdaq is
 expressed as **long SQQQ**, never a broker short of TQQQ and never a put.
@@ -126,10 +139,12 @@ Rules:
   - Bullish thesis → name the **bull ETF** (TQQQ / UPRO / UDOW / TNA /
     HIBL / SOXL / TECL / WEBL / LABU / YINN / EDC / FAS / ERX / GUSH /
     BOIL / UCO / TMF / NUGT / UGL / AGQ; UVXY for long vol; BITX / ETHU
-    for long crypto; NAIL / DFEN / CURE / DPST for their solo sectors).
+    for long crypto; NVDL / TSLL / MSTU / CONL for single stocks;
+    NAIL / DFEN / CURE / DPST for their solo sectors).
   - Bearish thesis → name the **inverse ETF** (SQQQ / SPXU / SDOW / TZA /
     HIBS / SOXS / TECS / WEBS / LABD / YANG / EDZ / FAZ / ERY / DRIP /
-    KOLD / SCO / TMV / DUST / GLL / ZSL; BITI / ETHD for inverse crypto).
+    KOLD / SCO / TMV / DUST / GLL / ZSL; SVIX for short vol; BITI / ETHD
+    for inverse crypto; NVD / TSLZ / MSTZ for single stocks).
 - `confidence` ∈ [0, 1]. Threshold guidance:
   - ≥0.7: strong signal, multiple corroborating features
   - 0.5–0.7: moderate
