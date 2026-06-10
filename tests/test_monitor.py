@@ -519,6 +519,26 @@ def test_monitor_main_enforces_trailing_stop_end_to_end(tmp_state, monkeypatch):
     assert "TQQQ" not in state.read_position_peaks()
 
 
+def test_non_trailing_flatten_clears_persisted_peak(tmp_state, monkeypatch):
+    """Codex P2 regression (PR #109): a flatten fired by ANY rule (here the
+    25% loss cap) must drop the symbol's trailing-stop peak before the peak
+    file is persisted — otherwise a re-entry could be stopped out against
+    the prior trade's high-water mark."""
+    _write_portfolio([_etf_pos(
+        symbol="TQQQ", shares=4, avg_cost=70.0,
+        kill_conditions={"max_loss_pct": 25, "trailing_stop_pct": 10},
+    )])
+    state.write_position_peaks({"TQQQ": {"peak_mark": 100.0, "updated_at": "x"}})
+    flat_log: list = []
+    # Mark 52 vs avg_cost 70 = ~26% loss → the loss cap fires (the trailing
+    # threshold 90 also breached, but loss-cap evaluation runs first).
+    fake = _FakeBroker([_bp("TQQQ", 4, 4 * 52.0, avg_cost=70.0)], flatten_log=flat_log)
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
+    monitor.main([])
+    assert flat_log == ["TQQQ"]
+    assert "TQQQ" not in state.read_position_peaks()
+
+
 def test_monitor_flatten_appends_kill_event(tmp_state, monkeypatch):
     """A loss-cap flatten records an exit-outcome row with exit_kind."""
     _write_portfolio([_etf_pos(symbol="TQQQ", shares=4, avg_cost=70.0)])

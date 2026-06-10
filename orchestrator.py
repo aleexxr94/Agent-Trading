@@ -741,13 +741,25 @@ def _positions_fingerprint(positions: list[dict]) -> str:
     return _hash_inputs(json.dumps(rows, sort_keys=True))
 
 
-def _portfolio_is_noop(portfolio: dict, current_positions: list[dict]) -> bool:
+def _portfolio_is_noop(
+    portfolio: dict,
+    current_positions: list[dict],
+    prior_portfolio: dict | None = None,
+) -> bool:
     """True when the target portfolio exactly matches current broker
     holdings (same symbols, same share counts) — i.e. the execute stage
-    would produce zero orders. Used to skip the LLM critic on hold-steady
-    cycles. Conservative: any difference (including an extra or missing
-    symbol, or a fractional share drift > 1e-6) returns False so the
-    critic still reviews every cycle that would actually trade."""
+    would produce zero orders — AND every position's kill_conditions
+    match the previously published portfolio's. Used to skip the LLM
+    critic on hold-steady cycles.
+
+    The kill-condition check (Codex P2, PR #109): zero orders is not
+    "nothing new to critique" if the constructor rewired the stops the
+    monitor enforces — widening a trailing stop or dropping a price stop
+    changes risk behavior the moment current_portfolio.json is rewritten,
+    so that cycle still deserves an adversarial review. Conservative:
+    any difference — extra/missing symbol, fractional share drift
+    > 1e-6, changed/unknown kill_conditions, or no prior portfolio to
+    compare against — returns False so the critic runs."""
     target = {
         p.get("symbol"): float(p.get("shares") or 0.0)
         for p in (portfolio.get("positions") or [])
@@ -759,7 +771,19 @@ def _portfolio_is_noop(portfolio: dict, current_positions: list[dict]) -> bool:
     }
     if set(target) != set(held):
         return False
-    return all(abs(target[s] - held[s]) <= 1e-6 for s in target)
+    if not all(abs(target[s] - held[s]) <= 1e-6 for s in target):
+        return False
+    if not target:
+        return True  # all-cash vs empty account — no stops in play
+    prior_kc = {
+        p.get("symbol"): json.dumps(p.get("kill_conditions") or {}, sort_keys=True)
+        for p in ((prior_portfolio or {}).get("positions") or [])
+    }
+    return all(
+        prior_kc.get(p.get("symbol"))
+        == json.dumps(p.get("kill_conditions") or {}, sort_keys=True)
+        for p in (portfolio.get("positions") or [])
+    )
 
 
 def _cooldown_fingerprint(cooldown_symbols: dict | None) -> str:
@@ -1636,8 +1660,9 @@ def run_pipeline(
     #
     # Cost guard: when the constructed portfolio is a NO-OP against current
     # broker holdings (same symbols, same share counts — zero orders would
-    # be produced), skip the LLM critic. There is nothing for an adversarial
-    # review to veto on a hold-steady cycle; the holdings were already
+    # be produced) AND its kill_conditions match the previously published
+    # portfolio's, skip the LLM critic. There is nothing for an adversarial
+    # review to veto on a true hold-steady cycle; the holdings were already
     # critiqued when they were opened. Saves ~$0.03 on quiet cycles.
     #
     # The free deterministic sanity rules also run here as a PREVIEW so the
@@ -1659,7 +1684,11 @@ def run_pipeline(
         except Exception:
             sanity_preview = None
 
-    if not dry_run and _portfolio_is_noop(portfolio, current_positions):
+    prior_published = (
+        state.read_json(state.CURRENT_PORTFOLIO)
+        if state.CURRENT_PORTFOLIO.exists() else None
+    )
+    if not dry_run and _portfolio_is_noop(portfolio, current_positions, prior_published):
         critique = _run_stage(
             ctx=ctx, stage_id="critic", schema="critique.schema.json",
             output_filename="critique.json",

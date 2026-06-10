@@ -439,6 +439,16 @@ def main(argv: list[str] | None = None) -> int:
             actions.extend(
                 a for a in trailing_actions if a["symbol"] not in already
             )
+            # ANY flatten this pass (loss cap, price/time stop, orphan,
+            # or trailing) invalidates the symbol's ratchet — peaks are
+            # persisted before execute_actions() runs, so a surviving
+            # peak could stop a re-entry against the prior trade's
+            # high-water mark (Codex P2 follow-up, PR #109: the
+            # fire-time drop inside update_trailing_stops only covers
+            # trailing-stop exits, not the other flatten rules).
+            for a in actions:
+                if a.get("action") == "flatten":
+                    new_peaks.pop(a.get("symbol"), None)
             if not args.dry_run:
                 state.write_position_peaks(new_peaks)
         except Exception as e:

@@ -947,14 +947,44 @@ def test_sync_fills_before_cooldown_returns_error_string_on_failure(monkeypatch)
 def test_portfolio_is_noop_when_target_matches_holdings():
     import orchestrator as orch
     portfolio = {"positions": [
-        {"symbol": "TQQQ", "shares": 4},
-        {"symbol": "TMF", "shares": 10},
+        {"symbol": "TQQQ", "shares": 4,
+         "kill_conditions": {"max_loss_pct": 25, "underlying_price_below": 60.0}},
+        {"symbol": "TMF", "shares": 10,
+         "kill_conditions": {"max_loss_pct": 25, "trailing_stop_pct": 12}},
     ]}
     current = [
         {"symbol": "TQQQ", "qty": 4.0},
         {"symbol": "TMF", "qty": 10.0},
     ]
-    assert orch._portfolio_is_noop(portfolio, current) is True
+    # Prior published portfolio carries the SAME kill conditions.
+    assert orch._portfolio_is_noop(portfolio, current, portfolio) is True
+
+
+def test_portfolio_is_not_noop_when_kill_conditions_change():
+    """Codex P2 regression (PR #109): zero orders is not 'nothing to
+    critique' if the constructor rewired the stops the monitor enforces.
+    Same symbols + shares but changed kill_conditions must NOT skip the
+    critic; an unknown prior portfolio is conservative (no skip)."""
+    import orchestrator as orch
+    prior = {"positions": [
+        {"symbol": "TQQQ", "shares": 4,
+         "kill_conditions": {"max_loss_pct": 25, "trailing_stop_pct": 10}},
+    ]}
+    current = [{"symbol": "TQQQ", "qty": 4.0}]
+    widened = {"positions": [
+        {"symbol": "TQQQ", "shares": 4,
+         "kill_conditions": {"max_loss_pct": 25, "trailing_stop_pct": 20}},
+    ]}
+    assert orch._portfolio_is_noop(widened, current, prior) is False
+    # Stop removed entirely → also not a no-op.
+    dropped = {"positions": [
+        {"symbol": "TQQQ", "shares": 4, "kill_conditions": {"max_loss_pct": 25}},
+    ]}
+    assert orch._portfolio_is_noop(dropped, current, prior) is False
+    # No prior portfolio to compare against → conservative, critic runs.
+    assert orch._portfolio_is_noop(prior, current, None) is False
+    # Unchanged stops → still a no-op.
+    assert orch._portfolio_is_noop(prior, current, prior) is True
 
 
 def test_portfolio_is_not_noop_on_any_difference():
@@ -974,5 +1004,6 @@ def test_portfolio_is_not_noop_on_any_difference():
 
 
 def test_portfolio_is_noop_all_cash_with_empty_account():
+    """No positions on either side → no stops in play, no prior needed."""
     import orchestrator as orch
     assert orch._portfolio_is_noop({"positions": [], "all_cash": True}, []) is True
