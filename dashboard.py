@@ -107,6 +107,22 @@ def _cached_nav_history(_mtimes: tuple) -> list:
     return dd.load_nav_history()
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def _cached_run_ids(_mtimes: tuple) -> list[str]:
+    """All run_ids under state/runs/, newest first. Run-dir names start
+    with a UTC timestamp so a reverse lexicographic sort is newest-first
+    (same trick as dd.load_run_summaries)."""
+    try:
+        if not state.RUNS_DIR.exists():
+            return []
+        return sorted(
+            (p.name for p in state.RUNS_DIR.iterdir() if p.is_dir()),
+            reverse=True,
+        )
+    except OSError:
+        return []
+
+
 # ---------- chart helpers ----------
 # Plotly's defaults make every chart click-to-zoom, which on touch/mobile
 # fires an instant zoom on tap. NO_ZOOM_CONFIG + per-axis fixedrange=True
@@ -2358,15 +2374,41 @@ with tabs[5]:
 
 # ===== Tab 7: Agent Logs =====
 with tabs[6]:
-    if latest_rid is None:
+    _run_ids = _cached_run_ids(_state_mtimes())
+    if not _run_ids:
         st.info("No runs yet.")
     else:
+        def _fmt_rid(rid: str) -> str:
+            # Run-dir names start "YYYYMMDDTHHMMSSZ…" (same shape
+            # dd.load_run_summaries parses) — pretty-print that prefix.
+            if len(rid) >= 16 and rid[8] == "T" and rid[15] == "Z":
+                pretty = (
+                    f"{rid[0:4]}-{rid[4:6]}-{rid[6:8]} "
+                    f"{rid[9:11]}:{rid[11:13]}:{rid[13:15]} UTC"
+                )
+            else:
+                pretty = rid
+            return f"{pretty} · latest" if rid == _run_ids[0] else pretty
+
+        selected_rid = st.selectbox(
+            "Run archive",
+            _run_ids,
+            index=0,
+            key="agent_logs_run",
+            format_func=_fmt_rid,
+            help=(
+                f"{len(_run_ids)} archived runs under state/runs/ — "
+                "pick any past cycle to inspect its full artifact trail."
+            ),
+        )
+        _latest_suffix = " · latest" if selected_rid == _run_ids[0] else ""
         st.markdown(
-            f'<div class="at-section-label">Latest run · '
-            f'<code style="color:var(--text-0);">{latest_rid}</code></div>',
+            f'<div class="at-section-label">Run · '
+            f'<code style="color:var(--text-0);">{selected_rid}</code>'
+            f'{_latest_suffix}</div>',
             unsafe_allow_html=True,
         )
-        run_dir = state.RUNS_DIR / latest_rid
+        run_dir = state.RUNS_DIR / selected_rid
 
         # Sanity report — surface as a structured panel above the JSON
         # dumps so the operator sees rule status at a glance, not buried
@@ -2428,7 +2470,12 @@ with tabs[6]:
             f = run_dir / name
             if f.exists():
                 with st.expander(f"{icon}  {name} — {f.stat().st_size:,} bytes"):
-                    st.json(json.loads(f.read_text()))
+                    # Old/aborted runs can leave truncated artifacts —
+                    # surface the parse error instead of crashing the tab.
+                    try:
+                        st.json(json.loads(f.read_text()))
+                    except (json.JSONDecodeError, OSError) as exc:
+                        st.warning(f"Unreadable artifact: `{exc}`")
 
     st.markdown('<div class="at-section-label">Last 20 decisions</div>', unsafe_allow_html=True)
     if decisions:
