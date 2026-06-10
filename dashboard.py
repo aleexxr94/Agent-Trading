@@ -29,6 +29,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from lib import benchmark as bench
 from lib import dashboard_data as dd
 from lib import pnl as pnl_lib
 from lib import state
@@ -102,8 +103,34 @@ def _cached_cost_by_month(_mtimes: tuple) -> list:
 
 
 @st.cache_data(ttl=15, show_spinner=False)
+def _cached_cost_by_stage(_mtimes: tuple) -> list:
+    return dd.cost_by_stage()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _cached_cache_hit_trend(_mtimes: tuple) -> list:
+    return dd.cache_hit_trend()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
 def _cached_nav_history(_mtimes: tuple) -> list:
     return dd.load_nav_history()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _cached_run_ids(_mtimes: tuple) -> list[str]:
+    """All run_ids under state/runs/, newest first. Run-dir names start
+    with a UTC timestamp so a reverse lexicographic sort is newest-first
+    (same trick as dd.load_run_summaries)."""
+    try:
+        if not state.RUNS_DIR.exists():
+            return []
+        return sorted(
+            (p.name for p in state.RUNS_DIR.iterdir() if p.is_dir()),
+            reverse=True,
+        )
+    except OSError:
+        return []
 
 
 # ---------- chart helpers ----------
@@ -146,6 +173,38 @@ def _tight_yrange(ys, min_pad: float = 5.0, frac: float = 0.08):
     lo, hi = min(vals), max(vals)
     pad = max((hi - lo) * frac, min_pad)
     return [lo - pad, hi + pad]
+
+
+def _style_fig(
+    fig,
+    *,
+    height: int = 380,
+    yaxis_title: str = "",
+    yrange=None,
+    legend: bool = False,
+    right_margin: int = 10,
+) -> None:
+    """Apply the shared light-theme Plotly layout in one place: white
+    template on transparent backgrounds, slate gridlines, zoom disabled
+    (pairs with NO_ZOOM_CONFIG), tight margins, unified hover style."""
+    fig.update_layout(
+        template="plotly_white",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=height,
+        yaxis_title=yaxis_title,
+        xaxis_title="",
+        yaxis=dict(gridcolor="#e2e8f0", fixedrange=True, range=yrange),
+        xaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
+        margin=dict(l=10, r=right_margin, t=20 if legend else 10, b=10),
+        hoverlabel=dict(bgcolor="white", bordercolor="#e2e8f0", font_size=13),
+        dragmode=False,
+        showlegend=legend,
+    )
+    if legend:
+        fig.update_layout(
+            legend=dict(orientation="h", y=1.1, font=dict(size=12)),
+        )
 
 
 def _render_balance_chart(*, xs, ys, hover_texts, yaxis_title: str, caption: str) -> None:
@@ -372,13 +431,27 @@ st.markdown(
         border-radius: 12px;
         padding: 1rem 1.15rem;
         box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+        transition: box-shadow 0.15s ease;
+        min-width: 0;
+        overflow-wrap: break-word;
       }
+      .at-stat:hover { box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08); }
       .at-stat-label { color: var(--text-1); font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; }
       .at-stat-value { color: var(--text-0); font-size: 1.7rem; font-weight: 700; margin-top: 0.2rem; letter-spacing: -0.01em; }
       .at-stat-sub { color: var(--text-1); font-size: 0.85rem; margin-top: 0.25rem; font-weight: 500; }
       .at-stat-value.pos { color: var(--green); }
       .at-stat-value.neg { color: var(--red); }
       .at-stat-value.warn { color: var(--amber); }
+      /* small delta chip rendered beside a stat value */
+      .at-stat-delta {
+        display: inline-block; vertical-align: middle;
+        font-size: 0.85rem; font-weight: 700;
+        padding: 0.1rem 0.45rem; margin-left: 0.45rem;
+        border-radius: 999px; border: 1px solid var(--border);
+        background: var(--bg-2); color: var(--text-1);
+      }
+      .at-stat-delta.pos { background: var(--green-soft); color: var(--green-text); border-color: #a7f3d0; }
+      .at-stat-delta.neg { background: var(--red-soft);   color: var(--red-text);   border-color: #fecaca; }
 
       /* cost meter bar */
       .at-meter { height: 7px; background: var(--bg-2); border-radius: 999px; overflow: hidden; margin-top: 0.5rem; }
@@ -389,6 +462,7 @@ st.markdown(
       /* tabs */
       .stTabs [data-baseweb="tab-list"] { gap: 0.3rem; border-bottom: 1px solid var(--border); }
       .stTabs [data-baseweb="tab"] { padding: 0.65rem 1.2rem; font-size: 0.95rem; font-weight: 600; }
+      .stTabs [data-baseweb="tab-highlight"] { background-color: var(--green); height: 3px; border-radius: 3px 3px 0 0; }
 
       /* dataframe */
       [data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
@@ -411,6 +485,8 @@ st.markdown(
         color: var(--text-1); font-size: 0.88rem; text-transform: uppercase;
         letter-spacing: 0.08em; font-weight: 700;
         margin: 1rem 0 0.5rem 0;
+        border-left: 3px solid var(--green);
+        padding-left: 0.5rem;
       }
 
       /* small-muted text */
@@ -477,6 +553,30 @@ def _fmt_ts(iso: str) -> str:
         return dt.strftime("%b %d %H:%M UTC")
     except Exception:
         return iso[:16].replace("T", " ")
+
+
+def _fmt_countdown(iso: str) -> str:
+    """'in 3h 12m' / 'in 14m' / 'overdue 22m' relative to now; '' on bad
+    input. Accurate as of page render — Streamlit doesn't tick live."""
+    if not iso:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        secs = (dt - datetime.now(timezone.utc)).total_seconds()
+    except Exception:
+        return ""
+    prefix, secs = ("in", secs) if secs >= 0 else ("overdue", -secs)
+    mins = int(secs // 60)
+    hours, mins = divmod(mins, 60)
+    days, hours = divmod(hours, 24)
+    if days > 0:
+        return f"{prefix} {days}d {hours}h"
+    if hours > 0:
+        return f"{prefix} {hours}h {mins}m"
+    return f"{prefix} {mins}m"
 
 
 # ---------- halt banner (sticky, top) ----------
@@ -587,7 +687,10 @@ st.markdown(
           </div>
           <div class="at-hero-sub" style="opacity:0.75; font-size:0.85rem;">
             Last cycle: <strong>{_fmt_ts(last_run_at)}</strong>
-            &nbsp;•&nbsp; Next: <strong>{_fmt_ts(next_run_at)}</strong>
+            &nbsp;•&nbsp; Next: <strong>{_fmt_ts(next_run_at)}</strong>{
+                f' <span style="color:var(--text-2);">({_fmt_countdown(next_run_at)})</span>'
+                if _fmt_countdown(next_run_at) else ""
+            }
             &nbsp;•&nbsp; Source: <strong>{source}</strong>
           </div>{extra_lines}
         </div>
@@ -698,6 +801,7 @@ def _stat_card(
     sub: str = "",
     tone: str = "",
     help_text: str = "",
+    delta: str = "",
 ) -> str:
     cls = f"at-stat-value {tone}".strip()
     sub_html = f'<div class="at-stat-sub">{sub}</div>' if sub else ""
@@ -705,10 +809,20 @@ def _stat_card(
         f'<span class="at-help-icon" title="{html.escape(help_text)}">ⓘ</span>'
         if help_text else ""
     )
+    delta_html = ""
+    if delta:
+        # Signed string like "+1.2%" / "-0.8%" — arrow + tone from the sign.
+        negative = delta.lstrip().startswith(("-", "−"))
+        arrow = "▼" if negative else "▲"
+        dcls = "neg" if negative else "pos"
+        delta_html = (
+            f'<span class="at-stat-delta {dcls}">{arrow} '
+            f'{html.escape(delta.lstrip("+-− "))}</span>'
+        )
     return (
         f'<div class="at-stat">'
         f'<div class="at-stat-label">{label}{help_html}</div>'
-        f'<div class="{cls}">{value}</div>'
+        f'<div class="{cls}">{value}{delta_html}</div>'
         f'{sub_html}'
         f'</div>'
     )
@@ -1572,18 +1686,12 @@ with tabs[3]:
             name="Cumulative LLM cost",
             line=dict(color="#2563eb", width=2.5),
             fill="tozeroy",
-            fillcolor="rgba(37, 99, 235, 0.12)",
+            fillgradient=dict(type="vertical", colorscale=[
+                [0.0, _rgba("#2563eb", 0.0)],
+                [1.0, _rgba("#2563eb", 0.22)],
+            ]),
         ))
-        fig.update_layout(
-            template="plotly_white",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            height=320, yaxis_title="USD",
-            yaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
-            xaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
-            margin=dict(l=10, r=10, t=10, b=10),
-            showlegend=False, dragmode=False,
-        )
+        _style_fig(fig, height=320, yaxis_title="USD")
         st.plotly_chart(fig, width="stretch", config=NO_ZOOM_CONFIG)
     else:
         st.info("No LLM cost history yet — run the orchestrator (live mode) to populate.")
@@ -1601,18 +1709,12 @@ with tabs[3]:
             name="Cumulative trading fees",
             line=dict(color="#d97706", width=2.5),  # amber to distinguish from blue LLM line
             fill="tozeroy",
-            fillcolor="rgba(217, 119, 6, 0.12)",
+            fillgradient=dict(type="vertical", colorscale=[
+                [0.0, _rgba("#d97706", 0.0)],
+                [1.0, _rgba("#d97706", 0.22)],
+            ]),
         ))
-        fig_fees.update_layout(
-            template="plotly_white",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            height=320, yaxis_title="USD (fees)",
-            yaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
-            xaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
-            margin=dict(l=10, r=10, t=10, b=10),
-            showlegend=False, dragmode=False,
-        )
+        _style_fig(fig_fees, height=320, yaxis_title="USD (fees)")
         st.plotly_chart(fig_fees, width="stretch", config=NO_ZOOM_CONFIG)
         total_fees = dd.total_trading_fees_usd()
         st.caption(
@@ -1663,6 +1765,64 @@ with tabs[3]:
         )
     else:
         st.info("No monthly cost data yet.")
+
+    st.markdown(
+        '<div class="at-section-label">Cost by pipeline stage</div>',
+        unsafe_allow_html=True,
+    )
+    by_stage = _cached_cost_by_stage(_state_mtimes())
+    if by_stage:
+        st.dataframe(
+            pd.DataFrame(by_stage).rename(columns={
+                "stage": "Stage",
+                "calls": "Calls",
+                "cost_usd": "Cost (USD)",
+                "total_tokens": "Tokens",
+                "cache_hit_pct": "Cache hit",
+            }),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Cost (USD)": st.column_config.NumberColumn(format="$%.4f"),
+                "Tokens": st.column_config.NumberColumn(format="%d"),
+                "Cache hit": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+        st.caption(
+            "Where the LLM budget actually goes — calls, spend, and "
+            "prompt-cache efficiency per pipeline stage, all time "
+            "(reset-aware)."
+        )
+    else:
+        st.info("No per-stage cost data yet.")
+
+    st.markdown(
+        '<div class="at-section-label">Prompt-cache hit rate by run</div>',
+        unsafe_allow_html=True,
+    )
+    cache_trend = _cached_cache_hit_trend(_state_mtimes())
+    if cache_trend:
+        df_ct = pd.DataFrame(cache_trend)
+        fig_ct = go.Figure()
+        fig_ct.add_trace(go.Scatter(
+            x=df_ct["at"], y=df_ct["cache_hit_pct"],
+            mode="lines+markers", name="Cache hit %",
+            line=dict(color="#2563eb", width=2),
+            marker=dict(size=5),
+            customdata=[[r] for r in df_ct["run_id"]],
+            hovertemplate="%{customdata[0]}<br>%{y:.1f}%<extra></extra>",
+        ))
+        _style_fig(fig_ct, height=240, yaxis_title="Cache hit (%)",
+                   yrange=[0, 105])
+        st.plotly_chart(fig_ct, width="stretch", config=NO_ZOOM_CONFIG)
+        st.caption(
+            "Token-weighted prompt-cache hit rate per orchestrator run, "
+            "from costs.jsonl cache counters. Sustained high values mean "
+            "the static system prompts are caching as designed; a sudden "
+            "drop usually means a prompt was edited."
+        )
+    else:
+        st.info("No cache-hit history yet.")
 
 
 # ===== Tab 5: vs S&P 500 =====
@@ -1747,9 +1907,11 @@ with tabs[4]:
         )
     else:
         # ---- (b) Headline 3-column stat cards ----
-        strat_end = float(bundle.strategy_curve["nav"].iloc[-1])
-        spy_end = float(bundle.spy_curve["nav"].iloc[-1])
-        delta_tone = "pos" if bundle.delta_usd >= 0 else "neg"
+        # _fnum keeps a stray NaN (e.g. an un-scrubbed SPY tip) from
+        # rendering as a literal "$nan" in the cards.
+        strat_end = _fnum(bundle.strategy_curve["nav"].iloc[-1])
+        spy_end = _fnum(bundle.spy_curve["nav"].iloc[-1])
+        delta_tone = "pos" if _fnum(bundle.delta_usd) >= 0 else "neg"
         cols = st.columns(3)
         cols[0].markdown(
             _stat_card(
@@ -1762,8 +1924,8 @@ with tabs[4]:
         cols[1].markdown(
             _stat_card(
                 "Delta vs SPY",
-                f"${bundle.delta_usd:+,.2f}",
-                sub=f"{bundle.delta_pct:+.2f} pp on total return",
+                f"${_fnum(bundle.delta_usd):+,.2f}",
+                sub=f"{_fnum(bundle.delta_pct):+.2f} pp on total return",
                 tone=delta_tone,
                 help_text=(
                     "Dollar and percentage-point gap between the strategy "
@@ -1772,12 +1934,14 @@ with tabs[4]:
             ),
             unsafe_allow_html=True,
         )
-        beating = bundle.strategy_total_return_pct >= bundle.spy_total_return_pct
+        beating = _fnum(bundle.strategy_total_return_pct) >= _fnum(
+            bundle.spy_total_return_pct
+        )
         cols[2].markdown(
             _stat_card(
                 "Total return",
-                f"{bundle.strategy_total_return_pct:+.2f}%",
-                sub=f"SPY {bundle.spy_total_return_pct:+.2f}%",
+                f"{_fnum(bundle.strategy_total_return_pct):+.2f}%",
+                sub=f"SPY {_fnum(bundle.spy_total_return_pct):+.2f}%",
                 tone="pos" if beating else "neg",
             ),
             unsafe_allow_html=True,
@@ -1828,24 +1992,55 @@ with tabs[4]:
             showarrow=False, xanchor="left",
             font=dict(color="#d97706", size=12, family="monospace"),
         )
-        fig_bench.update_layout(
-            template="plotly_white",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
+        # Tight y-range hugging both curves — autorange gets dragged to
+        # zero by stray annotation anchors and flattens the lines
+        # against the top of the chart.
+        _bench_yrange = _tight_yrange(
+            list(strat_df["nav"]) + list(spy_df["nav"]), min_pad=10.0
+        )
+        _style_fig(
+            fig_bench,
             height=380,
             yaxis_title="Portfolio value (USD)",
-            xaxis_title="",
-            yaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
-            xaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
-            margin=dict(l=10, r=80, t=20, b=10),
-            legend=dict(orientation="h", y=1.1, font=dict(size=12)),
-            dragmode=False,
+            yrange=_bench_yrange,
+            legend=True,
+            right_margin=80,
         )
         st.plotly_chart(fig_bench, width="stretch", config=NO_ZOOM_CONFIG)
         st.caption(
             f"Inception {bundle.inception.isoformat()} → as of "
             f"{bundle.as_of.isoformat()} · {len(strat_df)} trading-day points · "
             "Sharpe risk-free rate = 0%."
+        )
+
+        # ---- (c2) Underwater (drawdown) chart ----
+        st.markdown(
+            '<div class="at-section-label">Underwater (drawdown from peak)</div>',
+            unsafe_allow_html=True,
+        )
+        _dd_strat = bench.drawdown_series(bundle.strategy_curve["nav"]) * 100.0
+        _dd_spy = bench.drawdown_series(bundle.spy_curve["nav"]) * 100.0
+        fig_dd = go.Figure()
+        fig_dd.add_trace(go.Scatter(
+            x=list(_dd_strat.index), y=list(_dd_strat.values),
+            mode="lines", name="Strategy",
+            line=dict(width=2, color="#059669"),
+            fill="tozeroy", fillcolor=_rgba("#059669", 0.18),
+            hovertemplate="%{x|%Y-%m-%d}<br>Strategy: %{y:.2f}%<extra></extra>",
+        ))
+        fig_dd.add_trace(go.Scatter(
+            x=list(_dd_spy.index), y=list(_dd_spy.values),
+            mode="lines", name="SPY-equivalent",
+            line=dict(width=2, color="#d97706"),
+            fill="tozeroy", fillcolor=_rgba("#d97706", 0.14),
+            hovertemplate="%{x|%Y-%m-%d}<br>SPY-eqv: %{y:.2f}%<extra></extra>",
+        ))
+        _style_fig(fig_dd, height=220, yaxis_title="Drawdown (%)", legend=True)
+        st.plotly_chart(fig_dd, width="stretch", config=NO_ZOOM_CONFIG)
+        st.caption(
+            "Percent below the running peak at each point — 0% means a "
+            "fresh equity high; the depth of each dip is how far the "
+            "curve sat under water before recovering."
         )
 
         # ---- (d) Risk-adjusted comparison cards ----
@@ -2076,6 +2271,88 @@ with tabs[5]:
                 unsafe_allow_html=True,
             )
 
+    # ---- Trade statistics (closed trades, net P&L methodology) ----
+    _tstats = dd.trade_stats(view["closed"])
+    if _tstats is not None:
+        st.markdown(
+            '<div class="at-section-label">Trade statistics (closed trades)</div>',
+            unsafe_allow_html=True,
+        )
+
+        def _fmt_hold(hours: float | None) -> str:
+            if hours is None:
+                return "—"
+            return f"{hours / 24.0:.1f} d" if hours >= 48.0 else f"{hours:.1f} h"
+
+        _pf = _tstats["profit_factor"]
+        _aw, _al = _tstats["avg_win_usd"], _tstats["avg_loss_usd"]
+        srow1 = st.columns(3)
+        srow1[0].markdown(
+            _stat_card(
+                "Win rate (net)",
+                f"{_tstats['win_rate_pct']:.0f}%",
+                sub=f"{_tstats['wins']} wins · {_tstats['losses']} losses",
+                tone="pos" if _tstats["win_rate_pct"] >= 50.0 else "neg",
+                help_text=(
+                    "Share of closed trades with positive NET P&L "
+                    "(gross − fees − attributed LLM cost). $0 nets "
+                    "count as non-wins."
+                ),
+            ),
+            unsafe_allow_html=True,
+        )
+        srow1[1].markdown(
+            _stat_card(
+                "Profit factor",
+                f"{_pf:.2f}" if _pf is not None else "—",
+                sub="win $ / loss $" if _pf is not None else "no losing trades yet",
+                tone=("pos" if _pf >= 1.0 else "neg") if _pf is not None else "",
+                help_text=(
+                    "Sum of winning trades' net P&L divided by the "
+                    "absolute sum of losing trades'. >1 means winners "
+                    "outweigh losers."
+                ),
+            ),
+            unsafe_allow_html=True,
+        )
+        srow1[2].markdown(
+            _stat_card(
+                "Avg win / avg loss",
+                (f"${_aw:,.2f}" if _aw is not None else "—")
+                + " / "
+                + (f"${_al:,.2f}" if _al is not None else "—"),
+                sub="per closed trade, net",
+            ),
+            unsafe_allow_html=True,
+        )
+        srow2 = st.columns(3)
+        srow2[0].markdown(
+            _stat_card(
+                "Avg hold time",
+                _fmt_hold(_tstats["avg_hold_hours"]),
+                sub="open fill → closing fill",
+            ),
+            unsafe_allow_html=True,
+        )
+        srow2[1].markdown(
+            _stat_card(
+                "Best trade",
+                f"${_tstats['best']['net_pnl_usd']:+,.2f}",
+                sub=_tstats["best"]["symbol"],
+                tone="pos" if _tstats["best"]["net_pnl_usd"] > 0 else "neg",
+            ),
+            unsafe_allow_html=True,
+        )
+        srow2[2].markdown(
+            _stat_card(
+                "Worst trade",
+                f"${_tstats['worst']['net_pnl_usd']:+,.2f}",
+                sub=_tstats["worst"]["symbol"],
+                tone="pos" if _tstats["worst"]["net_pnl_usd"] > 0 else "neg",
+            ),
+            unsafe_allow_html=True,
+        )
+
     # Shared color formatter for Gross / Net columns on both the closed
     # and open tables. Codex P1 caught a previous version that defined
     # this inside the `if view["closed"]:` branch — when the closed list
@@ -2192,15 +2469,41 @@ with tabs[5]:
 
 # ===== Tab 7: Agent Logs =====
 with tabs[6]:
-    if latest_rid is None:
+    _run_ids = _cached_run_ids(_state_mtimes())
+    if not _run_ids:
         st.info("No runs yet.")
     else:
+        def _fmt_rid(rid: str) -> str:
+            # Run-dir names start "YYYYMMDDTHHMMSSZ…" (same shape
+            # dd.load_run_summaries parses) — pretty-print that prefix.
+            if len(rid) >= 16 and rid[8] == "T" and rid[15] == "Z":
+                pretty = (
+                    f"{rid[0:4]}-{rid[4:6]}-{rid[6:8]} "
+                    f"{rid[9:11]}:{rid[11:13]}:{rid[13:15]} UTC"
+                )
+            else:
+                pretty = rid
+            return f"{pretty} · latest" if rid == _run_ids[0] else pretty
+
+        selected_rid = st.selectbox(
+            "Run archive",
+            _run_ids,
+            index=0,
+            key="agent_logs_run",
+            format_func=_fmt_rid,
+            help=(
+                f"{len(_run_ids)} archived runs under state/runs/ — "
+                "pick any past cycle to inspect its full artifact trail."
+            ),
+        )
+        _latest_suffix = " · latest" if selected_rid == _run_ids[0] else ""
         st.markdown(
-            f'<div class="at-section-label">Latest run · '
-            f'<code style="color:var(--text-0);">{latest_rid}</code></div>',
+            f'<div class="at-section-label">Run · '
+            f'<code style="color:var(--text-0);">{selected_rid}</code>'
+            f'{_latest_suffix}</div>',
             unsafe_allow_html=True,
         )
-        run_dir = state.RUNS_DIR / latest_rid
+        run_dir = state.RUNS_DIR / selected_rid
 
         # Sanity report — surface as a structured panel above the JSON
         # dumps so the operator sees rule status at a glance, not buried
@@ -2262,7 +2565,12 @@ with tabs[6]:
             f = run_dir / name
             if f.exists():
                 with st.expander(f"{icon}  {name} — {f.stat().st_size:,} bytes"):
-                    st.json(json.loads(f.read_text()))
+                    # Old/aborted runs can leave truncated artifacts —
+                    # surface the parse error instead of crashing the tab.
+                    try:
+                        st.json(json.loads(f.read_text()))
+                    except (json.JSONDecodeError, OSError) as exc:
+                        st.warning(f"Unreadable artifact: `{exc}`")
 
     st.markdown('<div class="at-section-label">Last 20 decisions</div>', unsafe_allow_html=True)
     if decisions:

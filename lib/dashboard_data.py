@@ -807,6 +807,87 @@ def cost_by_month() -> list[dict]:
     return sorted(by_month.values(), key=lambda x: x["month"])
 
 
+def cost_by_stage() -> list[dict]:
+    """Per-pipeline-stage LLM cost rollup from state/costs.jsonl.
+
+    Returns ``[{stage, calls, cost_usd, total_tokens, cache_hit_pct}]``
+    sorted by cost descending. ``cache_hit_pct`` is
+    ``100 * cache_read / (input + cache_creation + cache_read)`` over the
+    stage's summed token counts (0.0 when the denominator is 0).
+    Reset-aware via load_costs(); [] when no cost history exists.
+    """
+    rows = load_costs(limit=10**9)
+    by_stage: dict[str, dict] = {}
+    for r in rows:
+        stage = str(r.get("stage") or "unknown")
+        b = by_stage.setdefault(stage, {
+            "stage": stage, "calls": 0, "cost_usd": 0.0,
+            "_input": 0, "_creation": 0, "_read": 0, "_output": 0,
+        })
+        b["calls"] += 1
+        b["cost_usd"] += r.get("cost_usd", 0.0) or 0
+        b["_input"] += r.get("input_tokens") or 0
+        b["_creation"] += r.get("cache_creation_input_tokens") or 0
+        b["_read"] += r.get("cache_read_input_tokens") or 0
+        b["_output"] += r.get("output_tokens") or 0
+    out = []
+    for b in by_stage.values():
+        denom = b["_input"] + b["_creation"] + b["_read"]
+        out.append({
+            "stage": b["stage"],
+            "calls": b["calls"],
+            "cost_usd": b["cost_usd"],
+            "total_tokens": denom + b["_output"],
+            "cache_hit_pct": (100.0 * b["_read"] / denom) if denom > 0 else 0.0,
+        })
+    return sorted(out, key=lambda x: x["cost_usd"], reverse=True)
+
+
+def cache_hit_trend(limit: int = 200) -> list[dict]:
+    """Per-run prompt-cache hit rate from state/costs.jsonl.
+
+    ``100 * cache_read / (input + cache_creation + cache_read)`` over
+    each run's summed token counters — same definition as
+    ``cost_by_stage``. Sourced from cost rows, NOT the decision log:
+    the orchestrator writes every decision row with a hard-coded
+    ``prompt_cache_hit_pct: 0.0``, while lib/llm.py records the real
+    cache token counters in costs.jsonl (codex P2 on PR #108).
+
+    Returns ``[{run_id, at, cache_hit_pct}]`` oldest→newest, one row
+    per run. Runs whose cost rows carry no token counters are skipped.
+    ``at`` is the run's earliest cost-row timestamp. Reset-aware via
+    load_costs().
+    """
+    rows = load_costs(limit=10**9)
+    by_run: dict[str, dict] = {}
+    for r in rows:
+        rid = str(r.get("run_id") or "")
+        if not rid:
+            continue
+        b = by_run.setdefault(rid, {
+            "run_id": rid, "at": "", "_input": 0, "_creation": 0, "_read": 0,
+        })
+        b["_input"] += r.get("input_tokens") or 0
+        b["_creation"] += r.get("cache_creation_input_tokens") or 0
+        b["_read"] += r.get("cache_read_input_tokens") or 0
+        at = str(r.get("at") or "")
+        if at and (not b["at"] or at < b["at"]):
+            b["at"] = at
+    out = []
+    for b in by_run.values():
+        denom = b["_input"] + b["_creation"] + b["_read"]
+        if denom <= 0:
+            continue
+        out.append({
+            "run_id": b["run_id"],
+            "at": b["at"],
+            "cache_hit_pct": 100.0 * b["_read"] / denom,
+        })
+    # run_ids are timestamp-prefixed, so sorting by run_id is chronological.
+    out.sort(key=lambda x: x["run_id"])
+    return out[-limit:]
+
+
 def load_nav_history(limit: int | None = None) -> list[dict]:
     return state.read_nav_history(limit=limit)
 
@@ -1025,6 +1106,69 @@ def trades_pnl_view(marks: dict[str, float] | None = None) -> dict:
             }
             for u in pnl.unmatched_sells
         ],
+    }
+
+
+def trade_stats(closed: list[dict]) -> dict | None:
+    """Aggregate statistics over closed-trade rows from
+    ``trades_pnl_view()["closed"]``.
+
+    Win/loss classification uses NET P&L (gross − fees − attributed LLM
+    cost), consistent with the Trades tab's "Realised net" headline; a
+    $0.00 net trade counts as a non-win. Returns None when there are no
+    closed trades. Keys:
+      - ``win_rate_pct``, ``wins``, ``losses``
+      - ``profit_factor`` — gross win sum / |loss sum|; None when no
+        losing trades exist (undefined, not infinite-good)
+      - ``avg_win_usd`` / ``avg_loss_usd`` — None when the side is empty
+      - ``avg_hold_hours`` — None when no row has parseable
+        ``opened_at``/``closed_at`` timestamps
+      - ``best`` / ``worst`` — ``{symbol, net_pnl_usd}`` dicts
+    """
+    from . import trades as trades_lib
+
+    rows = [
+        r for r in (closed or [])
+        if isinstance(r.get("net_pnl_usd"), (int, float))
+    ]
+    if not rows:
+        return None
+
+    nets = [float(r["net_pnl_usd"]) for r in rows]
+    wins = [n for n in nets if n > 0]
+    losses = [n for n in nets if n < 0]
+
+    profit_factor: float | None = None
+    if losses:
+        profit_factor = sum(wins) / abs(sum(losses))
+
+    hold_hours: list[float] = []
+    for r in rows:
+        opened = trades_lib._parse_iso_utc(r.get("opened_at"))
+        closed_dt = trades_lib._parse_iso_utc(r.get("closed_at"))
+        if opened is None or closed_dt is None or closed_dt < opened:
+            continue
+        hold_hours.append((closed_dt - opened).total_seconds() / 3600.0)
+
+    best_row = max(rows, key=lambda r: float(r["net_pnl_usd"]))
+    worst_row = min(rows, key=lambda r: float(r["net_pnl_usd"]))
+
+    return {
+        "win_rate_pct": 100.0 * len(wins) / len(rows),
+        "wins": len(wins),
+        "losses": len(losses),
+        "profit_factor": profit_factor,
+        "avg_win_usd": (sum(wins) / len(wins)) if wins else None,
+        "avg_loss_usd": (sum(losses) / len(losses)) if losses else None,
+        "avg_hold_hours": (sum(hold_hours) / len(hold_hours)) if hold_hours else None,
+        "best": {
+            "symbol": best_row.get("symbol", "?"),
+            "net_pnl_usd": float(best_row["net_pnl_usd"]),
+        },
+        "worst": {
+            "symbol": worst_row.get("symbol", "?"),
+            "net_pnl_usd": float(worst_row["net_pnl_usd"]),
+        },
     }
 
 

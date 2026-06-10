@@ -2100,3 +2100,171 @@ def test_trades_pnl_view_honours_all_time_cost_reset(tmp_state):
     assert c["net_pnl_usd"] == pytest.approx(50.0 - 0.20)
 
 
+
+
+# ---------- trade_stats ----------
+
+
+def _closed_row(symbol: str, net: float, opened: str, closed: str) -> dict:
+    return {
+        "symbol": symbol,
+        "net_pnl_usd": net,
+        "opened_at": opened,
+        "closed_at": closed,
+    }
+
+
+def test_trade_stats_basic():
+    closed = [
+        _closed_row("SOXL", 100.0, "2026-06-01T14:00:00Z", "2026-06-01T20:00:00Z"),
+        _closed_row("TQQQ", 50.0, "2026-06-02T14:00:00Z", "2026-06-03T14:00:00Z"),
+        _closed_row("TMV", -75.0, "2026-06-03T14:00:00Z", "2026-06-03T20:00:00Z"),
+    ]
+    s = dd.trade_stats(closed)
+    assert s is not None
+    assert s["win_rate_pct"] == pytest.approx(100.0 * 2 / 3)
+    assert s["wins"] == 2 and s["losses"] == 1
+    assert s["profit_factor"] == pytest.approx(150.0 / 75.0)
+    assert s["avg_win_usd"] == pytest.approx(75.0)
+    assert s["avg_loss_usd"] == pytest.approx(-75.0)
+    # Holds: 6h + 24h + 6h → mean 12h.
+    assert s["avg_hold_hours"] == pytest.approx(12.0)
+    assert s["best"] == {"symbol": "SOXL", "net_pnl_usd": 100.0}
+    assert s["worst"] == {"symbol": "TMV", "net_pnl_usd": -75.0}
+
+
+def test_trade_stats_empty_returns_none():
+    assert dd.trade_stats([]) is None
+    assert dd.trade_stats(None) is None
+    # Rows without a numeric net_pnl_usd are ignored entirely.
+    assert dd.trade_stats([{"symbol": "TQQQ", "net_pnl_usd": "bad"}]) is None
+
+
+def test_trade_stats_no_losses_profit_factor_none():
+    closed = [
+        _closed_row("SOXL", 10.0, "2026-06-01T14:00:00Z", "2026-06-01T15:00:00Z"),
+        _closed_row("TQQQ", 20.0, "2026-06-01T14:00:00Z", "2026-06-01T16:00:00Z"),
+    ]
+    s = dd.trade_stats(closed)
+    assert s["profit_factor"] is None
+    assert s["avg_loss_usd"] is None
+    assert s["win_rate_pct"] == pytest.approx(100.0)
+
+
+def test_trade_stats_bad_timestamps_hold_none():
+    closed = [
+        _closed_row("SOXL", 10.0, "not-a-date", ""),
+        _closed_row("TQQQ", -5.0, None, "2026-06-01T16:00:00Z"),
+    ]
+    s = dd.trade_stats(closed)
+    assert s is not None
+    assert s["avg_hold_hours"] is None
+    # Zero-net trades count as non-wins.
+    s2 = dd.trade_stats([_closed_row("UVXY", 0.0, "x", "y")])
+    assert s2["win_rate_pct"] == pytest.approx(0.0)
+    assert s2["wins"] == 0 and s2["losses"] == 0
+    assert s2["profit_factor"] is None
+
+
+# ---------- cost_by_stage / cache_hit_trend ----------
+
+
+def test_cost_by_stage_groups_and_computes_cache_pct(tmp_state):
+    state.append_cost({
+        "run_id": "r1", "stage": "construct", "model": "m",
+        "cost_usd": 0.20, "at": "2026-06-01T12:00:00Z",
+        "input_tokens": 100, "output_tokens": 50,
+        "cache_creation_input_tokens": 100, "cache_read_input_tokens": 800,
+    })
+    state.append_cost({
+        "run_id": "r2", "stage": "construct", "model": "m",
+        "cost_usd": 0.10, "at": "2026-06-02T12:00:00Z",
+        "input_tokens": 100, "output_tokens": 50,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+    })
+    state.append_cost({
+        "run_id": "r1", "stage": "strategist", "model": "m",
+        "cost_usd": 0.05, "at": "2026-06-01T12:01:00Z",
+        "input_tokens": 200, "output_tokens": 20,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 200,
+    })
+    out = dd.cost_by_stage()
+    assert [r["stage"] for r in out] == ["construct", "strategist"]  # cost desc
+    construct = out[0]
+    assert construct["calls"] == 2
+    assert construct["cost_usd"] == pytest.approx(0.30)
+    # tokens: (100+100+800+50) + (100+0+0+50) = 1200
+    assert construct["total_tokens"] == 1200
+    # cache hit: 800 / (200 + 100 + 800) = 72.7%
+    assert construct["cache_hit_pct"] == pytest.approx(100.0 * 800 / 1100)
+    strategist = out[1]
+    assert strategist["cache_hit_pct"] == pytest.approx(50.0)
+
+
+def test_cost_by_stage_empty_state_returns_empty(tmp_state):
+    assert dd.cost_by_stage() == []
+    # Rows with no token fields don't divide by zero.
+    state.append_cost({
+        "run_id": "r1", "stage": "meta", "model": "m",
+        "cost_usd": 0.01, "at": "2026-06-01T12:00:00Z",
+    })
+    out = dd.cost_by_stage()
+    assert out[0]["cache_hit_pct"] == 0.0
+    assert out[0]["total_tokens"] == 0
+
+
+def test_cache_hit_trend_token_weighted_per_run(tmp_state):
+    """Sourced from costs.jsonl token counters, NOT the decision log —
+    the orchestrator hard-codes prompt_cache_hit_pct=0.0 in every
+    decision row, so decisions would always trend at 0% (codex P2)."""
+    state.append_cost({
+        "run_id": "20260601T120000Z-a", "stage": "strategist", "model": "m",
+        "cost_usd": 0.05, "at": "2026-06-01T12:00:00Z",
+        "input_tokens": 100, "output_tokens": 10,
+        "cache_creation_input_tokens": 100, "cache_read_input_tokens": 800,
+    })
+    state.append_cost({
+        "run_id": "20260601T120000Z-a", "stage": "construct", "model": "m",
+        "cost_usd": 0.20, "at": "2026-06-01T12:05:00Z",
+        "input_tokens": 500, "output_tokens": 50,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 500,
+    })
+    state.append_cost({
+        "run_id": "20260602T120000Z-b", "stage": "strategist", "model": "m",
+        "cost_usd": 0.05, "at": "2026-06-02T12:00:00Z",
+        "input_tokens": 100, "output_tokens": 10,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 900,
+    })
+    # Run with no token counters at all is skipped (no denominator).
+    state.append_cost({
+        "run_id": "20260603T120000Z-c", "stage": "meta", "model": "m",
+        "cost_usd": 0.01, "at": "2026-06-03T12:00:00Z",
+    })
+    out = dd.cache_hit_trend()
+    assert [r["run_id"] for r in out] == [
+        "20260601T120000Z-a", "20260602T120000Z-b",
+    ]
+    # Run a: read 1300 of (600 input + 100 creation + 1300 read) = 65%.
+    assert out[0]["cache_hit_pct"] == pytest.approx(65.0)
+    assert out[0]["at"] == "2026-06-01T12:00:00Z"  # earliest cost row
+    assert out[1]["cache_hit_pct"] == pytest.approx(90.0)
+
+
+def test_cache_hit_trend_ignores_hardcoded_decision_pct(tmp_state):
+    """Decision rows carrying the orchestrator's hard-coded 0.0 must not
+    drag the trend down — they're not consulted at all."""
+    with state.DECISIONS_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "run_id": "20260601T120000Z-a", "stage": "strategist",
+            "prompt_cache_hit_pct": 0.0,
+            "started_at": "2026-06-01T12:00:00Z",
+        }) + "\n")
+    state.append_cost({
+        "run_id": "20260601T120000Z-a", "stage": "strategist", "model": "m",
+        "cost_usd": 0.05, "at": "2026-06-01T12:00:30Z",
+        "input_tokens": 0, "output_tokens": 10,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 1000,
+    })
+    out = dd.cache_hit_trend()
+    assert len(out) == 1
+    assert out[0]["cache_hit_pct"] == pytest.approx(100.0)

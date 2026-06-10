@@ -704,3 +704,87 @@ def test_build_comparison_months_table_populated_after_one_month():
     assert not bundle.months_table.empty
     # pct_months_strategy_beat is a real number when ≥1 month is present.
     assert bundle.pct_months_strategy_beat is not None
+
+
+# ---------- NaN SPY closes (partial current-day rows) ----------
+
+
+def test_fetch_spy_total_return_drops_nan_trailing_close(monkeypatch):
+    """yfinance can return a partial row for the current day whose Close
+    is NaN (pre-market / mid-session), and run-dir parquet caches can
+    persist it. fetch_spy_total_return must scrub it — otherwise the NaN
+    propagates into the SPY-equivalent curve and the dashboard's delta
+    card renders "$nan".
+    """
+    import math
+
+    from lib import market_data
+
+    idx = pd.bdate_range(start=date(2026, 1, 5), periods=4)
+    raw = pd.DataFrame(
+        {"Close": [400.0, 402.0, 404.0, float("nan")]},
+        index=pd.DatetimeIndex(idx, tz="America/New_York"),
+    )
+    monkeypatch.setattr(
+        market_data, "total_return_history", lambda *a, **kw: raw
+    )
+
+    out = bench.fetch_spy_total_return(date(2026, 1, 5), date(2026, 1, 8))
+
+    assert not out["close"].isna().any()
+    assert idx[3].date() not in out.index
+    assert len(out) == 3
+    assert not math.isnan(float(out["close"].iloc[-1]))
+
+
+def test_build_comparison_live_tip_skips_nan_trailing_spy_close():
+    """Defense-in-depth: even if a caller passes an un-scrubbed SPY frame
+    whose trailing close is NaN, the live tip must walk back to the last
+    VALID close instead of poisoning spy_curve/delta_usd with NaN.
+    """
+    import math
+
+    start = date(2026, 1, 5)
+    strat = _strategy_eod(start, [2500.0, 2520.0, 2510.0, 2540.0])
+    spy = _spy_df(start, [400.0, 402.0, 401.0, 403.0])
+    # Append a NaN partial row for "today" (the next business day).
+    today = (pd.bdate_range(start=spy.index[-1], periods=2)[-1]).date()
+    spy.loc[today] = float("nan")
+
+    bundle = bench.build_comparison(
+        strat, spy, 2500.0, live_nav_usd=2600.0, as_of=today
+    )
+
+    assert bundle is not None
+    assert not bundle.spy_curve["nav"].isna().any()
+    assert not math.isnan(bundle.delta_usd)
+    assert not math.isnan(bundle.delta_pct)
+    # Tip uses the last VALID close: 2500 * 403/400 = 2518.75.
+    assert float(bundle.spy_curve["nav"].iloc[-1]) == pytest.approx(
+        2518.75, abs=1e-6
+    )
+    assert bundle.delta_usd == pytest.approx(2600.0 - 2518.75, abs=1e-6)
+
+
+# ---------- drawdown_series ----------
+
+
+def test_drawdown_series_known_inputs():
+    eq = pd.Series([100.0, 110.0, 99.0, 121.0])
+    out = bench.drawdown_series(eq)
+    assert list(out.index) == [0, 1, 2, 3]
+    assert out.iloc[0] == pytest.approx(0.0)
+    assert out.iloc[1] == pytest.approx(0.0)
+    # 99 vs peak 110 → -10%.
+    assert out.iloc[2] == pytest.approx(-0.10, abs=1e-9)
+    assert out.iloc[3] == pytest.approx(0.0)
+
+
+def test_drawdown_series_empty_and_nan():
+    assert bench.drawdown_series(None).empty
+    assert bench.drawdown_series(pd.Series(dtype=float)).empty
+    eq = pd.Series([100.0, float("nan"), 90.0])
+    out = bench.drawdown_series(eq)
+    assert len(out) == 2
+    assert not out.isna().any()
+    assert out.iloc[-1] == pytest.approx(-0.10, abs=1e-9)
