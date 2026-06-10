@@ -764,3 +764,27 @@ def test_build_comparison_live_tip_skips_nan_trailing_spy_close():
         2518.75, abs=1e-6
     )
     assert bundle.delta_usd == pytest.approx(2600.0 - 2518.75, abs=1e-6)
+
+
+# ---------- drawdown_series ----------
+
+
+def test_drawdown_series_known_inputs():
+    eq = pd.Series([100.0, 110.0, 99.0, 121.0])
+    out = bench.drawdown_series(eq)
+    assert list(out.index) == [0, 1, 2, 3]
+    assert out.iloc[0] == pytest.approx(0.0)
+    assert out.iloc[1] == pytest.approx(0.0)
+    # 99 vs peak 110 → -10%.
+    assert out.iloc[2] == pytest.approx(-0.10, abs=1e-9)
+    assert out.iloc[3] == pytest.approx(0.0)
+
+
+def test_drawdown_series_empty_and_nan():
+    assert bench.drawdown_series(None).empty
+    assert bench.drawdown_series(pd.Series(dtype=float)).empty
+    eq = pd.Series([100.0, float("nan"), 90.0])
+    out = bench.drawdown_series(eq)
+    assert len(out) == 2
+    assert not out.isna().any()
+    assert out.iloc[-1] == pytest.approx(-0.10, abs=1e-9)

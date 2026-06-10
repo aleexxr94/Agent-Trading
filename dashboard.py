@@ -29,6 +29,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from lib import benchmark as bench
 from lib import dashboard_data as dd
 from lib import pnl as pnl_lib
 from lib import state
@@ -1899,6 +1900,36 @@ with tabs[4]:
             f"Inception {bundle.inception.isoformat()} → as of "
             f"{bundle.as_of.isoformat()} · {len(strat_df)} trading-day points · "
             "Sharpe risk-free rate = 0%."
+        )
+
+        # ---- (c2) Underwater (drawdown) chart ----
+        st.markdown(
+            '<div class="at-section-label">Underwater (drawdown from peak)</div>',
+            unsafe_allow_html=True,
+        )
+        _dd_strat = bench.drawdown_series(bundle.strategy_curve["nav"]) * 100.0
+        _dd_spy = bench.drawdown_series(bundle.spy_curve["nav"]) * 100.0
+        fig_dd = go.Figure()
+        fig_dd.add_trace(go.Scatter(
+            x=list(_dd_strat.index), y=list(_dd_strat.values),
+            mode="lines", name="Strategy",
+            line=dict(width=2, color="#059669"),
+            fill="tozeroy", fillcolor=_rgba("#059669", 0.18),
+            hovertemplate="%{x|%Y-%m-%d}<br>Strategy: %{y:.2f}%<extra></extra>",
+        ))
+        fig_dd.add_trace(go.Scatter(
+            x=list(_dd_spy.index), y=list(_dd_spy.values),
+            mode="lines", name="SPY-equivalent",
+            line=dict(width=2, color="#d97706"),
+            fill="tozeroy", fillcolor=_rgba("#d97706", 0.14),
+            hovertemplate="%{x|%Y-%m-%d}<br>SPY-eqv: %{y:.2f}%<extra></extra>",
+        ))
+        _style_fig(fig_dd, height=220, yaxis_title="Drawdown (%)", legend=True)
+        st.plotly_chart(fig_dd, width="stretch", config=NO_ZOOM_CONFIG)
+        st.caption(
+            "Percent below the running peak at each point — 0% means a "
+            "fresh equity high; the depth of each dip is how far the "
+            "curve sat under water before recovering."
         )
 
         # ---- (d) Risk-adjusted comparison cards ----

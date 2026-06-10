@@ -228,6 +228,21 @@ def max_drawdown(equity: "pd.Series") -> tuple[float, date, date]:
     return (trough_val, _to_date(peak_pos), _to_date(trough_pos))
 
 
+def drawdown_series(equity: "pd.Series") -> "pd.Series":
+    """Fraction below the running peak at each point — 0.0 at peaks,
+    negative elsewhere (-0.10 = 10% under water). Powers the dashboard's
+    underwater chart. NaN-safe: NaN rows are dropped; empty input returns
+    an empty float Series."""
+    import pandas as pd  # noqa: WPS433
+
+    if equity is None or len(equity) == 0:
+        return pd.Series(dtype=float)
+    eq = equity.dropna().astype(float)
+    if len(eq) == 0:
+        return pd.Series(dtype=float)
+    return eq / eq.cummax() - 1.0
+
+
 def _to_date(idx_val) -> date:
     if isinstance(idx_val, date) and not isinstance(idx_val, datetime):
         return idx_val
