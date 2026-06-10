@@ -1832,6 +1832,12 @@ with tabs[4]:
             showarrow=False, xanchor="left",
             font=dict(color="#d97706", size=12, family="monospace"),
         )
+        # Tight y-range hugging both curves — autorange gets dragged to
+        # zero by stray annotation anchors and flattens the lines
+        # against the top of the chart.
+        _bench_yrange = _tight_yrange(
+            list(strat_df["nav"]) + list(spy_df["nav"]), min_pad=10.0
+        )
         fig_bench.update_layout(
             template="plotly_white",
             paper_bgcolor="rgba(0,0,0,0)",
@@ -1839,7 +1845,7 @@ with tabs[4]:
             height=380,
             yaxis_title="Portfolio value (USD)",
             xaxis_title="",
-            yaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
+            yaxis=dict(gridcolor="#e2e8f0", fixedrange=True, range=_bench_yrange),
             xaxis=dict(gridcolor="#e2e8f0", fixedrange=True),
             margin=dict(l=10, r=80, t=20, b=10),
             legend=dict(orientation="h", y=1.1, font=dict(size=12)),
