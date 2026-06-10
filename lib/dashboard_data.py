@@ -844,35 +844,45 @@ def cost_by_stage() -> list[dict]:
 
 
 def cache_hit_trend(limit: int = 200) -> list[dict]:
-    """Per-run mean prompt-cache hit rate from the decision log.
+    """Per-run prompt-cache hit rate from state/costs.jsonl.
 
-    Returns ``[{run_id, at, cache_hit_pct}]`` oldest→newest, one row per
-    run (mean of that run's decision rows that carry a numeric
-    ``prompt_cache_hit_pct``). Runs whose rows all lack the field are
-    skipped. ``at`` is the run's earliest ``started_at``.
+    ``100 * cache_read / (input + cache_creation + cache_read)`` over
+    each run's summed token counters — same definition as
+    ``cost_by_stage``. Sourced from cost rows, NOT the decision log:
+    the orchestrator writes every decision row with a hard-coded
+    ``prompt_cache_hit_pct: 0.0``, while lib/llm.py records the real
+    cache token counters in costs.jsonl (codex P2 on PR #108).
+
+    Returns ``[{run_id, at, cache_hit_pct}]`` oldest→newest, one row
+    per run. Runs whose cost rows carry no token counters are skipped.
+    ``at`` is the run's earliest cost-row timestamp. Reset-aware via
+    load_costs().
     """
-    rows = load_decisions(limit=10**9)
+    rows = load_costs(limit=10**9)
     by_run: dict[str, dict] = {}
     for r in rows:
         rid = str(r.get("run_id") or "")
-        pct = r.get("prompt_cache_hit_pct")
-        if not rid or not isinstance(pct, (int, float)):
+        if not rid:
             continue
-        b = by_run.setdefault(rid, {"run_id": rid, "at": "", "_sum": 0.0, "_n": 0})
-        b["_sum"] += float(pct)
-        b["_n"] += 1
-        at = str(r.get("started_at") or r.get("ended_at") or "")
+        b = by_run.setdefault(rid, {
+            "run_id": rid, "at": "", "_input": 0, "_creation": 0, "_read": 0,
+        })
+        b["_input"] += r.get("input_tokens") or 0
+        b["_creation"] += r.get("cache_creation_input_tokens") or 0
+        b["_read"] += r.get("cache_read_input_tokens") or 0
+        at = str(r.get("at") or "")
         if at and (not b["at"] or at < b["at"]):
             b["at"] = at
-    out = [
-        {
+    out = []
+    for b in by_run.values():
+        denom = b["_input"] + b["_creation"] + b["_read"]
+        if denom <= 0:
+            continue
+        out.append({
             "run_id": b["run_id"],
             "at": b["at"],
-            "cache_hit_pct": b["_sum"] / b["_n"],
-        }
-        for b in by_run.values()
-        if b["_n"] > 0
-    ]
+            "cache_hit_pct": 100.0 * b["_read"] / denom,
+        })
     # run_ids are timestamp-prefixed, so sorting by run_id is chronological.
     out.sort(key=lambda x: x["run_id"])
     return out[-limit:]

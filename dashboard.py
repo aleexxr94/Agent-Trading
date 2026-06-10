@@ -1816,9 +1816,10 @@ with tabs[3]:
                    yrange=[0, 105])
         st.plotly_chart(fig_ct, width="stretch", config=NO_ZOOM_CONFIG)
         st.caption(
-            "Mean prompt-cache hit rate per orchestrator run. Sustained "
-            "high values mean the static system prompts are caching as "
-            "designed; a sudden drop usually means a prompt was edited."
+            "Token-weighted prompt-cache hit rate per orchestrator run, "
+            "from costs.jsonl cache counters. Sustained high values mean "
+            "the static system prompts are caching as designed; a sudden "
+            "drop usually means a prompt was edited."
         )
     else:
         st.info("No cache-hit history yet.")

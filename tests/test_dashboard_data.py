@@ -2213,25 +2213,58 @@ def test_cost_by_stage_empty_state_returns_empty(tmp_state):
     assert out[0]["total_tokens"] == 0
 
 
-def test_cache_hit_trend_averages_per_run(tmp_state):
-    rows = [
-        {"run_id": "20260601T120000Z-a", "stage": "strategist",
-         "prompt_cache_hit_pct": 80.0, "started_at": "2026-06-01T12:00:00Z"},
-        {"run_id": "20260601T120000Z-a", "stage": "construct",
-         "prompt_cache_hit_pct": 60.0, "started_at": "2026-06-01T12:05:00Z"},
-        {"run_id": "20260602T120000Z-b", "stage": "strategist",
-         "prompt_cache_hit_pct": 90.0, "started_at": "2026-06-02T12:00:00Z"},
-        # Row without the field is ignored; run with no usable rows is skipped.
-        {"run_id": "20260603T120000Z-c", "stage": "market_gate",
-         "started_at": "2026-06-03T12:00:00Z"},
-    ]
-    with state.DECISIONS_LOG.open("a", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r) + "\n")
+def test_cache_hit_trend_token_weighted_per_run(tmp_state):
+    """Sourced from costs.jsonl token counters, NOT the decision log —
+    the orchestrator hard-codes prompt_cache_hit_pct=0.0 in every
+    decision row, so decisions would always trend at 0% (codex P2)."""
+    state.append_cost({
+        "run_id": "20260601T120000Z-a", "stage": "strategist", "model": "m",
+        "cost_usd": 0.05, "at": "2026-06-01T12:00:00Z",
+        "input_tokens": 100, "output_tokens": 10,
+        "cache_creation_input_tokens": 100, "cache_read_input_tokens": 800,
+    })
+    state.append_cost({
+        "run_id": "20260601T120000Z-a", "stage": "construct", "model": "m",
+        "cost_usd": 0.20, "at": "2026-06-01T12:05:00Z",
+        "input_tokens": 500, "output_tokens": 50,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 500,
+    })
+    state.append_cost({
+        "run_id": "20260602T120000Z-b", "stage": "strategist", "model": "m",
+        "cost_usd": 0.05, "at": "2026-06-02T12:00:00Z",
+        "input_tokens": 100, "output_tokens": 10,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 900,
+    })
+    # Run with no token counters at all is skipped (no denominator).
+    state.append_cost({
+        "run_id": "20260603T120000Z-c", "stage": "meta", "model": "m",
+        "cost_usd": 0.01, "at": "2026-06-03T12:00:00Z",
+    })
     out = dd.cache_hit_trend()
     assert [r["run_id"] for r in out] == [
         "20260601T120000Z-a", "20260602T120000Z-b",
     ]
-    assert out[0]["cache_hit_pct"] == pytest.approx(70.0)
-    assert out[0]["at"] == "2026-06-01T12:00:00Z"  # earliest started_at
+    # Run a: read 1300 of (600 input + 100 creation + 1300 read) = 65%.
+    assert out[0]["cache_hit_pct"] == pytest.approx(65.0)
+    assert out[0]["at"] == "2026-06-01T12:00:00Z"  # earliest cost row
     assert out[1]["cache_hit_pct"] == pytest.approx(90.0)
+
+
+def test_cache_hit_trend_ignores_hardcoded_decision_pct(tmp_state):
+    """Decision rows carrying the orchestrator's hard-coded 0.0 must not
+    drag the trend down — they're not consulted at all."""
+    with state.DECISIONS_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "run_id": "20260601T120000Z-a", "stage": "strategist",
+            "prompt_cache_hit_pct": 0.0,
+            "started_at": "2026-06-01T12:00:00Z",
+        }) + "\n")
+    state.append_cost({
+        "run_id": "20260601T120000Z-a", "stage": "strategist", "model": "m",
+        "cost_usd": 0.05, "at": "2026-06-01T12:00:30Z",
+        "input_tokens": 0, "output_tokens": 10,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 1000,
+    })
+    out = dd.cache_hit_trend()
+    assert len(out) == 1
+    assert out[0]["cache_hit_pct"] == pytest.approx(100.0)
