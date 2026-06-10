@@ -11,51 +11,95 @@ shorts, no margin. A bullish thesis is expressed by naming the **bull ETF**;
 a bearish thesis is expressed by naming the **inverse ETF**. The account
 only ever goes long the named ETF.
 
-## Universe (29 tickers, curated)
+## Universe (49 tickers, curated)
 
-**Bull/bear leveraged-ETF pairs (13 factors × 2 directions):**
+**Bull/bear leveraged-ETF pairs (21 factors × 2 directions):**
 - `TQQQ` / `SQQQ` — Nasdaq 3x long / short
 - `UPRO` / `SPXU` — S&P 500 3x long / short
+- `UDOW` / `SDOW` — Dow Jones 3x long / short
 - `TNA` / `TZA` — Russell 2000 small-caps 3x long / short
+- `HIBL` / `HIBS` — S&P 500 High Beta 3x long / short
 - `SOXL` / `SOXS` — Semiconductors 3x long / short
 - `TECL` / `TECS` — Technology sector 3x long / short
+- `WEBL` / `WEBS` — Internet 3x long / short
 - `LABU` / `LABD` — Biotech 3x long / short
 - `YINN` / `YANG` — FTSE China 3x long / short
+- `EDC` / `EDZ` — Emerging markets 3x long / short
 - `FAS` / `FAZ` — Financials 3x long / short
 - `ERX` / `ERY` — Energy sector 2x long / short
 - `GUSH` / `DRIP` — Oil & gas E&P 2x long / short
 - `BOIL` / `KOLD` — Natural gas 2x long / short
+- `UCO` / `SCO` — WTI crude oil futures 2x long / short
 - `TMF` / `TMV` — 20+yr Treasuries 3x long / short (rates)
 - `NUGT` / `DUST` — Gold miners 2x long / short
+- `UGL` / `GLL` — Gold bullion 2x long / short
+- `AGQ` / `ZSL` — Silver 2x long / short
+- `ETHU` / `ETHD` — Ether futures 2x long / short (crypto-eth)
 
 **Solo / asymmetric entries:**
 - `UVXY` — VIX 1.5x long (long-vol play; no inverse counterpart)
 - `BITX` — Bitcoin 2x long / `BITI` — Bitcoin 1x inverse (crypto-btc)
+- `NAIL` — Homebuilders 3x long (solo; no liquid inverse)
+- `DFEN` — Aerospace & defense 3x long (solo)
+- `CURE` — Healthcare 3x long (solo)
+- `DPST` — Regional banks 3x long (solo)
 
 There are no short positions and no options — a bearish thesis on Nasdaq is
 expressed as **long SQQQ**, never a broker short of TQQQ and never a put.
-The system only goes long the named ETF.
+The system only goes long the named ETF. For the four solo bulls a bearish
+view is expressed by NOT holding them (or via a correlated inverse — e.g.
+bearish regional banks rhymes with FAZ — your judgment).
 
 Bull and inverse ETFs in a pair share a `factor` field (e.g. TQQQ and SQQQ
 both factor=`nasdaq`). The constructor avoids double-loading the same factor.
 
-## Input: signals.json
+## Input: signals (compact, factor-grouped)
 
-A table of rows, one per universe ticker. Per row:
+The signals table arrives grouped by factor: one object per factor with
+the factor's tickers inlined (`{"factor": "nasdaq", "events_7d": [...],
+"tickers": [{"sym": "TQQQ", "lev": 3.0, ...}, {"sym": "SQQQ", ...}]}`).
+Null fields are omitted. Per ticker:
 
 | Field | Meaning |
 |---|---|
-| `symbol` | Ticker |
-| `kind` | Always `etf` |
-| `factor` | Factor identifier (see above) |
-| `leverage_factor` | Signed daily leverage: +3/-3, +2/-2, +1.5, +2/-1 |
-| `last_close` | Most recent close price |
-| `adv_30d` | 30-day average daily volume (liquidity check) |
-| `momentum_30d_pct` / `momentum_60d_pct` | Trailing total return |
-| `hv_30d_annualised` / `hv_90d_annualised` | Annualised close-to-close vol |
-| `dist_from_50d_ma_pct` / `dist_from_200d_ma_pct` | Distance from MA (negative = below MA = downtrend) |
+| `sym` | Ticker |
+| `lev` | Signed daily leverage: +3/-3, +2/-2, +1.5, +2/-1 |
+| `close` | Most recent close price |
+| `adv` | 30-day average daily volume (liquidity check) |
+| `mom30` / `mom60` | Trailing total return % (30/60d) |
+| `hv30` / `hv90` | Annualised close-to-close vol |
+| `d50` / `d200` | Distance from 50/200d MA, % (negative = below MA = downtrend) |
+| `rsi14` | 14-day RSI: >70 extended, <30 washed out |
+| `rs_spy30` | 30d return minus SPY's 30d return (pct points) — positive = leading the tape, not just rising with it |
+| `trend_r2` | R² of price vs time over 60 sessions: ~1 = clean trend, ~0 = chop. **Chop is where leveraged ETFs decay** — a directional thesis on a low-`trend_r2` ticker needs extra conviction |
 
-Rows with an `error` field are unavailable — skip them silently.
+`events_7d` lists upcoming macro catalysts (FOMC/CPI/NFP/PCE) within 7
+days. Tickers with an `error` field are unavailable — skip them silently.
+
+The payload also carries `factor_correlations`: pairs of factors whose
+bull ETFs' 30d returns are correlated ≥ |0.7| right now. Use it both
+ways: avoid surfacing two candidates that are currently the same bet,
+AND notice which factors are genuinely independent diversifiers this
+cycle.
+
+## Your own track record (performance memo)
+
+The user message may include a performance memo: your realized win/loss
+record by factor, calibration of your past confidence scores ("your
+0.70-0.84 picks won X%"), and recent exits tagged with what killed them
+(loss cap / price stop / time stop / your own rebalance). Treat it as
+**calibration evidence**:
+
+- Where your high-confidence picks on a factor keep winning, trust
+  similar setups.
+- Where they keep losing, demand a cleaner signal before re-rating that
+  factor highly — or express the view through a different factor.
+- If your 0.8s win no more often than your 0.5s, your confidence scale
+  is miscalibrated — spread your scores to actually mean something.
+
+The memo is **not** an instruction to trade less. Staying active within
+the risk rails is expected; the memo exists to make your conviction
+scores honest, not timid.
 
 ## Output schema (view.schema.json)
 
@@ -79,12 +123,13 @@ Rules:
 - **0–6 candidates.** Lower bound zero is allowed if markets are
   genuinely uninvestable; bias toward 2–4 high-conviction picks.
 - `instrument_kind` is **always `"etf"`** — it is the only allowed value.
-  - Bullish thesis → name the **bull ETF** (TQQQ / UPRO / TNA / SOXL /
-    TECL / LABU / YINN / FAS / ERX / GUSH / BOIL / TMF / NUGT; UVXY for
-    long vol; BITX for long crypto).
-  - Bearish thesis → name the **inverse ETF** (SQQQ / SPXU / TZA / SOXS /
-    TECS / LABD / YANG / FAZ / ERY / DRIP / KOLD / TMV / DUST; BITI for
-    inverse crypto).
+  - Bullish thesis → name the **bull ETF** (TQQQ / UPRO / UDOW / TNA /
+    HIBL / SOXL / TECL / WEBL / LABU / YINN / EDC / FAS / ERX / GUSH /
+    BOIL / UCO / TMF / NUGT / UGL / AGQ; UVXY for long vol; BITX / ETHU
+    for long crypto; NAIL / DFEN / CURE / DPST for their solo sectors).
+  - Bearish thesis → name the **inverse ETF** (SQQQ / SPXU / SDOW / TZA /
+    HIBS / SOXS / TECS / WEBS / LABD / YANG / EDZ / FAZ / ERY / DRIP /
+    KOLD / SCO / TMV / DUST / GLL / ZSL; BITI / ETHD for inverse crypto).
 - `confidence` ∈ [0, 1]. Threshold guidance:
   - ≥0.7: strong signal, multiple corroborating features
   - 0.5–0.7: moderate

@@ -901,3 +901,40 @@ def test_sync_fills_before_cooldown_returns_error_string_on_failure(monkeypatch)
     err = orchestrator._sync_fills_before_cooldown(ctx)
     assert err is not None
     assert "alpaca down" in err
+
+
+# ---------- critic no-op skip helper ----------
+
+
+def test_portfolio_is_noop_when_target_matches_holdings():
+    import orchestrator as orch
+    portfolio = {"positions": [
+        {"symbol": "TQQQ", "shares": 4},
+        {"symbol": "TMF", "shares": 10},
+    ]}
+    current = [
+        {"symbol": "TQQQ", "qty": 4.0},
+        {"symbol": "TMF", "qty": 10.0},
+    ]
+    assert orch._portfolio_is_noop(portfolio, current) is True
+
+
+def test_portfolio_is_not_noop_on_any_difference():
+    import orchestrator as orch
+    current = [{"symbol": "TQQQ", "qty": 4.0}]
+    # Share-count drift.
+    assert orch._portfolio_is_noop(
+        {"positions": [{"symbol": "TQQQ", "shares": 5}]}, current,
+    ) is False
+    # New symbol in target.
+    assert orch._portfolio_is_noop(
+        {"positions": [{"symbol": "TQQQ", "shares": 4}, {"symbol": "TMF", "shares": 1}]},
+        current,
+    ) is False
+    # Held symbol dropped from target (a close IS an order).
+    assert orch._portfolio_is_noop({"positions": []}, current) is False
+
+
+def test_portfolio_is_noop_all_cash_with_empty_account():
+    import orchestrator as orch
+    assert orch._portfolio_is_noop({"positions": [], "all_cash": True}, []) is True

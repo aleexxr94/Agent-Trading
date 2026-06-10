@@ -182,12 +182,107 @@ def evaluate_portfolio(
     return actions
 
 
+def update_trailing_stops(
+    *,
+    portfolio: dict,
+    marks: dict[str, float],
+    broker_positions: list | None = None,
+    position_peaks: dict | None = None,
+    now_iso: str | None = None,
+) -> tuple[dict, list[dict]]:
+    """Evaluate the OPTIONAL trailing stops the constructor chose to set.
+
+    Pure function: returns (new_peaks, actions) without touching state —
+    main() persists the peaks. For every target position carrying
+    ``kill_conditions.trailing_stop_pct``:
+
+      - the peak mark ratchets up: ``peak = max(prior_peak, mark)``
+        (initialised at the current mark when first seen, so a freshly
+        set stop can never fire on its first observation)
+      - the stop fires when ``mark <= peak * (1 - pct/100)``
+
+    Symbols absent from the returned peaks map (position closed, trailing
+    stop removed by the constructor, or not currently held) are dropped
+    from the peak file so a later re-entry starts a fresh ratchet.
+
+    This enforces only what the agent itself chose per position — exactly
+    the same contract as the fixed price/time stops.
+    """
+    peaks = position_peaks or {}
+    now_iso = now_iso or state.utcnow_iso()
+    held = (
+        {bp.symbol for bp in broker_positions if abs(bp.qty) > 0}
+        if broker_positions is not None else None
+    )
+    new_peaks: dict = {}
+    actions: list[dict] = []
+    for pos in portfolio.get("positions", []):
+        symbol = pos.get("symbol")
+        kc = pos.get("kill_conditions") or {}
+        pct = kc.get("trailing_stop_pct")
+        if not isinstance(pct, (int, float)) or pct <= 0:
+            continue
+        if held is not None and symbol not in held:
+            continue  # not held — no ratchet to maintain
+        mark = marks.get(symbol)
+        if mark is None or mark <= 0:
+            # Unmarked this cycle: keep the prior peak (don't lose the
+            # ratchet to a transient data gap), but can't evaluate.
+            if symbol in peaks:
+                new_peaks[symbol] = peaks[symbol]
+            continue
+        prior = (peaks.get(symbol) or {}).get("peak_mark")
+        peak = max(float(prior), mark) if isinstance(prior, (int, float)) else mark
+        new_peaks[symbol] = {"peak_mark": peak, "updated_at": now_iso}
+        threshold = peak * (1.0 - float(pct) / 100.0)
+        if mark <= threshold and peak > mark:
+            actions.append({
+                "symbol": symbol,
+                "action": "flatten",
+                "reason": (
+                    f"trailing stop: mark {mark:g} ≤ {threshold:g} "
+                    f"(peak {peak:g} − {pct:g}%)"
+                ),
+            })
+    return new_peaks, actions
+
+
+def _exit_kind_from_reason(reason: str) -> str:
+    """Map a should_kill_position reason string to a stable exit_kind tag
+    for the kill-event log (consumed by lib.feedback + the dashboard)."""
+    r = (reason or "").lower()
+    if "trailing stop" in r:
+        return "trailing_stop"
+    if "time stop" in r:
+        return "time_stop"
+    if "kill_below" in r or "kill_above" in r:
+        return "price_stop"
+    if r.startswith("orphan"):
+        return "orphan_loss_cap"
+    if "cap" in r:
+        return "loss_cap"
+    return "other"
+
+
 def execute_actions(actions: list[dict], *, broker: Broker | None) -> None:
     if state.is_halted():
         return
     for a in actions:
         if a["action"] == "flatten" and broker is not None:
             broker.flatten(a["symbol"])
+            # Exit-outcome audit: record WHY this position died so the
+            # performance memo can show the agent its stop-out history.
+            # Guarded — telemetry must never break the kill loop.
+            try:
+                state.append_kill_event({
+                    "at": state.utcnow_iso(),
+                    "symbol": a["symbol"],
+                    "reason": a["reason"],
+                    "exit_kind": _exit_kind_from_reason(a["reason"]),
+                    "source": "monitor",
+                })
+            except Exception:
+                pass
 
 
 def audit_report(
@@ -321,6 +416,25 @@ def main(argv: list[str] | None = None) -> int:
         broker_positions=(positions if broker is not None else None),
         enforce_stops=enforce,
     )
+    # Trailing stops the constructor chose (ratchet from peak mark).
+    # Guarded like the other telemetry: a peak-file problem degrades the
+    # ratchet, it never breaks the hard loss-cap loop above.
+    if enforce:
+        try:
+            new_peaks, trailing_actions = update_trailing_stops(
+                portfolio=portfolio,
+                marks=marks,
+                broker_positions=(positions if broker is not None else None),
+                position_peaks=state.read_position_peaks(),
+            )
+            already = {a["symbol"] for a in actions}
+            actions.extend(
+                a for a in trailing_actions if a["symbol"] not in already
+            )
+            if not args.dry_run:
+                state.write_position_peaks(new_peaks)
+        except Exception as e:
+            print(f"monitor: trailing-stop error ({type(e).__name__}: {e}); ignored")
     print(
         f"monitor: {len(marks)} marks, {len(actions)} actions "
         f"(dry_run={args.dry_run}, broker={'on' if broker else 'off'}, "
