@@ -45,22 +45,18 @@ _CONFIDENCE_BUCKETS: tuple[tuple[float, float, str], ...] = (
 _KILL_EVENT_MATCH_WINDOW_S = 6 * 3600.0
 
 
-def entry_confidence_for(run_id: str | None, symbol: str,
-                         *, _cache: dict | None = None) -> float | None:
-    """Strategist confidence for `symbol` in the run that opened it.
-
-    Reads state/runs/{run_id}/view.json and matches the candidate list.
-    Returns None when the run/artifact/candidate is missing — legacy
-    trades predate this linkage and simply land in the "unknown" bucket.
-    `_cache` (optional dict keyed by run_id) avoids re-reading the same
-    view.json once per fill.
-    """
+def _view_info_for(run_id: str | None, *, _cache: dict | None = None) -> dict:
+    """{candidates: {symbol: confidence}, regime: str|None} for a run's
+    view.json. Empty/None values when the run/artifact is missing or
+    corrupt. `_cache` (optional dict keyed by run_id) avoids re-reading
+    the same view.json once per fill."""
+    empty = {"candidates": {}, "regime": None}
     if not run_id:
-        return None
+        return empty
     cache = _cache if _cache is not None else {}
     if run_id not in cache:
         view_path = state.RUNS_DIR / run_id / "view.json"
-        candidates: dict[str, float] = {}
+        info = {"candidates": {}, "regime": None}
         if view_path.exists():
             try:
                 view = json.loads(view_path.read_text(encoding="utf-8"))
@@ -68,11 +64,22 @@ def entry_confidence_for(run_id: str | None, symbol: str,
                     sym = c.get("symbol")
                     conf = c.get("confidence")
                     if isinstance(sym, str) and isinstance(conf, (int, float)):
-                        candidates[sym] = float(conf)
+                        info["candidates"][sym] = float(conf)
+                regime = view.get("regime")
+                if isinstance(regime, str):
+                    info["regime"] = regime
             except (json.JSONDecodeError, OSError):
                 pass
-        cache[run_id] = candidates
-    return cache[run_id].get(symbol)
+        cache[run_id] = info
+    return cache[run_id]
+
+
+def entry_confidence_for(run_id: str | None, symbol: str,
+                         *, _cache: dict | None = None) -> float | None:
+    """Strategist confidence for `symbol` in the run that opened it.
+    None when the run/artifact/candidate is missing — legacy trades
+    predate this linkage and land in the "unknown" bucket."""
+    return _view_info_for(run_id, _cache=_cache)["candidates"].get(symbol)
 
 
 def _confidence_bucket(conf: float | None) -> str:
@@ -167,9 +174,11 @@ def build_performance_memo(
 
     view_cache: dict = {}
     by_bucket: dict[str, list[trades.ClosedTrade]] = defaultdict(list)
+    by_regime: dict[str, list[trades.ClosedTrade]] = defaultdict(list)
     for ct in closed:
-        conf = entry_confidence_for(ct.buy_run_id, ct.symbol, _cache=view_cache)
-        by_bucket[_confidence_bucket(conf)].append(ct)
+        info = _view_info_for(ct.buy_run_id, _cache=view_cache)
+        by_bucket[_confidence_bucket(info["candidates"].get(ct.symbol))].append(ct)
+        by_regime[info["regime"] or "unknown"].append(ct)
 
     # Hold time on the same basis as the dashboard's trade_stats.
     hold_hours: list[float] = []
@@ -208,6 +217,12 @@ def build_performance_memo(
         "confidence_calibration": [
             {"bucket": b, **_record(by_bucket[b])}
             for b in bucket_order if b in by_bucket
+        ],
+        "by_regime": [
+            {"regime": r, **_record(rows_r)}
+            for r, rows_r in sorted(
+                by_regime.items(), key=lambda kv: len(kv[1]), reverse=True,
+            )
         ],
         "recent_exits": recent_exits,
     }

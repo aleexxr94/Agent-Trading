@@ -1737,3 +1737,266 @@ def allocation_pie(portfolio: dict) -> list[dict]:
     if cash_pct > 0:
         rows.append({"label": "Cash", "value": cash_pct})
     return rows
+
+
+# ---------- Calibration tab: self-knowledge + activity + readiness ----------
+
+
+def calibration_view() -> dict:
+    """Everything the Calibration tab renders about the agent's own record:
+    the performance memo (factor / confidence-bucket / regime win rates,
+    recent tagged exits) plus the raw kill-event audit. Mirrors exactly
+    what the LLM stages are fed, so the operator sees the same evidence
+    the agent sees."""
+    from . import feedback
+
+    memo = feedback.build_performance_memo_safe() or {
+        "closed_trades": 0, "note": "memo unavailable",
+    }
+    return {
+        "memo": memo,
+        "kill_events": list(reversed(state.read_kill_events(limit=50))),
+    }
+
+
+def critic_history(limit: int = 100) -> dict:
+    """Accept/reject record of the critic stage from run artifacts.
+
+    Walks state/runs/*/critique.json newest-first (run ids sort
+    chronologically). Returns {"rows": [...], "accepted": n,
+    "rejected": n} — rows carry run_id, accept, and a critique snippet.
+    Skipped-as-no-op critiques count as accepted (they are auto-accept
+    artifacts) but keep their distinguishing text visible in the row.
+    """
+    rows: list[dict] = []
+    runs_dir = state.RUNS_DIR
+    if runs_dir.exists():
+        for run_dir in sorted(runs_dir.iterdir(), reverse=True):
+            if len(rows) >= limit:
+                break
+            p = run_dir / "critique.json"
+            if not p.exists():
+                continue
+            try:
+                c = json.loads(p.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            rows.append({
+                "run_id": run_dir.name,
+                "accept": bool(c.get("accept", True)),
+                "critique": (c.get("critique") or "")[:300],
+                "suggested_changes": len(c.get("suggested_changes") or []),
+            })
+    return {
+        "rows": rows,
+        "accepted": sum(1 for r in rows if r["accept"]),
+        "rejected": sum(1 for r in rows if not r["accept"]),
+    }
+
+
+def activity_metrics(nav_rows: list[dict] | None = None, *, max_runs: int = 200) -> dict:
+    """Is the system actually trading? The original build over-gated into
+    chronic all-cash; these numbers make any regression toward that
+    visible at a glance.
+
+      - pct_cycles_with_orders: of recent runs that wrote an order plan,
+        how many submitted at least one order leg
+      - dedup_skipped: runs short-circuited by the cycle dedup
+      - time_in_market_pct: share of NAV-history rows holding >=1 position
+      - avg_positions / avg_cash_pct: deployment depth over the same rows
+    """
+    if nav_rows is None:
+        nav_rows = state.read_nav_history()
+
+    runs_seen = orders_cycles = dedup_skips = 0
+    runs_dir = state.RUNS_DIR
+    if runs_dir.exists():
+        for run_dir in sorted(runs_dir.iterdir(), reverse=True)[:max_runs]:
+            p = run_dir / "next_run.json"
+            if not p.exists():
+                continue
+            try:
+                nr = json.loads(p.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            runs_seen += 1
+            if nr.get("dedup_skipped"):
+                dedup_skips += 1
+                continue
+            plan = nr.get("order_plan") or {}
+            submitted = [
+                r for r in (plan.get("results") or [])
+                if not str(r.get("status", "")).startswith(("error", "skipped"))
+            ]
+            if submitted:
+                orders_cycles += 1
+
+    in_market = [r for r in nav_rows if (r.get("positions_count") or 0) > 0]
+    cash_pcts = [
+        (r.get("cash_usd") or 0.0) / r["nav_usd"] * 100.0
+        for r in nav_rows
+        if isinstance(r.get("nav_usd"), (int, float)) and r["nav_usd"] > 0
+    ]
+    n_nav = len(nav_rows)
+    return {
+        "runs_seen": runs_seen,
+        "cycles_with_orders": orders_cycles,
+        "pct_cycles_with_orders": (
+            round(100.0 * orders_cycles / runs_seen, 1) if runs_seen else None
+        ),
+        "dedup_skipped": dedup_skips,
+        "time_in_market_pct": (
+            round(100.0 * len(in_market) / n_nav, 1) if n_nav else None
+        ),
+        "avg_positions": (
+            round(sum((r.get("positions_count") or 0) for r in nav_rows) / n_nav, 2)
+            if n_nav else None
+        ),
+        "avg_cash_pct": (
+            round(sum(cash_pcts) / len(cash_pcts), 1) if cash_pcts else None
+        ),
+    }
+
+
+def trade_sync_gaps(*, lookback_days: int = 7) -> dict:
+    """Detect a silent trade-sync blackout: runs that SUBMITTED accepted
+    orders within the lookback window but have zero matching fills in
+    trades.jsonl. A 5-week gap like this happened once (May 2026) and
+    silently broke cooldown, P&L and the Sharpe gate — this surfaces it
+    on the dashboard the day it starts.
+
+    Returns {"stale": bool, "gaps": [{run_id, order_ids}], ...}.
+    """
+    from datetime import timedelta
+
+    cutoff = (state.utcnow() - timedelta(days=lookback_days)).strftime(
+        "%Y%m%dT%H%M%SZ"
+    )
+    runs_with_fills = {
+        r.get("run_id") for r in state.read_trades() if r.get("run_id")
+    }
+    gaps: list[dict] = []
+    runs_dir = state.RUNS_DIR
+    if runs_dir.exists():
+        for run_dir in sorted(runs_dir.iterdir(), reverse=True):
+            # Run ids start with the UTC timestamp — lexicographic compare
+            # against the cutoff prunes old runs cheaply.
+            if run_dir.name < cutoff:
+                break
+            p = run_dir / "orders.json"
+            if not p.exists():
+                continue
+            try:
+                orders = json.loads(p.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            order_ids = orders.get("order_ids") or []
+            if order_ids and run_dir.name not in runs_with_fills:
+                gaps.append({"run_id": run_dir.name, "order_ids": order_ids})
+    return {
+        "stale": bool(gaps),
+        "gaps": gaps,
+        "lookback_days": lookback_days,
+    }
+
+
+def readiness_scorecard(nav_rows: list[dict] | None = None) -> list[dict]:
+    """Auto-tracked promotion-to-live criteria (CLAUDE.md §Promotion).
+
+    Each row: {criterion, target, value, met} with met in {True, False,
+    None} (None = not enough data to evaluate). The cycle-completion
+    criterion is approximated as "weekdays with >=1 completed cycle /
+    weekdays elapsed" since the scheduler's intended cadence isn't
+    persisted. Purely informational — promotion remains a manual,
+    triple-locked decision.
+    """
+    from datetime import timedelta
+
+    from . import benchmark
+
+    if nav_rows is None:
+        nav_rows = state.read_nav_history()
+
+    rows: list[dict] = []
+
+    # --- continuous running >= 4 weeks ---
+    span_days = None
+    if len(nav_rows) >= 2:
+        try:
+            first = benchmark._parse_iso_utc(nav_rows[0]["at"])
+            last = benchmark._parse_iso_utc(nav_rows[-1]["at"])
+            span_days = (last - first).days
+        except (ValueError, TypeError, KeyError):
+            span_days = None
+    rows.append({
+        "criterion": "Continuous paper running",
+        "target": ">= 28 days",
+        "value": f"{span_days} days" if span_days is not None else "—",
+        "met": (span_days >= 28) if span_days is not None else None,
+    })
+
+    # --- cycle completion >= 80% (weekday-coverage proxy) ---
+    completion = None
+    if len(nav_rows) >= 2 and span_days is not None:
+        try:
+            first_d = benchmark._parse_iso_utc(nav_rows[0]["at"]).date()
+            last_d = benchmark._parse_iso_utc(nav_rows[-1]["at"]).date()
+            weekdays = [
+                first_d + timedelta(days=i)
+                for i in range((last_d - first_d).days + 1)
+            ]
+            weekdays = [d for d in weekdays if d.weekday() < 5]
+            covered = {
+                str(r.get("at") or "")[:10] for r in nav_rows
+            }
+            hit = sum(1 for d in weekdays if d.isoformat() in covered)
+            completion = 100.0 * hit / len(weekdays) if weekdays else None
+        except (ValueError, TypeError):
+            completion = None
+    rows.append({
+        "criterion": "Cycle completion (weekday coverage proxy)",
+        "target": ">= 80%",
+        "value": f"{completion:.0f}%" if completion is not None else "—",
+        "met": (completion >= 80.0) if completion is not None else None,
+    })
+
+    # --- Sharpe >= 0.5 and max DD <= 25% from the EOD equity curve ---
+    sharpe_v = dd_pct = None
+    try:
+        eod = benchmark.align_to_eod(nav_rows)
+        if len(eod) >= 10:
+            returns = eod["nav"].pct_change().dropna()
+            sharpe_v = benchmark.sharpe(returns)
+            dd, _, _ = benchmark.max_drawdown(eod["nav"])
+            dd_pct = abs(dd) * 100.0
+    except Exception:
+        pass
+    rows.append({
+        "criterion": "Sharpe (rf=0, EOD synthetic NAV)",
+        "target": ">= 0.5",
+        "value": f"{sharpe_v:.2f}" if sharpe_v is not None else "— (need >= 10 EOD points)",
+        "met": (sharpe_v >= 0.5) if sharpe_v is not None else None,
+    })
+    rows.append({
+        "criterion": "Max drawdown",
+        "target": "<= 25%",
+        "value": f"{dd_pct:.1f}%" if dd_pct is not None else "—",
+        "met": (dd_pct <= 25.0) if dd_pct is not None else None,
+    })
+
+    # --- no failures in the last 7 days ---
+    cutoff_iso = (state.utcnow() - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    failures = 0
+    for d in load_decisions(limit=2000):
+        if (d.get("started_at") or "") < cutoff_iso:
+            continue
+        status = str(d.get("status") or "")
+        if status.startswith("error") or "fail" in status:
+            failures += 1
+    rows.append({
+        "criterion": "Unresolved failures (last 7 days)",
+        "target": "0",
+        "value": str(failures),
+        "met": failures == 0,
+    })
+    return rows

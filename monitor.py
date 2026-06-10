@@ -477,6 +477,21 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception as e:
         print(f"monitor-audit: telemetry error ({type(e).__name__}: {e}); ignored")
+    # Trade-sync staleness: orders were accepted recently but no fills ever
+    # synced — the failure mode that once silently broke cooldown/P&L for
+    # 5 weeks. Loud in the journal; the dashboard shows the same banner.
+    try:
+        from lib import dashboard_data as _dd
+        sync = _dd.trade_sync_gaps()
+        if sync.get("stale"):
+            print(
+                f"monitor: WARNING trade-sync staleness — {len(sync['gaps'])} "
+                f"run(s) submitted accepted orders in the last "
+                f"{sync['lookback_days']}d with no matching fills in "
+                f"trades.jsonl (cooldown/P&L degraded)"
+            )
+    except Exception as e:
+        print(f"monitor: sync-staleness check error ({type(e).__name__}: {e}); ignored")
     return 0
 
 

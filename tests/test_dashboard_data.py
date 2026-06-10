@@ -2268,3 +2268,115 @@ def test_cache_hit_trend_ignores_hardcoded_decision_pct(tmp_state):
     out = dd.cache_hit_trend()
     assert len(out) == 1
     assert out[0]["cache_hit_pct"] == pytest.approx(100.0)
+
+
+# ---------- Calibration tab data layer ----------
+
+
+def _fill_row(symbol, side, qty, price, *, run_id=None, at, aid):
+    return {
+        "activity_id": aid, "alpaca_order_id": f"o_{aid}", "run_id": run_id,
+        "symbol": symbol, "kind": "etf", "side": side, "qty": qty,
+        "fill_price": price, "fees_usd": 0.0, "filled_at": at,
+    }
+
+
+def test_calibration_view_mirrors_memo(tmp_state):
+    state.append_trade(_fill_row("TQQQ", "buy", 4, 70.0, run_id="r1",
+                                 at="2026-06-01T14:00:00Z", aid="c1"))
+    state.append_trade(_fill_row("TQQQ", "sell", 4, 80.0,
+                                 at="2026-06-02T14:00:00Z", aid="c2"))
+    state.append_kill_event({
+        "at": "2026-06-02T14:00:00Z", "symbol": "TQQQ",
+        "reason": "x", "exit_kind": "loss_cap",
+    })
+    out = dd.calibration_view()
+    assert out["memo"]["closed_trades"] == 1
+    assert out["kill_events"][0]["symbol"] == "TQQQ"
+
+
+def test_critic_history_counts_accepts_and_rejects(tmp_state):
+    for rid, accept in (("20260601T100000Z-aaa", True),
+                        ("20260602T100000Z-bbb", False)):
+        d = state.RUNS_DIR / rid
+        d.mkdir(parents=True)
+        (d / "critique.json").write_text(json.dumps({
+            "accept": accept, "critique": "c", "suggested_changes": [],
+        }))
+    out = dd.critic_history()
+    assert out["accepted"] == 1 and out["rejected"] == 1
+    # Newest run first.
+    assert out["rows"][0]["run_id"].startswith("20260602")
+
+
+def test_activity_metrics_counts_order_cycles_and_market_time(tmp_state):
+    # Run 1: submitted an order. Run 2: dedup skip. Run 3: no orders.
+    specs = [
+        ("20260601T100000Z-aaa", {"order_plan": {"results": [
+            {"symbol": "TQQQ", "qty": 4, "side": "buy", "status": "accepted"},
+        ]}}),
+        ("20260602T100000Z-bbb", {"dedup_skipped": True}),
+        ("20260603T100000Z-ccc", {"order_plan": {"results": []}}),
+    ]
+    for rid, payload in specs:
+        d = state.RUNS_DIR / rid
+        d.mkdir(parents=True)
+        (d / "next_run.json").write_text(json.dumps({"run_id": rid, **payload}))
+    nav_rows = [
+        {"at": "2026-06-01T20:00:00Z", "nav_usd": 2500.0, "cash_usd": 2000.0, "positions_count": 1},
+        {"at": "2026-06-02T20:00:00Z", "nav_usd": 2500.0, "cash_usd": 2500.0, "positions_count": 0},
+    ]
+    out = dd.activity_metrics(nav_rows)
+    assert out["runs_seen"] == 3
+    assert out["cycles_with_orders"] == 1
+    assert out["dedup_skipped"] == 1
+    assert out["time_in_market_pct"] == 50.0
+    assert out["avg_positions"] == 0.5
+    assert out["avg_cash_pct"] == 90.0
+
+
+def test_trade_sync_gaps_flags_orders_without_fills(tmp_state, monkeypatch):
+    import lib.state as state_mod
+    # Freeze "now" indirectly: use a run id timestamped just now so it is
+    # inside the 7-day lookback.
+    rid = state_mod.utcnow().strftime("%Y%m%dT%H%M%SZ") + "-abc"
+    d = state.RUNS_DIR / rid
+    d.mkdir(parents=True)
+    (d / "orders.json").write_text(json.dumps({
+        "run_id": rid, "submitted_at": "x", "order_ids": ["oid1"],
+    }))
+    out = dd.trade_sync_gaps()
+    assert out["stale"] is True
+    assert out["gaps"][0]["run_id"] == rid
+    # Once a fill for that run lands in trades.jsonl, the gap clears.
+    state.append_trade(_fill_row("TQQQ", "buy", 4, 70.0, run_id=rid,
+                                 at="2026-06-09T14:00:00Z", aid="g1"))
+    out2 = dd.trade_sync_gaps()
+    assert out2["stale"] is False
+
+
+def test_readiness_scorecard_shapes_and_insufficient_data(tmp_state):
+    rows = dd.readiness_scorecard(nav_rows=[])
+    assert len(rows) == 5
+    by_name = {r["criterion"]: r for r in rows}
+    assert by_name["Continuous paper running"]["met"] is None
+    assert by_name["Unresolved failures (last 7 days)"]["met"] is True
+
+
+def test_readiness_scorecard_with_long_profitable_history(tmp_state):
+    import datetime as _dt
+    nav_rows = []
+    start = _dt.datetime(2026, 4, 1, 20, 0, tzinfo=_dt.timezone.utc)
+    nav = 2500.0
+    for i in range(45):
+        at = start + _dt.timedelta(days=i)
+        nav *= 1.004  # steady gentle uptrend → high sharpe, ~0 drawdown
+        nav_rows.append({
+            "at": at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "nav_usd": round(nav, 2), "cash_usd": 0.0, "positions_count": 2,
+        })
+    rows = dd.readiness_scorecard(nav_rows=nav_rows)
+    by_name = {r["criterion"]: r for r in rows}
+    assert by_name["Continuous paper running"]["met"] is True
+    assert by_name["Sharpe (rf=0, EOD synthetic NAV)"]["met"] is True
+    assert by_name["Max drawdown"]["met"] is True
