@@ -24,19 +24,33 @@ You are a senior quant systems engineer. Build a complete, **paper-trading-only*
 > real leveraged ETF pairs (TMF/TMV, ERX/ERY). This section supersedes the
 > earlier options-bearing spec.
 
-- Universe (ETF-only, 29 tickers): 13 bull/bear leveraged-ETF pairs —
-  TQQQ/SQQQ (nasdaq), UPRO/SPXU (sp500), TNA/TZA (small-caps), SOXL/SOXS
-  (semis), TECL/TECS (technology), LABU/LABD (biotech), YINN/YANG (china),
-  FAS/FAZ (financials-broad), ERX/ERY (energy), GUSH/DRIP (oil-gas-ep),
-  BOIL/KOLD (natural-gas), TMF/TMV (rates), NUGT/DUST (gold-miners) — plus
-  UVXY (solo long-vol) and BITX (2x bull) / BITI (1x inverse) on crypto-btc.
+- Universe (ETF-only, 57 tickers; widened from 29 on 2026-06-10 with explicit
+  user authorization, for diversification + more tradeable factors): 25
+  bull/bear leveraged-ETF pairs — TQQQ/SQQQ (nasdaq), UPRO/SPXU (sp500),
+  UDOW/SDOW (dow), TNA/TZA (small-caps), HIBL/HIBS (high-beta), SOXL/SOXS
+  (semis), TECL/TECS (technology), WEBL/WEBS (internet), LABU/LABD (biotech),
+  YINN/YANG (china), EDC/EDZ (emerging-markets), FAS/FAZ (financials-broad),
+  ERX/ERY (energy), GUSH/DRIP (oil-gas-ep), BOIL/KOLD (natural-gas), UCO/SCO
+  (crude-oil), TMF/TMV (rates), NUGT/DUST (gold-miners), UGL/GLL
+  (gold-bullion), AGQ/ZSL (silver), ETHU/ETHD (crypto-eth), UVXY/SVIX (vol),
+  and leveraged single-stock lines NVDL/NVD (nvda), TSLL/TSLZ (tsla),
+  MSTU/MSTZ (mstr) — plus BITX (2x bull) / BITI (1x inverse) on crypto-btc,
+  and 5 solo bull ETFs with no liquid inverse counterpart: NAIL
+  (homebuilders), DFEN (defense), CURE (healthcare), DPST (regional-banks),
+  CONL (coin, 2x Coinbase). Bearish views on solo-bull factors are expressed
+  by not holding them.
 - **No options. No spot single-name equities. No unleveraged broad-market
   ETFs as core positions.** Every position is a long leveraged/inverse ETF.
+  (Clarified 2026-06-10, user decision: liquid **leveraged single-stock
+  ETFs** — NVDL/NVD, TSLL/TSLZ, MSTU/MSTZ, CONL — are allowed; they are
+  listed ETFs riding the same caps and kill rails. Direct spot equities
+  remain banned. Single-stock lines carry idiosyncratic event risk
+  (earnings, guidance) outside the macro calendar — the prompts flag this.)
 - **No broker shorts.** Bear theses are expressed as long inverse ETFs
   (SQQQ, SPXU, etc.). Cash account only.
 - Portfolio target: **1–12 open positions** at the end of each cycle (or all-cash if conviction is genuinely absent). The 1-position floor lets a single strong-conviction thesis fire even when broader diversification isn't available. Concentration risk is bounded by the per-position entry cap (15% NAV) / hold ceiling (25% NAV) and kill conditions.
 - Per-position **entry/add cap: ≤15% of portfolio NAV** (adaptive — halved to 7.5% at ≥10% drawdown). This bounds *deliberate* risk: you can never open or add to a position above it. An **already-open position that appreciates past the entry cap is NOT force-trimmed back to it** — it may drift up to a **hold ceiling of 25% NAV** (also adaptive — 12.5% at ≥10% drawdown) before the excess is trimmed. (Hold ceiling 2026-05-29: a flat 15% schema cap on `position_pct` was previously re-validated on every cycle's full-portfolio rewrite, so any winner that drifted above 15% was force-trimmed back to entry weight each cycle — capping compounding and contradicting the "let winners run" harvest logic. Splitting into entry cap vs hold ceiling fixed that; enforced deterministically by the `entry_cap_on_adds` + `position_within_adaptive_cap` sanity rules, with the schema `maximum` raised to 25.)
-- Per-position kill condition: **≤25% loss of position NAV**. Each position must also carry at least one of `underlying_price_below`, `underlying_price_above`, or `time_stop_utc` (sanity rule fail otherwise). The price thresholds reference the ETF's own price.
+- Per-position kill condition: **≤25% loss of position NAV**. Each position must also carry at least one of `underlying_price_below`, `underlying_price_above`, `trailing_stop_pct`, or `time_stop_utc` (sanity rule fail otherwise). The price thresholds reference the ETF's own price. `trailing_stop_pct` (added 2026-06-10) is an OPTIONAL ratchet stop the constructor may choose per position: monitor.py tracks the peak mark in `state/position_peaks.json` and flattens when price falls that % below peak — same enforce-what-the-agent-chose contract as the fixed stops; never imposed mechanically.
 - Daily portfolio drawdown circuit breaker: **≥8% in a single UTC day** halts new orders and triggers monitor-only mode until next manual review.
 - Cycle cadence: **every 4 hours during market hours, weekdays only**. The market_gate stage queries Alpaca's clock and short-circuits weekends/holidays/after-hours without LLM cost. Within market hours, the orchestrator-meta agent picks the actual next-run timestamp (bounded 1–24h).
 
@@ -76,11 +90,11 @@ Sub-agents are separate Anthropic API calls with role-specific system prompts an
 Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-failed LLM outputs are retried once with the validation error fed back; second failure aborts the run and logs.
 
 0. **Market Gate** (Python, $0) — Alpaca `/v2/clock` query. If markets are closed → write `market_gate.json` + closed-market `next_run.json` and exit. No LLM calls billed on closed-market cycles.
-1. **Signals** (Python, $0) — For each of the 29 universe tickers, compute deterministic features from yfinance daily history: momentum (30/60d), HV (30/90d), distance from 50/200d MAs, ADV, last close. Includes per-ticker `upcoming_macro_events_7d` (FOMC/CPI/NFP/PCE within 7 days). Output: `signals.json`. Replaces the v1 screener + bull/bear research + scenarios chain entirely.
+1. **Signals** (Python, $0) — For each of the 57 universe tickers, compute deterministic features from yfinance daily history: momentum (30/60d), HV (30/90d), distance from 50/200d MAs, ADV, last close, RSI-14, relative strength vs SPY (30d), trend-quality R² (trend vs chop — the leveraged-ETF decay axis), plus a universe-level `factor_correlations` block (pairs of factors whose bull ETFs' 30d returns correlate ≥ |0.7|, so the LLM stages can see which factors are currently one bet). Includes per-ticker `upcoming_macro_events_7d` (FOMC/CPI/NFP/PCE within 7 days). Output: `signals.json`. The LLM stages read a compact factor-grouped rendering (`lib.signals.compact_for_llm`) rather than the raw table — the compaction pays for the wider universe + the performance memo, keeping per-cycle cost at or below the prior baseline. Replaces the v1 screener + bull/bear research + scenarios chain entirely.
 1b. **Cycle dedup** (Python, $0) — If the signals fingerprint AND broker-position fingerprint both match the prior cycle's, skip strategist + construct + execute and reuse the cached portfolio. Stored in `state/last_cycle_hash.json`.
-2. **Strategist** (Sonnet 4.6 medium effort, ~$0.05) — Reads `signals.json` + current broker positions + recent PnL history (last 5 cycles); emits a regime classification + up to 6 candidate ideas with `instrument_kind` (always `etf`), `thesis` (signal-citing), `confidence` ∈ [0, 1]. Bullish theses name the bull ETF; bearish theses name the inverse ETF. Output: `view.json`.
-3. **Portfolio Construction** (Opus 4.7 high effort, ~$0.20) — Converge on 1–12 positions (or all-cash). Reads signals + view + current positions + PnL history + adaptive per-position cap. Output: `portfolio.json`.
-3.5. **Critic** (Sonnet 4.6 low effort, ~$0.03) — Adversarial review. Returns `{accept, critique, suggested_changes}`. On reject, the constructor reruns ONCE with the critique fed back. Output: `critique.json`.
+2. **Strategist** (Sonnet 4.6 medium effort, ~$0.05) — Reads compact signals + current broker positions (with unrealized P&L %) + recent PnL history (last 5 cycles) + the **performance memo** (`lib/feedback.py`, $0: the agent's own realized win/loss record by factor, confidence-bucket calibration joined from each opening run's `view.json`, and recent exits tagged with what killed them via `state/kill_events.jsonl`); emits a regime classification + up to 6 candidate ideas with `instrument_kind` (always `etf`), `thesis` (signal-citing), `confidence` ∈ [0, 1]. The memo is framed in the prompts as calibration EVIDENCE for the agent's judgment — explicitly not an instruction to trade less. Bullish theses name the bull ETF; bearish theses name the inverse ETF. Output: `view.json`.
+3. **Portfolio Construction** (Opus 4.7 high effort, ~$0.20) — Converge on 1–12 positions (or all-cash). Reads compact signals + view + current positions + PnL history + performance memo + adaptive per-position cap + universe-median HV30 context. May choose `trailing_stop_pct` per position as an alternative/complement to fixed stops. Output: `portfolio.json`.
+3.5. **Critic** (Sonnet 4.6 low effort, ~$0.03) — Adversarial review, no longer blind: receives current positions, PnL history, performance memo, and a free pre-computed sanity preview alongside view + portfolio. Returns `{accept, critique, suggested_changes}`. On reject, the constructor reruns ONCE with the critique fed back. **Skipped ($0, auto-accept artifact) when the constructed portfolio is a no-op against current holdings** — zero orders means nothing new to critique. Prompt explicitly states the critic's job is better trades, not fewer trades. Output: `critique.json`.
 4. **Sanity** (Python, $0) — 10 deterministic post-construct rules covering concentration, kill_conditions, strategist endorsement, hold-ceiling enforcement (adaptive 25%: the 25% base is hard via the schema; the drawdown-tightened value down to 12.5% is advisory by default — constructor-guided + non-blocking unless `SANITY_BLOCK_ON_FAIL`), entry-cap-on-adds (adaptive 15% on opens/adds; held winners may drift past it), confidence-weighted sizing, notional floor ($50), ADV liquidity (≤1% of dollar ADV), and re-entry cooldown (no re-entry of a symbol exited within 7 days unless strategist confidence ≥ 0.8). Non-blocking by default; `SANITY_BLOCK_ON_FAIL=true` escalates any `fail` to a hard skip of stage_execute. **Exception: `entry_cap_on_adds` always hard-skips stage_execute on `fail`, independent of `SANITY_BLOCK_ON_FAIL`** — the entry/add cap used to be enforced by the schema's flat 15% `position_pct` maximum, which was raised to 25 to let held winners drift, so this rule is now the hard gate that stops a fresh open/add above the entry cap from executing. Output: `sanity.json`.
 5. **Execution + Monitoring** — submit paper orders via Alpaca (close before open; no-cross-zero invariant); orchestrator-meta picks next-run window in 1–24h and writes `next_run.json`. A lightweight `monitor.py` runs more frequently and only checks kill conditions; it can flatten a position but cannot open new ones.
 
@@ -118,6 +132,7 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
 │   ├── events.py               # macro calendar (FOMC/CPI/NFP/PCE) for signals
 │   ├── orders.py               # diff_portfolio + no-cross-zero invariant (ETF-only; rejects option payloads)
 │   ├── sanity.py               # v2 stage 4 — deterministic post-construct rules
+│   ├── feedback.py             # performance memo — agent's own track record as LLM context
 │   ├── stages.py               # StageConfig per LLM stage
 │   ├── llm.py                  # Anthropic client + prompt caching + cost tracking
 │   ├── risk.py                 # sizing, caps, kill checks, circuit breakers, cooldown
@@ -152,6 +167,8 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
     ├── decisions.jsonl
     ├── costs.jsonl
     ├── halt.flag               # presence = stop
+    ├── kill_events.jsonl       # exit-outcome audit (what killed each flatten)
+    ├── position_peaks.json     # trailing-stop peak marks (monitor-maintained)
     └── current_portfolio.json
 ```
 

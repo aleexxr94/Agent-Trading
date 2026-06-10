@@ -100,7 +100,16 @@ class Broker(ABC):
     def cancel_all(self) -> int: ...
 
     @abstractmethod
-    def flatten(self, symbol: str) -> OrderResult | None: ...
+    def flatten(self, symbol: str) -> OrderResult | None:
+        """Close the full position in ``symbol``.
+
+        Contract: return the close's OrderResult when the broker ACCEPTED
+        the close; return None when it was rejected or failed. Callers key
+        success on this — monitor.execute_actions records kill events and
+        clears trailing-stop peaks only for accepted closes — so an
+        implementation must never return None for an accepted close.
+        """
+        ...
 
     def get_clock(self) -> MarketClock | None:
         """Return the broker's market-clock snapshot, or None if unsupported.

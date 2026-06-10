@@ -120,7 +120,8 @@ def _r_kill_conditions_complete(portfolio: dict, view: dict | None) -> RuleResul
     Pass criteria:
       - ``max_loss_pct`` is a number in (0, 100]
       - AND ≥1 of {underlying_price_below, underlying_price_above,
-        time_stop_utc} is non-null
+        trailing_stop_pct, time_stop_utc} is non-null — a trailing stop
+        is a (dynamic) price stop, so it satisfies the requirement.
     """
     name = "kill_conditions_complete"
     severity: Severity = "fail"
@@ -138,7 +139,8 @@ def _r_kill_conditions_complete(portfolio: dict, view: dict | None) -> RuleResul
             continue
         has_stop = any(
             kc.get(k) is not None
-            for k in ("underlying_price_below", "underlying_price_above", "time_stop_utc")
+            for k in ("underlying_price_below", "underlying_price_above",
+                      "trailing_stop_pct", "time_stop_utc")
         )
         if not has_stop:
             bad.append({

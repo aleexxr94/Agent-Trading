@@ -43,7 +43,7 @@ except ImportError:
     pass
 from typing import Callable
 
-from lib import live_gate, llm, market_gate, risk, sanity, signals, stages, state, trades
+from lib import feedback, live_gate, llm, market_gate, risk, sanity, signals, stages, state, trades
 from lib.broker import Broker
 
 ROOT = Path(__file__).resolve().parent
@@ -250,15 +250,37 @@ def stage_signals(ctx: StageContext) -> dict:
     return signals.compute_signals(run_id=ctx.run_id)
 
 
+def _performance_memo_block(performance_memo: dict | None) -> str:
+    """Render the track-record memo for a stage's user message.
+
+    The framing sentence matters: the memo is calibration EVIDENCE for the
+    agent's judgment on conviction and sizing. It must never read as "be
+    more cautious" — over-gating into chronic all-cash is the failure mode
+    this system already escaped once.
+    """
+    if not performance_memo:
+        return ""
+    return (
+        f"Performance memo — your own realized track record: "
+        f"{json.dumps(performance_memo, sort_keys=True)}\n"
+        "Use the memo as calibration evidence: where your high-confidence "
+        "picks on a factor have repeatedly won, trust similar setups; where "
+        "they have repeatedly lost, demand a cleaner signal or express the "
+        "view through a different factor. The memo is NOT an instruction to "
+        "trade less — staying active within the risk rails is expected.\n"
+    )
+
+
 def stage_strategist(
     ctx: StageContext,
     signals_out: dict,
     current_positions: list[dict] | None = None,
     pnl_history: list[dict] | None = None,
+    performance_memo: dict | None = None,
 ) -> dict:
     """One LLM call — Sonnet 4.6, ~$0.05. Reads signals + current
-    portfolio + recent PnL feedback; emits view.json with regime
-    classification + 0-6 ranked candidates.
+    portfolio + recent PnL feedback + its own realized track record;
+    emits view.json with regime classification + 0-6 ranked candidates.
 
     current_positions: broker-reported holdings (passed through from
     orchestrator). Lets the strategist bias toward "keep this winner"
@@ -266,6 +288,10 @@ def stage_strategist(
 
     pnl_history: last 5 cycles' {regime, positions_summary,
     realized_4h_pnl_pct} so the strategist can self-correct drift.
+
+    performance_memo: lib.feedback.build_performance_memo output — the
+    factor-level win/loss record + confidence calibration the agent uses
+    as evidence when scoring new candidates.
     """
     if ctx.dry_run:
         out = _load_fixture("view.json")
@@ -275,10 +301,11 @@ def stage_strategist(
     current_positions = current_positions or []
     pnl_history = pnl_history or []
     content = (
-        f"Signals: {json.dumps(signals_out, sort_keys=True)}\n"
+        f"Signals: {json.dumps(signals.compact_for_llm(signals_out), sort_keys=True)}\n"
         f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
         f"Recent PnL history (last cycles, oldest first): "
         f"{json.dumps(pnl_history, sort_keys=True)}\n"
+        f"{_performance_memo_block(performance_memo)}"
         f"Run id: {ctx.run_id}\n"
         "Return JSON conforming to view.schema.json. When current "
         "positions already align with your regime call, prefer keeping "
@@ -358,6 +385,24 @@ def _sync_fills_before_cooldown(ctx: StageContext) -> str | None:
         return f"sync_fills_from_alpaca(pre-cooldown): {type(e).__name__}: {e}"
 
 
+def _vol_context_line(signals_out: dict) -> str:
+    """One context line giving the constructor the universe-median HV30 so
+    it can judge how choppy each candidate is relative to peers. Pure
+    information for sizing judgment — no formula, no rule."""
+    hvs = sorted(
+        t["hv_30d_annualised"] for t in signals_out.get("tickers", [])
+        if isinstance(t.get("hv_30d_annualised"), (int, float))
+    )
+    if not hvs:
+        return ""
+    median = hvs[len(hvs) // 2] if len(hvs) % 2 else (hvs[len(hvs) // 2 - 1] + hvs[len(hvs) // 2]) / 2
+    return (
+        f"Universe median HV30: {median:.2f}. Candidates well above it are "
+        "choppier than peers (more leveraged-ETF decay in chop, wider stops "
+        "needed) — weigh that in your sizing judgment.\n"
+    )
+
+
 def stage_construct(
     ctx: StageContext,
     signals_out: dict,
@@ -367,10 +412,11 @@ def stage_construct(
     adaptive_cap_pct: float = 15.0,
     hold_ceiling_pct: float = 25.0,
     cooldown_symbols: dict | None = None,
+    performance_memo: dict | None = None,
 ) -> dict:
     """One LLM call — Opus 4.7, ~$0.20. Reads signals + view + current
-    positions + recent PnL feedback; emits the final portfolio.json with
-    ETF positions, sizing, kill conditions."""
+    positions + recent PnL feedback + the agent's own track record; emits
+    the final portfolio.json with ETF positions, sizing, kill conditions."""
     if ctx.dry_run:
         out = _load_fixture("portfolio.json")
         out["run_id"] = ctx.run_id
@@ -381,10 +427,11 @@ def stage_construct(
     pnl_history = pnl_history or []
     cooldown_symbols = cooldown_symbols or {}
     content = (
-        f"Signals: {json.dumps(signals_out, sort_keys=True)}\n"
+        f"Signals: {json.dumps(signals.compact_for_llm(signals_out), sort_keys=True)}\n"
         f"Strategist view: {json.dumps(view, sort_keys=True)}\n"
         f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
         f"Recent PnL history (last cycles): {json.dumps(pnl_history, sort_keys=True)}\n"
+        f"{_performance_memo_block(performance_memo)}"
         f"NAV (USD): {nav:.2f}\n"
         f"Entry/add cap %: {adaptive_cap_pct:.2f} (max weight to OPEN or ADD to "
         f"a position; reduced from 15.0% when NAV is in drawdown)\n"
@@ -393,6 +440,7 @@ def stage_construct(
         f"drawdown). Do NOT trim a winner back to the entry cap just because it "
         f"drifted above it — only trim weight above the hold ceiling. Never open "
         f"or add a position above the entry cap.\n"
+        f"{_vol_context_line(signals_out)}"
         f"{_cooldown_prompt_line(cooldown_symbols)}"
         f"Run id: {ctx.run_id}\n"
         "Return JSON conforming to portfolio.schema.json. All positions are "
@@ -414,13 +462,37 @@ def stage_construct(
     return res.payload
 
 
+def _sanity_preview_for_critic(sanity_report: dict | None) -> str:
+    """Compact non-pass sanity rules for the critic's user message. The
+    deterministic rules run for free, so previewing them pre-critic gives
+    the adversarial review concrete material instead of a blind read."""
+    if not sanity_report:
+        return ""
+    flagged = [
+        {"rule": r["name"], "status": r["status"], "detail": (r.get("detail") or "")[:200]}
+        for r in sanity_report.get("rules", [])
+        if r.get("status") in ("fail", "warn")
+    ]
+    if not flagged:
+        return "Sanity preview: all deterministic rules pass.\n"
+    return f"Sanity preview (deterministic rules): {json.dumps(flagged, sort_keys=True)}\n"
+
+
 def stage_critic(
     ctx: StageContext,
     view: dict,
     portfolio: dict,
+    current_positions: list[dict] | None = None,
+    pnl_history: list[dict] | None = None,
+    performance_memo: dict | None = None,
+    sanity_preview: dict | None = None,
 ) -> dict:
     """One LLM call — Sonnet 4.6 low effort, ~$0.03. Reads view +
-    portfolio; returns {accept, critique, suggested_changes}.
+    portfolio + the state context the constructor saw (positions, PnL
+    history, track record, sanity preview); returns {accept, critique,
+    suggested_changes}. Previously the critic reviewed blind — no
+    positions, no PnL, no sanity — which limited its objections to
+    internal consistency only.
 
     Dry-run returns a default-accept fixture so the pipeline doesn't
     require an LLM call in tests.
@@ -435,6 +507,10 @@ def stage_critic(
     content = (
         f"View: {json.dumps(view, sort_keys=True)}\n"
         f"Portfolio: {json.dumps(portfolio, sort_keys=True)}\n"
+        f"Current broker positions: {json.dumps(current_positions or [], sort_keys=True)}\n"
+        f"Recent PnL history (last cycles): {json.dumps(pnl_history or [], sort_keys=True)}\n"
+        f"{_performance_memo_block(performance_memo)}"
+        f"{_sanity_preview_for_critic(sanity_preview)}"
         f"Run id: {ctx.run_id}\n"
         "Return JSON conforming to critique.schema.json."
     )
@@ -531,7 +607,10 @@ def _current_positions_summary(ctx: StageContext) -> list[dict]:
     so they can reason about current state vs target.
 
     Each row: {symbol, qty, avg_cost, market_value, unrealized_pl_usd,
-    asset_class}. Returns empty list on dry-run or broker error.
+    unrealized_pl_pct, asset_class}. unrealized_pl_pct (vs cost basis) is
+    precomputed so the constructor's harvest judgment ("+30% opens a
+    decision") reads a direct number instead of deriving it. Returns empty
+    list on dry-run or broker error.
     """
     if ctx.broker is None or ctx.dry_run:
         return []
@@ -541,12 +620,16 @@ def _current_positions_summary(ctx: StageContext) -> list[dict]:
         return []
     rows = []
     for p in positions:
+        basis = abs(p.avg_cost * p.qty)
         rows.append({
             "symbol": p.symbol,
             "qty": p.qty,
             "avg_cost": p.avg_cost,
             "market_value": p.market_value,
             "unrealized_pl_usd": p.unrealized_pl_usd,
+            "unrealized_pl_pct": (
+                round(p.unrealized_pl_usd / basis * 100.0, 2) if basis > 0 else None
+            ),
             "asset_class": p.asset_class,
         })
     return rows
@@ -606,6 +689,11 @@ def _signals_fingerprint(signals_out: dict) -> str:
 
     Excludes generated_at + run_id so the same data on two different
     cycles produces the same hash.
+
+    Codex P2 on PR #109: every feature the LLM stages can see via
+    ``compact_for_llm`` must be fingerprinted, or dedup will reuse a
+    cached portfolio exactly when the unhashed evidence (RSI, relative
+    strength, trend quality, factor correlations) is what changed.
     """
     rows = []
     for t in signals_out.get("tickers", []):
@@ -624,10 +712,21 @@ def _signals_fingerprint(signals_out: dict) -> str:
             "hv90": round(t.get("hv_90d_annualised") or 0.0, 4),
             "d50": round(t.get("dist_from_50d_ma_pct") or 0.0, 2),
             "d200": round(t.get("dist_from_200d_ma_pct") or 0.0, 2),
+            "rsi14": round(t.get("rsi_14") or 0.0, 1),
+            "rs_spy30": round(t.get("rel_strength_spy_30d") or 0.0, 2),
+            "trend_r2": round(t.get("trend_r2") or 0.0, 3),
             "events": events_summary,
         })
     rows.sort(key=lambda r: r["sym"] or "")
-    return _hash_inputs(json.dumps(rows, sort_keys=True))
+    corr_summary = sorted(
+        (
+            (c.get("factor_a"), c.get("factor_b"), round(c.get("corr_30d") or 0.0, 2))
+            for c in (signals_out.get("factor_correlations") or [])
+        ),
+        key=lambda p: (p[0] or "", p[1] or ""),
+    )
+    payload = {"rows": rows, "factor_correlations": corr_summary}
+    return _hash_inputs(json.dumps(payload, sort_keys=True))
 
 
 def _positions_fingerprint(positions: list[dict]) -> str:
@@ -640,6 +739,51 @@ def _positions_fingerprint(positions: list[dict]) -> str:
         key=lambda r: r["sym"] or "",
     )
     return _hash_inputs(json.dumps(rows, sort_keys=True))
+
+
+def _portfolio_is_noop(
+    portfolio: dict,
+    current_positions: list[dict],
+    prior_portfolio: dict | None = None,
+) -> bool:
+    """True when the target portfolio exactly matches current broker
+    holdings (same symbols, same share counts) — i.e. the execute stage
+    would produce zero orders — AND every position's kill_conditions
+    match the previously published portfolio's. Used to skip the LLM
+    critic on hold-steady cycles.
+
+    The kill-condition check (Codex P2, PR #109): zero orders is not
+    "nothing new to critique" if the constructor rewired the stops the
+    monitor enforces — widening a trailing stop or dropping a price stop
+    changes risk behavior the moment current_portfolio.json is rewritten,
+    so that cycle still deserves an adversarial review. Conservative:
+    any difference — extra/missing symbol, fractional share drift
+    > 1e-6, changed/unknown kill_conditions, or no prior portfolio to
+    compare against — returns False so the critic runs."""
+    target = {
+        p.get("symbol"): float(p.get("shares") or 0.0)
+        for p in (portfolio.get("positions") or [])
+    }
+    held = {
+        p.get("symbol"): float(p.get("qty") or 0.0)
+        for p in current_positions
+        if float(p.get("qty") or 0.0) != 0.0
+    }
+    if set(target) != set(held):
+        return False
+    if not all(abs(target[s] - held[s]) <= 1e-6 for s in target):
+        return False
+    if not target:
+        return True  # all-cash vs empty account — no stops in play
+    prior_kc = {
+        p.get("symbol"): json.dumps(p.get("kill_conditions") or {}, sort_keys=True)
+        for p in ((prior_portfolio or {}).get("positions") or [])
+    }
+    return all(
+        prior_kc.get(p.get("symbol"))
+        == json.dumps(p.get("kill_conditions") or {}, sort_keys=True)
+        for p in (portfolio.get("positions") or [])
+    )
 
 
 def _cooldown_fingerprint(cooldown_symbols: dict | None) -> str:
@@ -658,10 +802,31 @@ def _cooldown_fingerprint(cooldown_symbols: dict | None) -> str:
     return _hash_inputs(json.dumps(syms, sort_keys=True))
 
 
+def _memo_fingerprint(performance_memo: dict | None) -> str:
+    """Stable hash of the performance memo, used as a dedup key.
+
+    Codex P2 on PR #109: the memo is LLM-visible evidence that can change
+    while signals, broker positions, and cooldown membership all stay
+    fixed — e.g. trade-sync backfills a fill/fee, or a monitor kill event
+    re-tags a recent exit. Without this key, dedup would reuse the cached
+    portfolio exactly when the agent's track record gained new
+    information. The memo is cheap to build ($0, pure Python over state),
+    so it is computed before the dedup check.
+
+    Deliberately NOT included: pnl_history (_recent_pnl_history). Every
+    completed cycle appends its own row, so fingerprinting it would make
+    consecutive cycles always differ and disable dedup outright; its
+    inputs (fills, marks, regime) are already covered by the signals,
+    positions, and memo fingerprints.
+    """
+    return _hash_inputs(json.dumps(performance_memo, sort_keys=True, default=str))
+
+
 def _check_cycle_dedup(
     signals_out: dict,
     current_positions: list[dict],
     cooldown_symbols: dict | None = None,
+    memo_fp: str | None = None,
 ) -> dict | None:
     """Return the cached portfolio dict if dedup applies; None otherwise.
 
@@ -670,6 +835,9 @@ def _check_cycle_dedup(
       - signals_fingerprint matches the prior cycle's
       - positions_fingerprint matches the prior cycle's
       - cooldown_fingerprint matches the prior cycle's
+      - memo_fingerprint matches the prior cycle's (when provided; a hash
+        file written before this key existed fails the match, which just
+        costs one fresh cycle)
       - state/current_portfolio.json exists (the cached portfolio
         to reuse)
     """
@@ -686,6 +854,7 @@ def _check_cycle_dedup(
         last.get("signals_fingerprint") != signals_fp
         or last.get("positions_fingerprint") != positions_fp
         or last.get("cooldown_fingerprint") != cooldown_fp
+        or last.get("memo_fingerprint") != memo_fp
     ):
         return None
     try:
@@ -706,9 +875,9 @@ def _write_dedup_next_run(rid: str, *, portfolio: dict, ctx: StageContext) -> di
         "run_id": rid,
         "next_run_at": next_at,
         "rationale": (
-            "cycle dedup: signals fingerprint and broker positions both "
-            "unchanged from prior cycle. Skipped strategist + "
-            "construct + execute; cached portfolio retained."
+            "cycle dedup: signals, broker positions, cooldown set, and "
+            "performance memo all unchanged from prior cycle. Skipped "
+            "strategist + construct + execute; cached portfolio retained."
         ),
         "dedup_skipped": True,
         "cycle_intent": "trade",
@@ -738,14 +907,19 @@ def _update_cycle_dedup_hash(
     signals_out: dict,
     current_positions: list[dict],
     cooldown_symbols: dict | None = None,
+    memo_fp: str | None = None,
 ) -> None:
     """Called at the END of a successful cycle to record the fingerprints
-    for the NEXT cycle's dedup check. Failures here are non-fatal."""
+    for the NEXT cycle's dedup check. ``memo_fp`` is the fingerprint of
+    the memo THIS cycle's LLM stages actually read (computed pre-dedup),
+    so the next cycle's freshly built memo is compared against the
+    evidence that produced the cached portfolio. Failures are non-fatal."""
     try:
         state.write_json(state.LAST_CYCLE_HASH, {
             "signals_fingerprint": _signals_fingerprint(signals_out),
             "positions_fingerprint": _positions_fingerprint(current_positions),
             "cooldown_fingerprint": _cooldown_fingerprint(cooldown_symbols),
+            "memo_fingerprint": memo_fp,
             "updated_at": state.utcnow_iso(),
         })
     except Exception:
@@ -1198,10 +1372,12 @@ def _run_pipeline_review(*, ctx: StageContext, dry_run: bool) -> dict:
         model="local-deterministic",
     )
 
-    # Pull current positions + PnL history so the strategist's regime
-    # commentary is informed by what we currently hold.
+    # Pull current positions + PnL history + track record so the
+    # strategist's regime commentary is informed by what we currently
+    # hold and how past calls actually performed.
     current_positions = _current_positions_summary(ctx)
     pnl_history = _recent_pnl_history(limit=5)
+    performance_memo = feedback.build_performance_memo_safe()
 
     # ----- Stage 2: strategist → review.json (not view.json) -----
     # Same prompt + schema as trade-cycle strategist; the artifact
@@ -1216,6 +1392,7 @@ def _run_pipeline_review(*, ctx: StageContext, dry_run: bool) -> dict:
             ctx, signals_out,
             current_positions=current_positions,
             pnl_history=pnl_history,
+            performance_memo=performance_memo,
         ),
         inputs_hash_parts=(rid, json.dumps(signals_out, sort_keys=True)),
         model=strat_model,
@@ -1428,13 +1605,25 @@ def run_pipeline(
     # then reused for the constructor prompt + sanity guardrail below.
     cooldown_symbols = _cooldown_symbols_now()
 
+    # Track-record memo (factor win/loss record, confidence calibration,
+    # recent exits) — fed to strategist + constructor + critic as
+    # calibration evidence. $0; guarded so corrupt state can't kill a run.
+    # Built BEFORE dedup (after the fill sync above) so its fingerprint
+    # participates in the dedup check: a backfilled fill or fresh kill
+    # event changes the evidence the LLM stages would read even when
+    # signals/positions/cooldown are unchanged.
+    performance_memo = feedback.build_performance_memo_safe()
+    memo_fp = _memo_fingerprint(performance_memo)
+
     # ----- Cycle dedup -----
-    # If the signals fingerprint matches the prior cycle AND the broker
-    # position set is unchanged AND the cooldown set is unchanged, skip
-    # strategist + construct + execute and reuse the last portfolio. Saves
-    # ~$0.25 on a quiet 4h window where nothing has moved meaningfully.
+    # Skip strategist + construct + execute and reuse the last portfolio
+    # when the signals fingerprint, broker position set, cooldown set, AND
+    # performance memo all match the prior cycle. Saves ~$0.25 on a quiet
+    # 4h window where nothing has moved meaningfully.
     if not dry_run:
-        dedup = _check_cycle_dedup(signals_out, current_positions, cooldown_symbols)
+        dedup = _check_cycle_dedup(
+            signals_out, current_positions, cooldown_symbols, memo_fp,
+        )
         if dedup is not None:
             next_run = _write_dedup_next_run(rid, portfolio=dedup["portfolio"], ctx=ctx)
             return {
@@ -1445,7 +1634,8 @@ def run_pipeline(
             }
 
     # Recent PnL feedback — last 5 cycles' regime + realized 4h PnL
-    # so the strategist can self-correct drift across cycles.
+    # so the strategist can self-correct drift across cycles. NOT part of
+    # the dedup fingerprint — see _memo_fingerprint for why.
     pnl_history = _recent_pnl_history(limit=5)
 
     # ----- Stage 2: strategist (1 LLM call) -----
@@ -1456,6 +1646,7 @@ def run_pipeline(
             ctx, signals_out,
             current_positions=current_positions,
             pnl_history=pnl_history,
+            performance_memo=performance_memo,
         ),
         inputs_hash_parts=(rid, json.dumps(signals_out, sort_keys=True)),
         model=strat_model,
@@ -1488,6 +1679,7 @@ def run_pipeline(
             adaptive_cap_pct=adaptive_cap,
             hold_ceiling_pct=hold_ceiling,
             cooldown_symbols=cooldown_symbols,
+            performance_memo=performance_memo,
         ),
         inputs_hash_parts=(
             rid,
@@ -1503,26 +1695,80 @@ def run_pipeline(
     # Adversarial review of the constructor's portfolio. If accept=true
     # proceed to sanity. If accept=false, retry the constructor ONCE
     # with the critique fed back; the retry's portfolio is then used.
-    critique = _run_stage(
-        ctx=ctx, stage_id="critic", schema="critique.schema.json",
-        output_filename="critique.json",
-        runner=lambda: stage_critic(ctx, view, portfolio),
-        inputs_hash_parts=(
-            rid,
-            json.dumps(view, sort_keys=True),
-            json.dumps(portfolio, sort_keys=True),
-        ),
-        model="fixture" if dry_run else stages.critic().model,
+    #
+    # Cost guard: when the constructed portfolio is a NO-OP against current
+    # broker holdings (same symbols, same share counts — zero orders would
+    # be produced) AND its kill_conditions match the previously published
+    # portfolio's, skip the LLM critic. There is nothing for an adversarial
+    # review to veto on a true hold-steady cycle; the holdings were already
+    # critiqued when they were opened. Saves ~$0.03 on quiet cycles.
+    #
+    # The free deterministic sanity rules also run here as a PREVIEW so the
+    # critic argues against concrete flags instead of reviewing blind. The
+    # authoritative sanity report still runs after the critique loop on the
+    # final (possibly retried) portfolio.
+    sanity_preview = None
+    if not dry_run:
+        try:
+            sanity_preview = sanity.run_sanity_checks(
+                portfolio, view,
+                signals=signals_out,
+                nav_usd=_account_nav(ctx),
+                adaptive_cap_pct=adaptive_cap,
+                hold_ceiling_pct=hold_ceiling,
+                cooldown_symbols=cooldown_symbols,
+                current_positions=current_positions,
+            )
+        except Exception:
+            sanity_preview = None
+
+    prior_published = (
+        state.read_json(state.CURRENT_PORTFOLIO)
+        if state.CURRENT_PORTFOLIO.exists() else None
     )
+    if not dry_run and _portfolio_is_noop(portfolio, current_positions, prior_published):
+        critique = _run_stage(
+            ctx=ctx, stage_id="critic", schema="critique.schema.json",
+            output_filename="critique.json",
+            runner=lambda: {
+                "accept": True,
+                "critique": (
+                    "skipped: portfolio is a no-op against current broker "
+                    "holdings (zero orders) — nothing new to critique"
+                ),
+                "suggested_changes": [],
+            },
+            inputs_hash_parts=(rid, json.dumps(portfolio, sort_keys=True)),
+            model="local-deterministic",
+        )
+    else:
+        critique = _run_stage(
+            ctx=ctx, stage_id="critic", schema="critique.schema.json",
+            output_filename="critique.json",
+            runner=lambda: stage_critic(
+                ctx, view, portfolio,
+                current_positions=current_positions,
+                pnl_history=pnl_history,
+                performance_memo=performance_memo,
+                sanity_preview=sanity_preview,
+            ),
+            inputs_hash_parts=(
+                rid,
+                json.dumps(view, sort_keys=True),
+                json.dumps(portfolio, sort_keys=True),
+            ),
+            model="fixture" if dry_run else stages.critic().model,
+        )
     if not critique.get("accept", True) and not dry_run:
         # Retry constructor with the critique appended as user context.
         def _retry_with_critique() -> dict:
             cfg = stages.constructor()
             content = (
-                f"Signals: {json.dumps(signals_out, sort_keys=True)}\n"
+                f"Signals: {json.dumps(signals.compact_for_llm(signals_out), sort_keys=True)}\n"
                 f"Strategist view: {json.dumps(view, sort_keys=True)}\n"
                 f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
                 f"Recent PnL history: {json.dumps(pnl_history, sort_keys=True)}\n"
+                f"{_performance_memo_block(performance_memo)}"
                 f"NAV (USD): {_account_nav(ctx):.2f}\n"
                 f"Entry/add cap %: {adaptive_cap:.2f} (open/add limit); "
                 f"hold ceiling %: {hold_ceiling:.2f} (a drifted winner may be "
@@ -1665,8 +1911,13 @@ def run_pipeline(
         # non-universe position the order layer refused (it was never held).
         state.write_json(state.CURRENT_PORTFOLIO, _publishable_portfolio(portfolio))
         # Update the cycle-dedup fingerprints so the next cycle can
-        # short-circuit cleanly if nothing material changed.
-        _update_cycle_dedup_hash(signals_out, current_positions, cooldown_symbols)
+        # short-circuit cleanly if nothing material changed. memo_fp is the
+        # pre-dedup fingerprint — the memo this cycle's LLM stages read; a
+        # fill or kill event recorded since (e.g. by this cycle's execute)
+        # changes the next cycle's freshly built memo and invalidates dedup.
+        _update_cycle_dedup_hash(
+            signals_out, current_positions, cooldown_symbols, memo_fp,
+        )
 
     return {
         "run_id": rid,

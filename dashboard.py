@@ -878,6 +878,7 @@ tabs = st.tabs([
     "📈 vs S&P 500",
     "💱 Trades",
     "🤖 Agent Logs",
+    "🎯 Calibration",
     "⚙️ Settings",
 ])
 
@@ -2593,8 +2594,162 @@ with tabs[6]:
         st.info("No next-run plan written yet.")
 
 
-# ===== Tab 8: Settings =====
+# ===== Tab 8: Calibration =====
 with tabs[7]:
+    st.caption(
+        "The agent's own track record — exactly the evidence the LLM stages "
+        "are fed each cycle — plus activity health and the promotion scorecard."
+    )
+
+    # --- trade-sync staleness alert (silent blackout detector) ---
+    try:
+        sync_check = dd.trade_sync_gaps()
+    except Exception:
+        sync_check = {"stale": False, "gaps": []}
+    if sync_check.get("stale"):
+        st.error(
+            f"⚠️ Trade-sync staleness: {len(sync_check['gaps'])} run(s) in the "
+            f"last {sync_check.get('lookback_days', 7)} days submitted accepted "
+            "orders but have NO matching fills in trades.jsonl. Cooldown, P&L "
+            "and the Sharpe gate are degraded until fills sync. Check Alpaca "
+            "credentials / trades_sync logs. Affected runs: "
+            + ", ".join(g["run_id"] for g in sync_check["gaps"][:5])
+        )
+
+    cal = dd.calibration_view()
+    memo = cal["memo"]
+
+    if not memo.get("closed_trades"):
+        st.info(
+            "No closed trades yet — the calibration views populate once the "
+            "first position is opened and closed."
+        )
+    else:
+        overall = memo.get("overall") or {}
+        oc = st.columns(4)
+        oc[0].markdown(_stat_card(
+            "Closed trades", str(memo["closed_trades"]),
+            sub=f"avg hold {overall.get('avg_hold_hours') or '—'}h",
+        ), unsafe_allow_html=True)
+        oc[1].markdown(_stat_card(
+            "Win rate",
+            f"{overall.get('win_rate_pct'):.0f}%" if overall.get("win_rate_pct") is not None else "—",
+            sub=f"{overall.get('wins', 0)}W / {overall.get('losses', 0)}L",
+        ), unsafe_allow_html=True)
+        oc[2].markdown(_stat_card(
+            "Profit factor",
+            f"{overall.get('profit_factor'):.2f}" if overall.get("profit_factor") is not None else "—",
+            sub="gross wins / |losses|",
+        ), unsafe_allow_html=True)
+        oc[3].markdown(_stat_card(
+            "Realized net",
+            f"${overall.get('net_pnl_usd', 0.0):+.2f}",
+            sub="after fees + LLM cost",
+        ), unsafe_allow_html=True)
+
+        cal_cols = st.columns(2)
+        with cal_cols[0]:
+            st.markdown('<div class="at-section-label">Win rate by confidence bucket</div>', unsafe_allow_html=True)
+            st.caption("Are the agent's confidence scores honest? 0.8s should win more than 0.5s.")
+            st.dataframe(
+                memo.get("confidence_calibration") or [],
+                use_container_width=True, hide_index=True,
+            )
+            st.markdown('<div class="at-section-label">By regime (at entry)</div>', unsafe_allow_html=True)
+            st.dataframe(
+                memo.get("by_regime") or [],
+                use_container_width=True, hide_index=True,
+            )
+        with cal_cols[1]:
+            st.markdown('<div class="at-section-label">By factor</div>', unsafe_allow_html=True)
+            st.dataframe(
+                memo.get("by_factor") or [],
+                use_container_width=True, hide_index=True,
+            )
+            st.markdown('<div class="at-section-label">Recent exits (what killed them)</div>', unsafe_allow_html=True)
+            st.dataframe(
+                memo.get("recent_exits") or [],
+                use_container_width=True, hide_index=True,
+            )
+
+    # --- activity health ---
+    st.markdown('<div class="at-section-label">Activity health</div>', unsafe_allow_html=True)
+    st.caption(
+        "The system was once over-gated into chronic all-cash. These should "
+        "show real deployment; a slide toward 0% activity is a regression."
+    )
+    try:
+        act = dd.activity_metrics()
+    except Exception:
+        act = {}
+    ac = st.columns(4)
+    ac[0].markdown(_stat_card(
+        "Cycles placing orders",
+        f"{act.get('pct_cycles_with_orders')}%" if act.get("pct_cycles_with_orders") is not None else "—",
+        sub=f"{act.get('cycles_with_orders', 0)} of {act.get('runs_seen', 0)} runs "
+            f"(+{act.get('dedup_skipped', 0)} dedup-skips)",
+    ), unsafe_allow_html=True)
+    ac[1].markdown(_stat_card(
+        "Time in market",
+        f"{act.get('time_in_market_pct')}%" if act.get("time_in_market_pct") is not None else "—",
+        sub="cycles holding ≥1 position",
+    ), unsafe_allow_html=True)
+    ac[2].markdown(_stat_card(
+        "Avg open positions", str(act.get("avg_positions") if act.get("avg_positions") is not None else "—"),
+    ), unsafe_allow_html=True)
+    ac[3].markdown(_stat_card(
+        "Avg cash buffer",
+        f"{act.get('avg_cash_pct')}%" if act.get("avg_cash_pct") is not None else "—",
+        sub="high = capital idle",
+    ), unsafe_allow_html=True)
+
+    # --- critic record ---
+    st.markdown('<div class="at-section-label">Critic record</div>', unsafe_allow_html=True)
+    try:
+        crit = dd.critic_history(limit=100)
+    except Exception:
+        crit = {"rows": [], "accepted": 0, "rejected": 0}
+    if crit["rows"]:
+        st.caption(
+            f"{crit['accepted']} accepted / {crit['rejected']} rejected over the "
+            f"last {len(crit['rows'])} critiqued cycles."
+        )
+        st.dataframe(crit["rows"], use_container_width=True, hide_index=True)
+    else:
+        st.info("No critique artifacts yet.")
+
+    # --- kill-event audit ---
+    st.markdown('<div class="at-section-label">Kill-event audit</div>', unsafe_allow_html=True)
+    if cal["kill_events"]:
+        st.dataframe(cal["kill_events"], use_container_width=True, hide_index=True)
+    else:
+        st.info("No monitor-driven flattens recorded yet (state/kill_events.jsonl).")
+
+    # --- live-readiness scorecard ---
+    st.markdown('<div class="at-section-label">Promotion scorecard (informational)</div>', unsafe_allow_html=True)
+    st.caption(
+        "Auto-tracked CLAUDE.md promotion criteria. Going live remains a "
+        "manual, triple-locked decision — this just shows distance to the bar."
+    )
+    try:
+        score = dd.readiness_scorecard()
+    except Exception:
+        score = []
+    score_rows = [
+        {
+            "": ("✅" if r["met"] else ("❌" if r["met"] is False else "⏳")),
+            "Criterion": r["criterion"],
+            "Target": r["target"],
+            "Current": r["value"],
+        }
+        for r in score
+    ]
+    if score_rows:
+        st.dataframe(score_rows, use_container_width=True, hide_index=True)
+
+
+# ===== Tab 9: Settings =====
+with tabs[8]:
     st.markdown('<div class="at-section-label">Mode</div>', unsafe_allow_html=True)
     mode_pills = []
     mode_pills.append('<span class="at-pill paper">● PAPER</span>' if not live_trading

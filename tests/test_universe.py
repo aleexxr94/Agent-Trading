@@ -1,9 +1,10 @@
-"""Invariants on the static universe (lib.universe) — ETF-only (29 tickers).
+"""Invariants on the static universe (lib.universe) — ETF-only (57 tickers).
 
-The universe is leveraged/inverse ETFs only (options were removed). It has
-13 bull/bear pairs + UVXY (solo vol) + BITX/BITI (crypto) = 29 tickers,
-spanning 15 distinct factors. Bullish theses hold the bull ETF; bearish
-theses hold the inverse ETF.
+The universe is leveraged/inverse ETFs only (options were removed). After
+the 2026-06-10 expansion it has 25 bull/bear pairs (incl. UVXY/SVIX on vol
+and the leveraged single-stock lines NVDA/TSLA/MSTR) + BITX/BITI (crypto)
++ 5 solo bull ETFs = 57 tickers spanning 31 distinct factors. Bullish
+theses hold the bull ETF; bearish theses hold the inverse ETF.
 """
 from __future__ import annotations
 
@@ -11,14 +12,48 @@ import pytest
 
 from lib import universe
 
+# Every bull/bear pair in the universe. Solo entries (NAIL, DFEN, CURE,
+# DPST, CONL) are intentionally absent here.
+PAIRS = [
+    ("TQQQ", "SQQQ"),
+    ("UPRO", "SPXU"),
+    ("TNA",  "TZA"),
+    ("SOXL", "SOXS"),
+    ("TECL", "TECS"),
+    ("LABU", "LABD"),
+    ("YINN", "YANG"),
+    ("FAS",  "FAZ"),
+    ("ERX",  "ERY"),
+    ("GUSH", "DRIP"),
+    ("BOIL", "KOLD"),
+    ("TMF",  "TMV"),
+    ("NUGT", "DUST"),
+    # 2026-06-10 expansion pairs.
+    ("UDOW", "SDOW"),
+    ("EDC",  "EDZ"),
+    ("WEBL", "WEBS"),
+    ("HIBL", "HIBS"),
+    ("UCO",  "SCO"),
+    ("AGQ",  "ZSL"),
+    ("UGL",  "GLL"),
+    ("ETHU", "ETHD"),
+    ("UVXY", "SVIX"),
+    # Leveraged single-stock lines (2026-06-10, user-authorized).
+    ("NVDL", "NVD"),
+    ("TSLL", "TSLZ"),
+    ("MSTU", "MSTZ"),
+]
 
-def test_universe_size_is_29():
-    """ETF-only universe has exactly 29 tickers: 13 bull/bear leveraged
-    pairs (26) + UVXY (solo vol) + BITX/BITI (crypto). If you change this,
-    update the factor-count floor below and the strategist prompt's
-    universe section."""
-    assert len(universe.UNIVERSE) == 29, (
-        f"universe size {len(universe.UNIVERSE)} != 29 (ETF-only)."
+SOLO_BULLS = ["NAIL", "DFEN", "CURE", "DPST", "CONL"]
+
+
+def test_universe_size_is_57():
+    """ETF-only universe has exactly 57 tickers: 25 bull/bear leveraged
+    pairs (50) + BITX/BITI (crypto) + 5 solo bull ETFs. If you change
+    this, update the factor-count floor below and the strategist
+    prompt's universe section."""
+    assert len(universe.UNIVERSE) == 57, (
+        f"universe size {len(universe.UNIVERSE)} != 57 (ETF-only)."
     )
 
 
@@ -38,13 +73,14 @@ def test_no_option_underlyings_present():
 
 
 def test_universe_covers_multiple_uncorrelated_factors():
-    """Universe must span ≥13 distinct factors. ETF expansion gave each
-    sector its own bull/bear pair (tech, biotech, china, energy, oil-gas,
-    nat-gas, rates) on top of the original equity/gold/vol/crypto set.
-    Several equity factors are correlated risk-on beta — the constructor
-    de-dupes by factor — but the factor *labels* stay distinct."""
+    """Universe must span ≥29 distinct factors after the 2026-06-10
+    expansion (commodities, geographies, style, sectors, second crypto,
+    leveraged single-stock lines). Several equity factors are correlated
+    risk-on beta — the constructor de-dupes by factor and now sees live
+    factor correlations in signals.json — but the factor *labels* stay
+    distinct."""
     factors = {e.factor for e in universe.UNIVERSE}
-    assert len(factors) >= 13, (
+    assert len(factors) >= 29, (
         f"universe spans only {len(factors)} factors: {sorted(factors)}."
     )
 
@@ -62,22 +98,7 @@ def test_every_entry_has_non_empty_factor():
 def test_bull_bear_pairs_share_factor():
     """Every bull/inverse pair must share a factor so the constructor's
     correlation check doesn't double-count them."""
-    pairs = [
-        ("TQQQ", "SQQQ"),
-        ("UPRO", "SPXU"),
-        ("TNA",  "TZA"),
-        ("SOXL", "SOXS"),
-        ("TECL", "TECS"),
-        ("LABU", "LABD"),
-        ("YINN", "YANG"),
-        ("FAS",  "FAZ"),
-        ("ERX",  "ERY"),
-        ("GUSH", "DRIP"),
-        ("BOIL", "KOLD"),
-        ("TMF",  "TMV"),
-        ("NUGT", "DUST"),
-    ]
-    for bull_sym, bear_sym in pairs:
+    for bull_sym, bear_sym in PAIRS:
         bull = universe.by_symbol(bull_sym)
         bear = universe.by_symbol(bear_sym)
         assert bull is not None and bear is not None, f"{bull_sym}/{bear_sym} missing"
@@ -87,6 +108,19 @@ def test_bull_bear_pairs_share_factor():
         assert bull.leverage_factor > 0 and bear.leverage_factor < 0, (
             f"{bull_sym} must be bull (+lev) and {bear_sym} inverse (-lev)"
         )
+
+
+def test_solo_entries_have_no_inverse_in_factor():
+    """The solo bulls genuinely have no inverse leg — if an inverse ever
+    gets added to one of these factors, move the factor into PAIRS."""
+    for sym in SOLO_BULLS:
+        e = universe.by_symbol(sym)
+        assert e is not None, f"{sym} missing"
+        bears = [
+            x for x in universe.UNIVERSE
+            if x.factor == e.factor and x.leverage_factor < 0
+        ]
+        assert not bears, f"{sym} factor {e.factor} unexpectedly has inverse legs: {bears}"
 
 
 def test_all_symbols_unique():
@@ -132,37 +166,30 @@ def test_metadata_block_shape():
 
 
 def test_factor_pair_returns_bull_and_bear_for_paired_factors():
-    """factor_pair("TQQQ") returns (TQQQ, SQQQ); factor_pair("UVXY")
-    returns (UVXY, None) since vol has no inverse pair; crypto pairs the
-    2x bull BITX with the 1x inverse BITI."""
+    """factor_pair("TQQQ") returns (TQQQ, SQQQ); vol pairs UVXY with
+    SVIX as of 2026-06-10; crypto pairs the 2x bull BITX with the 1x
+    inverse BITI; the solo bulls return (sym, None)."""
     assert universe.factor_pair("TQQQ") == ("TQQQ", "SQQQ")
     assert universe.factor_pair("SOXS") == ("SOXL", "SOXS")
     assert universe.factor_pair("TMV") == ("TMF", "TMV")
     assert universe.factor_pair("BITX") == ("BITX", "BITI")
-    bull, bear = universe.factor_pair("UVXY")
-    assert bull == "UVXY"
-    assert bear is None
+    assert universe.factor_pair("SCO") == ("UCO", "SCO")
+    assert universe.factor_pair("ETHU") == ("ETHU", "ETHD")
+    assert universe.factor_pair("UVXY") == ("UVXY", "SVIX")
+    assert universe.factor_pair("NVD") == ("NVDL", "NVD")
+    assert universe.factor_pair("TSLL") == ("TSLL", "TSLZ")
+    for sym in SOLO_BULLS:
+        bull, bear = universe.factor_pair(sym)
+        assert bull == sym
+        assert bear is None
     # Unknown symbol returns (None, None) — must not crash.
     assert universe.factor_pair("NOT_REAL") == (None, None)
 
 
-@pytest.mark.parametrize("expected", [
-    "TQQQ", "SQQQ",   # Nasdaq
-    "UPRO", "SPXU",   # S&P
-    "TNA",  "TZA",    # Russell small-caps
-    "SOXL", "SOXS",   # Semis
-    "TECL", "TECS",   # Technology
-    "LABU", "LABD",   # Biotech
-    "YINN", "YANG",   # China
-    "FAS",  "FAZ",    # Financials
-    "ERX",  "ERY",    # Energy
-    "GUSH", "DRIP",   # Oil & gas E&P
-    "BOIL", "KOLD",   # Natural gas
-    "TMF",  "TMV",    # Rates
-    "NUGT", "DUST",   # Gold miners
-    "UVXY",           # Vol
-    "BITX", "BITI",   # Crypto
-])
+@pytest.mark.parametrize(
+    "expected",
+    [s for pair in PAIRS for s in pair] + SOLO_BULLS + ["BITX", "BITI"],
+)
 def test_etf_universe_symbols_present(expected):
     assert universe.by_symbol(expected) is not None, (
         f"{expected} missing from the ETF-only universe — confirm intentional"
@@ -172,15 +199,14 @@ def test_etf_universe_symbols_present(expected):
 @pytest.mark.parametrize("dropped", [
     "SPY", "QQQ", "TLT", "GLD", "IWM", "XLF", "XLE",  # former option underlyings
     "URTY", "SRTY",  # Russell alts (TNA/TZA cover the factor)
-    "DPST",          # Regional banks
-    "CURE",          # Healthcare
-    "BITU", "SBIT", "ETHU",  # Crypto alts
-    "DIA",           # former option underlying (correlates ~99% with SPY)
+    "BITU", "SBIT",  # Crypto-btc alts (BITX/BITI cover the factor)
+    "DIA",           # former option underlying (UDOW/SDOW cover Dow with leverage)
 ])
 def test_dropped_symbols_absent(dropped):
     """Lock the trim: symbols intentionally excluded must NOT come back
     without a deliberate decision. Notably the 7 option underlyings were
-    removed when options were dropped entirely."""
+    removed when options were dropped entirely. (DPST, CURE and ETHU
+    moved OFF this list in the 2026-06-10 expansion — they are now in.)"""
     assert universe.by_symbol(dropped) is None, (
         f"{dropped} is excluded but is back in the universe. "
         "If intentional, remove from this test's parametrize list."

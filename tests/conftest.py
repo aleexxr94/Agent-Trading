@@ -30,4 +30,6 @@ def tmp_state(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setattr(state_mod, "ALL_TIME_COST_RESET_FLAG", sd / "cost_all_time_reset.json")
     monkeypatch.setattr(state_mod, "NAV_OFFSET_FLAG", sd / "nav_offset.json")
     monkeypatch.setattr(state_mod, "NAV_MANUAL_BASELINE_FLAG", sd / "nav_manual_baseline.json")
+    monkeypatch.setattr(state_mod, "KILL_EVENTS_LOG", sd / "kill_events.jsonl")
+    monkeypatch.setattr(state_mod, "POSITION_PEAKS", sd / "position_peaks.json")
     return sd

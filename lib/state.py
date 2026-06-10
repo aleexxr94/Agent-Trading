@@ -61,6 +61,16 @@ LAST_CYCLE_HASH = STATE_DIR / "last_cycle_hash.json"
 # gate orders. Lets the operator watch the controls before enforcement is
 # enabled in later phases.
 MONITOR_SHADOW_LOG = STATE_DIR / "monitor_shadow.jsonl"
+# Exit-outcome audit log: one row per monitor-driven flatten (kill stop,
+# price stop, time stop, trailing stop). Lets the performance memo and the
+# dashboard's calibration view attribute closed trades to the exit machinery
+# that fired them — without this the AI can never see WHY positions died.
+KILL_EVENTS_LOG = STATE_DIR / "kill_events.jsonl"
+# Per-position peak marks for trailing stops the constructor chose to set:
+# {symbol: {"peak_mark": float, "updated_at": iso}}. Maintained by monitor.py;
+# entries are dropped when the position is no longer held so a re-entry
+# starts a fresh ratchet.
+POSITION_PEAKS = STATE_DIR / "position_peaks.json"
 # Phase 2 daily-drawdown circuit breaker. A separate, auto-expiring halt
 # distinct from the manual halt.flag: monitor.py writes it when intraday
 # synthetic drawdown ≥ 8%, the orchestrator reads it to skip NEW orders
@@ -636,6 +646,57 @@ def append_monitor_shadow(entry: dict) -> None:
     MONITOR_SHADOW_LOG.parent.mkdir(parents=True, exist_ok=True)
     with MONITOR_SHADOW_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, sort_keys=False) + "\n")
+
+
+def append_kill_event(entry: dict) -> None:
+    """Append one exit-outcome row to state/kill_events.jsonl.
+
+    Written by monitor.py when a flatten actually fires. Required keys:
+    at, symbol, reason. Recommended: exit_kind (loss_cap / price_stop /
+    time_stop / trailing_stop / orphan_loss_cap), source.
+    """
+    required = {"at", "symbol", "reason"}
+    missing = required - entry.keys()
+    if missing:
+        raise ValueError(f"kill event missing keys: {sorted(missing)}")
+    KILL_EVENTS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with KILL_EVENTS_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, sort_keys=False) + "\n")
+
+
+def read_kill_events(limit: int | None = None) -> list[dict]:
+    """Return kill-event rows (oldest first). Pass `limit` to cap."""
+    if not KILL_EVENTS_LOG.exists():
+        return []
+    rows = []
+    for line in KILL_EVENTS_LOG.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    if limit is not None:
+        return rows[-limit:]
+    return rows
+
+
+def read_position_peaks() -> dict:
+    """Return the trailing-stop peak-mark map ({symbol: {peak_mark,
+    updated_at}}). Empty dict when missing or unreadable — a lost peak
+    file degrades the ratchet (it re-arms from the current mark), it
+    never crashes the kill loop."""
+    if not POSITION_PEAKS.exists():
+        return {}
+    try:
+        data = json.loads(POSITION_PEAKS.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def write_position_peaks(peaks: dict) -> None:
+    write_json(POSITION_PEAKS, peaks)
 
 
 def read_nav_history(limit: int | None = None) -> list[dict]:

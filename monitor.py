@@ -182,12 +182,130 @@ def evaluate_portfolio(
     return actions
 
 
-def execute_actions(actions: list[dict], *, broker: Broker | None) -> None:
+def update_trailing_stops(
+    *,
+    portfolio: dict,
+    marks: dict[str, float],
+    broker_positions: list | None = None,
+    position_peaks: dict | None = None,
+    now_iso: str | None = None,
+) -> tuple[dict, list[dict]]:
+    """Evaluate the OPTIONAL trailing stops the constructor chose to set.
+
+    Pure function: returns (new_peaks, actions) without touching state —
+    main() persists the peaks. For every target position carrying
+    ``kill_conditions.trailing_stop_pct``:
+
+      - the peak mark ratchets up: ``peak = max(prior_peak, mark)``
+        (initialised at the current mark when first seen, so a freshly
+        set stop can never fire on its first observation)
+      - the stop fires when ``mark <= peak * (1 - pct/100)``
+
+    Symbols absent from the returned peaks map (position closed, trailing
+    stop removed by the constructor, or not currently held) are dropped
+    from the peak file so a later re-entry starts a fresh ratchet. A
+    FIRING stop keeps its peak here: main() drops a peak only after the
+    broker ACCEPTS the flatten, so a rejected/failed close re-fires from
+    the same high-water mark on the next pass instead of re-seeding at a
+    lower mark, while a successful close clears it so a re-entry can't
+    be stopped against the prior trade's peak (Codex P2 rounds, PR #109).
+
+    This enforces only what the agent itself chose per position — exactly
+    the same contract as the fixed price/time stops.
+    """
+    peaks = position_peaks or {}
+    now_iso = now_iso or state.utcnow_iso()
+    held = (
+        {bp.symbol for bp in broker_positions if abs(bp.qty) > 0}
+        if broker_positions is not None else None
+    )
+    new_peaks: dict = {}
+    actions: list[dict] = []
+    for pos in portfolio.get("positions", []):
+        symbol = pos.get("symbol")
+        kc = pos.get("kill_conditions") or {}
+        pct = kc.get("trailing_stop_pct")
+        if not isinstance(pct, (int, float)) or pct <= 0:
+            continue
+        if held is not None and symbol not in held:
+            continue  # not held — no ratchet to maintain
+        mark = marks.get(symbol)
+        if mark is None or mark <= 0:
+            # Unmarked this cycle: keep the prior peak (don't lose the
+            # ratchet to a transient data gap), but can't evaluate.
+            if symbol in peaks:
+                new_peaks[symbol] = peaks[symbol]
+            continue
+        prior = (peaks.get(symbol) or {}).get("peak_mark")
+        peak = max(float(prior), mark) if isinstance(prior, (int, float)) else mark
+        new_peaks[symbol] = {"peak_mark": peak, "updated_at": now_iso}
+        threshold = peak * (1.0 - float(pct) / 100.0)
+        if mark <= threshold and peak > mark:
+            actions.append({
+                "symbol": symbol,
+                "action": "flatten",
+                "reason": (
+                    f"trailing stop: mark {mark:g} ≤ {threshold:g} "
+                    f"(peak {peak:g} − {pct:g}%)"
+                ),
+            })
+    return new_peaks, actions
+
+
+def _exit_kind_from_reason(reason: str) -> str:
+    """Map a should_kill_position reason string to a stable exit_kind tag
+    for the kill-event log (consumed by lib.feedback + the dashboard)."""
+    r = (reason or "").lower()
+    if "trailing stop" in r:
+        return "trailing_stop"
+    if "time stop" in r:
+        return "time_stop"
+    if "kill_below" in r or "kill_above" in r:
+        return "price_stop"
+    if r.startswith("orphan"):
+        return "orphan_loss_cap"
+    if "cap" in r:
+        return "loss_cap"
+    return "other"
+
+
+def execute_actions(actions: list[dict], *, broker: Broker | None) -> set[str]:
+    """Submit the flatten actions. Returns the symbols whose close the
+    broker ACCEPTED (Broker.flatten contract: OrderResult on acceptance,
+    None on rejection/failure).
+
+    A failed flatten records NO kill event (Codex P2, PR #109): the
+    position is still open, and a phantom event could mis-attribute an
+    unrelated later close inside the performance memo's 6h match window.
+    It is also excluded from the returned set, so main() keeps its
+    trailing-stop peak and the stop re-fires on the next pass."""
+    flattened: set[str] = set()
     if state.is_halted():
-        return
+        return flattened
     for a in actions:
         if a["action"] == "flatten" and broker is not None:
-            broker.flatten(a["symbol"])
+            result = broker.flatten(a["symbol"])
+            if result is None:
+                print(
+                    f"monitor: flatten {a['symbol']} rejected/failed; "
+                    "no kill event recorded, will re-evaluate next pass"
+                )
+                continue
+            flattened.add(a["symbol"])
+            # Exit-outcome audit: record WHY this position died so the
+            # performance memo can show the agent its stop-out history.
+            # Guarded — telemetry must never break the kill loop.
+            try:
+                state.append_kill_event({
+                    "at": state.utcnow_iso(),
+                    "symbol": a["symbol"],
+                    "reason": a["reason"],
+                    "exit_kind": _exit_kind_from_reason(a["reason"]),
+                    "source": "monitor",
+                })
+            except Exception:
+                pass
+    return flattened
 
 
 def audit_report(
@@ -303,12 +421,14 @@ def main(argv: list[str] | None = None) -> int:
     # One broker round trip; reuse the positions for marks, cost basis,
     # evaluation, and the audit so we never fetch twice.
     positions: list = []
+    positions_ok = True
     if broker is not None:
         try:
             positions = broker.get_positions()
         except Exception as e:
             print(f"monitor: get_positions failed ({type(e).__name__}: {e}); evaluating with no marks")
             positions = []
+            positions_ok = False
     marks = marks_lib.marks_from_positions(positions)
     cost_basis = marks_lib.cost_basis_from_positions(positions)
     enforce = _enforce_stops_enabled()
@@ -321,13 +441,53 @@ def main(argv: list[str] | None = None) -> int:
         broker_positions=(positions if broker is not None else None),
         enforce_stops=enforce,
     )
+    # Trailing stops the constructor chose (ratchet from peak mark).
+    # Guarded like the other telemetry: a peak-file problem degrades the
+    # ratchet, it never breaks the hard loss-cap loop above. Skipped
+    # entirely when the positions fetch FAILED (Codex P2, PR #109): a
+    # broker outage yields an empty positions list that is
+    # indistinguishable from a closed-out account inside
+    # update_trailing_stops, and persisting its output would wipe every
+    # peak — leave the file untouched and re-evaluate next pass.
+    new_peaks: dict | None = None
+    if enforce and positions_ok:
+        try:
+            new_peaks, trailing_actions = update_trailing_stops(
+                portfolio=portfolio,
+                marks=marks,
+                broker_positions=(positions if broker is not None else None),
+                position_peaks=state.read_position_peaks(),
+            )
+            already = {a["symbol"] for a in actions}
+            actions.extend(
+                a for a in trailing_actions if a["symbol"] not in already
+            )
+        except Exception as e:
+            new_peaks = None
+            print(f"monitor: trailing-stop error ({type(e).__name__}: {e}); ignored")
+    elif enforce:
+        print("monitor: positions fetch failed; trailing-stop peaks left untouched")
     print(
         f"monitor: {len(marks)} marks, {len(actions)} actions "
         f"(dry_run={args.dry_run}, broker={'on' if broker else 'off'}, "
         f"enforce_stops={enforce})"
     )
+    flattened: set[str] = set()
     if not args.dry_run:
-        execute_actions(actions, broker=broker)
+        flattened = execute_actions(actions, broker=broker)
+    # Persist the ratchet AFTER execution, dropping only the symbols whose
+    # flatten the broker actually ACCEPTED — any rule (loss cap, price/time
+    # stop, orphan, trailing) invalidates the peak once the close is real.
+    # A rejected close keeps its peak (the stop re-fires next pass from the
+    # same high-water mark); an accepted close clears it (a re-entry can't
+    # be stopped against the prior trade's peak). Codex P2 rounds, PR #109.
+    if new_peaks is not None and not args.dry_run:
+        for s in flattened:
+            new_peaks.pop(s, None)
+        try:
+            state.write_position_peaks(new_peaks)
+        except Exception as e:
+            print(f"monitor: peak persistence error ({type(e).__name__}: {e}); ignored")
     # Phase 2: 8% daily-drawdown breaker. Computes live synthetic equity from
     # the positions already fetched, manages the start-of-day baseline, and
     # writes the auto-expiring dd_halt flag the orchestrator reads to skip new
@@ -363,6 +523,21 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception as e:
         print(f"monitor-audit: telemetry error ({type(e).__name__}: {e}); ignored")
+    # Trade-sync staleness: orders were accepted recently but no fills ever
+    # synced — the failure mode that once silently broke cooldown/P&L for
+    # 5 weeks. Loud in the journal; the dashboard shows the same banner.
+    try:
+        from lib import dashboard_data as _dd
+        sync = _dd.trade_sync_gaps()
+        if sync.get("stale"):
+            print(
+                f"monitor: WARNING trade-sync staleness — {len(sync['gaps'])} "
+                f"run(s) submitted accepted orders in the last "
+                f"{sync['lookback_days']}d with no matching fills in "
+                f"trades.jsonl (cooldown/P&L degraded)"
+            )
+    except Exception as e:
+        print(f"monitor: sync-staleness check error ({type(e).__name__}: {e}); ignored")
     return 0
 
 

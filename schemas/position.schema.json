@@ -34,6 +34,8 @@
           "description": "Flatten if the ETF's own price falls to/below this level."},
         "underlying_price_above": {"type": ["number", "null"],
           "description": "Flatten if the ETF's own price rises to/above this level."},
+        "trailing_stop_pct": {"type": ["number", "null"], "minimum": 1, "maximum": 50,
+          "description": "Optional ratchet stop the constructor may choose: flatten when the ETF's mark falls this % below its peak mark since the stop was set (peaks tracked by monitor.py). Lets a winner run while locking in gains; an alternative or complement to the fixed price stops."},
         "time_stop_utc": {"type": ["string", "null"], "format": "date-time"},
         "notes": {"type": "string"}
       },

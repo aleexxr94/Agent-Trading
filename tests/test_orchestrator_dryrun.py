@@ -392,6 +392,40 @@ def test_cycle_dedup_does_not_skip_when_cooldown_expires(tmp_state):
     assert result is None
 
 
+def test_cycle_dedup_does_not_skip_when_memo_changes(tmp_state):
+    """Codex P2 regression (PR #109): the performance memo is LLM-visible
+    evidence that can change while signals, positions, and cooldown all
+    stay fixed (a backfilled fill, a new kill event re-tagging an exit).
+    A changed memo fingerprint must invalidate dedup; a pre-upgrade hash
+    file without the key must also fail the match (costs one fresh
+    cycle, then dedup resumes with the new key)."""
+    signals_out = {"tickers": [{"symbol": "TQQQ", "last_close": 72.0}]}
+    positions = [{"symbol": "TQQQ", "qty": 4.0}]
+    memo_a = orchestrator._memo_fingerprint({"closed_trades": 3})
+    memo_b = orchestrator._memo_fingerprint({"closed_trades": 4})
+    state.write_json(state.CURRENT_PORTFOLIO, {"positions": [], "all_cash": True})
+    base_hash = {
+        "signals_fingerprint": orchestrator._signals_fingerprint(signals_out),
+        "positions_fingerprint": orchestrator._positions_fingerprint(positions),
+        "cooldown_fingerprint": orchestrator._cooldown_fingerprint(None),
+        "updated_at": state.utcnow_iso(),
+    }
+    state.write_json(state.LAST_CYCLE_HASH, {**base_hash, "memo_fingerprint": memo_a})
+    assert orchestrator._check_cycle_dedup(signals_out, positions, None, memo_a) is not None
+    assert orchestrator._check_cycle_dedup(signals_out, positions, None, memo_b) is None
+    # Legacy hash file (written before the memo key existed) vs a real fp.
+    state.write_json(state.LAST_CYCLE_HASH, base_hash)
+    assert orchestrator._check_cycle_dedup(signals_out, positions, None, memo_a) is None
+
+
+def test_memo_fingerprint_stable_and_distinct(tmp_state):
+    assert (orchestrator._memo_fingerprint({"a": 1, "b": 2})
+            == orchestrator._memo_fingerprint({"b": 2, "a": 1}))
+    assert (orchestrator._memo_fingerprint({"closed_trades": 1})
+            != orchestrator._memo_fingerprint({"closed_trades": 2}))
+    assert isinstance(orchestrator._memo_fingerprint(None), str)
+
+
 def test_cycle_dedup_does_not_skip_when_signals_change(tmp_state):
     """Different signals fingerprint → dedup must NOT fire."""
     state.write_json(state.LAST_CYCLE_HASH, {
@@ -480,6 +514,44 @@ def test_signals_fingerprint_stable_when_events_reordered(tmp_state):
         ],
     }]}
     assert orchestrator._signals_fingerprint(a) == orchestrator._signals_fingerprint(b)
+
+
+def test_signals_fingerprint_differs_when_new_llm_visible_features_move(tmp_state):
+    """Codex P2 regression (PR #109): every feature compact_for_llm exposes
+    must be fingerprinted. Before the fix, a cycle where only RSI, SPY
+    relative strength, or trend R² changed would dedup-skip the LLM stages
+    even though the evidence they'd read had changed."""
+    base = {"symbol": "TQQQ", "last_close": 72.0,
+            "rsi_14": 55.0, "rel_strength_spy_30d": 3.2, "trend_r2": 0.81}
+    for field, moved in [("rsi_14", 71.0),
+                         ("rel_strength_spy_30d", -4.0),
+                         ("trend_r2", 0.22)]:
+        a = {"tickers": [dict(base)]}
+        b = {"tickers": [dict(base, **{field: moved})]}
+        assert orchestrator._signals_fingerprint(a) != orchestrator._signals_fingerprint(b), (
+            f"dedup hash must invalidate when {field} changes — the LLM stages see it"
+        )
+
+
+def test_signals_fingerprint_differs_when_factor_correlations_change(tmp_state):
+    """The universe-level factor_correlations block is LLM-visible and must
+    bump the hash; row order must not."""
+    tickers = [{"symbol": "TQQQ", "last_close": 72.0}]
+    quiet = {"tickers": tickers, "factor_correlations": []}
+    corr = {"tickers": tickers, "factor_correlations": [
+        {"factor_a": "nasdaq", "factor_b": "semis", "corr_30d": 0.91},
+    ]}
+    assert orchestrator._signals_fingerprint(quiet) != orchestrator._signals_fingerprint(corr)
+
+    reordered = {"tickers": tickers, "factor_correlations": [
+        {"factor_a": "sp500", "factor_b": "tech", "corr_30d": 0.84},
+        {"factor_a": "nasdaq", "factor_b": "semis", "corr_30d": 0.91},
+    ]}
+    canonical = {"tickers": tickers, "factor_correlations": [
+        {"factor_a": "nasdaq", "factor_b": "semis", "corr_30d": 0.91},
+        {"factor_a": "sp500", "factor_b": "tech", "corr_30d": 0.84},
+    ]}
+    assert orchestrator._signals_fingerprint(reordered) == orchestrator._signals_fingerprint(canonical)
 
 
 def test_positions_fingerprint_changes_when_qty_changes(tmp_state):
@@ -901,3 +973,71 @@ def test_sync_fills_before_cooldown_returns_error_string_on_failure(monkeypatch)
     err = orchestrator._sync_fills_before_cooldown(ctx)
     assert err is not None
     assert "alpaca down" in err
+
+
+# ---------- critic no-op skip helper ----------
+
+
+def test_portfolio_is_noop_when_target_matches_holdings():
+    import orchestrator as orch
+    portfolio = {"positions": [
+        {"symbol": "TQQQ", "shares": 4,
+         "kill_conditions": {"max_loss_pct": 25, "underlying_price_below": 60.0}},
+        {"symbol": "TMF", "shares": 10,
+         "kill_conditions": {"max_loss_pct": 25, "trailing_stop_pct": 12}},
+    ]}
+    current = [
+        {"symbol": "TQQQ", "qty": 4.0},
+        {"symbol": "TMF", "qty": 10.0},
+    ]
+    # Prior published portfolio carries the SAME kill conditions.
+    assert orch._portfolio_is_noop(portfolio, current, portfolio) is True
+
+
+def test_portfolio_is_not_noop_when_kill_conditions_change():
+    """Codex P2 regression (PR #109): zero orders is not 'nothing to
+    critique' if the constructor rewired the stops the monitor enforces.
+    Same symbols + shares but changed kill_conditions must NOT skip the
+    critic; an unknown prior portfolio is conservative (no skip)."""
+    import orchestrator as orch
+    prior = {"positions": [
+        {"symbol": "TQQQ", "shares": 4,
+         "kill_conditions": {"max_loss_pct": 25, "trailing_stop_pct": 10}},
+    ]}
+    current = [{"symbol": "TQQQ", "qty": 4.0}]
+    widened = {"positions": [
+        {"symbol": "TQQQ", "shares": 4,
+         "kill_conditions": {"max_loss_pct": 25, "trailing_stop_pct": 20}},
+    ]}
+    assert orch._portfolio_is_noop(widened, current, prior) is False
+    # Stop removed entirely → also not a no-op.
+    dropped = {"positions": [
+        {"symbol": "TQQQ", "shares": 4, "kill_conditions": {"max_loss_pct": 25}},
+    ]}
+    assert orch._portfolio_is_noop(dropped, current, prior) is False
+    # No prior portfolio to compare against → conservative, critic runs.
+    assert orch._portfolio_is_noop(prior, current, None) is False
+    # Unchanged stops → still a no-op.
+    assert orch._portfolio_is_noop(prior, current, prior) is True
+
+
+def test_portfolio_is_not_noop_on_any_difference():
+    import orchestrator as orch
+    current = [{"symbol": "TQQQ", "qty": 4.0}]
+    # Share-count drift.
+    assert orch._portfolio_is_noop(
+        {"positions": [{"symbol": "TQQQ", "shares": 5}]}, current,
+    ) is False
+    # New symbol in target.
+    assert orch._portfolio_is_noop(
+        {"positions": [{"symbol": "TQQQ", "shares": 4}, {"symbol": "TMF", "shares": 1}]},
+        current,
+    ) is False
+    # Held symbol dropped from target (a close IS an order).
+    assert orch._portfolio_is_noop({"positions": []}, current) is False
+
+
+def test_portfolio_is_noop_all_cash_with_empty_account():
+    """No positions on either side → no stops in play, no prior needed."""
+    import orchestrator as orch
+    assert orch._portfolio_is_noop({"positions": [], "all_cash": True}, []) is True

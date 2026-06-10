@@ -108,33 +108,30 @@ def upcoming_events(
     return sorted(out, key=lambda r: r["date"])
 
 
-# Tickers in the ETF-only universe that are sensitive to broad-macro
-# events. Nearly the whole universe is broad-equity / sector / rates
-# proxies, so the macro calendar attaches to all of them; only the
-# crypto pair (BITX/BITI) is exempt.
-_BROAD_MACRO_SYMBOLS: frozenset[str] = frozenset({
-    "TQQQ", "SQQQ", "UPRO", "SPXU", "TNA", "TZA",
-    "SOXL", "SOXS", "TECL", "TECS", "LABU", "LABD",
-    "YINN", "YANG", "FAS", "FAZ",
-    "UVXY",  # vol reacts to all macro
-    # Rates (TMF/TMV) — FOMC rate decisions and CPI/PCE surprises move
-    # the 20+yr Treasury curve directly.
-    "TMF", "TMV",
-    # Energy / oil-gas / nat-gas — FOMC moves USD which inversely drives
-    # crude; CPI prints bracket energy inflation.
-    "ERX", "ERY", "GUSH", "DRIP", "BOIL", "KOLD",
-    # Gold miners — extremely macro-sensitive. FOMC rate decisions move
-    # real yields → gold; CPI/PCE surprises swing inflation expectations.
-    "NUGT", "DUST",
-})
+# Factors in the ETF-only universe that are NOT sensitive to the broad
+# macro calendar. Everything else — broad equity, sectors, rates,
+# commodities, vol — gets the full calendar (FOMC moves real yields,
+# USD, and risk appetite; CPI/PCE/NFP bracket every one of those).
+# Derived from lib.universe at call time so universe expansions stay in
+# sync automatically (the previous hardcoded symbol set silently skipped
+# new tickers).
+_MACRO_EXEMPT_FACTORS: frozenset[str] = frozenset({"crypto-btc", "crypto-eth"})
+
+
+def _is_macro_sensitive(symbol: str) -> bool:
+    from . import universe  # local import to avoid a cycle at module load
+    entry = universe.by_symbol(symbol)
+    if entry is None:
+        return False
+    return entry.factor not in _MACRO_EXEMPT_FACTORS
 
 
 def events_for_symbol(symbol: str, *, within_days: int = 7,
                       from_date: date | None = None) -> list[dict]:
     """Per-symbol view: returns events that materially affect this
-    ticker. All broad-equity / sector / rates tickers get the full
-    macro calendar; crypto (BITX/BITI) is exempt.
+    ticker. All broad-equity / sector / rates / commodity tickers get
+    the full macro calendar; crypto factors are exempt.
     """
-    if symbol not in _BROAD_MACRO_SYMBOLS:
+    if not _is_macro_sensitive(symbol):
         return []
     return upcoming_events(within_days=within_days, from_date=from_date)
