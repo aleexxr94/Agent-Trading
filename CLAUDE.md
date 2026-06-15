@@ -138,7 +138,8 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
 │   ├── risk.py                 # sizing, caps, kill checks, circuit breakers, cooldown
 │   ├── universe.py             # 29-ticker leveraged/inverse ETF universe metadata
 │   ├── marks.py                # mark-price helpers (ETF symbols)
-│   ├── pnl.py                  # portfolio P&L computation
+│   ├── pnl.py                  # portfolio P&L computation (wraps alpaca_costs)
+│   ├── alpaca_costs.py         # Alpaca live-cost model (slippage + SEC/TAF; commission $0)
 │   ├── trades.py               # trade-log reader + re-entry cooldown state
 │   ├── trades_sync.py          # pulls filled orders from Alpaca into state
 │   ├── benchmark.py            # SPY benchmark + backtest/Monte-Carlo helpers

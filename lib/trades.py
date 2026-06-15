@@ -52,11 +52,14 @@ class ClosedTrade:
     """One matched (buy lot ↔ sell fill) pair — possibly a partial close.
 
     ``gross_pnl_usd`` = (sell_price - buy_price) * qty.
-    ``fees_usd`` = buy_fees_share + sell_fees_share (real, from Alpaca).
+    ``fees_usd`` = buy_fees_share + sell_fees_share (regulatory; real on live,
+    modelled on paper by lib.alpaca_costs).
+    ``slippage_usd`` = buy_slip_share + sell_slip_share (modelled spread cost,
+    both legs).
     ``attributed_llm_cost_usd`` = sum of equal-split allocations for the
     OPENING run (we attribute only to the run that put the position on,
     per the locked methodology).
-    ``net_pnl_usd`` = gross - fees - attributed_llm_cost.
+    ``net_pnl_usd`` = gross - fees - slippage - attributed_llm_cost.
     """
     symbol: str
     kind: Literal["etf"]
@@ -72,6 +75,7 @@ class ClosedTrade:
     fees_usd: float
     attributed_llm_cost_usd: float
     net_pnl_usd: float
+    slippage_usd: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -90,6 +94,7 @@ class OpenTradePnl:
     fees_usd: float                  # buy-side only
     attributed_llm_cost_usd: float
     net_pnl_usd: float | None        # None when mark is unavailable
+    slippage_usd: float = 0.0        # buy-side only (entry leg)
 
 
 @dataclass(frozen=True)
@@ -124,6 +129,10 @@ class TradesPnl:
     @property
     def total_realised_fees_usd(self) -> float:
         return sum(t.fees_usd for t in self.closed)
+
+    @property
+    def total_realised_slippage_usd(self) -> float:
+        return sum(t.slippage_usd for t in self.closed)
 
     @property
     def total_realised_llm_cost_usd(self) -> float:
@@ -223,6 +232,7 @@ def compute_trades_pnl(
         qty = float(t["qty"])
         price = float(t["fill_price"])
         fees = float(t.get("fees_usd", 0.0) or 0.0)
+        slippage = float(t.get("slippage_usd", 0.0) or 0.0)
         run_id = t.get("run_id")
         filled_at = t.get("filled_at", "")
         activity_id = t.get("activity_id", "")
@@ -236,23 +246,30 @@ def compute_trades_pnl(
                 "original_qty": qty,
                 "fill_price": price,
                 "remaining_fees": fees,
+                "remaining_slippage": slippage,
                 "filled_at": filled_at,
             })
             continue
 
         # side == "sell": consume oldest open lots FIFO.
         remaining_sell_qty = qty
-        # Pro-rate the sell-side fees by qty as we consume lots.
+        # Pro-rate the sell-side fees + slippage by qty as we consume lots.
         sell_fees_per_unit = (fees / qty) if qty > 0 else 0.0
+        sell_slip_per_unit = (slippage / qty) if qty > 0 else 0.0
         while remaining_sell_qty > 1e-9 and open_lots[symbol]:
             lot = open_lots[symbol][0]
             matched = min(remaining_sell_qty, lot["remaining_qty"])
-            # Pro-rate buy-side fees by matched fraction of the original lot.
+            # Pro-rate buy-side fees + slippage by matched fraction of the lot.
             buy_fees_share = (
                 lot["remaining_fees"] * (matched / lot["remaining_qty"])
                 if lot["remaining_qty"] > 0 else 0.0
             )
+            buy_slip_share = (
+                lot["remaining_slippage"] * (matched / lot["remaining_qty"])
+                if lot["remaining_qty"] > 0 else 0.0
+            )
             sell_fees_share = sell_fees_per_unit * matched
+            sell_slip_share = sell_slip_per_unit * matched
             gross = (price - lot["fill_price"]) * matched
             # Equal-split allocation: each (run_id, symbol) opening event
             # carries one share. The matched chunk represents the same
@@ -270,7 +287,8 @@ def compute_trades_pnl(
                 if lot["original_qty"] > 0 else 0.0
             )
             total_fees = buy_fees_share + sell_fees_share
-            net = gross - total_fees - llm_share
+            total_slippage = buy_slip_share + sell_slip_share
+            net = gross - total_fees - total_slippage - llm_share
             closed.append(ClosedTrade(
                 symbol=symbol,
                 kind=kind,
@@ -286,9 +304,11 @@ def compute_trades_pnl(
                 fees_usd=total_fees,
                 attributed_llm_cost_usd=llm_share,
                 net_pnl_usd=net,
+                slippage_usd=total_slippage,
             ))
             lot["remaining_qty"] -= matched
             lot["remaining_fees"] -= buy_fees_share
+            lot["remaining_slippage"] -= buy_slip_share
             remaining_sell_qty -= matched
             if lot["remaining_qty"] <= 1e-9:
                 open_lots[symbol].popleft()
@@ -328,7 +348,7 @@ def compute_trades_pnl(
                 if lot["original_qty"] > 0 else 0.0
             )
             net = (
-                gross - lot["remaining_fees"] - llm_share
+                gross - lot["remaining_fees"] - lot["remaining_slippage"] - llm_share
                 if gross is not None else None
             )
             open_rows.append(OpenTradePnl(
@@ -344,6 +364,7 @@ def compute_trades_pnl(
                 fees_usd=lot["remaining_fees"],
                 attributed_llm_cost_usd=llm_share,
                 net_pnl_usd=net,
+                slippage_usd=lot["remaining_slippage"],
             ))
 
     return TradesPnl(

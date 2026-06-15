@@ -686,18 +686,24 @@ def test_synthetic_balance_open_gross_from_broker_positions(tmp_state):
         held_keys=frozenset({"TQQQ"}),
     )
     assert sb.open_gross_pnl_usd == pytest.approx(20.0)
-    # Hybrid fees: real (closed) = $0 (no closed trades),
-    # modelled (open) > $0 from compute_position_pnl on the open
-    # TQQQ position. The synthetic balance subtracts the hybrid
-    # total, so it sits BELOW the raw $2,520 by the modelled-fee
-    # amount. Math: $2,500 + $20 open − modelled_open_fees.
+    # Real (closed) fees = $0 (no closed trades). The open TQQQ position
+    # contributes a modelled projected EXIT leg: regulatory fees
+    # (modelled_open_fees) + slippage (modelled_open_slippage). The entry
+    # leg is NOT charged here — it would land in trades.jsonl at fill time
+    # (no double-count). The synthetic balance subtracts fees + slippage.
+    # Math: $2,500 + $20 open − modelled_open_fees − slippage_total.
     assert sb.modelled_open_fees_usd > 0, (
-        "open ETF position should pick up a modelled round-trip cost"
+        "open ETF position should pick up modelled exit-leg reg fees"
+    )
+    assert sb.modelled_open_slippage_usd > 0, (
+        "open ETF position should pick up modelled exit-leg slippage"
     )
     assert sb.real_trading_fees_usd == pytest.approx(0.0)
+    assert sb.realized_slippage_usd == pytest.approx(0.0)
     assert sb.trading_fees_total_usd == sb.modelled_open_fees_usd
+    assert sb.slippage_total_usd == pytest.approx(sb.modelled_open_slippage_usd)
     assert sb.synthetic_balance_usd == pytest.approx(
-        2520.0 - sb.modelled_open_fees_usd
+        2520.0 - sb.modelled_open_fees_usd - sb.slippage_total_usd
     )
 
 

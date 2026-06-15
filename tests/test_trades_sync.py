@@ -117,6 +117,36 @@ def test_sync_appends_new_fill_with_zero_fees_for_etf(tmp_state):
     assert r["fees_usd"] == 0.0
     assert r["filled_at"] == "2026-05-12T14:30:00Z"
     assert r["run_id"] is None  # no order_id_to_run_id map passed
+    # Cost model on by default: buys carry modelled slippage but no
+    # regulatory fee (sell-side only), tagged as modelled provenance.
+    assert r["fee_source"] == "modelled"
+    assert r["slippage_usd"] > 0.0
+
+
+def test_sync_models_sell_side_costs_on_paper(tmp_state):
+    """A paper SELL with no fee activity gets modelled regulatory fees +
+    slippage from lib.alpaca_costs, tagged fee_source='modelled'."""
+    tc = _FakeTrading(responses={"/account/activities/FILL": [
+        _fill(side="sell", qty="500", price="20.00"),
+    ]})
+    trades_sync.sync_fills_from_alpaca(trading_client=tc)
+    r = state.read_trades()[0]
+    assert r["fee_source"] == "modelled"
+    assert r["fees_usd"] == pytest.approx(0.31, abs=0.01)   # SEC + TAF on $10k sell
+    assert r["slippage_usd"] > 0.0
+
+
+def test_sync_paper_cost_model_can_be_disabled(tmp_state, monkeypatch):
+    """PAPER_COST_MODEL=false records raw (gross) fills: no modelled cost."""
+    monkeypatch.setenv("PAPER_COST_MODEL", "false")
+    tc = _FakeTrading(responses={"/account/activities/FILL": [
+        _fill(side="sell", qty="500", price="20.00"),
+    ]})
+    trades_sync.sync_fills_from_alpaca(trading_client=tc)
+    r = state.read_trades()[0]
+    assert r["fees_usd"] == 0.0
+    assert r["slippage_usd"] == 0.0
+    assert r["fee_source"] == "none"
 
 
 def test_sync_folds_fee_into_etf_fill(tmp_state):

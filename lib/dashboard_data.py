@@ -241,19 +241,13 @@ class SyntheticBalance:
         in trades.jsonl. On paper ETFs this is \$0; on live trading it
         populates from the SEC/TAF schedules.
       - ``modelled_open_fees_usd``: sum of
-        ``compute_position_pnl(...).modelled_costs_usd`` across the
-        broker-held subset of positions (same source the positions
-        table's per-row ``Fees`` column uses). Round-trip estimate —
-        entry leg + projected exit leg.
-
-    Known caveat (paper-only deployment safe): on a live broker the
-    real entry-leg fee on a currently-open position would live in
-    trades.jsonl AND ``modelled_open_fees_usd`` would also include an
-    entry-leg term — slight double-count on the entry side until the
-    position closes. Acceptable for the current paper-ETF deployment
-    where real entry fees are \$0. Follow-up ticket should split
-    ``modelled_costs_usd`` into entry / exit halves so only the exit
-    leg is added here.
+        the projected EXIT-leg regulatory fees over the broker-held
+        subset of positions. The entry leg is NOT added here — it
+        already lands in trades.jsonl at fill time (counted via
+        ``real_trading_fees_usd`` / ``realized_slippage_usd``), so
+        charging a round-trip would double-count the entry. This is the
+        entry/exit split that the earlier "known caveat" called for.
+        Slippage is tracked separately (see the slippage fields).
     """
     starting_balance_usd: float = 2500.0
     closed_gross_pnl_usd: float = 0.0
@@ -265,6 +259,17 @@ class SyntheticBalance:
     trading_fees_total_usd: float = 0.0
     real_trading_fees_usd: float = 0.0
     modelled_open_fees_usd: float = 0.0
+    # Modelled slippage/spread cost — the dominant live friction that
+    # Alpaca paper (and even live) never reports. ``realized_slippage_usd``
+    # is the sum of per-fill ``slippage_usd`` already in trades.jsonl
+    # (closed round-trips + the entry leg of still-open positions);
+    # ``modelled_open_slippage_usd`` is the projected EXIT-leg slippage on
+    # currently-open positions (entry leg is already counted in the realized
+    # term, so we add only the exit to avoid double-counting). Both feed
+    # ``slippage_total_usd``, subtracted in the headline alongside fees.
+    realized_slippage_usd: float = 0.0
+    modelled_open_slippage_usd: float = 0.0
+    slippage_total_usd: float = 0.0
     unmarked_open_lots: int = 0
     # Sell fills that couldn't FIFO-match against an open buy lot.
     # Healthy operation never produces these (system spec is "no
@@ -283,6 +288,7 @@ class SyntheticBalance:
             + self.open_gross_pnl_usd
             - self.llm_cost_total_usd
             - self.trading_fees_total_usd
+            - self.slippage_total_usd
         )
 
     @property
@@ -352,7 +358,8 @@ def compute_synthetic_balance(
     closed_gross = view["totals"]["realised_gross_usd"]
 
     open_gross = 0.0
-    modelled_open_fees = 0.0  # Σ compute_position_pnl(...).modelled_costs_usd
+    modelled_open_fees = 0.0       # Σ projected EXIT-leg fees (commission+reg)
+    modelled_open_slippage = 0.0   # Σ projected EXIT-leg slippage
     unmarked = 0
     if portfolio is not None:
         open_subset, _ = split_positions_by_broker_holdings(
@@ -376,18 +383,24 @@ def compute_synthetic_balance(
                 unmarked += 1
             else:
                 open_gross += breakdown.gross_pnl_usd
-            # Codex P1 on PR #82: only accumulate modelled fees when
+            # Codex P1 on PR #82: only accumulate modelled costs when
             # the broker has confirmed which positions are actually
             # held. With ``held_keys=None`` (broker unreachable),
             # ``split_positions_by_broker_holdings`` returns every
             # portfolio.json row as "open" — including any that the
             # operator may have already closed manually. Charging
-            # modelled fees against those phantom rows would bias
+            # modelled costs against those phantom rows would bias
             # the synthetic balance downward during an outage. When
-            # we can't verify holdings, skip the modelled-fee
-            # contribution rather than risk a misleading deduction.
+            # we can't verify holdings, skip the contribution.
+            #
+            # We add only the projected EXIT leg: the entry leg's cost
+            # already lands in trades.jsonl at fill time (real_fees +
+            # realized_slippage below), so charging a full round-trip
+            # here would double-count the entry.
             if held_keys is not None:
-                modelled_open_fees += float(breakdown.modelled_costs_usd)
+                cost = pnl_lib.model_position_cost(p)
+                modelled_open_fees += float(cost.commission_usd + cost.reg_fees_usd)
+                modelled_open_slippage += float(cost.half_spread_usd)
     else:
         # Legacy fallback: derive open_gross from trades.jsonl open
         # lots. Used by tests that exercise compute_synthetic_balance
@@ -404,6 +417,8 @@ def compute_synthetic_balance(
                 open_gross += float(g)
 
     real_fees = total_trading_fees_usd()
+    realized_slippage = total_slippage_usd()
+    slippage_total = realized_slippage + modelled_open_slippage
     return SyntheticBalance(
         starting_balance_usd=float(starting_balance_usd),
         closed_gross_pnl_usd=float(closed_gross),
@@ -412,6 +427,9 @@ def compute_synthetic_balance(
         trading_fees_total_usd=real_fees + modelled_open_fees,
         real_trading_fees_usd=real_fees,
         modelled_open_fees_usd=modelled_open_fees,
+        realized_slippage_usd=realized_slippage,
+        modelled_open_slippage_usd=modelled_open_slippage,
+        slippage_total_usd=slippage_total,
         unmarked_open_lots=unmarked,
         unmatched_sell_count=int(view["totals"].get("unmatched_sell_count", 0)),
     )
@@ -502,7 +520,8 @@ def realized_balance_series(
           = starting_balance_usd
           + closed_gross_pnl_usd(t)
           − llm_cost_total_usd(t)        # reset-aware
-          − trading_fees_total_usd(t)
+          − trading_fees_total_usd(t)    # regulatory (real/modelled)
+          − slippage_total_usd(t)        # modelled spread cost
 
     Open-lot P&L is intentionally NOT included — the curve is
     reconstructable exactly from logs, with no need to know historical
@@ -527,6 +546,7 @@ def realized_balance_series(
             "closed_gross_delta": float(c.get("gross_pnl_usd") or 0.0),
             "llm_delta": 0.0,
             "fees_delta": 0.0,
+            "slippage_delta": 0.0,
         })
     # LLM cost events (reset-aware via load_costs).
     for row in load_costs(limit=10**9):
@@ -535,18 +555,21 @@ def realized_balance_series(
             "closed_gross_delta": 0.0,
             "llm_delta": float(row.get("cost_usd") or 0.0),
             "fees_delta": 0.0,
+            "slippage_delta": 0.0,
         })
-    # Trading-fee events — each fill (buy or sell) lands its fee at
-    # filled_at. NOT reset-aware (real money).
+    # Trading-cost events — each fill (buy or sell) lands its fee +
+    # modelled slippage at filled_at. NOT reset-aware (real/modelled cost).
     for t in load_trades():
         fee = float(t.get("fees_usd") or 0.0)
-        if fee <= 0:
+        slip = float(t.get("slippage_usd") or 0.0)
+        if fee <= 0 and slip <= 0:
             continue
         events.append({
             "at": t.get("filled_at") or "",
             "closed_gross_delta": 0.0,
             "llm_delta": 0.0,
             "fees_delta": fee,
+            "slippage_delta": slip,
         })
     if not events:
         return []
@@ -556,18 +579,22 @@ def realized_balance_series(
     closed_gross = 0.0
     llm_total = 0.0
     fees_total = 0.0
+    slippage_total = 0.0
     for e in events:
         closed_gross += e["closed_gross_delta"]
         llm_total += e["llm_delta"]
         fees_total += e["fees_delta"]
+        slippage_total += e["slippage_delta"]
         out.append({
             "at": e["at"],
             "synthetic_realized_balance_usd": (
-                starting_balance_usd + closed_gross - llm_total - fees_total
+                starting_balance_usd + closed_gross
+                - llm_total - fees_total - slippage_total
             ),
             "closed_gross_pnl_usd": closed_gross,
             "llm_cost_total_usd": llm_total,
             "trading_fees_total_usd": fees_total,
+            "slippage_total_usd": slippage_total,
         })
     return out
 
@@ -615,6 +642,7 @@ def live_balance_tip(
         "open_gross_pnl_usd": synthetic_balance.open_gross_pnl_usd,
         "llm_cost_total_usd": synthetic_balance.llm_cost_total_usd,
         "trading_fees_total_usd": synthetic_balance.trading_fees_total_usd,
+        "slippage_total_usd": synthetic_balance.slippage_total_usd,
         "kind": "live",
     }
 
@@ -997,6 +1025,14 @@ def total_trading_fees_usd() -> float:
     return sum(float(r.get("fees_usd", 0.0) or 0.0) for r in load_trades())
 
 
+def total_slippage_usd() -> float:
+    """Sum slippage_usd across every fill in trades.jsonl. Modelled spread
+    cost (lib.alpaca_costs) — the dominant live friction, never reported by
+    Alpaca even on a funded account. $0 on legacy rows that predate the cost
+    model."""
+    return sum(float(r.get("slippage_usd", 0.0) or 0.0) for r in load_trades())
+
+
 def fees_by_month() -> list[dict]:
     """Return sorted list of {month: 'YYYY-MM', fees_usd, fills}.
 
@@ -1064,6 +1100,7 @@ def trades_pnl_view(marks: dict[str, float] | None = None) -> dict:
                 "closed_at": c.closed_at,
                 "gross_pnl_usd": c.gross_pnl_usd,
                 "fees_usd": c.fees_usd,
+                "slippage_usd": c.slippage_usd,
                 "llm_cost_usd": c.attributed_llm_cost_usd,
                 "net_pnl_usd": c.net_pnl_usd,
                 "buy_run_id": c.buy_run_id,
@@ -1080,6 +1117,7 @@ def trades_pnl_view(marks: dict[str, float] | None = None) -> dict:
                 "opened_at": o.opened_at,
                 "gross_pnl_usd": o.gross_pnl_usd,
                 "fees_usd": o.fees_usd,
+                "slippage_usd": o.slippage_usd,
                 "llm_cost_usd": o.attributed_llm_cost_usd,
                 "net_pnl_usd": o.net_pnl_usd,
                 "buy_run_id": o.buy_run_id,
@@ -1089,6 +1127,7 @@ def trades_pnl_view(marks: dict[str, float] | None = None) -> dict:
         "totals": {
             "realised_gross_usd": pnl.total_realised_gross_usd,
             "realised_fees_usd": pnl.total_realised_fees_usd,
+            "realised_slippage_usd": pnl.total_realised_slippage_usd,
             "realised_llm_cost_usd": pnl.total_realised_llm_cost_usd,
             "realised_net_usd": pnl.total_realised_net_usd,
             "closed_count": len(pnl.closed),

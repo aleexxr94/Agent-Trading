@@ -39,7 +39,14 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
-from . import state
+from . import alpaca_costs, state
+
+
+def _paper_cost_model_enabled() -> bool:
+    """Whether to inject modelled Alpaca costs onto fills (default on). Makes
+    paper Sharpe friction-honest; see lib.alpaca_costs / CLAUDE.md §Promotion to
+    live. Set PAPER_COST_MODEL=false to record raw (gross) fills instead."""
+    return os.environ.get("PAPER_COST_MODEL", "true").strip().lower() == "true"
 
 
 # Alpaca's activities API paginates with a hard max of 100 rows per page.
@@ -321,25 +328,46 @@ def sync_fills_from_alpaca(
         # explicitly the territory of the reconcile-fees pass flagged
         # for PR #58 / Phase 2.5.
         total_qty = sum(_to_float(r.get("qty")) for r in rows) or 0.0
+        model_costs = _paper_cost_model_enabled()
         for row in rows:
             aid = row.get("id")
             symbol = row.get("symbol") or ""
+            side = _normalize_side(row.get("side"))
             qty = _to_float(row.get("qty"))
+            price = _to_float(row.get("price"))
             if total_qty > 0 and order_fee_total > 0:
                 fee_share = order_fee_total * (qty / total_qty)
             else:
                 fee_share = 0.0
             if fee_share > 0:
                 fees_matched += 1
+            # Cost model: Alpaca paper reports $0 fees and never models
+            # slippage (not even live). When enabled, fill in modelled
+            # regulatory fees (only when the broker reported none — i.e.
+            # paper) and ALWAYS model slippage. fee_source records the
+            # provenance of fees_usd so live real fees are never overwritten.
+            fees_usd = fee_share
+            slippage_usd = 0.0
+            fee_source = "real" if fee_share > 0 else "none"
+            if model_costs:
+                m_fee, m_slip = alpaca_costs.fill_cost(
+                    side=side, symbol=symbol, shares=qty, price=price,
+                )
+                slippage_usd = m_slip
+                if fee_share <= 0:
+                    fees_usd = m_fee
+                    fee_source = "modelled"
             state.append_trade({
                 "activity_id": aid,
                 "alpaca_order_id": oid,
                 "symbol": symbol,
                 "kind": _normalize_kind(symbol),
-                "side": _normalize_side(row.get("side")),
+                "side": side,
                 "qty": qty,
-                "fill_price": _to_float(row.get("price")),
-                "fees_usd": fee_share,
+                "fill_price": price,
+                "fees_usd": fees_usd,
+                "slippage_usd": slippage_usd,
+                "fee_source": fee_source,
                 "filled_at": row.get("transaction_time") or "",
                 "run_id": order_id_to_run_id.get(oid),
             })
