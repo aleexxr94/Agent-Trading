@@ -34,28 +34,11 @@ client, and live Alpaca's real SEC/TAF fees populate ``fees_usd`` automatically
 """
 from __future__ import annotations
 
-import os
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
 from . import alpaca_costs, state
-
-
-def _paper_cost_model_enabled() -> bool:
-    """Whether to inject modelled Alpaca costs onto fills (default on). Makes
-    paper Sharpe friction-honest; see lib.alpaca_costs / CLAUDE.md §Promotion to
-    live. Set PAPER_COST_MODEL=false to record raw (gross) fills instead."""
-    return os.environ.get("PAPER_COST_MODEL", "true").strip().lower() == "true"
-
-
-def _is_paper_account() -> bool:
-    """True unless live trading is engaged. Modelled costs are PAPER-ONLY: a
-    live Alpaca account fills at real execution prices that already embed the
-    spread (so modelling slippage again would double-count) and reports real
-    regulatory fees via activities. Live is impossible unless
-    LIVE_TRADING_ENABLED=true (triple lock), so that flag is the gate."""
-    return os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() != "true"
 
 
 # Alpaca's activities API paginates with a hard max of 100 rows per page.
@@ -339,7 +322,7 @@ def sync_fills_from_alpaca(
         total_qty = sum(_to_float(r.get("qty")) for r in rows) or 0.0
         # Modelled costs are paper-only (live fills embed slippage in the
         # price and report real fees via activities).
-        model_costs = _paper_cost_model_enabled() and _is_paper_account()
+        model_costs = alpaca_costs.cost_model_active()
         # Finding 4: model the regulatory fee ONCE per order (sells only),
         # then split pro-rata across the order's (possibly partial) fills —
         # mirroring the real-fee path. Computing per-fill would re-apply the

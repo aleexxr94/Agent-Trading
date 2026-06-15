@@ -2452,3 +2452,45 @@ def test_synthetic_balance_exit_only_slippage_when_entry_logged(tmp_state):
     )
     exit_slip = pnl_lib.model_position_cost(pos).half_spread_usd
     assert sb.modelled_open_slippage_usd == pytest.approx(exit_slip)
+
+
+def test_open_projection_disabled_when_paper_cost_model_off(tmp_state, monkeypatch):
+    """Codex P2 (round 2): with PAPER_COST_MODEL=false the fill log is gross,
+    so the open-position projection must also contribute $0 — otherwise the
+    NAV is partly cost-netted while fills are gross."""
+    monkeypatch.setenv("PAPER_COST_MODEL", "false")
+    pos = {
+        "kind": "etf", "symbol": "TQQQ", "shares": 2,
+        "avg_cost": 80.0, "leverage_factor": 3.0, "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25}, "position_pct": 8.0,
+    }
+    sb = dd.compute_synthetic_balance(
+        marks={"TQQQ": 90.0}, portfolio={"positions": [pos]},
+        broker_costs={"TQQQ": 80.0}, held_keys=frozenset({"TQQQ"}),
+    )
+    assert sb.modelled_open_fees_usd == 0.0
+    assert sb.modelled_open_slippage_usd == 0.0
+
+
+def test_open_projection_charges_entry_slippage_for_unsynced_add(tmp_state):
+    """Codex P2 (round 2): a partial add to an already-logged symbol. Only 1 of
+    the 3 broker-held shares is in trades.jsonl, so entry slippage on the other
+    2 must be charged: total = exit(full) + entry(2/3) = (5/3)·exit_slip."""
+    from lib import pnl as pnl_lib
+    state.append_trade({
+        "activity_id": "b1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 80.0,
+        "fees_usd": 0.0, "slippage_usd": 0.02, "fee_source": "modelled",
+        "filled_at": "2026-06-01T13:00:00Z", "run_id": None,
+    })
+    pos = {
+        "kind": "etf", "symbol": "TQQQ", "shares": 3,
+        "avg_cost": 80.0, "leverage_factor": 3.0, "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25}, "position_pct": 8.0,
+    }
+    sb = dd.compute_synthetic_balance(
+        marks={"TQQQ": 90.0}, portfolio={"positions": [pos]},
+        broker_costs={"TQQQ": 80.0}, held_keys=frozenset({"TQQQ"}),
+    )
+    exit_slip = pnl_lib.model_position_cost(pos).half_spread_usd
+    assert sb.modelled_open_slippage_usd == pytest.approx(exit_slip * 5.0 / 3.0)

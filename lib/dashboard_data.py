@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import alpaca_costs
 from . import pnl as pnl_lib
 from . import state
 from . import universe as universe_lib
@@ -361,12 +362,18 @@ def compute_synthetic_balance(
     modelled_open_fees = 0.0       # Σ projected EXIT-leg fees (commission+reg)
     modelled_open_slippage = 0.0   # Σ projected EXIT-leg slippage
     unmarked = 0
-    # Symbols whose entry fill is already recorded in trades.jsonl (so their
-    # entry-leg cost is in realized_slippage_usd). For a broker-held position
-    # NOT in this set (sync lag / post-wipe / legacy lot), the entry leg is
-    # missing, so we add it to the projection below to avoid overstating the
-    # headline. Symbol-level approximation; self-corrects once the fill syncs.
-    logged_open_symbols = {o["symbol"] for o in view["open"]}
+    # Project open-position costs only when the cost model is active (same
+    # gate the fill injector uses, so PAPER_COST_MODEL=false / live disables
+    # both consistently — otherwise the NAV would be cost-netted while the
+    # fill log is gross).
+    project_costs = alpaca_costs.cost_model_active()
+    # Per-symbol open qty already recorded in trades.jsonl (its entry-leg cost
+    # is therefore in realized_slippage_usd). For broker qty in excess of this
+    # (an unsynced open or add: sync lag / post-wipe / legacy lot), the entry
+    # leg is missing, so we add it below. Self-corrects once the fill syncs.
+    logged_open_qty: dict[str, float] = {}
+    for o in view["open"]:
+        logged_open_qty[o["symbol"]] = logged_open_qty.get(o["symbol"], 0.0) + float(o["qty"])
     if portfolio is not None:
         open_subset, _ = split_positions_by_broker_holdings(
             portfolio, held_keys=held_keys,
@@ -403,17 +410,20 @@ def compute_synthetic_balance(
             # already lands in trades.jsonl at fill time (real_fees +
             # realized_slippage below), so charging a full round-trip
             # here would double-count the entry.
-            if held_keys is not None:
+            if held_keys is not None and project_costs:
                 cost = pnl_lib.model_position_cost(p)
                 modelled_open_fees += float(cost.commission_usd + cost.reg_fees_usd)
-                # Exit-leg slippage always; add the entry leg too when this
-                # position's fill isn't in trades.jsonl yet (its entry cost
-                # isn't captured in realized_slippage_usd, so charge it here).
+                # Exit-leg slippage on the full broker position, plus entry-leg
+                # slippage on any shares not yet logged in trades.jsonl (an
+                # unsynced open or add — its entry cost isn't in
+                # realized_slippage_usd yet). Match by quantity, not just symbol
+                # presence, so a partial add to an already-logged symbol is
+                # handled. Self-corrects as fills sync.
                 exit_slip = float(cost.half_spread_usd)
-                if p.get("symbol") not in logged_open_symbols:
-                    modelled_open_slippage += 2.0 * exit_slip   # entry + exit
-                else:
-                    modelled_open_slippage += exit_slip         # exit only
+                broker_qty = float(p.get("shares") or 0.0)
+                unlogged_qty = max(0.0, broker_qty - logged_open_qty.get(p.get("symbol"), 0.0))
+                per_share_slip = (exit_slip / broker_qty) if broker_qty > 0 else 0.0
+                modelled_open_slippage += exit_slip + per_share_slip * unlogged_qty
     else:
         # Legacy fallback: derive open_gross from trades.jsonl open
         # lots. Used by tests that exercise compute_synthetic_balance

@@ -70,6 +70,28 @@ SLIPPAGE_OVERRIDES: dict[str, float] = {
 BPS = 10_000
 
 
+def paper_cost_model_enabled() -> bool:
+    """Whether modelled costs are switched on (default true). Set
+    PAPER_COST_MODEL=false to record/show raw (gross) paper results."""
+    return os.environ.get("PAPER_COST_MODEL", "true").strip().lower() == "true"
+
+
+def is_paper_account() -> bool:
+    """True unless live trading is engaged. Modelled costs are PAPER-ONLY: a
+    live Alpaca account fills at real execution prices that already embed the
+    spread and reports real regulatory fees via activities. Live is impossible
+    unless LIVE_TRADING_ENABLED=true (triple lock), so that flag is the gate."""
+    return os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() != "true"
+
+
+def cost_model_active() -> bool:
+    """Single source of truth for whether modelled Alpaca costs apply right now:
+    the cost model is enabled AND the account is paper. Used by both the fill
+    injector (lib.trades_sync) and the open-position projection
+    (lib.dashboard_data) so they never diverge."""
+    return paper_cost_model_enabled() and is_paper_account()
+
+
 def ceil_to_cent(x: float) -> float:
     """Round UP to the nearest cent, the way regulatory fees are assessed."""
     if x <= 0:
