@@ -801,7 +801,7 @@ def test_synthetic_balance_partial_unmatched_sell(tmp_state):
 
 def test_synthetic_balance_hybrid_fees_paper_etf_no_real(tmp_state):
     """On Alpaca paper ETFs, real fees are \$0. The hybrid fees model
-    surfaces the modelled IBKR-Pro round-trip estimate as the
+    surfaces the modelled round-trip estimate (conservative retail friction) as the
     headline fees so the synthetic balance reflects what the
     per-position table already shows. Without this fix the operator
     sees "$0.00 fees" in the breakdown despite per-row Fees showing

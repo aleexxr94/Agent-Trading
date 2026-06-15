@@ -27,8 +27,10 @@ parent order. Fills with no map entry land with ``run_id=None`` so
 attribution (manual / out-of-band trades).
 
 This is the only module besides ``lib.alpaca_client`` that imports
-alpaca-py — the IBKR swap path (CLAUDE.md §Critical preconditions #2)
-stays a one-file change with analogous helpers behind the same signature.
+alpaca-py. The live broker is Alpaca (CLAUDE.md §Critical preconditions #2),
+so going live needs no change here — live fills sync through the same Alpaca
+client, and live Alpaca's real SEC/TAF fees populate ``fees_usd`` automatically
+(paper reports $0).
 """
 from __future__ import annotations
 
