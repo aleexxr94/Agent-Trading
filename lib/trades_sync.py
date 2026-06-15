@@ -49,6 +49,15 @@ def _paper_cost_model_enabled() -> bool:
     return os.environ.get("PAPER_COST_MODEL", "true").strip().lower() == "true"
 
 
+def _is_paper_account() -> bool:
+    """True unless live trading is engaged. Modelled costs are PAPER-ONLY: a
+    live Alpaca account fills at real execution prices that already embed the
+    spread (so modelling slippage again would double-count) and reports real
+    regulatory fees via activities. Live is impossible unless
+    LIVE_TRADING_ENABLED=true (triple lock), so that flag is the gate."""
+    return os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() != "true"
+
+
 # Alpaca's activities API paginates with a hard max of 100 rows per page.
 # We loop until a page returns fewer than this OR until we see no new IDs,
 # whichever comes first. The cap below is a safety rail against an upstream
@@ -328,7 +337,23 @@ def sync_fills_from_alpaca(
         # explicitly the territory of the reconcile-fees pass flagged
         # for PR #58 / Phase 2.5.
         total_qty = sum(_to_float(r.get("qty")) for r in rows) or 0.0
-        model_costs = _paper_cost_model_enabled()
+        # Modelled costs are paper-only (live fills embed slippage in the
+        # price and report real fees via activities).
+        model_costs = _paper_cost_model_enabled() and _is_paper_account()
+        # Finding 4: model the regulatory fee ONCE per order (sells only),
+        # then split pro-rata across the order's (possibly partial) fills —
+        # mirroring the real-fee path. Computing per-fill would re-apply the
+        # SEC/TAF cent-rounding + per-trade cap on every partial and overcharge.
+        order_modelled_fee = 0.0
+        if model_costs and order_fee_total <= 0 and rows:
+            order_side = _normalize_side(rows[0].get("side"))
+            if order_side == "sell":
+                order_notional = sum(
+                    _to_float(r.get("qty")) * _to_float(r.get("price")) for r in rows
+                )
+                order_modelled_fee = alpaca_costs.regulatory_sell_fee(
+                    sell_notional=order_notional, shares_sold=total_qty,
+                )
         for row in rows:
             aid = row.get("id")
             symbol = row.get("symbol") or ""
@@ -341,22 +366,22 @@ def sync_fills_from_alpaca(
                 fee_share = 0.0
             if fee_share > 0:
                 fees_matched += 1
-            # Cost model: Alpaca paper reports $0 fees and never models
-            # slippage (not even live). When enabled, fill in modelled
-            # regulatory fees (only when the broker reported none — i.e.
-            # paper) and ALWAYS model slippage. fee_source records the
-            # provenance of fees_usd so live real fees are never overwritten.
+            # fees_usd provenance: real broker fee if Alpaca reported one
+            # (live), else the modelled order-level fee split by qty (paper),
+            # else $0. Slippage is modelled per fill (linear in notional, so
+            # no rounding/cap concern) and paper-only.
             fees_usd = fee_share
             slippage_usd = 0.0
             fee_source = "real" if fee_share > 0 else "none"
-            if model_costs:
-                m_fee, m_slip = alpaca_costs.fill_cost(
-                    side=side, symbol=symbol, shares=qty, price=price,
+            if model_costs and fee_share <= 0:
+                fees_usd = (
+                    order_modelled_fee * (qty / total_qty) if total_qty > 0 else 0.0
                 )
-                slippage_usd = m_slip
-                if fee_share <= 0:
-                    fees_usd = m_fee
-                    fee_source = "modelled"
+                fee_source = "modelled"
+            if model_costs:
+                slippage_usd = alpaca_costs.slippage_cost(
+                    symbol=symbol, notional=qty * price,
+                )
             state.append_trade({
                 "activity_id": aid,
                 "alpaca_order_id": oid,

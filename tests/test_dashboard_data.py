@@ -2386,3 +2386,69 @@ def test_readiness_scorecard_with_long_profitable_history(tmp_state):
     assert by_name["Continuous paper running"]["met"] is True
     assert by_name["Sharpe (rf=0, EOD synthetic NAV)"]["met"] is True
     assert by_name["Max drawdown"]["met"] is True
+
+
+# ---------- Codex P2: slippage in risk NAV + unlogged-entry handling ----------
+
+
+def test_realized_synthetic_nav_subtracts_slippage(tmp_state):
+    """Codex P2: the sizing NAV + drawdown breaker (via _risk_nav_from) must
+    net slippage, not just fees — otherwise orders size against inflated
+    equity. A flat round-trip with fees + slippage drops the NAV by both."""
+    state.append_trade({
+        "activity_id": "b1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 10, "fill_price": 50.0,
+        "fees_usd": 0.0, "slippage_usd": 0.10, "fee_source": "modelled",
+        "filled_at": "2026-06-01T13:00:00Z", "run_id": None,
+    })
+    state.append_trade({
+        "activity_id": "s1", "alpaca_order_id": "o2", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 10, "fill_price": 50.0,
+        "fees_usd": 0.12, "slippage_usd": 0.11, "fee_source": "modelled",
+        "filled_at": "2026-06-02T13:00:00Z", "run_id": None,
+    })
+    # Flat round-trip → gross 0. NAV = 2500 − fees(0.12) − slippage(0.21).
+    nav = dd.realized_synthetic_nav()
+    assert nav == pytest.approx(2500.0 - 0.12 - 0.21)
+
+
+def test_synthetic_balance_charges_entry_slippage_for_unlogged_position(tmp_state):
+    """Codex P2: a broker-held position whose entry fill isn't in trades.jsonl
+    yet must still be charged the entry-leg slippage (not exit-only), else the
+    headline overstates. trades.jsonl is empty here, so the open TQQQ gets
+    entry+exit slippage = 2× the exit leg."""
+    from lib import pnl as pnl_lib
+    pos = {
+        "kind": "etf", "symbol": "TQQQ", "shares": 2,
+        "avg_cost": 80.0, "leverage_factor": 3.0, "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25}, "position_pct": 8.0,
+    }
+    sb = dd.compute_synthetic_balance(
+        marks={"TQQQ": 90.0}, portfolio={"positions": [pos]},
+        broker_costs={"TQQQ": 80.0}, held_keys=frozenset({"TQQQ"}),
+    )
+    exit_slip = pnl_lib.model_position_cost(pos).half_spread_usd
+    assert sb.modelled_open_slippage_usd == pytest.approx(2.0 * exit_slip)
+
+
+def test_synthetic_balance_exit_only_slippage_when_entry_logged(tmp_state):
+    """Counterpart: once the entry fill is in trades.jsonl, only the exit leg
+    is projected (entry is already in realized_slippage), so no double-count."""
+    from lib import pnl as pnl_lib
+    state.append_trade({
+        "activity_id": "b1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 2, "fill_price": 80.0,
+        "fees_usd": 0.0, "slippage_usd": 0.03, "fee_source": "modelled",
+        "filled_at": "2026-06-01T13:00:00Z", "run_id": None,
+    })
+    pos = {
+        "kind": "etf", "symbol": "TQQQ", "shares": 2,
+        "avg_cost": 80.0, "leverage_factor": 3.0, "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25}, "position_pct": 8.0,
+    }
+    sb = dd.compute_synthetic_balance(
+        marks={"TQQQ": 90.0}, portfolio={"positions": [pos]},
+        broker_costs={"TQQQ": 80.0}, held_keys=frozenset({"TQQQ"}),
+    )
+    exit_slip = pnl_lib.model_position_cost(pos).half_spread_usd
+    assert sb.modelled_open_slippage_usd == pytest.approx(exit_slip)

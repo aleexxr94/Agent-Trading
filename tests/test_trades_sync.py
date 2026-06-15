@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from lib import state, trades_sync
+from lib import alpaca_costs, state, trades_sync
 
 
 class _Alpaca404(Exception):
@@ -147,6 +147,42 @@ def test_sync_paper_cost_model_can_be_disabled(tmp_state, monkeypatch):
     assert r["fees_usd"] == 0.0
     assert r["slippage_usd"] == 0.0
     assert r["fee_source"] == "none"
+
+
+def test_sync_does_not_model_costs_on_live_account(tmp_state, monkeypatch):
+    """Codex P2: live fills embed slippage in the price and report real fees,
+    so modelled costs must be PAPER-ONLY. With LIVE_TRADING_ENABLED=true a
+    fill with no real fee activity gets $0 modelled cost."""
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    tc = _FakeTrading(responses={"/account/activities/FILL": [
+        _fill(side="sell", qty="500", price="20.00"),
+    ]})
+    trades_sync.sync_fills_from_alpaca(trading_client=tc)
+    r = state.read_trades()[0]
+    assert r["slippage_usd"] == 0.0
+    assert r["fees_usd"] == 0.0
+    assert r["fee_source"] == "none"
+
+
+def test_sync_models_paper_fee_once_per_order_across_partials(tmp_state):
+    """Codex P2: a paper sell that fills as multiple partials must be charged
+    the order-level regulatory fee ONCE (split pro-rata), not re-rounded per
+    partial. Two 250-share partials of one 500-share order @ $20 → total
+    modelled fee == regulatory_sell_fee($10k, 500), not 2× the per-partial
+    ceil-rounded amount."""
+    tc = _FakeTrading(responses={"/account/activities/FILL": [
+        _fill(activity_id="f1", order_id="ord-X", side="sell", qty="250", price="20.00"),
+        _fill(activity_id="f2", order_id="ord-X", side="sell", qty="250", price="20.00"),
+    ]})
+    trades_sync.sync_fills_from_alpaca(trading_client=tc)
+    rows = state.read_trades()
+    assert len(rows) == 2
+    total_modelled_fee = sum(r["fees_usd"] for r in rows)
+    expected = alpaca_costs.regulatory_sell_fee(sell_notional=10_000.0, shares_sold=500)
+    assert total_modelled_fee == pytest.approx(expected)
+    # Strictly less than charging each partial its own ceil-rounded fee.
+    per_partial = 2 * alpaca_costs.regulatory_sell_fee(sell_notional=5_000.0, shares_sold=250)
+    assert total_modelled_fee < per_partial
 
 
 def test_sync_folds_fee_into_etf_fill(tmp_state):

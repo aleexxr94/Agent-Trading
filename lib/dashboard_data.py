@@ -361,6 +361,12 @@ def compute_synthetic_balance(
     modelled_open_fees = 0.0       # Σ projected EXIT-leg fees (commission+reg)
     modelled_open_slippage = 0.0   # Σ projected EXIT-leg slippage
     unmarked = 0
+    # Symbols whose entry fill is already recorded in trades.jsonl (so their
+    # entry-leg cost is in realized_slippage_usd). For a broker-held position
+    # NOT in this set (sync lag / post-wipe / legacy lot), the entry leg is
+    # missing, so we add it to the projection below to avoid overstating the
+    # headline. Symbol-level approximation; self-corrects once the fill syncs.
+    logged_open_symbols = {o["symbol"] for o in view["open"]}
     if portfolio is not None:
         open_subset, _ = split_positions_by_broker_holdings(
             portfolio, held_keys=held_keys,
@@ -400,7 +406,14 @@ def compute_synthetic_balance(
             if held_keys is not None:
                 cost = pnl_lib.model_position_cost(p)
                 modelled_open_fees += float(cost.commission_usd + cost.reg_fees_usd)
-                modelled_open_slippage += float(cost.half_spread_usd)
+                # Exit-leg slippage always; add the entry leg too when this
+                # position's fill isn't in trades.jsonl yet (its entry cost
+                # isn't captured in realized_slippage_usd, so charge it here).
+                exit_slip = float(cost.half_spread_usd)
+                if p.get("symbol") not in logged_open_symbols:
+                    modelled_open_slippage += 2.0 * exit_slip   # entry + exit
+                else:
+                    modelled_open_slippage += exit_slip         # exit only
     else:
         # Legacy fallback: derive open_gross from trades.jsonl open
         # lots. Used by tests that exercise compute_synthetic_balance
@@ -477,6 +490,7 @@ def _risk_nav_from(sb: "SyntheticBalance") -> float:
         + sb.open_gross_pnl_usd
         - _raw_llm_cost_total_usd()
         - sb.trading_fees_total_usd
+        - sb.slippage_total_usd
     )
 
 
