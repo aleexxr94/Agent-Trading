@@ -214,7 +214,7 @@ Most cycles run the full pipeline (a **trade** cycle). The meta-scheduler can in
 - **Cost caps**: per-run **$3**, daily **$12**. Cleanly aborts between stages if hit.
 - **Market gate**: a **trade** cycle queries Alpaca's clock before any LLM work. Closed market → no LLM calls billed, no orders submitted, exits cleanly with a `next_run_at` pointing at the broker-reported next open. (A **review** cycle deliberately skips the gate — it's meant to run after close — so it still bills ~$0.05 for signals + strategist + meta, but never submits orders.)
 - **Post-construct sanity rules** (`lib/sanity.py`, runs after every cycle, zero LLM cost). **Non-blocking by default** — set `SANITY_BLOCK_ON_FAIL=true` to hard-skip `stage_execute` on `fail` status (the `entry_cap_on_adds` rule hard-skips regardless).
-- **Modelled trading costs** (`lib/pnl.py`): an IBKR-Pro-calibrated cost estimate — half-spread, commission, SEC fee, FINRA TAF — is computed each cycle and logged to `nav_history.jsonl` as `modelled_costs_usd`. **Caveat (not yet wired into the displayed performance):** the equity curve and the SPY/Sharpe comparison use `realized_balance_series()` (`lib/dashboard_data.py`), which subtracts only realized Alpaca fill fees (≈$0 on paper) and LLM cost — not the modelled IBKR costs. So the paper Sharpe shown today is **not** friction-adjusted for the live-broker cost model; the modelled figure is captured in state but still needs to be plumbed into the promote-to-live Sharpe before that gate can be trusted as friction-adjusted.
+- **Modelled trading costs** (`lib/pnl.py`): a conservative retail-friction estimate — half-spread, commission, SEC fee, FINRA TAF — is computed each cycle and logged to `nav_history.jsonl` as `modelled_costs_usd`. The commission leg is a deliberately conservative floor (Alpaca live is commission-free, so this over-estimates Alpaca's actual cost). **Caveat (not yet wired into the displayed performance):** the equity curve and the SPY/Sharpe comparison use `realized_balance_series()` (`lib/dashboard_data.py`), which subtracts only realized Alpaca fill fees (≈$0 on paper) and LLM cost — not the modelled costs. So the paper Sharpe shown today is **not** friction-adjusted; the modelled figure is captured in state but still needs to be plumbed into the promote-to-live Sharpe before that gate can be trusted as friction-adjusted. A follow-up cost-accuracy task adds Alpaca-exact slippage + SEC/TAF netting.
 - **Order safety invariant** (`lib/orders._plan_for_symbol`): orders never cross zero in a single ticket. Going from long to short on a symbol is split into close + open. The long-only schema never triggers it today, but the invariant is defensive against future short-enabling changes.
 
 ### Strategy in one paragraph
@@ -411,7 +411,7 @@ The `bin/analyze_runs.py` helper joins the per-run artifacts into a cycle-by-cyc
 - `state/` is gitignored — runtime artifacts only.
 - All schemas under `schemas/` are validated on every write. Schema-failed agent outputs retry once with the validation error fed back; second failure aborts the run.
 - Conventional commits. Open a PR against `main`; do not push to `main` directly.
-- `lib/broker.py` is the only abstraction layer over the broker — swapping to IBKR is a one-file change behind that interface.
+- `lib/broker.py` is the only abstraction layer over the broker — the live broker is Alpaca via `lib/alpaca_client.py`; the interface is retained so an alternative broker could be added behind it later if ever needed.
 
 ---
 
@@ -423,7 +423,7 @@ Live trading is gated by a triple lock and is intentionally not buildable from t
 2. `LIVE_VERSION = 0` constant in `lib/live_gate.py` — must be bumped in code. The shared `assert_live_gate()` guard (called by both `orchestrator.py` and `monitor.py`) refuses to run if the env var is set while the version is still 0.
 3. `lib/alpaca_client.py` refuses to construct against a non-paper base URL unless both gates are satisfied.
 
-The full set of pre-conditions (≥ 4 weeks paper, Sharpe ≥ 0.5, max DD ≤ 25%, IBKR client implemented for UK suitability) is documented in [CLAUDE.md §Promotion to live](./CLAUDE.md#promotion-to-live-documented-only--do-not-enable-in-code).
+The full set of pre-conditions (≥ 4 weeks paper, Sharpe ≥ 0.5, max DD ≤ 25%, Alpaca live eligibility confirmed for UK ETF trading — no new broker client required) is documented in [CLAUDE.md §Promotion to live](./CLAUDE.md#promotion-to-live-documented-only--do-not-enable-in-code).
 
 ---
 

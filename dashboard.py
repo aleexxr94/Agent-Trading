@@ -1107,9 +1107,9 @@ with tabs[0]:
                     "Fees",
                     format="$%,.2f",
                     help="Modelled round-trip broker costs for this "
-                         "position (IBKR Pro retail): entry-leg spread + "
-                         "commission already paid, plus projected close. "
-                         "Net P&L = Gross P&L − Fees.",
+                         "position (conservative retail estimate): entry-leg "
+                         "spread + commission already paid, plus projected "
+                         "close. Net P&L = Gross P&L − Fees.",
                 ),
                 "Gross P&L": st.column_config.NumberColumn("Gross P&L", format="$%+,.2f"),
                 "Net P&L":   st.column_config.NumberColumn("Net P&L",  format="$%+,.2f"),
@@ -1476,8 +1476,9 @@ with tabs[3]:
         "'Reset ALL LLM costs' button bumps the synthetic balance upward "
         "by the historical attribution). Trading fees combine real "
         "broker fees on closed trades (from `state/trades.jsonl`; \\$0 "
-        "on Alpaca paper ETFs) with the IBKR-Pro round-trip estimate "
-        "on currently-open positions — same source the positions "
+        "on Alpaca paper ETFs) with the modelled round-trip estimate "
+        "(conservative retail friction) on currently-open positions "
+        "— same source the positions "
         "table's per-row Fees column uses. Real fees never reset; "
         "modelled fees taper as positions close."
     )

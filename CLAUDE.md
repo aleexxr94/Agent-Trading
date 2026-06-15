@@ -7,7 +7,7 @@ You are a senior quant systems engineer. Build a complete, **paper-trading-only*
 
 ## Critical preconditions (read and confirm before writing any code)
 1. **Paper trading only** until I explicitly promote it via the criteria in §11. Live mode must be gated behind both an env var and a hard-coded version flag. Do not build a UI button that toggles live.
-2. **I am UK-based.** Alpaca **paper** is fine. Alpaca **live** brokerage is not available to UK retail. Do not assume live USD funding via Alpaca will ever happen. Add a TODO and an interface seam in `lib/broker.py` so the broker can be swapped to IBKR later without rewriting the orchestrator.
+2. **I am UK-based.** Alpaca **paper** is fine. Alpaca **live** brokerage **is** available to UK retail for US-listed ETFs (verified 2026-06-15): a UK resident can open a USD-funded live Alpaca brokerage account and trade the ETF universe. Caveats that do not block trading: it is a cross-border US broker (not FCA-authorised, so no FSCS protection on that entity), there is no GBP-denominated account or ISA wrapper, and funding is USD-only (a one-off GBP→USD FX conversion cost applies on deposit, not per-trade). Therefore the **planned live broker is Alpaca itself**, via the existing `lib/alpaca_client.py` gated behind the triple lock — **not** a future IBKR swap. The `lib/broker.py` interface is retained purely for optionality (an alternative broker could be added behind it later), but no IBKR client is planned. (Historical note: the original spec assumed Alpaca live was closed to UK retail and mandated an IBKR swap; that assumption was wrong/outdated and was corrected on 2026-06-15.)
 3. **Account size:** $2,500 paper (all sizing in USD). Every sizing calculation must respect this. The orchestrator must be willing to hold cash if conviction is insufficient — do not force-fill 10 slots.
 4. **Environment / runtime:** **Linux VPS + systemd is the sole supported production runtime.** Schedule the orchestrator and monitor with the systemd services/timers under `deploy/` (idempotent `install.sh`, service+timer units, the `agent-scheduler.service` dynamic-cadence daemon, Tailscale phone access) on an Ubuntu 24.04 box that doesn't sleep. Use a project-local `.venv` (Python 3.11+; 3.12 on Ubuntu 24.04). Do not use Claude Code Routines for production runtime. **Windows 10/11 + Windows Task Scheduler is no longer a supported runtime** — do not add or maintain Windows Task Scheduler XML, PowerShell wrappers, or Windows runtime docs unless I explicitly request Windows support in the future. Any lingering Windows references are obsolete history, not setup guidance. (Historical note: the original build targeted Windows Task Scheduler; that path was removed in favour of the Linux VPS path.)
 5. **Runtime architecture:** local Python service on the VPS calling the **Anthropic API directly** with prompt caching. **Claude Code is for development only, not runtime execution.** Pro-plan usage limits make routine-driven production execution unreliable.
@@ -124,7 +124,7 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
 │   ├── sanity.schema.json
 │   └── decision_log.schema.json
 ├── lib/
-│   ├── broker.py               # interface; Alpaca impl behind it (IBKR TODO)
+│   ├── broker.py               # broker interface; Alpaca impl behind it (live path is Alpaca; interface retained for optional future brokers)
 │   ├── alpaca_client.py        # AlpacaBroker — implements get_clock for market_gate
 │   ├── market_gate.py          # v2 stage 0 — Alpaca clock short-circuit
 │   ├── signals.py              # v2 stage 1 — deterministic feature generator
@@ -223,7 +223,7 @@ All of:
 - Sharpe ≥ 0.5 on paper after modelled costs (sanity floor, not a target).
 - Max drawdown ≤ 25% on paper.
 - No unresolved schema-validation failures or unhandled exceptions in last 7 days.
-- I confirm a UK-suitable broker (likely IBKR) and a new `lib/ibkr_client.py` is implemented behind the existing broker interface.
+- I confirm Alpaca live eligibility for my account (UK ETF trading, USD funding). **No new broker client is required** — the existing `lib/alpaca_client.py` is the live broker, gated behind the triple lock.
 - `LIVE_TRADING_ENABLED=true` env var **and** a hard-coded `LIVE_VERSION` constant bumped in code.
 
 ### Paper → live code change map (reference only — keep the triple lock engaged)
@@ -242,20 +242,17 @@ checkout — the triple lock is designed to fail closed at every layer.
      `lib/alpaca_client.py:61` independently refuses to construct a non-paper
      client unless `LIVE_TRADING_ENABLED=true`.
 
-2. **Broker.** UK retail **cannot** trade Alpaca live (precondition §2), so "going live" in
-   practice means a new **`lib/ibkr_client.py:IBKRBroker(Broker)`** behind the existing seam
-   (`lib/broker.py`), not flipping `ALPACA_BASE_URL` to `https://api.alpaca.markets`.
-   - Implement the 6 abstract members: the `name` property plus `get_account`, `get_positions`,
-     `submit_order`, `cancel_all`, `flatten` — omitting any one (incl. `name`) leaves the class
-     abstract and un-instantiable behind `_try_load_broker()`.
-   - Override the optional `get_clock` method used by market_gate (default returns `None`, which
-     silently degrades the market gate — must be real). (The former option-data methods —
-     `option_contract_tradable`, `get_option_quote`, `get_underlying_price` — were removed with
-     options; ETF price stops use the ETF's own mark, so no underlying-price fetch is needed.)
-   - Map IBKR responses onto the existing dataclasses (`Account`, `BrokerPosition`,
-     `OrderRequest`, `OrderResult`, `MarketClock`); keep `is_paper=False`.
-   - Point `_try_load_broker()` at `IBKRBroker` (a ~5-line glue change), and add the live
-     credential env vars to `.env.example`.
+2. **Broker.** Alpaca live **is** available to UK retail for ETFs (precondition §2), so "going
+   live" means pointing the **existing** `AlpacaBroker` at the live endpoint — **no new broker
+   client is needed**.
+   - Set `ALPACA_BASE_URL=https://api.alpaca.markets` (the same `ALPACA_API_KEY` /
+     `ALPACA_API_SECRET` env vars are reused — these are live USD-funded keys, not paper keys).
+   - `lib/alpaca_client.py` already constructs a non-paper client once `LIVE_TRADING_ENABLED=true`
+     (it refuses otherwise), and `get_clock` / `get_account` / `get_positions` / `submit_order` /
+     `cancel_all` / `flatten` all work unchanged against the live account. `_try_load_broker()`
+     needs no change — it already loads `AlpacaBroker`.
+   - `is_paper` flips to `False` automatically because the base URL is no longer the paper URL
+     (`lib/alpaca_client.py`), which drives the dashboard PAPER→LIVE pill.
 
 3. **Sizing — replace the synthetic NAV pin (code change, not config).** Paper sizing is pinned to
    a synthetic balance (`VIRTUAL_NAV_USD=2500` + realized P&L, never the broker's $100k paper
@@ -266,13 +263,15 @@ checkout — the triple lock is designed to fail closed at every layer.
    `_account_nav` / `synthetic_base_usd` to read the live broker's `Account.equity_usd`, then
    re-verifying the 15% per-position cap and adaptive-cap math against real equity.
 
-4. **Costs / fills (also an Alpaca-only seam).** `lib/trades_sync.py:sync_fills_from_alpaca` is
-   called at `orchestrator.py:363-364` (pre-cooldown) and `1021-1022` (post-execute) with
-   `getattr(ctx.broker, "_client", None)`. With an `IBKRBroker` that attribute is `None`, so it
-   constructs an **Alpaca** client instead; the caught failure means **live fills/fees never reach
-   `trades.jsonl`**, silently breaking cooldown, P&L, and the Sharpe gate. A live swap must add an
-   IBKR fill-sync path here. Live also needs the broker's real commission / SEC / regulatory fee
-   schedule, or P&L and Sharpe will be overstated.
+4. **Costs / fills.** `lib/trades_sync.py:sync_fills_from_alpaca` is called at
+   `orchestrator.py:363-364` (pre-cooldown) and `1021-1022` (post-execute) with
+   `getattr(ctx.broker, "_client", None)`. Because the live broker **is** Alpaca, this works
+   unchanged — the live `AlpacaBroker` exposes `_client`, so live fills sync into `trades.jsonl`
+   just like paper, and live Alpaca's **real SEC/TAF fees populate `fees_usd` automatically**
+   (paper reports $0). No new fill-sync path is required. The one remaining gap is that paper does
+   not model slippage/spread, so paper Sharpe is gross of that cost — see the separate cost-accuracy
+   task (slippage + SEC/TAF netting) for making paper Sharpe friction-honest before the Sharpe gate
+   is trusted.
 
 5. **Order gate.** `ORDERS_ENABLED=true` must already have been validated on paper (it is the
    same switch live uses to actually submit). Confirm it has run cleanly on paper first.

@@ -1,12 +1,12 @@
 """Broker interface — the only place orchestrator.py talks to a broker.
 
-Concrete implementation lives in lib/alpaca_client.py. This indirection is
-deliberate: spec §Critical preconditions #2 mandates that swapping to IBKR
-later is a one-file change.
-
-TODO(ibkr): implement lib/ibkr_client.py:IBKRBroker(Broker) when the user
-confirms a UK-suitable broker for live trading. Do not implement live
-trading until §Promotion to live in CLAUDE.md is satisfied.
+Concrete implementation lives in lib/alpaca_client.py. The planned live broker
+is Alpaca itself (Alpaca live is available to UK retail for ETFs — spec
+§Critical preconditions #2), enabled by pointing ALPACA_BASE_URL at the live
+endpoint and releasing the triple lock in lib/live_gate.py. This interface is
+retained for optionality only — an alternative broker could be added behind it
+later — but no separate broker client is planned. Do not enable live trading
+until §Promotion to live in CLAUDE.md is satisfied.
 """
 from __future__ import annotations
 

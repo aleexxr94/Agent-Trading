@@ -222,7 +222,8 @@ class SyntheticBalance:
 
             trading_fees_total_usd
               = real_trading_fees_usd        # closed-side real broker fees
-              + modelled_open_fees_usd       # IBKR-Pro round-trip estimate
+              + modelled_open_fees_usd       # modelled round-trip estimate
+                                             #   (conservative retail friction)
                                              #   for currently-open positions
 
         Rationale: Alpaca paper reports \$0 fees on equity fills
@@ -321,8 +322,8 @@ def compute_synthetic_balance(
     - ``llm_cost_total_usd`` is the all-time, reset-aware sum from
       ``costs.jsonl``.
     - ``trading_fees_total_usd`` is HYBRID: real broker fees on closed
-      trades (from trades.jsonl) PLUS modelled IBKR-Pro round-trip
-      estimate on currently-open positions (from
+      trades (from trades.jsonl) PLUS modelled round-trip estimate
+      (conservative retail friction) on currently-open positions (from
       ``compute_position_pnl``). See ``SyntheticBalance`` docstring
       for rationale. The two components are surfaced separately on
       the dataclass as ``real_trading_fees_usd`` /
