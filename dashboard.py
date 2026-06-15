@@ -644,7 +644,7 @@ breakdown_html = (
     f"<span style='color: var(--text-2);'>−</span> "
     f"${_synth_live.llm_cost_total_usd:,.2f} LLM "
     f"<span style='color: var(--text-2);'>−</span> "
-    f"${_synth_live.trading_fees_total_usd:,.2f} fees"
+    f"${_synth_live.trading_fees_total_usd + _synth_live.slippage_total_usd:,.2f} costs"
 )
 # Build the conditional sub-line block as a SINGLE concatenated
 # string. Each line is included only when its data is non-empty.
@@ -1106,10 +1106,11 @@ with tabs[0]:
                 "Fees":      st.column_config.NumberColumn(
                     "Fees",
                     format="$%,.2f",
-                    help="Modelled round-trip broker costs for this "
-                         "position (conservative retail estimate): entry-leg "
-                         "spread + commission already paid, plus projected "
-                         "close. Net P&L = Gross P&L − Fees.",
+                    help="Modelled round-trip Alpaca cost for this position "
+                         "(lib/alpaca_costs.py): entry-leg slippage already "
+                         "paid, plus projected close (slippage + sell-side "
+                         "SEC/FINRA fees). Commission is $0. "
+                         "Net P&L = Gross P&L − Fees.",
                 ),
                 "Gross P&L": st.column_config.NumberColumn("Gross P&L", format="$%+,.2f"),
                 "Net P&L":   st.column_config.NumberColumn("Net P&L",  format="$%+,.2f"),
@@ -1447,11 +1448,11 @@ with tabs[3]:
     )
     row2[1].markdown(
         _stat_card(
-            "Trading fees",
-            f"${_synth.trading_fees_total_usd:,.2f}",
+            "Trading costs",
+            f"${_synth.trading_fees_total_usd + _synth.slippage_total_usd:,.2f}",
             sub=(
-                f"${_synth.real_trading_fees_usd:,.2f} real (closed) "
-                f"+ ${_synth.modelled_open_fees_usd:,.2f} modelled (open)"
+                f"${_synth.trading_fees_total_usd:,.2f} fees "
+                f"+ ${_synth.slippage_total_usd:,.2f} slippage (modelled Alpaca)"
             ),
         ),
         unsafe_allow_html=True,
@@ -1461,7 +1462,7 @@ with tabs[3]:
             "Synthetic balance",
             f"${_synth.synthetic_balance_usd:,.2f}",
             tone=_tone_for(_synth.synthetic_balance_usd - _synth.starting_balance_usd),
-            sub="= start + closed + open − LLM − fees",
+            sub="= start + closed + open − LLM − fees − slippage",
         ),
         unsafe_allow_html=True,
     )
@@ -1474,13 +1475,13 @@ with tabs[3]:
     st.caption(
         marks_status + " LLM cost is reset-aware (the Settings tab "
         "'Reset ALL LLM costs' button bumps the synthetic balance upward "
-        "by the historical attribution). Trading fees combine real "
-        "broker fees on closed trades (from `state/trades.jsonl`; \\$0 "
-        "on Alpaca paper ETFs) with the modelled round-trip estimate "
-        "(conservative retail friction) on currently-open positions "
-        "— same source the positions "
-        "table's per-row Fees column uses. Real fees never reset; "
-        "modelled fees taper as positions close."
+        "by the historical attribution). Trading costs are modelled on the "
+        "**Alpaca** live schedule (lib/alpaca_costs.py): sell-side SEC/FINRA "
+        "fees (real on live, modelled on paper) plus per-side slippage — the "
+        "dominant friction, which Alpaca never reports even live. Both are "
+        "subtracted from the synthetic balance and the equity curve, so paper "
+        "Sharpe is friction-honest. Commission is \\$0; margin/borrow are \\$0 "
+        "(cash, long-only)."
     )
 
     st.markdown('<div class="at-section-label">Portfolio balance over time</div>',
@@ -1652,7 +1653,8 @@ with tabs[3]:
                     f"${_fnum(r['synthetic_realized_balance_usd']):,.2f}"
                     f"<br>Closed gross: ${_fnum(r['closed_gross_pnl_usd']):,.2f}"
                     f"<br>LLM: −${_fnum(r['llm_cost_total_usd']):,.2f}"
-                    f"<br>Real fees: −${_fnum(r['trading_fees_total_usd']):,.2f}"
+                    f"<br>Fees: −${_fnum(r['trading_fees_total_usd']):,.2f}"
+                    f"<br>Slippage: −${_fnum(r.get('slippage_total_usd', 0.0)):,.2f}"
                 )
                 for _, r in nav_df.iterrows()
             ]
@@ -1663,6 +1665,8 @@ with tabs[3]:
                 f"<br>LLM: −${_fnum(live_tip['llm_cost_total_usd']):,.4f}"
                 f"<br>Fees (real + modelled): −"
                 f"${_fnum(live_tip['trading_fees_total_usd']):,.2f}"
+                f"<br>Slippage (modelled): −"
+                f"${_fnum(live_tip.get('slippage_total_usd', 0.0)):,.2f}"
             )
             _render_balance_chart(
                 xs=xs, ys=ys, hover_texts=hover_texts,
@@ -1670,9 +1674,9 @@ with tabs[3]:
                 caption=(
                     "Line = historical realized balance reconstructed from "
                     "`state/trades.jsonl` + `state/costs.jsonl` (closed gross "
-                    "+ real fees + LLM, exact), flowing into the live snapshot "
-                    "(adds open P&L + modelled open fees) at the labelled end "
-                    "point — matches the hero card."
+                    "− fees − slippage − LLM, exact), flowing into the live "
+                    "snapshot (adds open P&L + modelled open costs) at the "
+                    "labelled end point — matches the hero card."
                 ),
             )
 
@@ -2210,9 +2214,11 @@ with tabs[5]:
     )
     st.caption(
         "Each row pairs a buy fill with the sell that closed it (FIFO). "
-        "Fees are real, pulled per-fill from Alpaca activities. "
+        "Fees + slippage are modelled on the Alpaca live schedule "
+        "(lib/alpaca_costs.py; real fees on live, modelled on paper). "
         "LLM cost is the opening run's total split evenly across the positions "
-        "it opened (per the locked methodology). Net = gross − fees − LLM."
+        "it opened (per the locked methodology). "
+        "Net = gross − fees − slippage − LLM."
     )
 
     # Surface the orchestrator's last activities-sync error. The sync is
@@ -2244,7 +2250,7 @@ with tabs[5]:
     # `KeyError: 'cost_usd'` on the lifetime-cost stat card.
     trade_totals = view["totals"]
 
-    tcols = st.columns(4)
+    tcols = st.columns(5)
     for col, label, value, fmt in [
         (tcols[0], "Closed trades", trade_totals["closed_count"], "{}"),
         (tcols[1], "Open lots", trade_totals["open_count"], "{}"),
@@ -2258,6 +2264,12 @@ with tabs[5]:
             tcols[3],
             "Realised fees",
             trade_totals["realised_fees_usd"],
+            "${:,.2f}",
+        ),
+        (
+            tcols[4],
+            "Realised slippage",
+            trade_totals.get("realised_slippage_usd", 0.0),
             "${:,.2f}",
         ),
     ]:
@@ -2383,6 +2395,7 @@ with tabs[5]:
             "closed_at": "Closed",
             "gross_pnl_usd": "Gross",
             "fees_usd": "Fees",
+            "slippage_usd": "Slippage",
             "llm_cost_usd": "LLM",
             "net_pnl_usd": "Net",
             "buy_run_id": "Run",
@@ -2393,6 +2406,7 @@ with tabs[5]:
             "Exit": "${:,.4f}",
             "Gross": "${:,.2f}",
             "Fees": "${:,.2f}",
+            "Slippage": "${:,.2f}",
             "LLM": "${:,.4f}",
             "Net": "${:,.2f}",
         }).map(_pnl_color, subset=["Gross", "Net"])
@@ -2449,6 +2463,7 @@ with tabs[5]:
             "opened_at": "Opened",
             "gross_pnl_usd": "Gross",
             "fees_usd": "Fees",
+            "slippage_usd": "Slippage",
             "llm_cost_usd": "LLM",
             "net_pnl_usd": "Net",
             "buy_run_id": "Run",
@@ -2458,6 +2473,7 @@ with tabs[5]:
             "Mark": lambda v: "—" if v is None else f"${v:,.4f}",
             "Gross": lambda v: "—" if v is None else f"${v:,.2f}",
             "Fees": "${:,.2f}",
+            "Slippage": "${:,.2f}",
             "LLM": "${:,.4f}",
             "Net": lambda v: "—" if v is None else f"${v:,.2f}",
         }).map(_pnl_color, subset=["Gross", "Net"])

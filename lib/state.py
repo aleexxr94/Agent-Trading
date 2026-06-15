@@ -577,11 +577,18 @@ def append_trade(entry: dict) -> None:
       - side ("buy" | "sell")
       - qty (number)
       - fill_price (number) — per-share fill price
-      - fees_usd (number) — sum of SEC + any other regulatory fees from the fill
+      - fees_usd (number) — regulatory fees (SEC + FINRA TAF) on the fill. On
+        live Alpaca these are real; on paper they are modelled by
+        lib.alpaca_costs (paper reports $0) when the cost model is enabled.
       - filled_at (ISO UTC)
       - run_id (str | None) — the orchestrator run that triggered this fill,
         when known. None is allowed for manual / out-of-band trades that the
         operator placed without the agent's involvement.
+
+    Optional keys (persisted verbatim when present):
+      - slippage_usd (number) — modelled per-leg slippage/spread cost for the
+        fill (lib.alpaca_costs). Alpaca never reports spread, even live.
+      - fee_source ("real" | "modelled") — provenance of fees_usd.
     """
     required = {
         "activity_id", "alpaca_order_id", "symbol", "kind", "side",

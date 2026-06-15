@@ -214,7 +214,7 @@ Most cycles run the full pipeline (a **trade** cycle). The meta-scheduler can in
 - **Cost caps**: per-run **$3**, daily **$12**. Cleanly aborts between stages if hit.
 - **Market gate**: a **trade** cycle queries Alpaca's clock before any LLM work. Closed market → no LLM calls billed, no orders submitted, exits cleanly with a `next_run_at` pointing at the broker-reported next open. (A **review** cycle deliberately skips the gate — it's meant to run after close — so it still bills ~$0.05 for signals + strategist + meta, but never submits orders.)
 - **Post-construct sanity rules** (`lib/sanity.py`, runs after every cycle, zero LLM cost). **Non-blocking by default** — set `SANITY_BLOCK_ON_FAIL=true` to hard-skip `stage_execute` on `fail` status (the `entry_cap_on_adds` rule hard-skips regardless).
-- **Modelled trading costs** (`lib/pnl.py`): a conservative retail-friction estimate — half-spread, commission, SEC fee, FINRA TAF — is computed each cycle and logged to `nav_history.jsonl` as `modelled_costs_usd`. The commission leg is a deliberately conservative floor (Alpaca live is commission-free, so this over-estimates Alpaca's actual cost). **Caveat (not yet wired into the displayed performance):** the equity curve and the SPY/Sharpe comparison use `realized_balance_series()` (`lib/dashboard_data.py`), which subtracts only realized Alpaca fill fees (≈$0 on paper) and LLM cost — not the modelled costs. So the paper Sharpe shown today is **not** friction-adjusted; the modelled figure is captured in state but still needs to be plumbed into the promote-to-live Sharpe before that gate can be trusted as friction-adjusted. A follow-up cost-accuracy task adds Alpaca-exact slippage + SEC/TAF netting.
+- **Modelled trading costs** (`lib/alpaca_costs.py`, wrapped by `lib/pnl.py`): an Alpaca-calibrated cost model — per-side slippage (the dominant live friction) + sell-side SEC/FINRA TAF; commission is $0 on Alpaca. With `PAPER_COST_MODEL=true` (default) every synced fill is stamped with modelled `fees_usd` (paper only; live uses real fees) and `slippage_usd`, so realized P&L, the equity curve, **and the SPY/Sharpe comparison are NET of cost** — `realized_balance_series()` (`lib/dashboard_data.py`) subtracts both. Paper Sharpe is therefore friction-honest for the promote-to-live gate. Margin interest and borrow fees are $0 (cash account, long-only). Rates are env-configurable (they reset periodically). Set `PAPER_COST_MODEL=false` to fall back to gross fills.
 - **Order safety invariant** (`lib/orders._plan_for_symbol`): orders never cross zero in a single ticket. Going from long to short on a symbol is split into close + open. The long-only schema never triggers it today, but the invariant is defensive against future short-enabling changes.
 
 ### Strategy in one paragraph
@@ -402,6 +402,8 @@ journalctl -u agent-dashboard.service    -n 200 --no-pager
 ```
 
 The `bin/analyze_runs.py` helper joins the per-run artifacts into a cycle-by-cycle table (`python -m bin.analyze_runs [--limit N] [--csv path]`). The dashboard's Performance and Settings tabs surface the same numbers without the JSON wrangling.
+
+If you have paper history that predates the modelled-cost layer (fills written before `PAPER_COST_MODEL` existed), run `python -m bin.backfill_costs --dry-run` then `python -m bin.backfill_costs` once to net modelled slippage + SEC/TAF onto those legacy rows (idempotent; backs up `trades.jsonl` first). New fills are stamped automatically at sync time, so this is a one-off for pre-upgrade history.
 
 ---
 

@@ -686,18 +686,24 @@ def test_synthetic_balance_open_gross_from_broker_positions(tmp_state):
         held_keys=frozenset({"TQQQ"}),
     )
     assert sb.open_gross_pnl_usd == pytest.approx(20.0)
-    # Hybrid fees: real (closed) = $0 (no closed trades),
-    # modelled (open) > $0 from compute_position_pnl on the open
-    # TQQQ position. The synthetic balance subtracts the hybrid
-    # total, so it sits BELOW the raw $2,520 by the modelled-fee
-    # amount. Math: $2,500 + $20 open − modelled_open_fees.
+    # Real (closed) fees = $0 (no closed trades). The open TQQQ position
+    # contributes a modelled projected EXIT leg: regulatory fees
+    # (modelled_open_fees) + slippage (modelled_open_slippage). The entry
+    # leg is NOT charged here — it would land in trades.jsonl at fill time
+    # (no double-count). The synthetic balance subtracts fees + slippage.
+    # Math: $2,500 + $20 open − modelled_open_fees − slippage_total.
     assert sb.modelled_open_fees_usd > 0, (
-        "open ETF position should pick up a modelled round-trip cost"
+        "open ETF position should pick up modelled exit-leg reg fees"
+    )
+    assert sb.modelled_open_slippage_usd > 0, (
+        "open ETF position should pick up modelled exit-leg slippage"
     )
     assert sb.real_trading_fees_usd == pytest.approx(0.0)
+    assert sb.realized_slippage_usd == pytest.approx(0.0)
     assert sb.trading_fees_total_usd == sb.modelled_open_fees_usd
+    assert sb.slippage_total_usd == pytest.approx(sb.modelled_open_slippage_usd)
     assert sb.synthetic_balance_usd == pytest.approx(
-        2520.0 - sb.modelled_open_fees_usd
+        2520.0 - sb.modelled_open_fees_usd - sb.slippage_total_usd
     )
 
 
@@ -2380,3 +2386,131 @@ def test_readiness_scorecard_with_long_profitable_history(tmp_state):
     assert by_name["Continuous paper running"]["met"] is True
     assert by_name["Sharpe (rf=0, EOD synthetic NAV)"]["met"] is True
     assert by_name["Max drawdown"]["met"] is True
+
+
+# ---------- Codex P2: slippage in risk NAV + unlogged-entry handling ----------
+
+
+def test_realized_synthetic_nav_subtracts_slippage(tmp_state):
+    """Codex P2: the sizing NAV + drawdown breaker (via _risk_nav_from) must
+    net slippage, not just fees — otherwise orders size against inflated
+    equity. A flat round-trip with fees + slippage drops the NAV by both."""
+    state.append_trade({
+        "activity_id": "b1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 10, "fill_price": 50.0,
+        "fees_usd": 0.0, "slippage_usd": 0.10, "fee_source": "modelled",
+        "filled_at": "2026-06-01T13:00:00Z", "run_id": None,
+    })
+    state.append_trade({
+        "activity_id": "s1", "alpaca_order_id": "o2", "symbol": "TQQQ",
+        "kind": "etf", "side": "sell", "qty": 10, "fill_price": 50.0,
+        "fees_usd": 0.12, "slippage_usd": 0.11, "fee_source": "modelled",
+        "filled_at": "2026-06-02T13:00:00Z", "run_id": None,
+    })
+    # Flat round-trip → gross 0. NAV = 2500 − fees(0.12) − slippage(0.21).
+    nav = dd.realized_synthetic_nav()
+    assert nav == pytest.approx(2500.0 - 0.12 - 0.21)
+
+
+def test_synthetic_balance_charges_entry_slippage_for_unlogged_position(tmp_state):
+    """Codex P2: a broker-held position whose entry fill isn't in trades.jsonl
+    yet must still be charged the entry-leg slippage (not exit-only), else the
+    headline overstates. trades.jsonl is empty here, so the open TQQQ gets
+    entry+exit slippage = 2× the exit leg."""
+    from lib import pnl as pnl_lib
+    pos = {
+        "kind": "etf", "symbol": "TQQQ", "shares": 2,
+        "avg_cost": 80.0, "leverage_factor": 3.0, "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25}, "position_pct": 8.0,
+    }
+    sb = dd.compute_synthetic_balance(
+        marks={"TQQQ": 90.0}, portfolio={"positions": [pos]},
+        broker_costs={"TQQQ": 80.0}, held_keys=frozenset({"TQQQ"}),
+    )
+    exit_slip = pnl_lib.model_position_cost(pos).half_spread_usd
+    assert sb.modelled_open_slippage_usd == pytest.approx(2.0 * exit_slip)
+
+
+def test_synthetic_balance_exit_only_slippage_when_entry_logged(tmp_state):
+    """Counterpart: once the entry fill is in trades.jsonl, only the exit leg
+    is projected (entry is already in realized_slippage), so no double-count."""
+    from lib import pnl as pnl_lib
+    state.append_trade({
+        "activity_id": "b1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 2, "fill_price": 80.0,
+        "fees_usd": 0.0, "slippage_usd": 0.03, "fee_source": "modelled",
+        "filled_at": "2026-06-01T13:00:00Z", "run_id": None,
+    })
+    pos = {
+        "kind": "etf", "symbol": "TQQQ", "shares": 2,
+        "avg_cost": 80.0, "leverage_factor": 3.0, "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25}, "position_pct": 8.0,
+    }
+    sb = dd.compute_synthetic_balance(
+        marks={"TQQQ": 90.0}, portfolio={"positions": [pos]},
+        broker_costs={"TQQQ": 80.0}, held_keys=frozenset({"TQQQ"}),
+    )
+    exit_slip = pnl_lib.model_position_cost(pos).half_spread_usd
+    assert sb.modelled_open_slippage_usd == pytest.approx(exit_slip)
+
+
+def test_open_projection_disabled_when_paper_cost_model_off(tmp_state, monkeypatch):
+    """Codex P2 (round 2): with PAPER_COST_MODEL=false the fill log is gross,
+    so the open-position projection must also contribute $0 — otherwise the
+    NAV is partly cost-netted while fills are gross."""
+    monkeypatch.setenv("PAPER_COST_MODEL", "false")
+    pos = {
+        "kind": "etf", "symbol": "TQQQ", "shares": 2,
+        "avg_cost": 80.0, "leverage_factor": 3.0, "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25}, "position_pct": 8.0,
+    }
+    sb = dd.compute_synthetic_balance(
+        marks={"TQQQ": 90.0}, portfolio={"positions": [pos]},
+        broker_costs={"TQQQ": 80.0}, held_keys=frozenset({"TQQQ"}),
+    )
+    assert sb.modelled_open_fees_usd == 0.0
+    assert sb.modelled_open_slippage_usd == 0.0
+
+
+def test_open_projection_charges_entry_slippage_for_unsynced_add(tmp_state):
+    """Codex P2 (round 2): a partial add to an already-logged symbol. Only 1 of
+    the 3 broker-held shares is in trades.jsonl, so entry slippage on the other
+    2 must be charged: total = exit(full) + entry(2/3) = (5/3)·exit_slip."""
+    from lib import pnl as pnl_lib
+    state.append_trade({
+        "activity_id": "b1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 1, "fill_price": 80.0,
+        "fees_usd": 0.0, "slippage_usd": 0.02, "fee_source": "modelled",
+        "filled_at": "2026-06-01T13:00:00Z", "run_id": None,
+    })
+    pos = {
+        "kind": "etf", "symbol": "TQQQ", "shares": 3,
+        "avg_cost": 80.0, "leverage_factor": 3.0, "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25}, "position_pct": 8.0,
+    }
+    sb = dd.compute_synthetic_balance(
+        marks={"TQQQ": 90.0}, portfolio={"positions": [pos]},
+        broker_costs={"TQQQ": 80.0}, held_keys=frozenset({"TQQQ"}),
+    )
+    exit_slip = pnl_lib.model_position_cost(pos).half_spread_usd
+    assert sb.modelled_open_slippage_usd == pytest.approx(exit_slip * 5.0 / 3.0)
+
+
+def test_position_table_rows_gross_when_cost_model_disabled(tmp_state, monkeypatch):
+    """Codex P2 (round 3): with PAPER_COST_MODEL=false the Portfolio table must
+    show gross — Fees=0 and Net P&L == Gross P&L — not modelled costs."""
+    portfolio = {"positions": [{
+        "kind": "etf", "symbol": "TQQQ", "shares": 10, "avg_cost": 70.0,
+        "leverage_factor": 3.0, "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25}, "position_pct": 10.0,
+    }]}
+    marks = {"TQQQ": 75.0}
+    monkeypatch.setenv("PAPER_COST_MODEL", "false")
+    off = dd.position_table_rows(portfolio, marks=marks, held_keys=frozenset({"TQQQ"}))[0]
+    assert off["Fees"] == 0.0
+    assert off["Net P&L"] == pytest.approx(off["Gross P&L"])
+
+    monkeypatch.setenv("PAPER_COST_MODEL", "true")
+    on = dd.position_table_rows(portfolio, marks=marks, held_keys=frozenset({"TQQQ"}))[0]
+    assert on["Fees"] > 0.0
+    assert on["Net P&L"] == pytest.approx(on["Gross P&L"] - on["Fees"])
