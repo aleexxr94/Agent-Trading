@@ -90,6 +90,33 @@ def test_margin_and_borrow_stubs_are_zero():
 # ---------- integration: realized P&L is net of fees + slippage ----------
 
 
+def test_model_order_fill_costs_single_sell():
+    fills = [{"side": "sell", "symbol": "SQQQ", "shares": 500, "price": 20.0}]
+    [(fee, slip)] = alpaca_costs.model_order_fill_costs(fills)
+    assert fee == pytest.approx(0.31, abs=0.005)            # SEC + TAF on $10k
+    assert slip == pytest.approx(10_000.0 * alpaca_costs.SLIPPAGE_BPS_PER_SIDE / 10_000)
+
+
+def test_model_order_fill_costs_splits_fee_once_across_partials():
+    """Order-level fee computed once, split pro-rata; not re-rounded per fill."""
+    fills = [
+        {"side": "sell", "symbol": "SQQQ", "shares": 250, "price": 20.0},
+        {"side": "sell", "symbol": "SQQQ", "shares": 250, "price": 20.0},
+    ]
+    res = alpaca_costs.model_order_fill_costs(fills)
+    total_fee = sum(f for f, _ in res)
+    assert total_fee == pytest.approx(
+        alpaca_costs.regulatory_sell_fee(sell_notional=10_000.0, shares_sold=500)
+    )
+
+
+def test_model_order_fill_costs_buy_has_no_fee():
+    fills = [{"side": "buy", "symbol": "TQQQ", "shares": 10, "price": 90.0}]
+    [(fee, slip)] = alpaca_costs.model_order_fill_costs(fills)
+    assert fee == 0.0
+    assert slip > 0.0
+
+
 def test_compute_trades_pnl_nets_fees_and_slippage():
     """A closed round-trip: net P&L = gross − fees − slippage. The regression
     that proves paper Sharpe is no longer gross."""

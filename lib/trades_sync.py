@@ -323,21 +323,26 @@ def sync_fills_from_alpaca(
         # Modelled costs are paper-only (live fills embed slippage in the
         # price and report real fees via activities).
         model_costs = alpaca_costs.cost_model_active()
-        # Finding 4: model the regulatory fee ONCE per order (sells only),
-        # then split pro-rata across the order's (possibly partial) fills —
-        # mirroring the real-fee path. Computing per-fill would re-apply the
+        # Model the regulatory fee ONCE per order (sells only) + per-fill
+        # slippage, via the shared helper that the legacy backfill also uses
+        # (so the two never diverge). Computing per-fill would re-apply the
         # SEC/TAF cent-rounding + per-trade cap on every partial and overcharge.
-        order_modelled_fee = 0.0
-        if model_costs and order_fee_total <= 0 and rows:
-            order_side = _normalize_side(rows[0].get("side"))
-            if order_side == "sell":
-                order_notional = sum(
-                    _to_float(r.get("qty")) * _to_float(r.get("price")) for r in rows
-                )
-                order_modelled_fee = alpaca_costs.regulatory_sell_fee(
-                    sell_notional=order_notional, shares_sold=total_qty,
-                )
-        for row in rows:
+        # (Note: like the real-fee split above, this assumes an order's fills
+        # land within one sync window — the cross-sync-window case is the
+        # documented reconcile-pass territory; PR #58 / Phase 2.5.)
+        modelled = (
+            alpaca_costs.model_order_fill_costs([
+                {
+                    "side": _normalize_side(r.get("side")),
+                    "symbol": r.get("symbol") or "",
+                    "shares": _to_float(r.get("qty")),
+                    "price": _to_float(r.get("price")),
+                }
+                for r in rows
+            ])
+            if model_costs else None
+        )
+        for idx, row in enumerate(rows):
             aid = row.get("id")
             symbol = row.get("symbol") or ""
             side = _normalize_side(row.get("side"))
@@ -356,15 +361,12 @@ def sync_fills_from_alpaca(
             fees_usd = fee_share
             slippage_usd = 0.0
             fee_source = "real" if fee_share > 0 else "none"
-            if model_costs and fee_share <= 0:
-                fees_usd = (
-                    order_modelled_fee * (qty / total_qty) if total_qty > 0 else 0.0
-                )
-                fee_source = "modelled"
-            if model_costs:
-                slippage_usd = alpaca_costs.slippage_cost(
-                    symbol=symbol, notional=qty * price,
-                )
+            if modelled is not None:
+                m_fee, m_slip = modelled[idx]
+                slippage_usd = m_slip
+                if fee_share <= 0:
+                    fees_usd = m_fee
+                    fee_source = "modelled"
             state.append_trade({
                 "activity_id": aid,
                 "alpaca_order_id": oid,

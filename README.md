@@ -403,6 +403,8 @@ journalctl -u agent-dashboard.service    -n 200 --no-pager
 
 The `bin/analyze_runs.py` helper joins the per-run artifacts into a cycle-by-cycle table (`python -m bin.analyze_runs [--limit N] [--csv path]`). The dashboard's Performance and Settings tabs surface the same numbers without the JSON wrangling.
 
+If you have paper history that predates the modelled-cost layer (fills written before `PAPER_COST_MODEL` existed), run `python -m bin.backfill_costs --dry-run` then `python -m bin.backfill_costs` once to net modelled slippage + SEC/TAF onto those legacy rows (idempotent; backs up `trades.jsonl` first). New fills are stamped automatically at sync time, so this is a one-off for pre-upgrade history.
+
 ---
 
 ## Repo hygiene

@@ -2494,3 +2494,23 @@ def test_open_projection_charges_entry_slippage_for_unsynced_add(tmp_state):
     )
     exit_slip = pnl_lib.model_position_cost(pos).half_spread_usd
     assert sb.modelled_open_slippage_usd == pytest.approx(exit_slip * 5.0 / 3.0)
+
+
+def test_position_table_rows_gross_when_cost_model_disabled(tmp_state, monkeypatch):
+    """Codex P2 (round 3): with PAPER_COST_MODEL=false the Portfolio table must
+    show gross — Fees=0 and Net P&L == Gross P&L — not modelled costs."""
+    portfolio = {"positions": [{
+        "kind": "etf", "symbol": "TQQQ", "shares": 10, "avg_cost": 70.0,
+        "leverage_factor": 3.0, "entry_thesis": "x",
+        "kill_conditions": {"max_loss_pct": 25}, "position_pct": 10.0,
+    }]}
+    marks = {"TQQQ": 75.0}
+    monkeypatch.setenv("PAPER_COST_MODEL", "false")
+    off = dd.position_table_rows(portfolio, marks=marks, held_keys=frozenset({"TQQQ"}))[0]
+    assert off["Fees"] == 0.0
+    assert off["Net P&L"] == pytest.approx(off["Gross P&L"])
+
+    monkeypatch.setenv("PAPER_COST_MODEL", "true")
+    on = dd.position_table_rows(portfolio, marks=marks, held_keys=frozenset({"TQQQ"}))[0]
+    assert on["Fees"] > 0.0
+    assert on["Net P&L"] == pytest.approx(on["Gross P&L"] - on["Fees"])

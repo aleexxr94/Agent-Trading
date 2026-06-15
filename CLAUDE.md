@@ -151,7 +151,8 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
 │   ├── systemd/                # orchestrator/monitor service+timer, dashboard, scheduler
 │   └── tailscale.md            # phone access without public ports
 ├── bin/
-│   └── analyze_runs.py         # offline run-log analysis
+│   ├── analyze_runs.py         # offline run-log analysis
+│   └── backfill_costs.py       # one-time: net modelled costs onto legacy paper fills
 ├── tests/                      # ~30 files, ~800 tests (representative below)
 │   ├── test_risk.py            # + test_risk_adaptive_cap.py
 │   ├── test_sanity.py

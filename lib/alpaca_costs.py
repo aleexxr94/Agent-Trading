@@ -142,6 +142,42 @@ def fill_cost(
     return fee, slip
 
 
+def model_order_fill_costs(
+    order_fills: list[dict],
+) -> list[tuple[float, float]]:
+    """Modelled per-fill ``(fee_usd, slippage_usd)`` for the fills of ONE order.
+
+    The regulatory fee is computed ONCE for the whole order (sells only) and
+    split pro-rata by qty, so a multi-partial-fill order isn't charged the
+    SEC/TAF cent-rounding + per-trade cap on every partial. Slippage is per fill
+    (linear in notional — no rounding/cap, so per-fill is exact).
+
+    ``order_fills`` items are dicts with ``side``, ``symbol``, ``shares``,
+    ``price``. All fills of one order share a side. Returned list is aligned with
+    the input order. Single source of truth for both the live fill sync
+    (lib.trades_sync) and the legacy backfill (bin/backfill_costs.py).
+    """
+    if not order_fills:
+        return []
+    total_qty = sum(abs(float(f["shares"])) for f in order_fills) or 0.0
+    side = str(order_fills[0]["side"]).lower()
+    order_fee = 0.0
+    if side == "sell":
+        order_notional = sum(
+            abs(float(f["shares"])) * float(f["price"]) for f in order_fills
+        )
+        order_fee = regulatory_sell_fee(
+            sell_notional=order_notional, shares_sold=total_qty,
+        )
+    out: list[tuple[float, float]] = []
+    for f in order_fills:
+        qty = abs(float(f["shares"]))
+        fee_share = order_fee * (qty / total_qty) if total_qty > 0 else 0.0
+        slip = slippage_cost(symbol=f.get("symbol"), notional=qty * float(f["price"]))
+        out.append((fee_share, slip))
+    return out
+
+
 # ---- Stubs: $0 and not applicable to a cash, long-only account ----
 # Bearish exposure is taken by buying inverse ETFs, never by shorting, and the
 # agent never trades on margin (it sizes against a synthetic NAV, not buying

@@ -1786,9 +1786,16 @@ def position_table_rows(
         # + reg fees. Mirrors what the Performance tab "Modelled
         # trading costs" aggregate is built from. Makes the per-row
         # Net P&L breakdown self-explanatory (Gross − Fees = Net).
-        row["Fees"] = breakdown.modelled_costs_usd
+        # Gated on the same cost-model switch as every other surface:
+        # when disabled (PAPER_COST_MODEL=false / live), show gross so the
+        # table doesn't keep netting costs after the operator turned them off.
         row["Gross P&L"] = breakdown.gross_pnl_usd if mark is not None else None
-        row["Net P&L"] = breakdown.net_pnl_usd if mark is not None else None
+        if alpaca_costs.cost_model_active():
+            row["Fees"] = breakdown.modelled_costs_usd
+            row["Net P&L"] = breakdown.net_pnl_usd if mark is not None else None
+        else:
+            row["Fees"] = 0.0
+            row["Net P&L"] = breakdown.gross_pnl_usd if mark is not None else None
         out.append(row)
     return out
 
