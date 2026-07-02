@@ -230,6 +230,7 @@ def sync_fills_from_alpaca(
     trading_client: Any | None = None,
     order_id_to_run_id: dict[str, str] | None = None,
     after: str | None = None,
+    mode: str | None = None,
 ) -> SyncResult:
     """Pull FILL + fee activities from Alpaca, append new fills to trades.jsonl.
 
@@ -246,6 +247,10 @@ def sync_fills_from_alpaca(
             are requested. When None, pulls Alpaca's default window. Use
             this when you want to sync recent activity without re-paging
             through months of history.
+        mode: "paper" | "live" era tag stamped on every new row. Callers
+            with a broker in hand should pass live_gate.trading_mode(broker);
+            when None, state.append_trade defaults it from the env-only
+            trading_mode() (which requires the full triple lock to say live).
 
     Returns: SyncResult with counts. Always idempotent — re-running the
     same window writes nothing if all activity_ids are already on disk.
@@ -255,6 +260,10 @@ def sync_fills_from_alpaca(
         # AlpacaBroker exposes its internal TradingClient as ._client.
         broker = AlpacaBroker()
         trading_client = broker._client  # noqa: SLF001
+        if mode is None:
+            from . import live_gate
+
+            mode = live_gate.trading_mode(broker)
 
     # ---- Pull FILL activities (paginated) ----
     fill_rows = _paginate_activities(
@@ -367,7 +376,7 @@ def sync_fills_from_alpaca(
                 if fee_share <= 0:
                     fees_usd = m_fee
                     fee_source = "modelled"
-            state.append_trade({
+            entry = {
                 "activity_id": aid,
                 "alpaca_order_id": oid,
                 "symbol": symbol,
@@ -380,7 +389,10 @@ def sync_fills_from_alpaca(
                 "fee_source": fee_source,
                 "filled_at": row.get("transaction_time") or "",
                 "run_id": order_id_to_run_id.get(oid),
-            })
+            }
+            if mode is not None:
+                entry["mode"] = mode
+            state.append_trade(entry)
             written += 1
             fills_written_orders.add(oid)
 

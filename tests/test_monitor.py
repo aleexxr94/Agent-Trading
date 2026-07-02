@@ -623,3 +623,11 @@ def test_exit_kind_from_reason_mapping():
     assert monitor._exit_kind_from_reason("time stop 2026-01-01T00:00:00Z reached") == "time_stop"
     assert monitor._exit_kind_from_reason("trailing stop: mark 90 ≤ 91.8 (peak 102 − 10%)") == "trailing_stop"
     assert monitor._exit_kind_from_reason("orphan (not in target portfolio): loss 30% ≥ 25% cap") == "orphan_loss_cap"
+
+def test_monitor_kill_event_carries_mode(tmp_state):
+    """Kill events are era-tagged; a paper broker (no is_paper attr → env
+    default with the lock down) records mode=paper."""
+    actions = [{"symbol": "TQQQ", "action": "flatten", "reason": "loss 26% ≥ 25% cap"}]
+    monitor.execute_actions(actions, broker=_FakeBroker([]))
+    events = state.read_kill_events()
+    assert events[0]["mode"] == "paper"

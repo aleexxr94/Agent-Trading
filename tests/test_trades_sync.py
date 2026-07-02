@@ -755,3 +755,32 @@ def test_sync_uses_run_id_map_built_from_runs_dir(tmp_state):
     rows = {r["activity_id"]: r for r in state.read_trades()}
     assert rows["a1"]["run_id"] == "run-A"
     assert rows["a2"]["run_id"] is None  # manual fill, no run dir for ord-manual
+
+
+# ---------- paper/live mode tagging ----------
+
+
+def test_sync_stamps_paper_mode_by_default(tmp_state):
+    """No mode passed + no broker constructed internally → append_trade's
+    env-only default applies, which is paper while the triple lock is down."""
+    tc = _FakeTrading(responses={"/account/activities/FILL": [_fill()]})
+    trades_sync.sync_fills_from_alpaca(trading_client=tc)
+    assert state.read_trades()[0]["mode"] == "paper"
+
+
+def test_sync_stamps_explicit_live_mode(tmp_state):
+    tc = _FakeTrading(responses={"/account/activities/FILL": [_fill()]})
+    trades_sync.sync_fills_from_alpaca(trading_client=tc, mode="live")
+    assert state.read_trades()[0]["mode"] == "live"
+
+
+def test_sync_dedup_unchanged_by_mode_key(tmp_state):
+    """Re-running the same window with a different mode writes nothing —
+    idempotency stays keyed purely on activity_id."""
+    tc = _FakeTrading(responses={"/account/activities/FILL": [_fill()]})
+    trades_sync.sync_fills_from_alpaca(trading_client=tc, mode="paper")
+    res = trades_sync.sync_fills_from_alpaca(trading_client=tc, mode="live")
+    assert res.new_fills_written == 0
+    rows = state.read_trades()
+    assert len(rows) == 1
+    assert rows[0]["mode"] == "paper"

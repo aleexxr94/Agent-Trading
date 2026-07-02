@@ -302,6 +302,7 @@ def execute_actions(actions: list[dict], *, broker: Broker | None) -> set[str]:
                     "reason": a["reason"],
                     "exit_kind": _exit_kind_from_reason(a["reason"]),
                     "source": "monitor",
+                    "mode": live_gate.trading_mode(broker),
                 })
             except Exception:
                 pass

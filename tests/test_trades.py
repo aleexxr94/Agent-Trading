@@ -445,3 +445,18 @@ def test_cooldown_robust_to_out_of_order_log():
     ]
     out = trades.symbols_in_cooldown(rows, now=_now("2026-05-26T15:00:00Z"), window_days=7)
     assert out == {"TQQQ": "2026-05-24T15:00:00Z"}
+
+
+def test_cooldown_spans_paper_to_live_boundary():
+    """Continuity requirement: a full exit tagged mode=paper still blocks a
+    live-era re-entry inside the window — the cooldown is era-agnostic."""
+    rows = [
+        _trade(activity_id="b1", side="buy", qty=10, fill_price=50.0,
+               filled_at="2026-05-10T15:00:00Z"),
+        _trade(activity_id="s1", side="sell", qty=10, fill_price=55.0,
+               filled_at="2026-05-24T15:00:00Z"),
+    ]
+    rows[0]["mode"] = "paper"
+    rows[1]["mode"] = "paper"
+    out = trades.symbols_in_cooldown(rows, now=_now("2026-05-26T15:00:00Z"), window_days=7)
+    assert out == {"TQQQ": "2026-05-24T15:00:00Z"}

@@ -375,10 +375,11 @@ def _sync_fills_before_cooldown(ctx: StageContext) -> str | None:
     if ctx.dry_run:
         return None
     try:
-        from lib import trades_sync
+        from lib import live_gate, trades_sync
         trades_sync.sync_fills_from_alpaca(
             trading_client=getattr(ctx.broker, "_client", None),
             order_id_to_run_id=trades_sync.order_id_to_run_id_from_runs(),
+            mode=live_gate.trading_mode(ctx.broker),
         )
         return None
     except Exception as e:
@@ -1249,10 +1250,11 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
         # activity. Run EVERY cycle that reaches stage_execute (idempotent
         # via known_ids dedupe).
         try:
-            from lib import trades_sync
+            from lib import live_gate, trades_sync
             trades_sync.sync_fills_from_alpaca(
                 trading_client=getattr(ctx.broker, "_client", None),
                 order_id_to_run_id=trades_sync.order_id_to_run_id_from_runs(),
+                mode=live_gate.trading_mode(ctx.broker),
             )
         except Exception as e:
             next_run["trades_sync_error"] = (
@@ -1289,11 +1291,13 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
             synthetic_nav = _dd.realized_synthetic_nav()
         except Exception:
             synthetic_nav = nav_portfolio.get("nav_usd", 0.0)
+        from lib import live_gate as _lg
         state.append_nav({
             "run_id": ctx.run_id,
             "at": state.utcnow_iso(),
             "nav_usd": synthetic_nav,
             "nav_source": "virtual",
+            "mode": _lg.trading_mode(ctx.broker),
             "cash_usd": nav_portfolio.get("cash_usd", 0.0),
             "positions_count": len(nav_portfolio.get("positions", [])),
             "all_cash": nav_portfolio.get("all_cash", False),
