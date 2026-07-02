@@ -41,6 +41,33 @@ def live_gate_blocked() -> bool:
     return live_trading_env_enabled() and LIVE_VERSION == 0
 
 
+def trading_mode(broker=None) -> str:
+    """Return ``"paper"`` or ``"live"`` — the mode stamped onto state records
+    (trades, nav history, kill events) so the paper era stays distinguishable
+    from the live era after promotion.
+
+    With a broker object, its ``is_paper`` attribute is authoritative (it is
+    fixed at construction from the base URL, no network call). Without one,
+    the env can only claim "live" under the FULL triple lock: env flag set,
+    ``LIVE_VERSION`` bumped in code, and a non-paper base URL. Any ambiguity —
+    missing attribute, half-raised lock, paper URL — resolves to "paper", so
+    this can never mislabel a paper record as live while the gate is closed.
+    """
+    if broker is not None:
+        is_paper = getattr(broker, "is_paper", None)
+        if isinstance(is_paper, bool):
+            return "paper" if is_paper else "live"
+        return "paper"
+    if not live_trading_env_enabled() or LIVE_VERSION < 1:
+        return "paper"
+    # Lazy import: alpaca_client imports nothing from this module at import
+    # time beyond os/env, but keep the dependency one-directional regardless.
+    from .alpaca_client import PAPER_BASE_URL  # noqa: WPS433
+
+    base_url = os.environ.get("ALPACA_BASE_URL", PAPER_BASE_URL)
+    return "live" if base_url != PAPER_BASE_URL else "paper"
+
+
 def assert_live_gate(*, entrypoint: str) -> int | None:
     """Return a non-zero exit code if the live gate is half-raised, else None.
 

@@ -70,6 +70,12 @@ class AlpacaBroker(Broker):
     def name(self) -> str:
         return "alpaca-paper" if self._paper else "alpaca-live"
 
+    @property
+    def is_paper(self) -> bool:
+        """Fixed at construction from the base URL; no network call. Drives
+        record mode-tagging (live_gate.trading_mode) and the live NAV path."""
+        return self._paper
+
     def get_account(self) -> Account:
         a = self._client.get_account()
         return Account(
