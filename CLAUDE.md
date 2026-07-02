@@ -288,7 +288,13 @@ checkout — the triple lock is designed to fail closed at every layer.
    against real-money ones. While paper-only the memo output is byte-identical to the pre-tagging
    shape (it feeds the cycle-dedup fingerprint + cached prompts). The 7-day re-entry cooldown
    intentionally spans the boundary. The dashboard NAV charts draw a dotted LIVE marker at the
-   transition.
+   transition. The static `prompts/*.md` keep their paper framing (they are cached and
+   byte-stable across promotion); once live, every LLM stage's user message is prefixed with a
+   LIVE TRADING OVERRIDE line (`orchestrator.py:_live_mode_context_line`) stating the real
+   allocated NAV and superseding the paper references — no prompt edits are required on switch
+   day. The 8% daily-drawdown halt flag is mode-scoped like its SOD baseline, and
+   `state/live_transition.json` is deliberately preserved by history wipes (re-anchoring the
+   live risk budget is an explicit manual action, never a cleanup side effect).
 
 4. **Costs / fills.** `lib/trades_sync.py:sync_fills_from_alpaca` is called at
    `orchestrator.py:363-364` (pre-cooldown) and `1021-1022` (post-execute) with

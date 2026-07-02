@@ -69,7 +69,8 @@ def run_dd_breaker(*, current_nav: float | None, enabled: bool, persist: bool = 
     if current_nav is None:
         return {
             "sod_nav_usd": None, "current_nav_usd": None, "dd_pct": None,
-            "tripped": False, "enabled": enabled, "halt_active": state.dd_halt_active(),
+            "tripped": False, "enabled": enabled,
+            "halt_active": state.dd_halt_active(mode=mode),
         }
     sod = state.read_sod_nav_today(mode=mode)
     if sod is None:
@@ -80,10 +81,11 @@ def run_dd_breaker(*, current_nav: float | None, enabled: bool, persist: bool = 
         sod_nav_usd=sod, current_nav_usd=current_nav,
     )
     if tripped and enabled and persist:
-        state.set_dd_halt(dd_pct=dd, sod_nav=sod, current_nav=current_nav)
+        state.set_dd_halt(dd_pct=dd, sod_nav=sod, current_nav=current_nav, mode=mode)
     return {
         "sod_nav_usd": sod, "current_nav_usd": current_nav, "dd_pct": round(dd, 2),
-        "tripped": tripped, "enabled": enabled, "halt_active": state.dd_halt_active(),
+        "tripped": tripped, "enabled": enabled,
+        "halt_active": state.dd_halt_active(mode=mode),
     }
 
 

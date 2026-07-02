@@ -382,3 +382,30 @@ def test_live_nav_cap_without_marker_fails_closed(tmp_state, monkeypatch):
     # Uncapped, the marker is telemetry only — same failure must NOT block.
     monkeypatch.delenv("LIVE_NAV_CAP_USD", raising=False)
     assert live_nav.live_allocated_nav(_LiveBroker(equity_usd=5000.0)) == 5000.0
+
+
+def test_live_mode_context_line_empty_on_paper(tmp_state):
+    ctx = orchestrator.StageContext(run_id="t", dry_run=False, broker=None)
+    assert orchestrator._live_mode_context_line(ctx) == ""
+
+
+def test_live_mode_context_line_present_on_live(tmp_state, monkeypatch):
+    """Codex P2 (PR #112): the static system prompts keep their paper
+    framing; on live every LLM stage's user message must carry the
+    override line with the real allocated NAV."""
+    ctx = _live_ctx(_LiveBroker(equity_usd=12345.0))
+    ctx.live_nav_usd = 2500.0
+    line = orchestrator._live_mode_context_line(ctx)
+    assert "LIVE TRADING OVERRIDE" in line
+    assert "$2,500.00" in line
+
+
+def test_run_pipeline_live_nav_skip_preserves_review_intent(tmp_state, monkeypatch):
+    """Codex P2 (PR #112): a transient live-equity failure during a
+    scheduled review must retry as a review, not convert to trade."""
+    broker = _LiveBroker(fail=True)
+    out = orchestrator.run_pipeline(
+        dry_run=False, run_id="livefail2", broker=broker, cli_intent="review",
+    )
+    assert out["live_nav_unavailable"] is True
+    assert out["next_run"]["cycle_intent"] == "review"

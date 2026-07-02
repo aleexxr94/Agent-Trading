@@ -593,11 +593,38 @@ def test_read_live_transition_missing_and_corrupt(tmp_state):
     assert state.read_live_transition() is None
 
 
-def test_wipe_run_history_removes_live_transition(tmp_state):
+def test_wipe_run_history_preserves_live_transition(tmp_state):
+    """Codex P1 (PR #112): wiping history must NOT re-anchor the live risk
+    budget — under a cap the marker anchors the P&L-since-transition debit,
+    so a cleanup that removed it would silently restore a drawn-down
+    allocation to the full cap. Re-anchoring is an explicit manual action."""
     state.write_live_transition_once(
         live_starting_equity_usd=2500.0, nav_cap_usd=None,
         run_id=None, live_version=1,
     )
     assert state.LIVE_TRANSITION.exists()
     state.wipe_run_history(backup=False)
-    assert not state.LIVE_TRANSITION.exists()
+    assert state.LIVE_TRANSITION.exists()
+
+
+def test_dd_halt_is_mode_scoped(tmp_state):
+    """Codex P2 (PR #112): a paper halt tripped earlier on promotion day is
+    denominated in synthetic units and must not block live buys."""
+    state.set_dd_halt(dd_pct=9.0, sod_nav=2500.0, current_nav=2270.0, mode="paper")
+    assert state.dd_halt_active(mode="paper") is True
+    assert state.dd_halt_active(mode="live") is False
+    state.clear_dd_halt()
+    state.set_dd_halt(dd_pct=9.0, sod_nav=5000.0, current_nav=4540.0, mode="live")
+    assert state.dd_halt_active(mode="live") is True
+    assert state.dd_halt_active(mode="paper") is False
+
+
+def test_dd_halt_legacy_untagged_reads_as_paper(tmp_state):
+    import json as _json
+    state.DD_HALT_FLAG.write_text(_json.dumps({
+        "date": state.utcnow().date().isoformat(),
+        "dd_pct": 9.0, "sod_nav_usd": 2500.0, "current_nav_usd": 2270.0,
+        "reason": "x", "set_at": state.utcnow_iso(),
+    }), encoding="utf-8")
+    assert state.dd_halt_active(mode="paper") is True
+    assert state.dd_halt_active(mode="live") is False

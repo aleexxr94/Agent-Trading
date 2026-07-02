@@ -306,6 +306,7 @@ def stage_strategist(
     current_positions = current_positions or []
     pnl_history = pnl_history or []
     content = (
+        f"{_live_mode_context_line(ctx)}"
         f"Signals: {json.dumps(signals.compact_for_llm(signals_out), sort_keys=True)}\n"
         f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
         f"Recent PnL history (last cycles, oldest first): "
@@ -392,6 +393,32 @@ def _sync_fills_before_cooldown(ctx: StageContext) -> str | None:
         return f"sync_fills_from_alpaca(pre-cooldown): {type(e).__name__}: {e}"
 
 
+def _live_mode_context_line(ctx: StageContext) -> str:
+    """One user-message line that overrides the paper framing baked into the
+    static system prompts once the account is genuinely live (Codex P2 on
+    PR #112: prompts/*.md all describe a '$2,500 paper account', and the
+    cached system blocks deliberately stay byte-stable across promotion —
+    this per-cycle line is the mode-aware correction). Empty on paper so
+    pre-promotion inputs stay byte-identical for the prompt cache + dedup.
+    """
+    if live_gate.trading_mode(ctx.broker) != "live":
+        return ""
+    nav = ctx.live_nav_usd
+    nav_txt = (
+        f"${nav:,.2f}" if isinstance(nav, (int, float))
+        else "the NAV figure provided in this message"
+    )
+    return (
+        "LIVE TRADING OVERRIDE: this account now trades REAL MONEY on Alpaca "
+        f"live. The capital you size against is {nav_txt} — the operator's "
+        "allocated live NAV (real equity, possibly capped) — NOT the $2,500 "
+        "paper account described in your system prompt; read every 'paper' "
+        "reference there as historical framing. Losses are real. Capital "
+        "preservation outweighs upside chasing even more strictly than on "
+        "paper: when conviction is marginal, hold cash.\n"
+    )
+
+
 def _vol_context_line(signals_out: dict) -> str:
     """One context line giving the constructor the universe-median HV30 so
     it can judge how choppy each candidate is relative to peers. Pure
@@ -434,6 +461,7 @@ def stage_construct(
     pnl_history = pnl_history or []
     cooldown_symbols = cooldown_symbols or {}
     content = (
+        f"{_live_mode_context_line(ctx)}"
         f"Signals: {json.dumps(signals.compact_for_llm(signals_out), sort_keys=True)}\n"
         f"Strategist view: {json.dumps(view, sort_keys=True)}\n"
         f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
@@ -512,6 +540,7 @@ def stage_critic(
         }
     cfg = stages.critic()
     content = (
+        f"{_live_mode_context_line(ctx)}"
         f"View: {json.dumps(view, sort_keys=True)}\n"
         f"Portfolio: {json.dumps(portfolio, sort_keys=True)}\n"
         f"Current broker positions: {json.dumps(current_positions or [], sort_keys=True)}\n"
@@ -1121,6 +1150,7 @@ def _compute_next_run_at(
     user_msg = {
         "role": "user",
         "content": (
+            f"{_live_mode_context_line(ctx)}"
             f"Current UTC: {state.utcnow_iso()}\n"
             f"Market clock: is_open={market_is_open}, next_open={next_open}\n"
             f"Today's autonomous review cycles: {reviews_today}/{review_cap} "
@@ -1256,7 +1286,9 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
         # of the UTC day. The flag auto-expires next day. Codex P1 (PR #98):
         # _plan_for_symbol puts reductions in `requests`, so filter by side
         # rather than dropping every request.
-        if risk.dd_breaker_enabled() and state.dd_halt_active():
+        if risk.dd_breaker_enabled() and state.dd_halt_active(
+            mode=live_gate.trading_mode(ctx.broker)
+        ):
             derisking = [r for r in plan.requests if r.side == "sell"]
             skipped_opens = len(plan.requests) - len(derisking)
             plan = orders.OrderPlan(
@@ -1623,7 +1655,11 @@ def run_pipeline(
                     "and no LLM calls were made; retrying in 30 minutes. "
                     "Check LIVE_NAV_CAP_USD and broker connectivity."
                 ),
-                "cycle_intent": "trade",
+                # Preserve the scheduled intent (Codex P2 on PR #112): a
+                # transient equity-read failure during an after-hours review
+                # must retry as a review, not convert into a trade cycle
+                # that the market gate will then skip until next open.
+                "cycle_intent": cycle_intent,
                 "live_nav_unavailable": True,
             }
             state.write_json(state.run_dir(rid) / "next_run.json", next_run)

@@ -268,3 +268,26 @@ def test_memo_exit_attribution_does_not_cross_eras(tmp_state):
     memo = feedback.build_performance_memo(trade_rows=rows, cost_rows=[],
                                            kill_events=kill_events)
     assert memo["recent_exits"][0]["exit_kind"] == "loss_cap"
+
+
+def test_live_since_uses_earlier_of_marker_and_first_live_fill(tmp_state):
+    """Codex P2 (PR #112): a dashboard resync can land live fills BEFORE the
+    first live cycle writes the marker — those real-money trades must not be
+    re-classified as paper by the later marker timestamp."""
+    rows = [
+        {**_fill("TQQQ", "buy", 4, 70.0, run_id="r2", at="2026-07-01T13:00:00Z", aid="a1"),
+         "mode": "live"},
+        {**_fill("TQQQ", "sell", 4, 60.0, at="2026-07-01T15:00:00Z", aid="a2"),
+         "mode": "live"},
+    ]
+    # Marker written AFTER those fills (first orchestrator cycle came later).
+    state.write_live_transition_once(
+        live_starting_equity_usd=5000.0, nav_cap_usd=None,
+        run_id="r9", live_version=1,
+    )
+    memo = feedback.build_performance_memo(trade_rows=rows, cost_rows=[], kill_events=[])
+    es = memo["era_split"]
+    assert es["live_since"] == "2026-07-01T13:00:00Z"  # first live fill, not marker
+    assert es["live"]["trades"] == 1
+    assert es["paper"]["trades"] == 0
+    assert memo["recent_exits"][0]["mode"] == "live"

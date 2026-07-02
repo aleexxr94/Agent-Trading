@@ -122,14 +122,21 @@ def _live_since(trade_rows: list[dict]) -> str | None:
     correctly if the marker was lost. None → the memo output stays exactly
     as it was pre-era-tagging (byte-stable: it participates in the cycle
     dedup fingerprint and cached prompts)."""
+    candidates: list[str] = []
     marker = state.read_live_transition()
     if marker is not None and isinstance(marker.get("at"), str) and marker["at"]:
-        return marker["at"]
+        candidates.append(marker["at"])
     live_ts = [
         r.get("filled_at") for r in trade_rows
         if state.record_mode(r) == "live" and r.get("filled_at")
     ]
-    return min(live_ts) if live_ts else None
+    if live_ts:
+        # The EARLIER of marker vs first live fill wins (Codex P2 on
+        # PR #112): a dashboard resync under the full lock can land live
+        # fills before the first live cycle writes the marker, and those
+        # real-money outcomes must not be re-classified as paper.
+        candidates.append(min(live_ts))
+    return min(candidates) if candidates else None
 
 
 def _era_of(ct: trades.ClosedTrade, live_since: str) -> str:

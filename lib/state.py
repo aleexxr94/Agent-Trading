@@ -212,7 +212,7 @@ def set_sod_nav_today(nav: float, *, mode: str = "paper") -> None:
 
 
 def set_dd_halt(*, dd_pct: float, sod_nav: float, current_nav: float,
-                reason: str = "daily drawdown ≥ 8%") -> None:
+                reason: str = "daily drawdown ≥ 8%", mode: str = "paper") -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     DD_HALT_FLAG.write_text(
         json.dumps({
@@ -222,6 +222,7 @@ def set_dd_halt(*, dd_pct: float, sod_nav: float, current_nav: float,
             "current_nav_usd": float(current_nav),
             "reason": reason,
             "set_at": utcnow_iso(),
+            "mode": mode,
         }, sort_keys=True),
         encoding="utf-8",
     )
@@ -237,11 +238,19 @@ def read_dd_halt() -> dict | None:
     return d if isinstance(d, dict) else None
 
 
-def dd_halt_active() -> bool:
-    """True iff a drawdown halt was set TODAY (UTC). Prior-day flags are
-    treated as expired so the breaker resets each UTC day."""
+def dd_halt_active(*, mode: str = "paper") -> bool:
+    """True iff a drawdown halt was set TODAY (UTC) for this ``mode``.
+    Prior-day flags are treated as expired so the breaker resets each UTC
+    day. Mode-scoped like the SOD baseline (Codex P2 on PR #112): a paper
+    halt tripped earlier on promotion day denominated in synthetic units
+    and must not block live buys for the rest of the day (and vice versa).
+    A flag without a mode key predates tagging and reads as paper."""
     d = read_dd_halt()
-    return bool(d) and d.get("date") == utcnow().date().isoformat()
+    return (
+        bool(d)
+        and d.get("date") == utcnow().date().isoformat()
+        and record_mode(d) == mode
+    )
 
 
 def clear_dd_halt() -> None:
@@ -929,7 +938,13 @@ def wipe_run_history(*, include_costs: bool = True, backup: bool = True) -> dict
         STATE_DIR / "scheduler_last_fired.txt",
         COST_RESET_FLAG, ALL_TIME_COST_RESET_FLAG,
         NAV_OFFSET_FLAG, NAV_MANUAL_BASELINE_FLAG,
-        DD_HALT_FLAG, SOD_NAV_FILE, LIVE_TRANSITION,
+        DD_HALT_FLAG, SOD_NAV_FILE,
+        # LIVE_TRANSITION is deliberately NOT wiped (Codex P1 on PR #112):
+        # under LIVE_NAV_CAP_USD it anchors the P&L-since-transition debit,
+        # so removing it during a history cleanup would silently restore a
+        # drawn-down live allocation back to the full cap. Re-anchoring the
+        # live risk budget is an explicit operator action (delete the file
+        # by hand after re-funding), never a side effect of a wipe.
     ]
     for f in snapshots:
         if f.exists():
