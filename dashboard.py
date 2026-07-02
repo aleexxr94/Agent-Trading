@@ -1269,6 +1269,73 @@ with tabs[0]:
     elif not is_all_cash:
         st.write("No open positions.")
 
+    # ---------- Universe reference ----------
+    # Plain-English explainer for every ticker the agent may trade, below
+    # the charts. Rows with an open position sort to the top and get a
+    # green/red row background by Net P&L sign. Purely informational —
+    # nothing above reads from it.
+    st.markdown('<div class="at-section-label">Universe reference</div>', unsafe_allow_html=True)
+    open_pnl_by_symbol = {r["Symbol"]: r.get("Net P&L") for r in rows}
+    uni_rows = dd.universe_explainer_rows(open_pnl_by_symbol)
+    df_uni = pd.DataFrame(uni_rows)
+    uni_status = df_uni.pop("_status")
+    # Pre-format to strings: the data grid formats NumberColumn cells from
+    # the raw value (styler display text is ignored there), and a raw None
+    # renders as the literal "None" — a string column renders verbatim.
+    df_uni["Open P&L"] = [
+        "—" if pd.isna(v) else f"${v:+,.2f}" for v in df_uni["Open P&L"]
+    ]
+
+    def _universe_row_style(row: "pd.Series") -> list[str]:
+        status = uni_status.loc[row.name]
+        if status == "win":
+            css = "background-color: #d1fae5; color: #065f46"
+        elif status == "loss":
+            css = "background-color: #fee2e2; color: #991b1b"
+        elif status == "open":
+            css = "background-color: #e2e8f0; color: #0f172a"
+        else:
+            return [""] * len(row)
+        return [css] * len(row)
+
+    styled_uni = (
+        df_uni.style
+        .format(na_rep="—", precision=None)
+        .apply(_universe_row_style, axis=1)
+    )
+    st.dataframe(
+        styled_uni,
+        width="stretch",
+        hide_index=True,
+        height=430,
+        column_config={
+            "Symbol":    st.column_config.Column("Symbol", width="small"),
+            "Factor":    st.column_config.Column("Factor", width="small"),
+            "Direction": st.column_config.Column(
+                "Direction", width="small",
+                help="Bull = rises with the factor; Bear = inverse ETF that "
+                     "rises when the factor falls (the system never shorts).",
+            ),
+            "Leverage":  st.column_config.Column("Leverage", width="small"),
+            "Pair":      st.column_config.Column(
+                "Pair", width="small",
+                help="Opposite-direction ETF on the same factor; — for solo "
+                     "lines with no liquid counterpart.",
+            ),
+            "Explainer": st.column_config.Column("What it is", width="large"),
+            "Open P&L":  st.column_config.Column(
+                "Open P&L",
+                width="small",
+                help="Net P&L of the currently-open position in this ticker "
+                     "(— when not held, or held but unmarked).",
+            ),
+        },
+    )
+    st.caption(
+        "Green = open position currently winning · red = losing · grey = "
+        "open but no live mark. Open positions sort to the top."
+    )
+
 
 # ===== Tab 2: Cycles =====
 with tabs[1]:
