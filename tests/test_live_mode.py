@@ -74,3 +74,26 @@ def test_alpaca_broker_exposes_is_paper_property():
     b._paper = False
     assert b.is_paper is False
     assert live_gate.trading_mode(b) == "live"
+
+
+def test_alpaca_broker_refuses_non_paper_under_half_raised_lock(monkeypatch):
+    """Codex P2 (PR #112): env=true alone (LIVE_VERSION still 0) must not be
+    able to construct a live client — broker-less callers like the dashboard
+    resync never pass through assert_live_gate, so the constructor is the
+    gate that stops a half-raised lock from reaching the live account."""
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_API_SECRET", "s")
+    assert live_gate.LIVE_VERSION == 0
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError, match="triple"):
+        AlpacaBroker(base_url="https://api.alpaca.markets")
+
+
+def test_alpaca_broker_still_refuses_without_env_flag(monkeypatch):
+    monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_API_SECRET", "s")
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError, match="triple"):
+        AlpacaBroker(base_url="https://api.alpaca.markets")

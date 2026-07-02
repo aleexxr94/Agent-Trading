@@ -364,6 +364,7 @@ def _cooldown_symbols_now() -> dict:
             state.read_trades(),
             now=state.utcnow(),
             window_days=risk.REENTRY_COOLDOWN_DAYS,
+            mode=live_gate.trading_mode(),
         )
     except Exception:
         return {}

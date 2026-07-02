@@ -67,11 +67,17 @@ def live_nav_cap_usd() -> float | None:
     return cap
 
 
-def live_allocated_nav(broker, *, run_id: str | None = None) -> float:
+def live_allocated_nav(
+    broker, *, run_id: str | None = None, write_marker: bool = True,
+) -> float:
     """The NAV the agent may size against on a live broker (see module
     docstring for the allocation formula). Raises LiveNavUnavailable on ANY
     problem. On the first successful read it records the write-once
-    paper→live transition marker with the real starting equity."""
+    paper→live transition marker with the real starting equity.
+
+    ``write_marker=False`` (dry-run monitoring) never mutates state: a test
+    invocation before the real live launch must not lock in its equity as
+    the transition baseline (Codex P2 on PR #112)."""
     cap = live_nav_cap_usd()
     if not broker_is_live(broker):
         raise LiveNavUnavailable(
@@ -90,22 +96,37 @@ def live_allocated_nav(broker, *, run_id: str | None = None) -> float:
         raise LiveNavUnavailable(f"live equity unreadable: {type(e).__name__}: {e}")
     if not (equity > 0) or equity != equity or equity == float("inf"):
         raise LiveNavUnavailable(f"live equity invalid: {equity!r}")
-    try:
-        marker = state.write_live_transition_once(
-            live_starting_equity_usd=equity,
-            nav_cap_usd=cap,
-            run_id=run_id,
-            live_version=live_gate.LIVE_VERSION,
-        )
-    except Exception:
-        marker = None  # marker is telemetry; recording must never block sizing
+    if write_marker:
+        try:
+            marker = state.write_live_transition_once(
+                live_starting_equity_usd=equity,
+                nav_cap_usd=cap,
+                run_id=run_id,
+                live_version=live_gate.LIVE_VERSION,
+            )
+        except Exception:
+            # Fall back to a plain read: the write may have failed while an
+            # earlier marker is still perfectly readable.
+            marker = state.read_live_transition()
+    else:
+        marker = state.read_live_transition()
     if cap is None:
+        # Uncapped: the marker is telemetry only; its absence never blocks.
         return equity
-    start = equity
-    if isinstance(marker, dict) and isinstance(
-        marker.get("live_starting_equity_usd"), (int, float)
+    if not (
+        isinstance(marker, dict)
+        and isinstance(marker.get("live_starting_equity_usd"), (int, float))
     ):
-        start = float(marker["live_starting_equity_usd"])
+        # Capped: the marker anchors the P&L-since-transition debit. Without
+        # it the allocation would silently pin at the cap through losses
+        # (Codex P2 on PR #112) — fail closed instead.
+        raise LiveNavUnavailable(
+            "LIVE_NAV_CAP_USD is set but the live transition marker "
+            "(state/live_transition.json) could not be written or read — "
+            "the capped allocation cannot be anchored. Fix state/ "
+            "permissions or clear the path, then retry."
+        )
+    start = float(marker["live_starting_equity_usd"])
     nav = min(start, cap) + (equity - start)
     if not (nav > 0):
         raise LiveNavUnavailable(

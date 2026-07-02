@@ -1626,6 +1626,18 @@ with tabs[3]:
             _latest_is_live = bool(nav_rows) and state.record_mode(nav_rows[-1]) == "live"
             if _latest_is_live:
                 tip_phrase = "the latest live cycle"
+                if not xs:
+                    # The trailing window filtered out every row (e.g. 1D
+                    # with the last live cycle older than a day). Anchor the
+                    # chart with the latest live row so _render_balance_chart
+                    # has a point to draw — never the paper-scale synthetic
+                    # tip (Codex P2 on PR #112).
+                    last_row = nav_rows[-1]
+                    xs.append(last_row.get("at") or live_at)
+                    ys.append(_fnum(last_row.get("nav_usd")))
+                    hover_texts.append(
+                        f"Latest live cycle<br>${_fnum(last_row.get('nav_usd')):,.2f}"
+                    )
             else:
                 synth_tip = float(_synth_live.synthetic_balance_usd)
                 xs.append(live_at)

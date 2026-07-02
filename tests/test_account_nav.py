@@ -354,3 +354,31 @@ def test_live_nav_cap_exhausted_allocation_fails_closed(tmp_state, monkeypatch):
     # Equity down to the deposit-minus-allocation floor: allocation ≤ 0.
     with pytest.raises(orchestrator.LiveNavUnavailable):
         orchestrator._account_nav(_live_ctx(_LiveBroker(equity_usd=2500.0)))
+
+
+def test_live_nav_write_marker_false_never_mutates_state(tmp_state, monkeypatch):
+    """Codex P2 (PR #112): dry-run monitoring must not lock in a transition
+    baseline from a test invocation."""
+    from lib import live_nav
+    monkeypatch.delenv("LIVE_NAV_CAP_USD", raising=False)
+    nav = live_nav.live_allocated_nav(_LiveBroker(equity_usd=5000.0), write_marker=False)
+    assert nav == 5000.0
+    assert state.read_live_transition() is None
+
+
+def test_live_nav_cap_without_marker_fails_closed(tmp_state, monkeypatch):
+    """Codex P2 (PR #112): with a cap set, the transition marker anchors the
+    P&L-since-transition debit — if it can't be written OR read, fail closed
+    rather than silently pinning the allocation at the cap."""
+    from lib import live_nav
+    monkeypatch.setenv("LIVE_NAV_CAP_USD", "2500")
+    monkeypatch.setattr(
+        state, "write_live_transition_once",
+        lambda **kw: (_ for _ in ()).throw(OSError("state/ unwritable")),
+    )
+    monkeypatch.setattr(state, "read_live_transition", lambda: None)
+    with pytest.raises(live_nav.LiveNavUnavailable, match="marker"):
+        live_nav.live_allocated_nav(_LiveBroker(equity_usd=5000.0))
+    # Uncapped, the marker is telemetry only — same failure must NOT block.
+    monkeypatch.delenv("LIVE_NAV_CAP_USD", raising=False)
+    assert live_nav.live_allocated_nav(_LiveBroker(equity_usd=5000.0)) == 5000.0

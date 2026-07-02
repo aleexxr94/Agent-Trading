@@ -515,7 +515,12 @@ def main(argv: list[str] | None = None) -> int:
             # baseline (Codex P1 on PR #112).
             dd_mode = "live"
             try:
-                current_nav = live_nav.live_allocated_nav(broker)
+                # Dry-run must not lock in a transition baseline from a test
+                # invocation (write_marker=False keeps the read side-effect
+                # free; run_dd_breaker already gets persist=False below).
+                current_nav = live_nav.live_allocated_nav(
+                    broker, write_marker=not args.dry_run,
+                )
             except live_nav.LiveNavUnavailable as e:
                 print(f"monitor: live NAV unavailable ({e}); dd update skipped")
                 current_nav = None

@@ -12,7 +12,9 @@ Triple lock (see CLAUDE.md §Promotion to live):
   1. ``LIVE_VERSION`` constant below — bump 0 → 1 in code (can't be set via env).
   2. ``LIVE_TRADING_ENABLED=true`` env var.
   3. ``lib/alpaca_client.py`` independently refuses a non-paper client unless
-     ``LIVE_TRADING_ENABLED=true``.
+     the FULL lock is raised (``LIVE_TRADING_ENABLED=true`` AND
+     ``LIVE_VERSION >= 1``) — covers broker-less callers (dashboard resync)
+     that never pass through ``assert_live_gate``.
 
 ``assert_live_gate`` fails closed: if the env says live but the version is
 still 0, the entrypoint exits without doing anything.

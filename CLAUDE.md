@@ -241,8 +241,10 @@ checkout — the triple lock is designed to fail closed at every layer.
    - `lib/live_gate.py:assert_live_gate()` refuses to run if env is `true` while
      `LIVE_VERSION == 0` (exit code 2), and is called from BOTH `orchestrator.main`
      and `monitor.main`, so the two must be raised together at either entrypoint.
-     `lib/alpaca_client.py:61` independently refuses to construct a non-paper
-     client unless `LIVE_TRADING_ENABLED=true`.
+     `lib/alpaca_client.py` independently refuses to construct a non-paper
+     client unless the FULL lock is raised (`LIVE_TRADING_ENABLED=true` AND
+     `LIVE_VERSION >= 1`), so broker-less callers (e.g. the dashboard resync
+     button) can't reach the live account under a half-raised lock either.
 
 2. **Broker.** Alpaca live **is** available to UK retail for ETFs (precondition §2), so "going
    live" means pointing the **existing** `AlpacaBroker` at the live endpoint — **no new broker

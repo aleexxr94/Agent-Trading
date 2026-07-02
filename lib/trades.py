@@ -99,6 +99,7 @@ class OpenTradePnl:
     attributed_llm_cost_usd: float
     net_pnl_usd: float | None        # None when mark is unavailable
     slippage_usd: float = 0.0        # buy-side only (entry leg)
+    mode: str = "paper"              # account era the lot belongs to
 
 
 @dataclass(frozen=True)
@@ -339,9 +340,12 @@ def compute_trades_pnl(
                 activity_id=activity_id,
             ))
 
-    # Flatten remaining open lots into OpenTradePnl rows.
+    # Flatten remaining open lots into OpenTradePnl rows. The era is kept
+    # on the row (Codex P2 on PR #112) so consumers judging "currently
+    # open" — the re-entry cooldown above all — can scope inventory to the
+    # account they actually trade in.
     open_rows: list[OpenTradePnl] = []
-    for (_mode, symbol), lots in open_lots.items():
+    for (lot_mode, symbol), lots in open_lots.items():
         for lot in lots:
             mark = marks.get(symbol)
             gross = (
@@ -371,6 +375,7 @@ def compute_trades_pnl(
                 attributed_llm_cost_usd=llm_share,
                 net_pnl_usd=net,
                 slippage_usd=lot["remaining_slippage"],
+                mode=lot_mode,
             ))
 
     return TradesPnl(
@@ -394,6 +399,7 @@ def symbols_in_cooldown(
     *,
     now: datetime,
     window_days: float,
+    mode: str = "paper",
 ) -> dict[str, str]:
     """Symbols that were FULLY exited within ``window_days`` of ``now``.
 
@@ -413,10 +419,16 @@ def symbols_in_cooldown(
     append-order and a sync can append a sell ahead of its earlier buy,
     which would otherwise leave the buy as a phantom open lot and wrongly
     exclude a just-exited symbol from cooldown.
+
+    ``mode`` is the CURRENT account era: "currently open" only counts lots
+    from that era (Codex P2 on PR #112 — a leftover paper lot must not make
+    a fully-exited live symbol look like a continuing hold), while exits
+    from ANY era still start the cooldown clock (the 7-day window
+    deliberately spans the paper→live boundary).
     """
     rows = sorted(trades, key=lambda r: r.get("filled_at") or "")
     pnl = compute_trades_pnl(rows)
-    open_symbols = {lot.symbol for lot in pnl.open}
+    open_symbols = {lot.symbol for lot in pnl.open if lot.mode == mode}
     last_exit: dict[str, str] = {}
     for ct in pnl.closed:
         if ct.symbol in open_symbols:

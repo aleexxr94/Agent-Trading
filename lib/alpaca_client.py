@@ -56,11 +56,23 @@ class AlpacaBroker(Broker):
                 "Alpaca credentials missing — set ALPACA_API_KEY and ALPACA_API_SECRET"
             )
         self._paper = self._base_url == PAPER_BASE_URL if paper is None else paper
-        if not self._paper and os.environ.get("LIVE_TRADING_ENABLED", "false").lower() != "true":
-            raise RuntimeError(
-                "Refusing non-paper Alpaca client without LIVE_TRADING_ENABLED=true. "
-                "See CLAUDE.md §Promotion to live."
-            )
+        if not self._paper:
+            # Full triple lock, not just the env half (Codex P2 on PR #112):
+            # orchestrator/monitor entrypoints check assert_live_gate, but
+            # broker-less callers (dashboard resync) construct this client
+            # directly — with only the env flag checked here, a half-raised
+            # lock (env=true, LIVE_VERSION=0) could reach the live account
+            # and stamp live-mode state before the version was ever bumped.
+            from . import live_gate  # noqa: WPS433 — lazy, avoids import cycle
+
+            if not (
+                live_gate.live_trading_env_enabled() and live_gate.LIVE_VERSION >= 1
+            ):
+                raise RuntimeError(
+                    "Refusing non-paper Alpaca client without the FULL triple "
+                    "lock (LIVE_TRADING_ENABLED=true AND LIVE_VERSION >= 1). "
+                    "See CLAUDE.md §Promotion to live."
+                )
         # Lazy import keeps the dependency optional for unit tests / dry runs.
         from alpaca.trading.client import TradingClient  # noqa: WPS433
 
