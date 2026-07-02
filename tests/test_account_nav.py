@@ -128,3 +128,158 @@ def test_parsed_virtual_nav_override_handles_whitespace_negative(monkeypatch):
     NAV scenario). The helper just reports parseability."""
     monkeypatch.setenv("VIRTUAL_NAV_USD", "  -500  ")
     assert orchestrator._parsed_virtual_nav_override() == -500.0
+
+
+# ---------- live sizing path (fail closed; inert on paper) ----------
+
+
+import pytest  # noqa: E402
+
+
+class _LiveBroker:
+    """Stub of a genuinely live broker (triple lock notionally raised)."""
+
+    is_paper = False
+
+    def __init__(self, equity_usd=12345.0, fail=False, account_is_paper=False):
+        self._equity = equity_usd
+        self._fail = fail
+        self._account_is_paper = account_is_paper
+        self.get_account_calls = 0
+
+    @property
+    def name(self): return "fake-live"
+
+    def get_account(self):
+        self.get_account_calls += 1
+        if self._fail:
+            raise RuntimeError("alpaca down")
+        return Account(
+            cash_usd=self._equity, equity_usd=self._equity,
+            buying_power_usd=self._equity, is_paper=self._account_is_paper,
+        )
+
+    def get_positions(self): return []
+    def submit_order(self, *a, **kw): raise NotImplementedError
+    def cancel_all(self): return 0
+    def flatten(self, sym): return None
+
+
+def _live_ctx(broker) -> orchestrator.StageContext:
+    return orchestrator.StageContext(run_id="t", dry_run=False, broker=broker)
+
+
+def test_live_nav_returns_real_equity(tmp_state, monkeypatch):
+    monkeypatch.delenv("LIVE_NAV_CAP_USD", raising=False)
+    broker = _LiveBroker(equity_usd=12345.0)
+    assert orchestrator._account_nav(_live_ctx(broker)) == 12345.0
+
+
+def test_live_nav_capped_by_env(tmp_state, monkeypatch):
+    monkeypatch.setenv("LIVE_NAV_CAP_USD", "2500")
+    broker = _LiveBroker(equity_usd=12345.0)
+    assert orchestrator._account_nav(_live_ctx(broker)) == 2500.0
+
+
+def test_live_nav_cap_above_equity_is_noop(tmp_state, monkeypatch):
+    monkeypatch.setenv("LIVE_NAV_CAP_USD", "50000")
+    broker = _LiveBroker(equity_usd=12345.0)
+    assert orchestrator._account_nav(_live_ctx(broker)) == 12345.0
+
+
+def test_live_nav_read_failure_raises_never_2500(tmp_state, monkeypatch):
+    """The live path has NO fallback: a failed equity read must raise, not
+    silently size against the paper baseline."""
+    monkeypatch.delenv("LIVE_NAV_CAP_USD", raising=False)
+    broker = _LiveBroker(fail=True)
+    with pytest.raises(orchestrator.LiveNavUnavailable):
+        orchestrator._account_nav(_live_ctx(broker))
+
+
+def test_live_nav_malformed_cap_fails_closed(tmp_state, monkeypatch):
+    monkeypatch.setenv("LIVE_NAV_CAP_USD", "not-a-number")
+    broker = _LiveBroker(equity_usd=12345.0)
+    with pytest.raises(orchestrator.LiveNavUnavailable):
+        orchestrator._account_nav(_live_ctx(broker))
+    monkeypatch.setenv("LIVE_NAV_CAP_USD", "-100")
+    with pytest.raises(orchestrator.LiveNavUnavailable):
+        orchestrator._account_nav(_live_ctx(broker))
+
+
+def test_live_nav_invalid_equity_fails_closed(tmp_state, monkeypatch):
+    monkeypatch.delenv("LIVE_NAV_CAP_USD", raising=False)
+    broker = _LiveBroker(equity_usd=0.0)
+    with pytest.raises(orchestrator.LiveNavUnavailable):
+        orchestrator._account_nav(_live_ctx(broker))
+
+
+def test_live_nav_paper_account_on_live_path_fails_closed(tmp_state, monkeypatch):
+    """Belt and braces: a broker claiming live whose account says paper is a
+    misconfiguration, not something to size against."""
+    monkeypatch.delenv("LIVE_NAV_CAP_USD", raising=False)
+    broker = _LiveBroker(account_is_paper=True)
+    with pytest.raises(orchestrator.LiveNavUnavailable):
+        orchestrator._account_nav(_live_ctx(broker))
+
+
+def test_live_nav_writes_transition_marker_once(tmp_state, monkeypatch):
+    monkeypatch.setenv("LIVE_NAV_CAP_USD", "2500")
+    broker = _LiveBroker(equity_usd=2612.34)
+    orchestrator._account_nav(_live_ctx(broker))
+    marker = state.read_live_transition()
+    assert marker["live_starting_equity_usd"] == 2612.34
+    assert marker["nav_cap_usd"] == 2500.0
+    # A later, richer account must not overwrite the recorded start.
+    orchestrator._account_nav(_live_ctx(_LiveBroker(equity_usd=9999.0)))
+    assert state.read_live_transition() == marker
+
+
+def test_live_nav_cached_on_ctx_single_broker_call(tmp_state, monkeypatch):
+    monkeypatch.delenv("LIVE_NAV_CAP_USD", raising=False)
+    broker = _LiveBroker(equity_usd=12345.0)
+    ctx = _live_ctx(broker)
+    assert orchestrator._account_nav(ctx) == 12345.0
+    assert orchestrator._account_nav(ctx) == 12345.0
+    assert broker.get_account_calls == 1
+
+
+def test_paper_broker_never_hits_live_path(tmp_state, monkeypatch):
+    """A paper broker (is_paper=True) on a non-dry-run ctx stays on the
+    synthetic path and never calls get_account."""
+    monkeypatch.delenv("VIRTUAL_NAV_USD", raising=False)
+
+    class _PaperNeverCalled:
+        is_paper = True
+
+        def get_account(self):
+            raise AssertionError("paper path must not read broker equity")
+
+    assert orchestrator._account_nav(_live_ctx(_PaperNeverCalled())) == 2500.0
+
+
+def test_dry_run_never_hits_live_path(tmp_state, monkeypatch):
+    """Dry-run with a live-shaped broker still sizes synthetically."""
+    monkeypatch.delenv("VIRTUAL_NAV_USD", raising=False)
+    broker = _LiveBroker(equity_usd=12345.0)
+    ctx = orchestrator.StageContext(run_id="t", dry_run=True, broker=broker)
+    assert orchestrator._account_nav(ctx) == 2500.0
+    assert broker.get_account_calls == 0
+
+
+def test_run_pipeline_skips_cycle_when_live_nav_unavailable(tmp_state, monkeypatch):
+    """Fail-closed prefetch: a live broker whose equity read fails skips the
+    ENTIRE cycle — no orders, no LLM calls — and leaves a retry-soon
+    next_run.json plus an audited decision row."""
+    broker = _LiveBroker(fail=True)
+    out = orchestrator.run_pipeline(dry_run=False, run_id="livefail", broker=broker)
+    assert out["live_nav_unavailable"] is True
+    nr = out["next_run"]
+    assert nr["live_nav_unavailable"] is True
+    assert "live NAV unavailable" in nr["rationale"]
+    rows = [
+        __import__("json").loads(line)
+        for line in state.DECISIONS_LOG.read_text().splitlines() if line.strip()
+    ]
+    assert rows[-1]["status"] == "skipped_live_nav_unavailable"
+    assert rows[-1]["stage"] == "live_nav_prefetch"
+    assert rows[-1]["cost_usd"] == 0.0

@@ -496,7 +496,19 @@ def main(argv: list[str] | None = None) -> int:
     dd_info = None
     try:
         dd_enabled = risk.dd_breaker_enabled()
-        current_nav = _live_synthetic_nav(portfolio=portfolio, marks=marks, cost_basis=cost_basis)
+        if broker is not None and getattr(broker, "is_paper", True) is False:
+            # Live account: the breaker must denominate in REAL equity, not
+            # the paper-era synthetic units (2500 + all paper P&L), which
+            # drift from the live balance. On a failed read, None skips this
+            # pass's dd update (fail closed) rather than mixing baselines.
+            try:
+                current_nav = float(broker.get_account().equity_usd)
+            except Exception:
+                current_nav = None
+        else:
+            current_nav = _live_synthetic_nav(
+                portfolio=portfolio, marks=marks, cost_basis=cost_basis,
+            )
         dd_info = run_dd_breaker(
             current_nav=current_nav, enabled=dd_enabled, persist=not args.dry_run,
         )

@@ -133,6 +133,11 @@ class StageContext:
     # operator's `--intent=review` doesn't burn the autonomous-review
     # budget.
     intent_source: str = "default"
+    # Live-mode sizing NAV, prefetched once per cycle by run_pipeline when
+    # the broker is genuinely live (triple lock fully raised). None on
+    # paper. Caching avoids re-hitting broker.get_account at every
+    # _account_nav call site within a cycle.
+    live_nav_usd: float | None = None
 
 
 # Daily-review-frequency cap defaults. Operator can override via env.
@@ -375,7 +380,7 @@ def _sync_fills_before_cooldown(ctx: StageContext) -> str | None:
     if ctx.dry_run:
         return None
     try:
-        from lib import live_gate, trades_sync
+        from lib import trades_sync
         trades_sync.sync_fills_from_alpaca(
             trading_client=getattr(ctx.broker, "_client", None),
             order_id_to_run_id=trades_sync.order_id_to_run_id_from_runs(),
@@ -546,19 +551,95 @@ def _parsed_virtual_nav_override() -> float | None:
         return None
 
 
+class LiveNavUnavailable(RuntimeError):
+    """Live broker equity could not be read or validated. The live sizing
+    path NEVER falls back to the synthetic/$2,500 baseline — sizing a real
+    account against the wrong scale is worse than skipping the cycle, so
+    callers must fail closed (no orders, no LLM spend, retry later)."""
+
+
+def _broker_is_live(broker: Broker | None) -> bool:
+    """True iff the broker object is a genuinely live (non-paper) client.
+    Constructing one already requires the triple lock (AlpacaBroker refuses
+    non-paper without LIVE_TRADING_ENABLED=true); a broker without an
+    is_paper attribute is treated as paper."""
+    return broker is not None and getattr(broker, "is_paper", True) is False
+
+
+def _live_nav_cap_usd() -> float | None:
+    """Optional operator ceiling on the live sizing NAV (LIVE_NAV_CAP_USD).
+    Lets the account hold more cash than the agent is allowed to size
+    against. Unset/blank → no cap. A malformed or non-positive value raises
+    LiveNavUnavailable: a typo'd cap must halt the cycle loudly, never
+    silently size against the full deposit."""
+    raw = os.environ.get("LIVE_NAV_CAP_USD")
+    if raw is None or not raw.strip():
+        return None
+    try:
+        cap = float(raw)
+    except ValueError:
+        raise LiveNavUnavailable(f"LIVE_NAV_CAP_USD is not a number: {raw!r}")
+    if not (cap > 0) or cap != cap or cap == float("inf"):
+        raise LiveNavUnavailable(f"LIVE_NAV_CAP_USD must be a positive finite USD amount: {raw!r}")
+    return cap
+
+
+def _live_account_nav(ctx: StageContext) -> float:
+    """Live sizing NAV: real broker equity, optionally capped by
+    LIVE_NAV_CAP_USD. Raises LiveNavUnavailable on ANY problem — this path
+    has no fallback by design (see LiveNavUnavailable). On the first
+    successful read it records the write-once paper→live transition marker
+    with the real starting equity."""
+    cap = _live_nav_cap_usd()
+    try:
+        account = ctx.broker.get_account()
+    except Exception as e:
+        raise LiveNavUnavailable(f"broker.get_account failed: {type(e).__name__}: {e}")
+    if getattr(account, "is_paper", True):
+        raise LiveNavUnavailable("broker reports a paper account on the live NAV path")
+    try:
+        equity = float(account.equity_usd)
+    except (TypeError, ValueError, AttributeError) as e:
+        raise LiveNavUnavailable(f"live equity unreadable: {type(e).__name__}: {e}")
+    if not (equity > 0) or equity != equity or equity == float("inf"):
+        raise LiveNavUnavailable(f"live equity invalid: {equity!r}")
+    try:
+        state.write_live_transition_once(
+            live_starting_equity_usd=equity,
+            nav_cap_usd=cap,
+            run_id=ctx.run_id,
+            live_version=live_gate.LIVE_VERSION,
+        )
+    except Exception:
+        pass  # the marker is telemetry; recording it must never block sizing
+    return min(equity, cap) if cap is not None else equity
+
+
 def _account_nav(ctx: StageContext) -> float:
-    """Synthetic NAV the agent sizes against: the $2,500 baseline
+    """NAV the agent sizes against.
+
+    Paper (today's steady state): the synthetic $2,500 baseline
     (VIRTUAL_NAV_USD-overridable) + realized P&L to date. NEVER the broker's
     ~$100k paper equity — Phase 3 removed that fallback so a missing/garbled
     env var can't make the agent size ~40× too large. Sourced from the same
     trades.jsonl-derived balance the dashboard shows, so sizing and the
-    headline agree.
+    headline agree. Realized (settled) basis is intentional: it tracks
+    closed P&L — compounds as wins are banked, de-risks after realized
+    losses — without whipsawing on open-position mark-to-market. Falls back
+    to the baseline if the synthetic computation errors.
 
-    Realized (settled) basis is intentional: it tracks closed P&L — compounds
-    as wins are banked, de-risks after realized losses — without whipsawing on
-    open-position mark-to-market. Falls back to the baseline if the synthetic
-    computation errors.
+    Live (triple lock fully raised, non-paper broker): real broker equity,
+    optionally capped by LIVE_NAV_CAP_USD, prefetched once per cycle into
+    ctx.live_nav_usd by run_pipeline. This branch sits OUTSIDE the paper
+    try/except and never falls back to 2500/synthetic — a failed live
+    equity read raises LiveNavUnavailable and the cycle skips (fail closed).
     """
+    if ctx.live_nav_usd is not None:
+        return ctx.live_nav_usd
+    if not ctx.dry_run and _broker_is_live(ctx.broker):
+        nav = _live_account_nav(ctx)
+        ctx.live_nav_usd = nav
+        return nav
     try:
         from lib import dashboard_data
         return dashboard_data.realized_synthetic_nav()
@@ -1250,7 +1331,7 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
         # activity. Run EVERY cycle that reaches stage_execute (idempotent
         # via known_ids dedupe).
         try:
-            from lib import live_gate, trades_sync
+            from lib import trades_sync
             trades_sync.sync_fills_from_alpaca(
                 trading_client=getattr(ctx.broker, "_client", None),
                 order_id_to_run_id=trades_sync.order_id_to_run_id_from_runs(),
@@ -1291,13 +1372,12 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
             synthetic_nav = _dd.realized_synthetic_nav()
         except Exception:
             synthetic_nav = nav_portfolio.get("nav_usd", 0.0)
-        from lib import live_gate as _lg
         state.append_nav({
             "run_id": ctx.run_id,
             "at": state.utcnow_iso(),
             "nav_usd": synthetic_nav,
             "nav_source": "virtual",
-            "mode": _lg.trading_mode(ctx.broker),
+            "mode": live_gate.trading_mode(ctx.broker),
             "cash_usd": nav_portfolio.get("cash_usd", 0.0),
             "positions_count": len(nav_portfolio.get("positions", [])),
             "all_cash": nav_portfolio.get("all_cash", False),
@@ -1533,6 +1613,54 @@ def run_pipeline(
         cycle_intent=cycle_intent,
         intent_source=intent_source,
     )
+
+    # Live sizing prefetch (fail closed) — BEFORE the review branch, the
+    # market gate, and any LLM spend. On a live broker the cycle must know
+    # the real equity it sizes against; if that read fails there is no safe
+    # fallback (never 2500/synthetic on live), so skip the whole cycle and
+    # retry soon. Paper and dry-run are untouched: live_nav_usd stays None
+    # and _account_nav uses the synthetic path exactly as before.
+    if not dry_run and _broker_is_live(broker):
+        try:
+            ctx.live_nav_usd = _live_account_nav(ctx)
+        except LiveNavUnavailable as e:
+            from datetime import timedelta
+            next_at = (state.utcnow() + timedelta(minutes=30)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            next_run = {
+                "run_id": rid,
+                "next_run_at": next_at,
+                "rationale": (
+                    f"cycle skipped: live NAV unavailable ({e}). No orders "
+                    "and no LLM calls were made; retrying in 30 minutes. "
+                    "Check LIVE_NAV_CAP_USD and broker connectivity."
+                ),
+                "cycle_intent": "trade",
+                "live_nav_unavailable": True,
+            }
+            state.write_json(state.run_dir(rid) / "next_run.json", next_run)
+            state.write_json(state.NEXT_RUN, next_run)
+            state.append_decision({
+                "run_id": rid,
+                "stage": "live_nav_prefetch",
+                "model": "local-deterministic",
+                "inputs_hash": _hash_inputs(rid),
+                "output_ref": "next_run.json",
+                "prompt_cache_hit_pct": 0.0,
+                "cost_usd": 0.0,
+                "started_at": state.utcnow_iso(),
+                "ended_at": state.utcnow_iso(),
+                "status": "skipped_live_nav_unavailable",
+                "risk_warning": RISK_WARNING,
+                "cycle_intent": cycle_intent,
+                "intent_source": intent_source,
+            })
+            return {
+                "run_id": rid,
+                "live_nav_unavailable": True,
+                "next_run": next_run,
+            }
 
     if cycle_intent == "review":
         return _run_pipeline_review(ctx=ctx, dry_run=dry_run)

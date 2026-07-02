@@ -631,3 +631,36 @@ def test_monitor_kill_event_carries_mode(tmp_state):
     monitor.execute_actions(actions, broker=_FakeBroker([]))
     events = state.read_kill_events()
     assert events[0]["mode"] == "paper"
+
+def test_dd_breaker_uses_real_equity_on_live_broker(tmp_state, monkeypatch):
+    """On a live broker the 8% breaker denominates in real account equity,
+    not paper-era synthetic units; the SOD baseline is set from it."""
+    from lib.broker import Account
+
+    class _LiveBroker(_FakeBroker):
+        is_paper = False
+
+        def get_account(self):
+            return Account(cash_usd=5000.0, equity_usd=5000.0,
+                           buying_power_usd=5000.0, is_paper=False)
+
+    _write_portfolio([])
+    fake = _LiveBroker([])
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
+    monitor.main([])
+    assert state.read_sod_nav_today() == 5000.0
+
+
+def test_dd_breaker_skips_update_when_live_equity_read_fails(tmp_state, monkeypatch):
+    """Fail closed: a live broker whose equity read errors must skip the dd
+    update for the pass (no baseline written from synthetic units)."""
+
+    class _LiveBrokenBroker(_FakeBroker):
+        is_paper = False
+        # get_account inherits NotImplementedError from _FakeBroker
+
+    _write_portfolio([])
+    fake = _LiveBrokenBroker([])
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
+    monitor.main([])
+    assert state.read_sod_nav_today() is None
