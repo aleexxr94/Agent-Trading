@@ -170,3 +170,73 @@ def test_entry_confidence_handles_missing_and_corrupt_artifacts(tmp_state):
     d.mkdir(parents=True)
     (d / "view.json").write_text("{not json")
     assert feedback.entry_confidence_for("bad_run", "TQQQ") is None
+
+
+# ---------- era split (paper→live memory continuity) ----------
+
+
+def test_memo_all_paper_output_has_no_era_keys(tmp_state):
+    """Byte-stability: while paper-only, the memo must be identical to the
+    pre-era-tagging output — it feeds the cycle-dedup fingerprint and cached
+    prompts. No era_split key, no mode on recent_exits."""
+    rows = [
+        _fill("TQQQ", "buy", 4, 70.0, run_id="r1", at="2026-06-01T14:00:00Z", aid="a1"),
+        _fill("TQQQ", "sell", 4, 80.0, at="2026-06-03T14:00:00Z", aid="a2"),
+    ]
+    memo = feedback.build_performance_memo(trade_rows=rows, cost_rows=[], kill_events=[])
+    assert set(memo.keys()) == {
+        "closed_trades", "overall", "by_factor", "confidence_calibration",
+        "by_regime", "recent_exits",
+    }
+    assert all("mode" not in r for r in memo["recent_exits"])
+
+
+def test_memo_era_split_from_live_tagged_fills(tmp_state):
+    """Mixed history without a transition marker: live_since falls back to
+    the earliest live fill; combined sections keep the FULL history."""
+    rows = [
+        # Paper era: TQQQ +40 win.
+        _fill("TQQQ", "buy", 4, 70.0, run_id="r1", at="2026-06-01T14:00:00Z", aid="a1"),
+        _fill("TQQQ", "sell", 4, 80.0, at="2026-06-03T14:00:00Z", aid="a2"),
+        # Live era: SOXL -30 loss.
+        {**_fill("SOXL", "buy", 10, 30.0, run_id="r2", at="2026-07-01T14:00:00Z", aid="a3"),
+         "mode": "live"},
+        {**_fill("SOXL", "sell", 10, 27.0, at="2026-07-02T14:00:00Z", aid="a4"),
+         "mode": "live"},
+    ]
+    memo = feedback.build_performance_memo(trade_rows=rows, cost_rows=[], kill_events=[])
+    # Combined sections still cover everything (the carryover the user wants).
+    assert memo["closed_trades"] == 2
+    assert memo["overall"]["trades"] == 2
+    es = memo["era_split"]
+    assert es["live_since"] == "2026-07-01T14:00:00Z"
+    assert es["paper"]["trades"] == 1
+    assert es["paper"]["wins"] == 1
+    assert es["paper"]["through"] == "2026-06-03T14:00:00Z"
+    assert es["live"]["trades"] == 1
+    assert es["live"]["losses"] == 1
+    modes = {r["symbol"]: r["mode"] for r in memo["recent_exits"]}
+    assert modes == {"TQQQ": "paper", "SOXL": "live"}
+
+
+def test_memo_era_split_prefers_transition_marker(tmp_state):
+    """The write-once marker is authoritative over fill tags: a boundary-
+    spanning round trip (opened paper, closed live) counts as a live exit."""
+    state.write_live_transition_once(
+        live_starting_equity_usd=2600.0, nav_cap_usd=2500.0,
+        run_id="r9", live_version=1,
+    )
+    marker_at = state.read_live_transition()["at"]
+    rows = [
+        # Closed well before any plausible marker date → paper.
+        _fill("TQQQ", "buy", 4, 70.0, run_id="r1", at="2020-01-01T14:00:00Z", aid="a1"),
+        _fill("TQQQ", "sell", 4, 80.0, at="2020-01-03T14:00:00Z", aid="a2"),
+        # Untagged fills closing after the marker → live by timestamp split.
+        _fill("SOXL", "buy", 10, 30.0, run_id="r2", at="2999-01-01T14:00:00Z", aid="a3"),
+        _fill("SOXL", "sell", 10, 27.0, at="2999-01-02T14:00:00Z", aid="a4"),
+    ]
+    memo = feedback.build_performance_memo(trade_rows=rows, cost_rows=[], kill_events=[])
+    es = memo["era_split"]
+    assert es["live_since"] == marker_at
+    assert es["paper"]["trades"] == 1
+    assert es["live"]["trades"] == 1

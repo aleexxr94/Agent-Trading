@@ -114,6 +114,35 @@ def _exit_kind_for(ct: trades.ClosedTrade, kill_events: list[dict]) -> str:
     return "agent_decision"
 
 
+def _live_since(trade_rows: list[dict]) -> str | None:
+    """ISO UTC timestamp the live era began at, or None while paper-only.
+
+    Prefers the write-once transition marker (state/live_transition.json);
+    falls back to the earliest live-tagged fill so the memo still splits
+    correctly if the marker was lost. None → the memo output stays exactly
+    as it was pre-era-tagging (byte-stable: it participates in the cycle
+    dedup fingerprint and cached prompts)."""
+    marker = state.read_live_transition()
+    if marker is not None and isinstance(marker.get("at"), str) and marker["at"]:
+        return marker["at"]
+    live_ts = [
+        r.get("filled_at") for r in trade_rows
+        if state.record_mode(r) == "live" and r.get("filled_at")
+    ]
+    return min(live_ts) if live_ts else None
+
+
+def _era_of(ct: trades.ClosedTrade, live_since: str) -> str:
+    """Era a closed trade belongs to: timestamp split on closed_at. A round
+    trip spanning the boundary (opened on paper, closed live) counts as a
+    live-era exit — the realized outcome landed in the live account."""
+    c = trades._parse_iso_utc(ct.closed_at)
+    ls = trades._parse_iso_utc(live_since)
+    if c is not None and ls is not None:
+        return "live" if c >= ls else "paper"
+    return "live" if (ct.closed_at or "") >= live_since else "paper"
+
+
 def _record(rows: list[trades.ClosedTrade]) -> dict:
     """Win/loss record over a set of closed trades (net-PnL basis,
     consistent with the dashboard's trade_stats)."""
@@ -215,7 +244,7 @@ def build_performance_memo(
     )
 
     bucket_order = [label for _, _, label in _CONFIDENCE_BUCKETS] + ["unknown"]
-    return {
+    memo = {
         "closed_trades": len(closed),
         "overall": overall,
         "by_factor": [
@@ -236,6 +265,36 @@ def build_performance_memo(
         ],
         "recent_exits": recent_exits,
     }
+
+    # Era split: only once the live era has actually begun. While paper-only
+    # (live_since is None) the memo above is byte-identical to the pre-era
+    # output — it participates in the cycle-dedup fingerprint and cached
+    # prompts, so it must not churn before promotion. When live records
+    # exist, the combined sections above deliberately keep the FULL history
+    # (the carryover is the point); this block just labels which evidence
+    # came from which era so the strategist can weigh simulated fills
+    # (modelled fees, no real slippage) against real-money ones.
+    live_since = _live_since(rows)
+    if live_since is not None:
+        eras: dict[str, list[trades.ClosedTrade]] = {"paper": [], "live": []}
+        for ct in closed:
+            eras[_era_of(ct, live_since)].append(ct)
+        for exit_row, ct in zip(recent_exits, reversed(recent)):
+            exit_row["mode"] = _era_of(ct, live_since)
+        paper_rec = _record(eras["paper"])
+        if eras["paper"]:
+            paper_rec["through"] = max(t.closed_at for t in eras["paper"])
+        memo["era_split"] = {
+            "live_since": live_since,
+            "note": (
+                "sections above cover the FULL history (paper + live). "
+                "'paper' = simulated fills (modelled fees, no real slippage) "
+                f"through {live_since}; 'live' = real-money fills."
+            ),
+            "paper": paper_rec,
+            "live": _record(eras["live"]),
+        }
+    return memo
 
 
 def build_performance_memo_safe() -> dict | None:
