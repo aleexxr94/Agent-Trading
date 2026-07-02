@@ -12,7 +12,7 @@ The system is ETF-only. Any option-shaped target (kind="option", an OSI
 symbol, or option-only fields like contracts/strike/expiry/premium_paid) is
 rejected defensively before it can reach the broker — it is never submitted.
 
-Hard universe guard (fail-closed): the tradable set is exactly the 29 symbols
+Hard universe guard (fail-closed): the tradable set is exactly the symbols
 in lib/universe.py. Any non-universe symbol — a typo, a plain index ETF
 (SPY/QQQ), a single name (TSLA) — is refused at the order boundary, both when
 planning opens (diff_portfolio) and at submission (submit_plan), for BOTH buys
@@ -47,19 +47,22 @@ def is_osi_symbol(symbol: str) -> bool:
 # layer refuses anything outside it. Symbols are upper-case (schema-enforced).
 _UNIVERSE_SYMBOLS: frozenset[str] = frozenset(universe.all_symbols())
 
-# Reason strings (shared so tests can assert on a stable phrase).
-_NOT_IN_UNIVERSE_SKIP_REASON = "symbol not in ETF-only universe (29 symbols)"
-_NOT_IN_UNIVERSE_ORDER_STATUS = "skipped: symbol not in ETF-only universe (29 symbols)"
+# Reason strings (shared so tests can assert on a stable phrase). Symbol count
+# is derived from the universe so the message can't rot when the universe grows.
+_NOT_IN_UNIVERSE_SKIP_REASON = (
+    f"symbol not in ETF-only universe ({len(_UNIVERSE_SYMBOLS)} symbols)"
+)
+_NOT_IN_UNIVERSE_ORDER_STATUS = f"skipped: {_NOT_IN_UNIVERSE_SKIP_REASON}"
 
 
 def in_universe(symbol: str) -> bool:
-    """True iff ``symbol`` is one of the 29 tradable ETF tickers."""
+    """True iff ``symbol`` is one of the tradable ETF tickers in lib/universe.py."""
     return symbol in _UNIVERSE_SYMBOLS
 
 
 def is_tradable_target(position: dict) -> bool:
     """True iff this target position is one the order layer would actually
-    submit: ETF-only (not option-shaped) AND in the 29-ticker universe. The
+    submit: ETF-only (not option-shaped) AND in the tradable universe. The
     inverse of what diff_portfolio drops into ``skipped``. Used to keep
     current_portfolio.json from recording a position that can never be held.
     """
@@ -191,7 +194,7 @@ def diff_portfolio(target_portfolio: dict, broker_positions: list[BrokerPosition
             })
             continue
         # Hard universe guard (fail-closed): never plan an open for a symbol
-        # outside the 29-ticker ETF universe — a typo or a non-universe ETF
+        # outside the tradable ETF universe — a typo or a non-universe ETF
         # (SPY/QQQ/TSLA) is dropped here rather than sized into a position.
         if not in_universe(p["symbol"]):
             skipped.append({
@@ -247,7 +250,7 @@ def submit_plan(plan: OrderPlan, *, broker: Broker) -> list[OrderResult]:
     builds option symbols, but if an OSI-shaped symbol ever reaches here it
     is refused outright rather than submitted to the broker.
 
-    Hard universe guard (fail-closed): any symbol outside the 29-ticker ETF
+    Hard universe guard (fail-closed): any symbol outside the tradable ETF
     universe is refused here too — for BOTH buys and sells. This is the true
     broker boundary (it also sees closes), so a non-universe symbol can never
     reach broker.submit_order regardless of how the plan was built. Exiting a

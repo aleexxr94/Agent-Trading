@@ -241,8 +241,10 @@ checkout — the triple lock is designed to fail closed at every layer.
    - `lib/live_gate.py:assert_live_gate()` refuses to run if env is `true` while
      `LIVE_VERSION == 0` (exit code 2), and is called from BOTH `orchestrator.main`
      and `monitor.main`, so the two must be raised together at either entrypoint.
-     `lib/alpaca_client.py:61` independently refuses to construct a non-paper
-     client unless `LIVE_TRADING_ENABLED=true`.
+     `lib/alpaca_client.py` independently refuses to construct a non-paper
+     client unless the FULL lock is raised (`LIVE_TRADING_ENABLED=true` AND
+     `LIVE_VERSION >= 1`), so broker-less callers (e.g. the dashboard resync
+     button) can't reach the live account under a half-raised lock either.
 
 2. **Broker.** Alpaca live **is** available to UK retail for ETFs (precondition §2), so "going
    live" means pointing the **existing** `AlpacaBroker` at the live endpoint — **no new broker
@@ -254,16 +256,45 @@ checkout — the triple lock is designed to fail closed at every layer.
      `cancel_all` / `flatten` all work unchanged against the live account. `_try_load_broker()`
      needs no change — it already loads `AlpacaBroker`.
    - `is_paper` flips to `False` automatically because the base URL is no longer the paper URL
-     (`lib/alpaca_client.py`), which drives the dashboard PAPER→LIVE pill.
+     (`lib/alpaca_client.py`). The dashboard PAPER→LIVE pill is driven by the
+     `LIVE_TRADING_ENABLED` env var directly (`dashboard.py`), not by `is_paper` — it flips as
+     soon as the env half of the lock is set.
 
-3. **Sizing — replace the synthetic NAV pin (code change, not config).** Paper sizing is pinned to
-   a synthetic balance (`VIRTUAL_NAV_USD=2500` + realized P&L, never the broker's $100k paper
-   equity) via `orchestrator.py:_account_nav` (≈ 481-499) → `lib.dashboard_data.realized_synthetic_nav`
-   / `synthetic_base_usd`. **Note the fallback: if `VIRTUAL_NAV_USD` is unset or malformed, the code
-   falls back to a hard-coded `2500.0`, not broker equity** (Phase 3 deliberately removed the
-   broker-equity path so a missing var couldn't size ~40× too large). So going live means reworking
-   `_account_nav` / `synthetic_base_usd` to read the live broker's `Account.equity_usd`, then
-   re-verifying the 15% per-position cap and adaptive-cap math against real equity.
+3. **Sizing — IMPLEMENTED (2026-07-02), gated behind the triple lock; no switch-day code
+   change needed.** Paper sizing stays pinned to the synthetic balance (`VIRTUAL_NAV_USD=2500`
+   + realized P&L, never the broker's $100k paper equity) via `orchestrator.py:_account_nav` →
+   `lib.dashboard_data.realized_synthetic_nav` / `synthetic_base_usd`, with the deliberate
+   hard-coded `2500.0` fallback (Phase 3 removed the broker-equity path so a missing var
+   couldn't size ~40× too large). When the broker is **genuinely live** (`is_paper=False`,
+   which itself requires the triple lock), `_account_nav` instead sizes against real
+   `Account.equity_usd` — or, when `LIVE_NAV_CAP_USD` is set, the capped starting allocation
+   `min(starting_equity, cap)` plus live P&L since the transition (never more than equity;
+   losses debit the allocation immediately, profits compound it — shared with the monitor's
+   DD breaker via `lib/live_nav.py` so sizing and the breaker denominate identically).
+   **Fail-closed:** the live path has
+   NO fallback — a failed/invalid equity read or a malformed cap raises `LiveNavUnavailable`,
+   and `run_pipeline` prefetches the NAV before the market gate / any LLM spend, skipping the
+   whole cycle (retry-soon `next_run.json` + `skipped_live_nav_unavailable` decision row) rather
+   than ever sizing live against 2500/synthetic. The monitor's 8% daily-drawdown breaker likewise
+   denominates in real equity on a live broker. The first successful live equity read records the
+   write-once `state/live_transition.json` marker (timestamp + real starting equity).
+
+3b. **Memory continuity (2026-07-02).** Paper history deliberately carries into live as
+   labeled context: trades.jsonl / nav_history.jsonl / kill_events.jsonl rows are stamped
+   `mode: "paper"|"live"` (rows predating tagging read as paper via `state.record_mode`), and
+   once live records exist the performance memo (`lib/feedback.py`) keeps its combined sections
+   over the FULL history but adds an `era_split` block (paper record through the transition date
+   vs live record) and mode-tags `recent_exits`, so the strategist can weigh simulated fills
+   against real-money ones. While paper-only the memo output is byte-identical to the pre-tagging
+   shape (it feeds the cycle-dedup fingerprint + cached prompts). The 7-day re-entry cooldown
+   intentionally spans the boundary. The dashboard NAV charts draw a dotted LIVE marker at the
+   transition. The static `prompts/*.md` keep their paper framing (they are cached and
+   byte-stable across promotion); once live, every LLM stage's user message is prefixed with a
+   LIVE TRADING OVERRIDE line (`orchestrator.py:_live_mode_context_line`) stating the real
+   allocated NAV and superseding the paper references — no prompt edits are required on switch
+   day. The 8% daily-drawdown halt flag is mode-scoped like its SOD baseline, and
+   `state/live_transition.json` is deliberately preserved by history wipes (re-anchoring the
+   live risk budget is an explicit manual action, never a cleanup side effect).
 
 4. **Costs / fills.** `lib/trades_sync.py:sync_fills_from_alpaca` is called at
    `orchestrator.py:363-364` (pre-cooldown) and `1021-1022` (post-execute) with

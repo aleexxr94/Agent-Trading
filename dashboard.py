@@ -207,10 +207,15 @@ def _style_fig(
         )
 
 
-def _render_balance_chart(*, xs, ys, hover_texts, yaxis_title: str, caption: str) -> None:
+def _render_balance_chart(
+    *, xs, ys, hover_texts, yaxis_title: str, caption: str,
+    live_transition_at: str | None = None,
+) -> None:
     """CoinGecko-style balance chart: one smooth area line that flows into
     the current value at a labelled end dot. Direction-aware colour (green
-    up / red down over the visible window), tight y-axis, zoom disabled."""
+    up / red down over the visible window), tight y-axis, zoom disabled.
+    ``live_transition_at`` (ISO UTC) draws a dotted LIVE marker at the first
+    point of the live era, segmenting paper history from real-money cycles."""
     up = len(ys) < 2 or _fnum(ys[-1]) >= _fnum(ys[0])
     col = "#059669" if up else "#dc2626"
     shape = "spline" if len(ys) > 2 else "linear"
@@ -249,6 +254,18 @@ def _render_balance_chart(*, xs, ys, hover_texts, yaxis_title: str, caption: str
         font=dict(size=13, color=col),
         bgcolor=_rgba(col, 0.10), bordercolor=col, borderwidth=1, borderpad=4,
     )
+    if live_transition_at:
+        # Anchor the marker to the first plotted point inside the live era
+        # (works on both categorical and date x-axes; ISO strings compare
+        # chronologically). No point in range → transition predates/postdates
+        # the visible window, skip silently.
+        vx = next((x for x in xs if str(x) >= live_transition_at), None)
+        if vx is not None:
+            fig.add_vline(x=vx, line_width=1, line_dash="dot", line_color="#f59e0b")
+            fig.add_annotation(
+                x=vx, y=1.0, yref="paper", text="LIVE", showarrow=False,
+                yanchor="bottom", font=dict(size=10, color="#f59e0b"),
+            )
     fig.update_layout(
         template="plotly_white",
         paper_bgcolor="rgba(0,0,0,0)",
@@ -1584,19 +1601,8 @@ with tabs[3]:
             # P2). The synthetic fallback is already in virtual units so
             # no offset applies.
             live_at = state.utcnow_iso()
-            # The persisted Actual-NAV rows are in synthetic units (the
-            # orchestrator stamps the synthetic balance), so the live tip must
-            # be too — otherwise the line jumps from ~$2.5k history to the
-            # broker's ~$100k equity at the tip (Codex P2 on PR #98). Use the
-            # mark-aware synthetic balance, the same figure as the hero card.
-            live_nav = float(_synth_live.synthetic_balance_usd)
-            live_label = "Live (synthetic balance)"
-            # Fold the live value into one continuous line so the curve
-            # flows into "now" and the y-axis fits the whole series tightly
-            # (the old floating diamond sat ~$100 above the line and blew
-            # the scale wide, flattening real cycle variation).
-            xs = list(nav_df["at"]) + [live_at]
-            ys = [_fnum(v) for v in nav_df["nav_usd"]] + [_fnum(live_nav)]
+            xs = list(nav_df["at"])
+            ys = [_fnum(v) for v in nav_df["nav_usd"]]
             hover_texts = [
                 (
                     f"{r['at']}<br>NAV: ${_fnum(r['nav_usd']):,.2f}"
@@ -1608,15 +1614,47 @@ with tabs[3]:
                 )
                 for _, r in nav_df.iterrows()
             ]
-            hover_texts.append(f"{live_label}<br>${_fnum(live_nav):,.2f}")
+            # Once the live era has begun, the persisted rows are in
+            # live/capped-allocation units — appending the paper-scale
+            # synthetic tip would end the line with a false jump/drop
+            # (Codex P2 on PR #112); the latest live row IS the current
+            # marker. On paper, the rows are synthetic units so the tip
+            # must be the mark-aware synthetic balance, the same figure as
+            # the hero card — not the broker's ~$100k equity (Codex P2 on
+            # PR #98). Fold the tip into one continuous line so the curve
+            # flows into "now" and the y-axis fits the whole series tightly.
+            _latest_is_live = bool(nav_rows) and state.record_mode(nav_rows[-1]) == "live"
+            if _latest_is_live:
+                tip_phrase = "the latest live cycle"
+                if not xs:
+                    # The trailing window filtered out every row (e.g. 1D
+                    # with the last live cycle older than a day). Anchor the
+                    # chart with the latest live row so _render_balance_chart
+                    # has a point to draw — never the paper-scale synthetic
+                    # tip (Codex P2 on PR #112).
+                    last_row = nav_rows[-1]
+                    xs.append(last_row.get("at") or live_at)
+                    ys.append(_fnum(last_row.get("nav_usd")))
+                    hover_texts.append(
+                        f"Latest live cycle<br>${_fnum(last_row.get('nav_usd')):,.2f}"
+                    )
+            else:
+                synth_tip = float(_synth_live.synthetic_balance_usd)
+                xs.append(live_at)
+                ys.append(_fnum(synth_tip))
+                hover_texts.append(
+                    f"Live (synthetic balance)<br>${_fnum(synth_tip):,.2f}"
+                )
+                tip_phrase = "the current live (synthetic balance)"
             _render_balance_chart(
                 xs=xs, ys=ys, hover_texts=hover_texts,
                 yaxis_title="Portfolio NAV (USD)",
+                live_transition_at=(state.read_live_transition() or {}).get("at"),
                 caption=(
                     f"Line = portfolio NAV at the end of each orchestrator "
                     f"cycle from `state/nav_history.jsonl` ({len(nav_df)} of "
-                    f"{len(nav_rows)} cycles shown), flowing into the current "
-                    f"{live_label.lower()} at the labelled end point. Colour "
+                    f"{len(nav_rows)} cycles shown), flowing into "
+                    f"{tip_phrase} at the labelled end point. Colour "
                     f"is green when up over the window, red when down. Toggle "
                     f"Source → *Synthetic balance* for a broker-independent "
                     f"reconstruction from trades.jsonl + costs.jsonl."
@@ -1671,6 +1709,7 @@ with tabs[3]:
             _render_balance_chart(
                 xs=xs, ys=ys, hover_texts=hover_texts,
                 yaxis_title="Synthetic balance (USD)",
+                live_transition_at=(state.read_live_transition() or {}).get("at"),
                 caption=(
                     "Line = historical realized balance reconstructed from "
                     "`state/trades.jsonl` + `state/costs.jsonl` (closed gross "

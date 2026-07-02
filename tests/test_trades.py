@@ -445,3 +445,127 @@ def test_cooldown_robust_to_out_of_order_log():
     ]
     out = trades.symbols_in_cooldown(rows, now=_now("2026-05-26T15:00:00Z"), window_days=7)
     assert out == {"TQQQ": "2026-05-24T15:00:00Z"}
+
+
+def test_cooldown_spans_paper_to_live_boundary():
+    """Continuity requirement: a full exit tagged mode=paper still blocks a
+    live-era re-entry inside the window — the cooldown is era-agnostic."""
+    rows = [
+        _trade(activity_id="b1", side="buy", qty=10, fill_price=50.0,
+               filled_at="2026-05-10T15:00:00Z"),
+        _trade(activity_id="s1", side="sell", qty=10, fill_price=55.0,
+               filled_at="2026-05-24T15:00:00Z"),
+    ]
+    rows[0]["mode"] = "paper"
+    rows[1]["mode"] = "paper"
+    out = trades.symbols_in_cooldown(rows, now=_now("2026-05-26T15:00:00Z"), window_days=7)
+    assert out == {"TQQQ": "2026-05-24T15:00:00Z"}
+
+
+def test_fifo_never_matches_across_eras():
+    """Codex P1 (PR #112): paper and live accounts do not share inventory.
+    A live sell must match the live buy, never a leftover open paper lot —
+    even though the paper lot is older (FIFO within the era only)."""
+    rows = [
+        _trade(activity_id="pb", side="buy", qty=10, fill_price=50.0,
+               filled_at="2026-06-01T15:00:00Z"),                       # paper, left open
+        _trade(activity_id="lb", side="buy", qty=10, fill_price=80.0,
+               filled_at="2026-07-01T15:00:00Z"),
+        _trade(activity_id="ls", side="sell", qty=10, fill_price=90.0,
+               filled_at="2026-07-02T15:00:00Z"),
+    ]
+    rows[0]["mode"] = "paper"
+    rows[1]["mode"] = "live"
+    rows[2]["mode"] = "live"
+    res = trades.compute_trades_pnl(rows)
+    assert len(res.closed) == 1
+    ct = res.closed[0]
+    assert ct.buy_activity_id == "lb"          # live sell closed the LIVE buy
+    assert ct.gross_pnl_usd == pytest.approx(100.0)  # (90-80)×10, not (90-50)×10
+    assert len(res.open) == 1
+    assert res.open[0].buy_activity_id == "pb"  # paper lot stays open
+    assert res.unmatched_sells == []
+
+
+def test_fifo_live_sell_with_only_paper_lot_is_unmatched():
+    """A live sell with no live inventory must surface as an unmatched sell
+    (operator warning), not silently consume the paper lot."""
+    rows = [
+        _trade(activity_id="pb", side="buy", qty=10, fill_price=50.0,
+               filled_at="2026-06-01T15:00:00Z"),
+        _trade(activity_id="ls", side="sell", qty=10, fill_price=90.0,
+               filled_at="2026-07-02T15:00:00Z"),
+    ]
+    rows[0]["mode"] = "paper"
+    rows[1]["mode"] = "live"
+    res = trades.compute_trades_pnl(rows)
+    assert res.closed == []
+    assert len(res.unmatched_sells) == 1
+    assert len(res.open) == 1
+
+
+def test_cooldown_live_exit_not_masked_by_leftover_paper_lot():
+    """Codex P2 (PR #112): a paper lot left open at promotion must not make
+    a fully-exited live symbol look like a continuing hold — the live exit
+    starts the cooldown for the live era."""
+    rows = [
+        _trade(activity_id="pb", side="buy", qty=10, fill_price=50.0,
+               filled_at="2026-05-10T15:00:00Z"),                       # paper, left open
+        _trade(activity_id="lb", side="buy", qty=8, fill_price=80.0,
+               filled_at="2026-05-20T15:00:00Z"),
+        _trade(activity_id="ls", side="sell", qty=8, fill_price=75.0,
+               filled_at="2026-05-24T15:00:00Z"),                       # live full exit
+    ]
+    rows[0]["mode"] = "paper"
+    rows[1]["mode"] = "live"
+    rows[2]["mode"] = "live"
+    now = _now("2026-05-26T15:00:00Z")
+    # Live era: exit within window, live inventory empty → in cooldown.
+    assert trades.symbols_in_cooldown(rows, now=now, window_days=7, mode="live") == {
+        "TQQQ": "2026-05-24T15:00:00Z",
+    }
+    # Paper era: the paper lot is still open → continuing hold, not flagged.
+    assert trades.symbols_in_cooldown(rows, now=now, window_days=7, mode="paper") == {}
+
+
+def test_open_lots_carry_mode():
+    rows = [
+        _trade(activity_id="pb", side="buy", qty=10, fill_price=50.0,
+               filled_at="2026-05-10T15:00:00Z"),
+        _trade(activity_id="lb", side="buy", qty=8, fill_price=80.0,
+               filled_at="2026-05-20T15:00:00Z"),
+    ]
+    rows[1]["mode"] = "live"
+    res = trades.compute_trades_pnl(rows)
+    modes = {lot.buy_activity_id: lot.mode for lot in res.open}
+    assert modes == {"pb": "paper", "lb": "live"}
+
+
+def test_cooldown_partial_paper_close_does_not_block_live():
+    """Codex P2 (PR #112): a PARTIAL paper close (rest of the paper lot
+    still open) was never a full exit — it must not put the symbol in
+    cooldown for the live era."""
+    rows = [
+        _trade(activity_id="pb", side="buy", qty=10, fill_price=50.0,
+               filled_at="2026-05-10T15:00:00Z"),
+        _trade(activity_id="ps", side="sell", qty=4, fill_price=55.0,
+               filled_at="2026-05-24T15:00:00Z"),  # partial — 6 remain open
+    ]
+    rows[0]["mode"] = "paper"
+    rows[1]["mode"] = "paper"
+    now = _now("2026-05-26T15:00:00Z")
+    assert trades.symbols_in_cooldown(rows, now=now, window_days=7, mode="live") == {}
+    assert trades.symbols_in_cooldown(rows, now=now, window_days=7, mode="paper") == {}
+
+
+def test_closed_trades_carry_mode():
+    rows = [
+        _trade(activity_id="lb", side="buy", qty=8, fill_price=80.0,
+               filled_at="2026-07-01T15:00:00Z"),
+        _trade(activity_id="ls", side="sell", qty=8, fill_price=90.0,
+               filled_at="2026-07-02T15:00:00Z"),
+    ]
+    rows[0]["mode"] = "live"
+    rows[1]["mode"] = "live"
+    res = trades.compute_trades_pnl(rows)
+    assert res.closed[0].mode == "live"

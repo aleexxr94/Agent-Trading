@@ -523,3 +523,150 @@ def test_wipe_run_history_idempotent(tmp_state):
     # (write_text("") is idempotent) — backup dir count is 0 since we
     # passed backup=False.
     assert r2["runs_dirs_removed"] == 0
+
+
+# --------- mode tagging + live-transition marker (paper→live continuity) ---------
+
+
+def _trade_row(**over):
+    row = {
+        "activity_id": "a1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 3, "fill_price": 70.0,
+        "fees_usd": 0.0, "filled_at": "2026-07-01T14:00:00Z", "run_id": "r1",
+    }
+    row.update(over)
+    return row
+
+
+def test_append_trade_default_stamps_paper_mode(tmp_state):
+    state.append_trade(_trade_row())
+    row = state.read_trades()[0]
+    assert row["mode"] == "paper"
+
+
+def test_append_trade_preserves_explicit_live_mode(tmp_state):
+    state.append_trade(_trade_row(mode="live"))
+    row = state.read_trades()[0]
+    assert row["mode"] == "live"
+
+
+def test_append_nav_and_kill_event_default_paper_mode(tmp_state):
+    state.append_nav({"run_id": "r1", "at": "2026-07-01T14:00:00Z", "nav_usd": 2500.0})
+    state.append_kill_event({"at": "2026-07-01T14:00:00Z", "symbol": "TQQQ",
+                             "reason": "loss cap"})
+    nav = json.loads(state.NAV_HISTORY_LOG.read_text().splitlines()[0])
+    kill = state.read_kill_events()[0]
+    assert nav["mode"] == "paper"
+    assert kill["mode"] == "paper"
+
+
+def test_record_mode_missing_key_reads_as_paper():
+    assert state.record_mode({}) == "paper"
+    assert state.record_mode({"mode": None}) == "paper"
+    assert state.record_mode({"mode": "live"}) == "live"
+
+
+def test_trade_activity_dedup_ignores_mode_key(tmp_state):
+    state.append_trade(_trade_row(activity_id="a1", mode="paper"))
+    state.append_trade(_trade_row(activity_id="a2", mode="live"))
+    assert state.read_trade_activity_ids() == {"a1", "a2"}
+
+
+def test_write_live_transition_once_is_write_once(tmp_state):
+    first = state.write_live_transition_once(
+        live_starting_equity_usd=2612.34, nav_cap_usd=2500.0,
+        run_id="r1", live_version=1,
+    )
+    assert first["live_starting_equity_usd"] == 2612.34
+    assert first["nav_cap_usd"] == 2500.0
+    again = state.write_live_transition_once(
+        live_starting_equity_usd=9999.0, nav_cap_usd=None,
+        run_id="r2", live_version=1,
+    )
+    assert again == first  # second write is a no-op
+    assert state.read_live_transition() == first
+
+
+def test_read_live_transition_missing_and_corrupt(tmp_state):
+    assert state.read_live_transition() is None
+    state.LIVE_TRANSITION.write_text("{not json", encoding="utf-8")
+    assert state.read_live_transition() is None
+
+
+def test_wipe_run_history_preserves_live_transition(tmp_state):
+    """Codex P1 (PR #112): wiping history must NOT re-anchor the live risk
+    budget — under a cap the marker anchors the P&L-since-transition debit,
+    so a cleanup that removed it would silently restore a drawn-down
+    allocation to the full cap. Re-anchoring is an explicit manual action."""
+    state.write_live_transition_once(
+        live_starting_equity_usd=2500.0, nav_cap_usd=None,
+        run_id=None, live_version=1,
+    )
+    assert state.LIVE_TRANSITION.exists()
+    state.wipe_run_history(backup=False)
+    assert state.LIVE_TRANSITION.exists()
+
+
+def test_dd_halt_is_mode_scoped(tmp_state):
+    """Codex P2 (PR #112): a paper halt tripped earlier on promotion day is
+    denominated in synthetic units and must not block live buys."""
+    state.set_dd_halt(dd_pct=9.0, sod_nav=2500.0, current_nav=2270.0, mode="paper")
+    assert state.dd_halt_active(mode="paper") is True
+    assert state.dd_halt_active(mode="live") is False
+    state.clear_dd_halt()
+    state.set_dd_halt(dd_pct=9.0, sod_nav=5000.0, current_nav=4540.0, mode="live")
+    assert state.dd_halt_active(mode="live") is True
+    assert state.dd_halt_active(mode="paper") is False
+
+
+def test_dd_halt_legacy_untagged_reads_as_paper(tmp_state):
+    import json as _json
+    state.DD_HALT_FLAG.write_text(_json.dumps({
+        "date": state.utcnow().date().isoformat(),
+        "dd_pct": 9.0, "sod_nav_usd": 2500.0, "current_nav_usd": 2270.0,
+        "reason": "x", "set_at": state.utcnow_iso(),
+    }), encoding="utf-8")
+    assert state.dd_halt_active(mode="paper") is True
+    assert state.dd_halt_active(mode="live") is False
+
+
+def test_write_live_transition_once_atomic_create(tmp_state, monkeypatch):
+    """Codex P2 (PR #112): two processes racing on the first live read must
+    not both write — O_EXCL create means the loser reads the winner's
+    marker. Simulate the race by making the pre-check miss an existing
+    file that appears before our exclusive create."""
+    winner = {"at": "2026-07-02T06:00:00Z", "live_starting_equity_usd": 5000.0,
+              "nav_cap_usd": 2500.0, "run_id": "winner", "live_version": 1,
+              "note": "first successful live equity read"}
+    real_read = state.read_live_transition
+    calls = {"n": 0}
+
+    def racy_read():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # First pre-check: pretend the file doesn't exist yet, then the
+            # "winner" process creates it before our open("x").
+            import json as _json
+            state.LIVE_TRANSITION.write_text(_json.dumps(winner), encoding="utf-8")
+            return None
+        return real_read()
+
+    monkeypatch.setattr(state, "read_live_transition", racy_read)
+    out = state.write_live_transition_once(
+        live_starting_equity_usd=4000.0, nav_cap_usd=2500.0,
+        run_id="loser", live_version=1,
+    )
+    assert out["run_id"] == "winner"          # loser adopted the winner's marker
+    assert out["live_starting_equity_usd"] == 5000.0
+
+
+def test_write_live_transition_once_raises_on_corrupt_existing_file(tmp_state):
+    """Codex P2 (PR #112): an existing-but-unreadable marker must surface as
+    an error, not be silently replaced by a fresh in-memory marker that
+    would re-anchor the capped live allocation to current equity."""
+    state.LIVE_TRANSITION.write_text("{partial json", encoding="utf-8")
+    with pytest.raises(OSError, match="unreadable"):
+        state.write_live_transition_once(
+            live_starting_equity_usd=5000.0, nav_cap_usd=2500.0,
+            run_id="r1", live_version=1,
+        )

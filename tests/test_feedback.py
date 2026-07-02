@@ -170,3 +170,131 @@ def test_entry_confidence_handles_missing_and_corrupt_artifacts(tmp_state):
     d.mkdir(parents=True)
     (d / "view.json").write_text("{not json")
     assert feedback.entry_confidence_for("bad_run", "TQQQ") is None
+
+
+# ---------- era split (paper→live memory continuity) ----------
+
+
+def test_memo_all_paper_output_has_no_era_keys(tmp_state):
+    """Byte-stability: while paper-only, the memo must be identical to the
+    pre-era-tagging output — it feeds the cycle-dedup fingerprint and cached
+    prompts. No era_split key, no mode on recent_exits."""
+    rows = [
+        _fill("TQQQ", "buy", 4, 70.0, run_id="r1", at="2026-06-01T14:00:00Z", aid="a1"),
+        _fill("TQQQ", "sell", 4, 80.0, at="2026-06-03T14:00:00Z", aid="a2"),
+    ]
+    memo = feedback.build_performance_memo(trade_rows=rows, cost_rows=[], kill_events=[])
+    assert set(memo.keys()) == {
+        "closed_trades", "overall", "by_factor", "confidence_calibration",
+        "by_regime", "recent_exits",
+    }
+    assert all("mode" not in r for r in memo["recent_exits"])
+
+
+def test_memo_era_split_from_live_tagged_fills(tmp_state):
+    """Mixed history without a transition marker: live_since falls back to
+    the earliest live fill; combined sections keep the FULL history."""
+    rows = [
+        # Paper era: TQQQ +40 win.
+        _fill("TQQQ", "buy", 4, 70.0, run_id="r1", at="2026-06-01T14:00:00Z", aid="a1"),
+        _fill("TQQQ", "sell", 4, 80.0, at="2026-06-03T14:00:00Z", aid="a2"),
+        # Live era: SOXL -30 loss.
+        {**_fill("SOXL", "buy", 10, 30.0, run_id="r2", at="2026-07-01T14:00:00Z", aid="a3"),
+         "mode": "live"},
+        {**_fill("SOXL", "sell", 10, 27.0, at="2026-07-02T14:00:00Z", aid="a4"),
+         "mode": "live"},
+    ]
+    memo = feedback.build_performance_memo(trade_rows=rows, cost_rows=[], kill_events=[])
+    # Combined sections still cover everything (the carryover the user wants).
+    assert memo["closed_trades"] == 2
+    assert memo["overall"]["trades"] == 2
+    es = memo["era_split"]
+    assert es["live_since"] == "2026-07-01T14:00:00Z"
+    assert es["paper"]["trades"] == 1
+    assert es["paper"]["wins"] == 1
+    assert es["paper"]["through"] == "2026-06-03T14:00:00Z"
+    assert es["live"]["trades"] == 1
+    assert es["live"]["losses"] == 1
+    modes = {r["symbol"]: r["mode"] for r in memo["recent_exits"]}
+    assert modes == {"TQQQ": "paper", "SOXL": "live"}
+
+
+def test_memo_era_split_activates_from_marker_and_uses_trade_modes(tmp_state):
+    """The write-once marker activates the era split even before any live
+    fill exists, and era assignment comes from each closed trade's own mode
+    (exact — stamped by the era-split FIFO matcher), not timestamps.
+    Untagged rows predate tagging and are paper by construction."""
+    state.write_live_transition_once(
+        live_starting_equity_usd=2600.0, nav_cap_usd=2500.0,
+        run_id="r9", live_version=1,
+    )
+    marker_at = state.read_live_transition()["at"]
+    rows = [
+        # Untagged legacy fills → paper.
+        _fill("TQQQ", "buy", 4, 70.0, run_id="r1", at="2020-01-01T14:00:00Z", aid="a1"),
+        _fill("TQQQ", "sell", 4, 80.0, at="2020-01-03T14:00:00Z", aid="a2"),
+        # Live-tagged fills → live, regardless of any timestamp heuristics.
+        {**_fill("SOXL", "buy", 10, 30.0, run_id="r2", at="2026-07-02T14:00:00Z", aid="a3"),
+         "mode": "live"},
+        {**_fill("SOXL", "sell", 10, 27.0, at="2026-07-02T18:00:00Z", aid="a4"),
+         "mode": "live"},
+    ]
+    memo = feedback.build_performance_memo(trade_rows=rows, cost_rows=[], kill_events=[])
+    es = memo["era_split"]
+    # live_since = earlier of marker vs first live fill.
+    assert es["live_since"] == min(marker_at, "2026-07-02T14:00:00Z")
+    assert es["paper"]["trades"] == 1
+    assert es["live"]["trades"] == 1
+    modes = {r["symbol"]: r["mode"] for r in memo["recent_exits"]}
+    assert modes == {"TQQQ": "paper", "SOXL": "live"}
+
+
+def test_memo_exit_attribution_does_not_cross_eras(tmp_state):
+    """Codex P2 (PR #112): a live exit inside the 6h match window of a PAPER
+    kill event on the same symbol must not inherit its exit_kind."""
+    rows = [
+        {**_fill("TQQQ", "buy", 4, 70.0, run_id="r2", at="2026-07-01T13:00:00Z", aid="a3"),
+         "mode": "live"},
+        {**_fill("TQQQ", "sell", 4, 60.0, at="2026-07-01T15:00:00Z", aid="a4"),
+         "mode": "live"},
+    ]
+    kill_events = [
+        # Paper stop-out on the same symbol 1h before the live close —
+        # inside the 6h window, but from the other era.
+        {"at": "2026-07-01T14:00:00Z", "symbol": "TQQQ",
+         "reason": "loss cap", "exit_kind": "loss_cap", "mode": "paper"},
+    ]
+    memo = feedback.build_performance_memo(trade_rows=rows, cost_rows=[],
+                                           kill_events=kill_events)
+    (exit_row,) = memo["recent_exits"]
+    assert exit_row["mode"] == "live"
+    assert exit_row["exit_kind"] == "agent_decision"  # NOT loss_cap
+
+    # Same setup but the event is live too → attribution applies.
+    kill_events[0]["mode"] = "live"
+    memo = feedback.build_performance_memo(trade_rows=rows, cost_rows=[],
+                                           kill_events=kill_events)
+    assert memo["recent_exits"][0]["exit_kind"] == "loss_cap"
+
+
+def test_live_since_uses_earlier_of_marker_and_first_live_fill(tmp_state):
+    """Codex P2 (PR #112): a dashboard resync can land live fills BEFORE the
+    first live cycle writes the marker — those real-money trades must not be
+    re-classified as paper by the later marker timestamp."""
+    rows = [
+        {**_fill("TQQQ", "buy", 4, 70.0, run_id="r2", at="2026-07-01T13:00:00Z", aid="a1"),
+         "mode": "live"},
+        {**_fill("TQQQ", "sell", 4, 60.0, at="2026-07-01T15:00:00Z", aid="a2"),
+         "mode": "live"},
+    ]
+    # Marker written AFTER those fills (first orchestrator cycle came later).
+    state.write_live_transition_once(
+        live_starting_equity_usd=5000.0, nav_cap_usd=None,
+        run_id="r9", live_version=1,
+    )
+    memo = feedback.build_performance_memo(trade_rows=rows, cost_rows=[], kill_events=[])
+    es = memo["era_split"]
+    assert es["live_since"] == "2026-07-01T13:00:00Z"  # first live fill, not marker
+    assert es["live"]["trades"] == 1
+    assert es["paper"]["trades"] == 0
+    assert memo["recent_exits"][0]["mode"] == "live"

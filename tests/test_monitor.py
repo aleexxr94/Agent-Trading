@@ -623,3 +623,104 @@ def test_exit_kind_from_reason_mapping():
     assert monitor._exit_kind_from_reason("time stop 2026-01-01T00:00:00Z reached") == "time_stop"
     assert monitor._exit_kind_from_reason("trailing stop: mark 90 ≤ 91.8 (peak 102 − 10%)") == "trailing_stop"
     assert monitor._exit_kind_from_reason("orphan (not in target portfolio): loss 30% ≥ 25% cap") == "orphan_loss_cap"
+
+def test_monitor_kill_event_carries_mode(tmp_state):
+    """Kill events are era-tagged; a paper broker (no is_paper attr → env
+    default with the lock down) records mode=paper."""
+    actions = [{"symbol": "TQQQ", "action": "flatten", "reason": "loss 26% ≥ 25% cap"}]
+    monitor.execute_actions(actions, broker=_FakeBroker([]))
+    events = state.read_kill_events()
+    assert events[0]["mode"] == "paper"
+
+def test_dd_breaker_uses_real_equity_on_live_broker(tmp_state, monkeypatch):
+    """On a live broker the 8% breaker denominates in real account equity,
+    not paper-era synthetic units; the SOD baseline is set from it."""
+    from lib.broker import Account
+
+    class _LiveBroker(_FakeBroker):
+        is_paper = False
+
+        def get_account(self):
+            return Account(cash_usd=5000.0, equity_usd=5000.0,
+                           buying_power_usd=5000.0, is_paper=False)
+
+    _write_portfolio([])
+    fake = _LiveBroker([])
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
+    monitor.main([])
+    assert state.read_sod_nav_today(mode="live") == 5000.0
+    # The live baseline must NOT read as a paper baseline.
+    assert state.read_sod_nav_today(mode="paper") is None
+
+
+def test_dd_breaker_skips_update_when_live_equity_read_fails(tmp_state, monkeypatch):
+    """Fail closed: a live broker whose equity read errors must skip the dd
+    update for the pass (no baseline written from synthetic units)."""
+
+    class _LiveBrokenBroker(_FakeBroker):
+        is_paper = False
+        # get_account inherits NotImplementedError from _FakeBroker
+
+    _write_portfolio([])
+    fake = _LiveBrokenBroker([])
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
+    monitor.main([])
+    assert state.read_sod_nav_today() is None
+
+def test_dd_breaker_rebaselines_on_same_day_mode_switch(tmp_state):
+    """Codex P2 (PR #112): a paper SOD baseline written earlier the same UTC
+    day must not be reused as the live baseline — promotion re-baselines
+    from the first live observation."""
+    state.set_sod_nav_today(2500.0, mode="paper")
+    info = monitor.run_dd_breaker(current_nav=5000.0, enabled=True, mode="live")
+    # Re-baselined at the live equity, not compared against the paper 2500
+    # (which would read as +100% and mask any live drawdown all day).
+    assert info["sod_nav_usd"] == 5000.0
+    assert info["tripped"] is False
+    assert state.read_sod_nav_today(mode="live") == 5000.0
+
+
+def test_dd_breaker_legacy_untagged_baseline_reads_as_paper(tmp_state):
+    """A pre-tagging sod_nav.json (no mode key) keeps working for paper."""
+    import json as _json
+    state.SOD_NAV_FILE.write_text(_json.dumps({
+        "date": state.utcnow().date().isoformat(),
+        "sod_nav_usd": 2500.0, "set_at": state.utcnow_iso(),
+    }), encoding="utf-8")
+    assert state.read_sod_nav_today(mode="paper") == 2500.0
+    assert state.read_sod_nav_today(mode="live") is None
+
+def test_dd_breaker_uses_capped_allocation_scale(tmp_state, monkeypatch):
+    """Codex P1 (PR #112): with LIVE_NAV_CAP_USD set, the breaker must
+    denominate in the same capped allocation the orchestrator sizes
+    against, not full equity (idle cash would dilute a real drawdown)."""
+    from lib.broker import Account
+
+    class _LiveBroker(_FakeBroker):
+        is_paper = False
+
+        def get_account(self):
+            return Account(cash_usd=5000.0, equity_usd=5000.0,
+                           buying_power_usd=5000.0, is_paper=False)
+
+    monkeypatch.setenv("LIVE_NAV_CAP_USD", "2500")
+    _write_portfolio([])
+    fake = _LiveBroker([])
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
+    monitor.main([])
+    assert state.read_sod_nav_today(mode="live") == 2500.0  # allocation, not 5000
+
+
+def test_dd_breaker_env_live_without_broker_writes_no_baseline(tmp_state, monkeypatch):
+    """Codex P1 (PR #112): env lock fully raised but broker construction
+    failed — the monitor must NOT fall back to the paper synthetic NAV and
+    write it as a live-mode SOD baseline."""
+    from lib import live_gate
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
+    monkeypatch.setattr(live_gate, "LIVE_VERSION", 1)
+    _write_portfolio([])
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: None)
+    monitor.main([])
+    assert state.read_sod_nav_today(mode="live") is None
+    assert state.read_sod_nav_today(mode="paper") is None

@@ -112,6 +112,23 @@ NAV_OFFSET_FLAG = STATE_DIR / "nav_offset.json"
 # Schema: {"broker_baseline_usd": <float>, "set_at": <ISO-UTC>}
 NAV_MANUAL_BASELINE_FLAG = STATE_DIR / "nav_manual_baseline.json"
 
+# Paper→live transition marker. Written ONCE by the orchestrator's live NAV
+# path on the first successful live equity read; never overwritten, so the
+# recorded starting equity is the real number the live era began with. Read
+# by lib.feedback (era-split memo labeling) and the dashboard (equity-curve
+# LIVE marker). Small-marker pattern like sod_nav.json — no jsonschema.
+#
+# Schema:
+#   {
+#     "at": <ISO-UTC>,
+#     "live_starting_equity_usd": <float>,
+#     "nav_cap_usd": <float | null>,
+#     "run_id": <str | null>,
+#     "live_version": <int>,
+#     "note": <str>
+#   }
+LIVE_TRANSITION = STATE_DIR / "live_transition.json"
+
 
 # --------- run_id ---------
 
@@ -157,9 +174,16 @@ def clear_halt() -> None:
 # --------- daily drawdown breaker (Phase 2) ---------
 
 
-def read_sod_nav_today() -> float | None:
-    """Start-of-day synthetic NAV for TODAY (UTC), or None if not set today.
-    A stale (prior-day) baseline reads as None so each UTC day re-baselines."""
+def read_sod_nav_today(*, mode: str = "paper") -> float | None:
+    """Start-of-day NAV baseline for TODAY (UTC), or None if not set today.
+    A stale (prior-day) baseline reads as None so each UTC day re-baselines.
+
+    The baseline is mode-scoped (Codex P2 on PR #112): a paper baseline is
+    synthetic-scale (~$2.5k) while a live baseline is real equity, so a
+    same-day paper→live promotion must re-baseline rather than compare live
+    equity against the paper number (which could mask an 8%+ live drawdown
+    until the next UTC day). A stored baseline without a mode key predates
+    tagging and reads as paper."""
     if not SOD_NAV_FILE.exists():
         return None
     try:
@@ -168,24 +192,27 @@ def read_sod_nav_today() -> float | None:
         return None
     if not isinstance(d, dict) or d.get("date") != utcnow().date().isoformat():
         return None
+    if record_mode(d) != mode:
+        return None
     v = d.get("sod_nav_usd")
     return float(v) if isinstance(v, (int, float)) else None
 
 
-def set_sod_nav_today(nav: float) -> None:
+def set_sod_nav_today(nav: float, *, mode: str = "paper") -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     SOD_NAV_FILE.write_text(
         json.dumps({
             "date": utcnow().date().isoformat(),
             "sod_nav_usd": float(nav),
             "set_at": utcnow_iso(),
+            "mode": mode,
         }, sort_keys=True),
         encoding="utf-8",
     )
 
 
 def set_dd_halt(*, dd_pct: float, sod_nav: float, current_nav: float,
-                reason: str = "daily drawdown ≥ 8%") -> None:
+                reason: str = "daily drawdown ≥ 8%", mode: str = "paper") -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     DD_HALT_FLAG.write_text(
         json.dumps({
@@ -195,6 +222,7 @@ def set_dd_halt(*, dd_pct: float, sod_nav: float, current_nav: float,
             "current_nav_usd": float(current_nav),
             "reason": reason,
             "set_at": utcnow_iso(),
+            "mode": mode,
         }, sort_keys=True),
         encoding="utf-8",
     )
@@ -210,11 +238,19 @@ def read_dd_halt() -> dict | None:
     return d if isinstance(d, dict) else None
 
 
-def dd_halt_active() -> bool:
-    """True iff a drawdown halt was set TODAY (UTC). Prior-day flags are
-    treated as expired so the breaker resets each UTC day."""
+def dd_halt_active(*, mode: str = "paper") -> bool:
+    """True iff a drawdown halt was set TODAY (UTC) for this ``mode``.
+    Prior-day flags are treated as expired so the breaker resets each UTC
+    day. Mode-scoped like the SOD baseline (Codex P2 on PR #112): a paper
+    halt tripped earlier on promotion day denominated in synthetic units
+    and must not block live buys for the rest of the day (and vice versa).
+    A flag without a mode key predates tagging and reads as paper."""
     d = read_dd_halt()
-    return bool(d) and d.get("date") == utcnow().date().isoformat()
+    return (
+        bool(d)
+        and d.get("date") == utcnow().date().isoformat()
+        and record_mode(d) == mode
+    )
 
 
 def clear_dd_halt() -> None:
@@ -564,6 +600,89 @@ def read_costs_for_run(run_id: str) -> list[dict]:
     return out
 
 
+def _default_record_mode() -> str:
+    """Mode stamped onto appended records when the caller didn't supply one.
+
+    Delegates to live_gate.trading_mode() (env-only path — "live" requires
+    the full triple lock); falls back to "paper" if anything goes wrong, so
+    a record can never be mislabeled live by accident.
+    """
+    try:
+        from . import live_gate  # local import: state is imported everywhere
+
+        return live_gate.trading_mode()
+    except Exception:
+        return "paper"
+
+
+def record_mode(row: dict) -> str:
+    """The paper/live era a state record belongs to. Rows written before
+    mode-tagging existed have no "mode" key — they are all paper by
+    construction (tagging shipped while the system was paper-only)."""
+    return row.get("mode") or "paper"
+
+
+def read_live_transition() -> dict | None:
+    """The paper→live transition marker, or None when the system has never
+    run a live cycle. Tolerant of a corrupt/unreadable file (returns None)."""
+    if not LIVE_TRANSITION.exists():
+        return None
+    try:
+        data = json.loads(LIVE_TRANSITION.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def write_live_transition_once(
+    *,
+    live_starting_equity_usd: float,
+    nav_cap_usd: float | None,
+    run_id: str | None,
+    live_version: int,
+) -> dict:
+    """Record the moment the live era began. Write-once: if the marker
+    already exists it is returned unchanged, so the starting equity stays
+    the real number from the FIRST successful live equity read.
+
+    Atomic against concurrent first writes (Codex P2 on PR #112): the
+    orchestrator cycle and a monitor pass can race on the first live read,
+    and under LIVE_NAV_CAP_USD a second write would re-anchor the risk
+    budget away from the first observation. Open with mode "x" (O_EXCL) so
+    exactly one process creates the file; the loser reads the winner's
+    marker back."""
+    existing = read_live_transition()
+    if existing is not None:
+        return existing
+    marker = {
+        "at": utcnow_iso(),
+        "live_starting_equity_usd": float(live_starting_equity_usd),
+        "nav_cap_usd": float(nav_cap_usd) if nav_cap_usd is not None else None,
+        "run_id": run_id,
+        "live_version": int(live_version),
+        "note": "first successful live equity read",
+    }
+    LIVE_TRANSITION.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with LIVE_TRANSITION.open("x", encoding="utf-8") as f:
+            f.write(json.dumps(marker, indent=2, sort_keys=False))
+    except FileExistsError:
+        existing = read_live_transition()
+        if existing is None:
+            # The file exists but is unreadable/corrupt (e.g. a crashed
+            # first writer left partial JSON). Returning the fresh
+            # in-memory marker would let the capped live NAV re-anchor to
+            # CURRENT equity on every pass, masking drawdowns (Codex P2 on
+            # PR #112) — surface the problem instead so the capped path
+            # fails closed until the operator fixes or removes the file.
+            raise OSError(
+                f"{LIVE_TRANSITION} exists but is unreadable/corrupt — fix "
+                "or remove it (this re-anchors the live risk budget)."
+            )
+        return existing
+    return marker
+
+
 def append_trade(entry: dict) -> None:
     """Append one row to state/trades.jsonl.
 
@@ -589,6 +708,12 @@ def append_trade(entry: dict) -> None:
       - slippage_usd (number) — modelled per-leg slippage/spread cost for the
         fill (lib.alpaca_costs). Alpaca never reports spread, even live.
       - fee_source ("real" | "modelled") — provenance of fees_usd.
+      - mode ("paper" | "live") — which account era the fill belongs to.
+        Defaulted here from live_gate.trading_mode() when the caller didn't
+        stamp it (defense in depth); callers with a broker in hand should
+        pass the broker-derived mode. Rows written before mode-tagging
+        existed have no mode key — readers treat missing as "paper" via
+        record_mode().
     """
     required = {
         "activity_id", "alpaca_order_id", "symbol", "kind", "side",
@@ -599,6 +724,7 @@ def append_trade(entry: dict) -> None:
         raise ValueError(f"trade entry missing keys: {sorted(missing)}")
     if "run_id" not in entry:
         entry["run_id"] = None
+    entry.setdefault("mode", _default_record_mode())
     TRADES_LOG.parent.mkdir(parents=True, exist_ok=True)
     with TRADES_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, sort_keys=False) + "\n")
@@ -635,11 +761,14 @@ def append_nav(entry: dict) -> None:
 
     Required keys: run_id, at, nav_usd. Optional but recommended: cash_usd,
     gross_pnl_usd, modelled_costs_usd, net_pnl_usd, positions_count, all_cash.
+    A "mode" ("paper" | "live") key is defaulted when the caller didn't stamp
+    one; rows predating mode-tagging read as paper via record_mode().
     """
     required = {"run_id", "at", "nav_usd"}
     missing = required - entry.keys()
     if missing:
         raise ValueError(f"nav entry missing keys: {sorted(missing)}")
+    entry.setdefault("mode", _default_record_mode())
     NAV_HISTORY_LOG.parent.mkdir(parents=True, exist_ok=True)
     with NAV_HISTORY_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, sort_keys=False) + "\n")
@@ -660,12 +789,14 @@ def append_kill_event(entry: dict) -> None:
 
     Written by monitor.py when a flatten actually fires. Required keys:
     at, symbol, reason. Recommended: exit_kind (loss_cap / price_stop /
-    time_stop / trailing_stop / orphan_loss_cap), source.
+    time_stop / trailing_stop / orphan_loss_cap), source. A "mode"
+    ("paper" | "live") key is defaulted when the caller didn't stamp one.
     """
     required = {"at", "symbol", "reason"}
     missing = required - entry.keys()
     if missing:
         raise ValueError(f"kill event missing keys: {sorted(missing)}")
+    entry.setdefault("mode", _default_record_mode())
     KILL_EVENTS_LOG.parent.mkdir(parents=True, exist_ok=True)
     with KILL_EVENTS_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, sort_keys=False) + "\n")
@@ -829,6 +960,12 @@ def wipe_run_history(*, include_costs: bool = True, backup: bool = True) -> dict
         COST_RESET_FLAG, ALL_TIME_COST_RESET_FLAG,
         NAV_OFFSET_FLAG, NAV_MANUAL_BASELINE_FLAG,
         DD_HALT_FLAG, SOD_NAV_FILE,
+        # LIVE_TRANSITION is deliberately NOT wiped (Codex P1 on PR #112):
+        # under LIVE_NAV_CAP_USD it anchors the P&L-since-transition debit,
+        # so removing it during a history cleanup would silently restore a
+        # drawn-down live allocation back to the full cap. Re-anchoring the
+        # live risk budget is an explicit operator action (delete the file
+        # by hand after re-funding), never a side effect of a wipe.
     ]
     for f in snapshots:
         if f.exists():

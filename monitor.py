@@ -19,7 +19,7 @@ try:
 except ImportError:
     pass
 
-from lib import live_gate
+from lib import live_gate, live_nav
 from lib import marks as marks_lib
 from lib import risk, state
 from lib.broker import Broker
@@ -50,33 +50,42 @@ def _live_synthetic_nav(*, portfolio: dict, marks: dict, cost_basis: dict) -> fl
         return None
 
 
-def run_dd_breaker(*, current_nav: float | None, enabled: bool, persist: bool = True) -> dict:
+def run_dd_breaker(*, current_nav: float | None, enabled: bool, persist: bool = True,
+                   mode: str = "paper") -> dict:
     """Manage the start-of-day baseline + the 8% daily-drawdown halt.
 
     The first observation of each UTC day sets the baseline. When current
-    synthetic NAV is ≥8% below it AND ``enabled``, writes the auto-expiring
+    NAV is ≥8% below it AND ``enabled``, writes the auto-expiring
     ``dd_halt`` flag the orchestrator reads to skip NEW orders (closes still
     allowed). ``persist=False`` (dry-run) computes without writing state.
+
+    ``mode`` scopes the baseline (Codex P2 on PR #112): paper baselines are
+    synthetic-scale, live baselines are real equity. A same-day paper→live
+    promotion re-baselines from the first live observation instead of
+    comparing live equity against the morning's paper number.
+
     Returns an info dict for the audit/log.
     """
     if current_nav is None:
         return {
             "sod_nav_usd": None, "current_nav_usd": None, "dd_pct": None,
-            "tripped": False, "enabled": enabled, "halt_active": state.dd_halt_active(),
+            "tripped": False, "enabled": enabled,
+            "halt_active": state.dd_halt_active(mode=mode),
         }
-    sod = state.read_sod_nav_today()
+    sod = state.read_sod_nav_today(mode=mode)
     if sod is None:
         if persist:
-            state.set_sod_nav_today(current_nav)
+            state.set_sod_nav_today(current_nav, mode=mode)
         sod = current_nav
     tripped, dd = risk.daily_circuit_breaker_tripped(
         sod_nav_usd=sod, current_nav_usd=current_nav,
     )
     if tripped and enabled and persist:
-        state.set_dd_halt(dd_pct=dd, sod_nav=sod, current_nav=current_nav)
+        state.set_dd_halt(dd_pct=dd, sod_nav=sod, current_nav=current_nav, mode=mode)
     return {
         "sod_nav_usd": sod, "current_nav_usd": current_nav, "dd_pct": round(dd, 2),
-        "tripped": tripped, "enabled": enabled, "halt_active": state.dd_halt_active(),
+        "tripped": tripped, "enabled": enabled,
+        "halt_active": state.dd_halt_active(mode=mode),
     }
 
 
@@ -302,6 +311,7 @@ def execute_actions(actions: list[dict], *, broker: Broker | None) -> set[str]:
                     "reason": a["reason"],
                     "exit_kind": _exit_kind_from_reason(a["reason"]),
                     "source": "monitor",
+                    "mode": live_gate.trading_mode(broker),
                 })
             except Exception:
                 pass
@@ -495,9 +505,34 @@ def main(argv: list[str] | None = None) -> int:
     dd_info = None
     try:
         dd_enabled = risk.dd_breaker_enabled()
-        current_nav = _live_synthetic_nav(portfolio=portfolio, marks=marks, cost_basis=cost_basis)
+        dd_mode = live_gate.trading_mode(broker)
+        if dd_mode == "live" or live_gate.trading_mode() == "live":
+            # Live era: the breaker must denominate in the SAME allocated
+            # NAV the orchestrator sizes against (capped scale when
+            # LIVE_NAV_CAP_USD is set — Codex P1 on PR #112: full equity
+            # dilutes a >8% drawdown of the risk budget with idle cash).
+            # Any failure — including env-live with a missing broker —
+            # yields None, which skips this pass's dd update entirely so a
+            # paper-synthetic number can never be written as a live
+            # baseline (Codex P1 on PR #112).
+            dd_mode = "live"
+            try:
+                # Dry-run must not lock in a transition baseline from a test
+                # invocation (write_marker=False keeps the read side-effect
+                # free; run_dd_breaker already gets persist=False below).
+                current_nav = live_nav.live_allocated_nav(
+                    broker, write_marker=not args.dry_run,
+                )
+            except live_nav.LiveNavUnavailable as e:
+                print(f"monitor: live NAV unavailable ({e}); dd update skipped")
+                current_nav = None
+        else:
+            current_nav = _live_synthetic_nav(
+                portfolio=portfolio, marks=marks, cost_basis=cost_basis,
+            )
         dd_info = run_dd_breaker(
             current_nav=current_nav, enabled=dd_enabled, persist=not args.dry_run,
+            mode=dd_mode,
         )
         if dd_info.get("tripped"):
             print(

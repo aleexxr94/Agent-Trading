@@ -43,7 +43,7 @@ except ImportError:
     pass
 from typing import Callable
 
-from lib import feedback, live_gate, llm, market_gate, risk, sanity, signals, stages, state, trades
+from lib import feedback, live_gate, live_nav, llm, market_gate, risk, sanity, signals, stages, state, trades
 from lib.broker import Broker
 
 ROOT = Path(__file__).resolve().parent
@@ -133,6 +133,11 @@ class StageContext:
     # operator's `--intent=review` doesn't burn the autonomous-review
     # budget.
     intent_source: str = "default"
+    # Live-mode sizing NAV, prefetched once per cycle by run_pipeline when
+    # the broker is genuinely live (triple lock fully raised). None on
+    # paper. Caching avoids re-hitting broker.get_account at every
+    # _account_nav call site within a cycle.
+    live_nav_usd: float | None = None
 
 
 # Daily-review-frequency cap defaults. Operator can override via env.
@@ -301,6 +306,7 @@ def stage_strategist(
     current_positions = current_positions or []
     pnl_history = pnl_history or []
     content = (
+        f"{_live_mode_context_line(ctx)}"
         f"Signals: {json.dumps(signals.compact_for_llm(signals_out), sort_keys=True)}\n"
         f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
         f"Recent PnL history (last cycles, oldest first): "
@@ -359,6 +365,7 @@ def _cooldown_symbols_now() -> dict:
             state.read_trades(),
             now=state.utcnow(),
             window_days=risk.REENTRY_COOLDOWN_DAYS,
+            mode=live_gate.trading_mode(),
         )
     except Exception:
         return {}
@@ -379,10 +386,37 @@ def _sync_fills_before_cooldown(ctx: StageContext) -> str | None:
         trades_sync.sync_fills_from_alpaca(
             trading_client=getattr(ctx.broker, "_client", None),
             order_id_to_run_id=trades_sync.order_id_to_run_id_from_runs(),
+            mode=live_gate.trading_mode(ctx.broker),
         )
         return None
     except Exception as e:
         return f"sync_fills_from_alpaca(pre-cooldown): {type(e).__name__}: {e}"
+
+
+def _live_mode_context_line(ctx: StageContext) -> str:
+    """One user-message line that overrides the paper framing baked into the
+    static system prompts once the account is genuinely live (Codex P2 on
+    PR #112: prompts/*.md all describe a '$2,500 paper account', and the
+    cached system blocks deliberately stay byte-stable across promotion —
+    this per-cycle line is the mode-aware correction). Empty on paper so
+    pre-promotion inputs stay byte-identical for the prompt cache + dedup.
+    """
+    if live_gate.trading_mode(ctx.broker) != "live":
+        return ""
+    nav = ctx.live_nav_usd
+    nav_txt = (
+        f"${nav:,.2f}" if isinstance(nav, (int, float))
+        else "the NAV figure provided in this message"
+    )
+    return (
+        "LIVE TRADING OVERRIDE: this account now trades REAL MONEY on Alpaca "
+        f"live. The capital you size against is {nav_txt} — the operator's "
+        "allocated live NAV (real equity, possibly capped) — NOT the $2,500 "
+        "paper account described in your system prompt; read every 'paper' "
+        "reference there as historical framing. Losses are real. Capital "
+        "preservation outweighs upside chasing even more strictly than on "
+        "paper: when conviction is marginal, hold cash.\n"
+    )
 
 
 def _vol_context_line(signals_out: dict) -> str:
@@ -427,6 +461,7 @@ def stage_construct(
     pnl_history = pnl_history or []
     cooldown_symbols = cooldown_symbols or {}
     content = (
+        f"{_live_mode_context_line(ctx)}"
         f"Signals: {json.dumps(signals.compact_for_llm(signals_out), sort_keys=True)}\n"
         f"Strategist view: {json.dumps(view, sort_keys=True)}\n"
         f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
@@ -505,6 +540,7 @@ def stage_critic(
         }
     cfg = stages.critic()
     content = (
+        f"{_live_mode_context_line(ctx)}"
         f"View: {json.dumps(view, sort_keys=True)}\n"
         f"Portfolio: {json.dumps(portfolio, sort_keys=True)}\n"
         f"Current broker positions: {json.dumps(current_positions or [], sort_keys=True)}\n"
@@ -545,19 +581,47 @@ def _parsed_virtual_nav_override() -> float | None:
         return None
 
 
+# Re-exported so call sites and tests have one import path; the shared
+# implementation lives in lib/live_nav.py because the monitor's DD breaker
+# must denominate in the SAME allocated-NAV scale as sizing (Codex P1s on
+# PR #112).
+LiveNavUnavailable = live_nav.LiveNavUnavailable
+_broker_is_live = live_nav.broker_is_live
+
+
+def _live_account_nav(ctx: StageContext) -> float:
+    """Live sizing NAV via lib.live_nav.live_allocated_nav: real equity, or
+    — when LIVE_NAV_CAP_USD is set — the capped starting allocation plus
+    live P&L since the transition. Raises LiveNavUnavailable on ANY problem;
+    this path has no fallback by design."""
+    return live_nav.live_allocated_nav(ctx.broker, run_id=ctx.run_id)
+
+
 def _account_nav(ctx: StageContext) -> float:
-    """Synthetic NAV the agent sizes against: the $2,500 baseline
+    """NAV the agent sizes against.
+
+    Paper (today's steady state): the synthetic $2,500 baseline
     (VIRTUAL_NAV_USD-overridable) + realized P&L to date. NEVER the broker's
     ~$100k paper equity — Phase 3 removed that fallback so a missing/garbled
     env var can't make the agent size ~40× too large. Sourced from the same
     trades.jsonl-derived balance the dashboard shows, so sizing and the
-    headline agree.
+    headline agree. Realized (settled) basis is intentional: it tracks
+    closed P&L — compounds as wins are banked, de-risks after realized
+    losses — without whipsawing on open-position mark-to-market. Falls back
+    to the baseline if the synthetic computation errors.
 
-    Realized (settled) basis is intentional: it tracks closed P&L — compounds
-    as wins are banked, de-risks after realized losses — without whipsawing on
-    open-position mark-to-market. Falls back to the baseline if the synthetic
-    computation errors.
+    Live (triple lock fully raised, non-paper broker): real broker equity,
+    optionally capped by LIVE_NAV_CAP_USD, prefetched once per cycle into
+    ctx.live_nav_usd by run_pipeline. This branch sits OUTSIDE the paper
+    try/except and never falls back to 2500/synthetic — a failed live
+    equity read raises LiveNavUnavailable and the cycle skips (fail closed).
     """
+    if ctx.live_nav_usd is not None:
+        return ctx.live_nav_usd
+    if not ctx.dry_run and _broker_is_live(ctx.broker):
+        nav = _live_account_nav(ctx)
+        ctx.live_nav_usd = nav
+        return nav
     try:
         from lib import dashboard_data
         return dashboard_data.realized_synthetic_nav()
@@ -635,16 +699,25 @@ def _current_positions_summary(ctx: StageContext) -> list[dict]:
     return rows
 
 
-def _recent_pnl_history(*, limit: int = 5) -> list[dict]:
+def _recent_pnl_history(*, limit: int = 5, mode: str = "paper") -> list[dict]:
     """Last N cycles' regime + portfolio + realized 4h PnL.
 
     Reads state/nav_history.jsonl in pairs to compute realized
     cycle-over-cycle NAV % change. Joins with the matching view.json
     in the run dir to get the regime classification per cycle.
 
+    Only rows of the given ``mode`` are paired (Codex P1 on PR #112):
+    paper rows are synthetic-scale (~$2.5k) and live rows are real-equity
+    scale, so a pair spanning the promotion boundary would report a
+    nonsense cycle-over-cycle % (e.g. +100% on a $5k deposit) to the
+    strategist for `limit` cycles.
+
     Returns oldest-first so the LLM reads a chronological tape.
     """
-    rows = state.read_nav_history(limit=limit + 1)
+    rows = [
+        r for r in state.read_nav_history(limit=1000)
+        if state.record_mode(r) == mode
+    ][-(limit + 1):]
     if len(rows) < 2:
         return []
     out: list[dict] = []
@@ -926,10 +999,18 @@ def _update_cycle_dedup_hash(
         pass
 
 
-def _peak_nav_30d() -> float:
+def _peak_nav_30d(*, mode: str = "paper") -> float:
     """Highest NAV observed in the last 30 calendar days from
     state.read_nav_history. Used by risk.adaptive_position_cap_pct
     to dial size down in drawdown.
+
+    Only rows of the given ``mode`` count (Codex P1 on PR #112): paper
+    rows are synthetic-scale and live rows are real-equity scale, so a
+    cross-era peak makes the drawdown-adaptive caps either never tighten
+    (live equity above the paper peak) or tighten spuriously for 30 days
+    (live funding below it). The live era cold-starts at peak 0.0, which
+    risk.adaptive_position_cap_pct already treats as "no history → full
+    base cap".
 
     Codex P2 on PR #69: an earlier version used ``limit=180`` (≈30d
     at 6 cycles/day) as a proxy for "last 30 days." But the orchestrator
@@ -953,6 +1034,8 @@ def _peak_nav_30d() -> float:
 
     peak = 0.0
     for r in rows:
+        if state.record_mode(r) != mode:
+            continue
         nav = r.get("nav_usd") or 0.0
         if nav <= 0:
             continue
@@ -1067,6 +1150,7 @@ def _compute_next_run_at(
     user_msg = {
         "role": "user",
         "content": (
+            f"{_live_mode_context_line(ctx)}"
             f"Current UTC: {state.utcnow_iso()}\n"
             f"Market clock: is_open={market_is_open}, next_open={next_open}\n"
             f"Today's autonomous review cycles: {reviews_today}/{review_cap} "
@@ -1202,7 +1286,9 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
         # of the UTC day. The flag auto-expires next day. Codex P1 (PR #98):
         # _plan_for_symbol puts reductions in `requests`, so filter by side
         # rather than dropping every request.
-        if risk.dd_breaker_enabled() and state.dd_halt_active():
+        if risk.dd_breaker_enabled() and state.dd_halt_active(
+            mode=live_gate.trading_mode(ctx.broker)
+        ):
             derisking = [r for r in plan.requests if r.side == "sell"]
             skipped_opens = len(plan.requests) - len(derisking)
             plan = orders.OrderPlan(
@@ -1253,6 +1339,7 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
             trades_sync.sync_fills_from_alpaca(
                 trading_client=getattr(ctx.broker, "_client", None),
                 order_id_to_run_id=trades_sync.order_id_to_run_id_from_runs(),
+                mode=live_gate.trading_mode(ctx.broker),
             )
         except Exception as e:
             next_run["trades_sync_error"] = (
@@ -1289,11 +1376,23 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
             synthetic_nav = _dd.realized_synthetic_nav()
         except Exception:
             synthetic_nav = nav_portfolio.get("nav_usd", 0.0)
+        # Live rows must record the SAME live/capped NAV the agent sizes
+        # against (Codex P1 on PR #112): _peak_nav_30d + _recent_pnl_history
+        # compare these rows to _account_nav, so a live row written in
+        # paper-synthetic units would leave the drawdown-adaptive caps blind
+        # to live drawdowns. nav_source="live" keeps the legacy NAV-offset
+        # display path from touching them.
+        _nav_mode = live_gate.trading_mode(ctx.broker)
+        if _nav_mode == "live" and ctx.live_nav_usd is not None:
+            _nav_value, _nav_source = ctx.live_nav_usd, "live"
+        else:
+            _nav_value, _nav_source = synthetic_nav, "virtual"
         state.append_nav({
             "run_id": ctx.run_id,
             "at": state.utcnow_iso(),
-            "nav_usd": synthetic_nav,
-            "nav_source": "virtual",
+            "nav_usd": _nav_value,
+            "nav_source": _nav_source,
+            "mode": _nav_mode,
             "cash_usd": nav_portfolio.get("cash_usd", 0.0),
             "positions_count": len(nav_portfolio.get("positions", [])),
             "all_cash": nav_portfolio.get("all_cash", False),
@@ -1376,7 +1475,7 @@ def _run_pipeline_review(*, ctx: StageContext, dry_run: bool) -> dict:
     # strategist's regime commentary is informed by what we currently
     # hold and how past calls actually performed.
     current_positions = _current_positions_summary(ctx)
-    pnl_history = _recent_pnl_history(limit=5)
+    pnl_history = _recent_pnl_history(limit=5, mode=live_gate.trading_mode(ctx.broker))
     performance_memo = feedback.build_performance_memo_safe()
 
     # ----- Stage 2: strategist → review.json (not view.json) -----
@@ -1530,6 +1629,62 @@ def run_pipeline(
         intent_source=intent_source,
     )
 
+    # Live sizing prefetch (fail closed) — BEFORE the review branch, the
+    # market gate, and any LLM spend. On a live broker the cycle must know
+    # the real equity it sizes against; if that read fails there is no safe
+    # fallback (never 2500/synthetic on live), so skip the whole cycle and
+    # retry soon. The env-only check catches the broker-construction-failed
+    # case (Codex P1 on PR #112): with the full triple lock raised but
+    # broker=None, the pipeline would otherwise run the no-broker paper path
+    # (market gate open, synthetic sizing, LLM spend) — that state is
+    # live-NAV-unavailable, not paper. Paper and dry-run are untouched:
+    # live_nav_usd stays None and _account_nav sizes synthetically as before.
+    if not dry_run and (_broker_is_live(broker) or live_gate.trading_mode() == "live"):
+        try:
+            ctx.live_nav_usd = _live_account_nav(ctx)
+        except LiveNavUnavailable as e:
+            from datetime import timedelta
+            next_at = (state.utcnow() + timedelta(minutes=30)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            next_run = {
+                "run_id": rid,
+                "next_run_at": next_at,
+                "rationale": (
+                    f"cycle skipped: live NAV unavailable ({e}). No orders "
+                    "and no LLM calls were made; retrying in 30 minutes. "
+                    "Check LIVE_NAV_CAP_USD and broker connectivity."
+                ),
+                # Preserve the scheduled intent (Codex P2 on PR #112): a
+                # transient equity-read failure during an after-hours review
+                # must retry as a review, not convert into a trade cycle
+                # that the market gate will then skip until next open.
+                "cycle_intent": cycle_intent,
+                "live_nav_unavailable": True,
+            }
+            state.write_json(state.run_dir(rid) / "next_run.json", next_run)
+            state.write_json(state.NEXT_RUN, next_run)
+            state.append_decision({
+                "run_id": rid,
+                "stage": "live_nav_prefetch",
+                "model": "local-deterministic",
+                "inputs_hash": _hash_inputs(rid),
+                "output_ref": "next_run.json",
+                "prompt_cache_hit_pct": 0.0,
+                "cost_usd": 0.0,
+                "started_at": state.utcnow_iso(),
+                "ended_at": state.utcnow_iso(),
+                "status": "skipped_live_nav_unavailable",
+                "risk_warning": RISK_WARNING,
+                "cycle_intent": cycle_intent,
+                "intent_source": intent_source,
+            })
+            return {
+                "run_id": rid,
+                "live_nav_unavailable": True,
+                "next_run": next_run,
+            }
+
     if cycle_intent == "review":
         return _run_pipeline_review(ctx=ctx, dry_run=dry_run)
 
@@ -1636,7 +1791,7 @@ def run_pipeline(
     # Recent PnL feedback — last 5 cycles' regime + realized 4h PnL
     # so the strategist can self-correct drift across cycles. NOT part of
     # the dedup fingerprint — see _memo_fingerprint for why.
-    pnl_history = _recent_pnl_history(limit=5)
+    pnl_history = _recent_pnl_history(limit=5, mode=live_gate.trading_mode(ctx.broker))
 
     # ----- Stage 2: strategist (1 LLM call) -----
     view = _run_stage(
@@ -1657,7 +1812,7 @@ def run_pipeline(
     #   entry/add cap  → rule: entry_cap_on_adds
     #   hold ceiling   → rule: position_within_adaptive_cap
     _nav_now = _account_nav(ctx)
-    _peak_now = _peak_nav_30d()
+    _peak_now = _peak_nav_30d(mode=live_gate.trading_mode(ctx.broker))
     adaptive_cap = risk.adaptive_position_cap_pct(
         current_nav=_nav_now, peak_nav_30d=_peak_now,
     )
@@ -1764,6 +1919,7 @@ def run_pipeline(
         def _retry_with_critique() -> dict:
             cfg = stages.constructor()
             content = (
+                f"{_live_mode_context_line(ctx)}"
                 f"Signals: {json.dumps(signals.compact_for_llm(signals_out), sort_keys=True)}\n"
                 f"Strategist view: {json.dumps(view, sort_keys=True)}\n"
                 f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"
