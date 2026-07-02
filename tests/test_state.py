@@ -523,3 +523,81 @@ def test_wipe_run_history_idempotent(tmp_state):
     # (write_text("") is idempotent) — backup dir count is 0 since we
     # passed backup=False.
     assert r2["runs_dirs_removed"] == 0
+
+
+# --------- mode tagging + live-transition marker (paper→live continuity) ---------
+
+
+def _trade_row(**over):
+    row = {
+        "activity_id": "a1", "alpaca_order_id": "o1", "symbol": "TQQQ",
+        "kind": "etf", "side": "buy", "qty": 3, "fill_price": 70.0,
+        "fees_usd": 0.0, "filled_at": "2026-07-01T14:00:00Z", "run_id": "r1",
+    }
+    row.update(over)
+    return row
+
+
+def test_append_trade_default_stamps_paper_mode(tmp_state):
+    state.append_trade(_trade_row())
+    row = state.read_trades()[0]
+    assert row["mode"] == "paper"
+
+
+def test_append_trade_preserves_explicit_live_mode(tmp_state):
+    state.append_trade(_trade_row(mode="live"))
+    row = state.read_trades()[0]
+    assert row["mode"] == "live"
+
+
+def test_append_nav_and_kill_event_default_paper_mode(tmp_state):
+    state.append_nav({"run_id": "r1", "at": "2026-07-01T14:00:00Z", "nav_usd": 2500.0})
+    state.append_kill_event({"at": "2026-07-01T14:00:00Z", "symbol": "TQQQ",
+                             "reason": "loss cap"})
+    nav = json.loads(state.NAV_HISTORY_LOG.read_text().splitlines()[0])
+    kill = state.read_kill_events()[0]
+    assert nav["mode"] == "paper"
+    assert kill["mode"] == "paper"
+
+
+def test_record_mode_missing_key_reads_as_paper():
+    assert state.record_mode({}) == "paper"
+    assert state.record_mode({"mode": None}) == "paper"
+    assert state.record_mode({"mode": "live"}) == "live"
+
+
+def test_trade_activity_dedup_ignores_mode_key(tmp_state):
+    state.append_trade(_trade_row(activity_id="a1", mode="paper"))
+    state.append_trade(_trade_row(activity_id="a2", mode="live"))
+    assert state.read_trade_activity_ids() == {"a1", "a2"}
+
+
+def test_write_live_transition_once_is_write_once(tmp_state):
+    first = state.write_live_transition_once(
+        live_starting_equity_usd=2612.34, nav_cap_usd=2500.0,
+        run_id="r1", live_version=1,
+    )
+    assert first["live_starting_equity_usd"] == 2612.34
+    assert first["nav_cap_usd"] == 2500.0
+    again = state.write_live_transition_once(
+        live_starting_equity_usd=9999.0, nav_cap_usd=None,
+        run_id="r2", live_version=1,
+    )
+    assert again == first  # second write is a no-op
+    assert state.read_live_transition() == first
+
+
+def test_read_live_transition_missing_and_corrupt(tmp_state):
+    assert state.read_live_transition() is None
+    state.LIVE_TRANSITION.write_text("{not json", encoding="utf-8")
+    assert state.read_live_transition() is None
+
+
+def test_wipe_run_history_removes_live_transition(tmp_state):
+    state.write_live_transition_once(
+        live_starting_equity_usd=2500.0, nav_cap_usd=None,
+        run_id=None, live_version=1,
+    )
+    assert state.LIVE_TRANSITION.exists()
+    state.wipe_run_history(backup=False)
+    assert not state.LIVE_TRANSITION.exists()

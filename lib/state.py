@@ -112,6 +112,23 @@ NAV_OFFSET_FLAG = STATE_DIR / "nav_offset.json"
 # Schema: {"broker_baseline_usd": <float>, "set_at": <ISO-UTC>}
 NAV_MANUAL_BASELINE_FLAG = STATE_DIR / "nav_manual_baseline.json"
 
+# Paper→live transition marker. Written ONCE by the orchestrator's live NAV
+# path on the first successful live equity read; never overwritten, so the
+# recorded starting equity is the real number the live era began with. Read
+# by lib.feedback (era-split memo labeling) and the dashboard (equity-curve
+# LIVE marker). Small-marker pattern like sod_nav.json — no jsonschema.
+#
+# Schema:
+#   {
+#     "at": <ISO-UTC>,
+#     "live_starting_equity_usd": <float>,
+#     "nav_cap_usd": <float | null>,
+#     "run_id": <str | null>,
+#     "live_version": <int>,
+#     "note": <str>
+#   }
+LIVE_TRANSITION = STATE_DIR / "live_transition.json"
+
 
 # --------- run_id ---------
 
@@ -564,6 +581,68 @@ def read_costs_for_run(run_id: str) -> list[dict]:
     return out
 
 
+def _default_record_mode() -> str:
+    """Mode stamped onto appended records when the caller didn't supply one.
+
+    Delegates to live_gate.trading_mode() (env-only path — "live" requires
+    the full triple lock); falls back to "paper" if anything goes wrong, so
+    a record can never be mislabeled live by accident.
+    """
+    try:
+        from . import live_gate  # local import: state is imported everywhere
+
+        return live_gate.trading_mode()
+    except Exception:
+        return "paper"
+
+
+def record_mode(row: dict) -> str:
+    """The paper/live era a state record belongs to. Rows written before
+    mode-tagging existed have no "mode" key — they are all paper by
+    construction (tagging shipped while the system was paper-only)."""
+    return row.get("mode") or "paper"
+
+
+def read_live_transition() -> dict | None:
+    """The paper→live transition marker, or None when the system has never
+    run a live cycle. Tolerant of a corrupt/unreadable file (returns None)."""
+    if not LIVE_TRANSITION.exists():
+        return None
+    try:
+        data = json.loads(LIVE_TRANSITION.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def write_live_transition_once(
+    *,
+    live_starting_equity_usd: float,
+    nav_cap_usd: float | None,
+    run_id: str | None,
+    live_version: int,
+) -> dict:
+    """Record the moment the live era began. Write-once: if the marker
+    already exists it is returned unchanged, so the starting equity stays
+    the real number from the FIRST successful live equity read."""
+    existing = read_live_transition()
+    if existing is not None:
+        return existing
+    marker = {
+        "at": utcnow_iso(),
+        "live_starting_equity_usd": float(live_starting_equity_usd),
+        "nav_cap_usd": float(nav_cap_usd) if nav_cap_usd is not None else None,
+        "run_id": run_id,
+        "live_version": int(live_version),
+        "note": "first successful live equity read",
+    }
+    LIVE_TRANSITION.parent.mkdir(parents=True, exist_ok=True)
+    LIVE_TRANSITION.write_text(
+        json.dumps(marker, indent=2, sort_keys=False), encoding="utf-8"
+    )
+    return marker
+
+
 def append_trade(entry: dict) -> None:
     """Append one row to state/trades.jsonl.
 
@@ -589,6 +668,12 @@ def append_trade(entry: dict) -> None:
       - slippage_usd (number) — modelled per-leg slippage/spread cost for the
         fill (lib.alpaca_costs). Alpaca never reports spread, even live.
       - fee_source ("real" | "modelled") — provenance of fees_usd.
+      - mode ("paper" | "live") — which account era the fill belongs to.
+        Defaulted here from live_gate.trading_mode() when the caller didn't
+        stamp it (defense in depth); callers with a broker in hand should
+        pass the broker-derived mode. Rows written before mode-tagging
+        existed have no mode key — readers treat missing as "paper" via
+        record_mode().
     """
     required = {
         "activity_id", "alpaca_order_id", "symbol", "kind", "side",
@@ -599,6 +684,7 @@ def append_trade(entry: dict) -> None:
         raise ValueError(f"trade entry missing keys: {sorted(missing)}")
     if "run_id" not in entry:
         entry["run_id"] = None
+    entry.setdefault("mode", _default_record_mode())
     TRADES_LOG.parent.mkdir(parents=True, exist_ok=True)
     with TRADES_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, sort_keys=False) + "\n")
@@ -635,11 +721,14 @@ def append_nav(entry: dict) -> None:
 
     Required keys: run_id, at, nav_usd. Optional but recommended: cash_usd,
     gross_pnl_usd, modelled_costs_usd, net_pnl_usd, positions_count, all_cash.
+    A "mode" ("paper" | "live") key is defaulted when the caller didn't stamp
+    one; rows predating mode-tagging read as paper via record_mode().
     """
     required = {"run_id", "at", "nav_usd"}
     missing = required - entry.keys()
     if missing:
         raise ValueError(f"nav entry missing keys: {sorted(missing)}")
+    entry.setdefault("mode", _default_record_mode())
     NAV_HISTORY_LOG.parent.mkdir(parents=True, exist_ok=True)
     with NAV_HISTORY_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, sort_keys=False) + "\n")
@@ -660,12 +749,14 @@ def append_kill_event(entry: dict) -> None:
 
     Written by monitor.py when a flatten actually fires. Required keys:
     at, symbol, reason. Recommended: exit_kind (loss_cap / price_stop /
-    time_stop / trailing_stop / orphan_loss_cap), source.
+    time_stop / trailing_stop / orphan_loss_cap), source. A "mode"
+    ("paper" | "live") key is defaulted when the caller didn't stamp one.
     """
     required = {"at", "symbol", "reason"}
     missing = required - entry.keys()
     if missing:
         raise ValueError(f"kill event missing keys: {sorted(missing)}")
+    entry.setdefault("mode", _default_record_mode())
     KILL_EVENTS_LOG.parent.mkdir(parents=True, exist_ok=True)
     with KILL_EVENTS_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, sort_keys=False) + "\n")
@@ -828,7 +919,7 @@ def wipe_run_history(*, include_costs: bool = True, backup: bool = True) -> dict
         STATE_DIR / "scheduler_last_fired.txt",
         COST_RESET_FLAG, ALL_TIME_COST_RESET_FLAG,
         NAV_OFFSET_FLAG, NAV_MANUAL_BASELINE_FLAG,
-        DD_HALT_FLAG, SOD_NAV_FILE,
+        DD_HALT_FLAG, SOD_NAV_FILE, LIVE_TRANSITION,
     ]
     for f in snapshots:
         if f.exists():
