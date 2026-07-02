@@ -152,6 +152,10 @@ def apply_nav_offset_to_history(
             continue
         if src == "virtual":
             is_virtual = True
+        elif src == "live":
+            # Live-era rows are real-equity units already; the legacy paper
+            # anchor offset must never be subtracted from them.
+            is_virtual = True
         elif src == "broker":
             is_virtual = False
         else:

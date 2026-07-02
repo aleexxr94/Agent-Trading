@@ -50,13 +50,20 @@ def _live_synthetic_nav(*, portfolio: dict, marks: dict, cost_basis: dict) -> fl
         return None
 
 
-def run_dd_breaker(*, current_nav: float | None, enabled: bool, persist: bool = True) -> dict:
+def run_dd_breaker(*, current_nav: float | None, enabled: bool, persist: bool = True,
+                   mode: str = "paper") -> dict:
     """Manage the start-of-day baseline + the 8% daily-drawdown halt.
 
     The first observation of each UTC day sets the baseline. When current
-    synthetic NAV is ≥8% below it AND ``enabled``, writes the auto-expiring
+    NAV is ≥8% below it AND ``enabled``, writes the auto-expiring
     ``dd_halt`` flag the orchestrator reads to skip NEW orders (closes still
     allowed). ``persist=False`` (dry-run) computes without writing state.
+
+    ``mode`` scopes the baseline (Codex P2 on PR #112): paper baselines are
+    synthetic-scale, live baselines are real equity. A same-day paper→live
+    promotion re-baselines from the first live observation instead of
+    comparing live equity against the morning's paper number.
+
     Returns an info dict for the audit/log.
     """
     if current_nav is None:
@@ -64,10 +71,10 @@ def run_dd_breaker(*, current_nav: float | None, enabled: bool, persist: bool = 
             "sod_nav_usd": None, "current_nav_usd": None, "dd_pct": None,
             "tripped": False, "enabled": enabled, "halt_active": state.dd_halt_active(),
         }
-    sod = state.read_sod_nav_today()
+    sod = state.read_sod_nav_today(mode=mode)
     if sod is None:
         if persist:
-            state.set_sod_nav_today(current_nav)
+            state.set_sod_nav_today(current_nav, mode=mode)
         sod = current_nav
     tripped, dd = risk.daily_circuit_breaker_tripped(
         sod_nav_usd=sod, current_nav_usd=current_nav,
@@ -511,6 +518,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         dd_info = run_dd_breaker(
             current_nav=current_nav, enabled=dd_enabled, persist=not args.dry_run,
+            mode=live_gate.trading_mode(broker),
         )
         if dd_info.get("tripped"):
             print(

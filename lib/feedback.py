@@ -227,16 +227,31 @@ def build_performance_memo(
         if o is not None and c is not None and c >= o:
             hold_hours.append((c - o).total_seconds() / 3600.0)
 
+    # live_since gates ALL era behavior: None (paper-only, today) keeps the
+    # memo byte-identical to the pre-era output. When set, exit attribution
+    # only matches kill events from the trade's own era (Codex P2 on
+    # PR #112: a live exit within the 6h window of a paper stop-out on the
+    # same symbol must not inherit the paper event's exit_kind).
+    live_since = _live_since(rows)
+
+    def _era_events(ct: trades.ClosedTrade) -> list[dict]:
+        if live_since is None:
+            return kill_events
+        era = _era_of(ct, live_since)
+        return [ev for ev in kill_events if state.record_mode(ev) == era]
+
     recent = sorted(closed, key=lambda t: t.closed_at)[-recent_exits_limit:]
-    recent_exits = [
-        {
+    recent_exits = []
+    for ct in reversed(recent):  # newest first — the tape the LLM reads
+        row = {
             "symbol": ct.symbol,
             "closed_at": ct.closed_at,
             "net_pnl_usd": _round(ct.net_pnl_usd),
-            "exit_kind": _exit_kind_for(ct, kill_events),
+            "exit_kind": _exit_kind_for(ct, _era_events(ct)),
         }
-        for ct in reversed(recent)  # newest first — the tape the LLM reads
-    ]
+        if live_since is not None:
+            row["mode"] = _era_of(ct, live_since)
+        recent_exits.append(row)
 
     overall = _record(closed)
     overall["avg_hold_hours"] = (
@@ -274,13 +289,10 @@ def build_performance_memo(
     # (the carryover is the point); this block just labels which evidence
     # came from which era so the strategist can weigh simulated fills
     # (modelled fees, no real slippage) against real-money ones.
-    live_since = _live_since(rows)
     if live_since is not None:
         eras: dict[str, list[trades.ClosedTrade]] = {"paper": [], "live": []}
         for ct in closed:
             eras[_era_of(ct, live_since)].append(ct)
-        for exit_row, ct in zip(recent_exits, reversed(recent)):
-            exit_row["mode"] = _era_of(ct, live_since)
         paper_rec = _record(eras["paper"])
         if eras["paper"]:
             paper_rec["through"] = max(t.closed_at for t in eras["paper"])

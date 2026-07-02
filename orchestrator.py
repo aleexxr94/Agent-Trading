@@ -717,16 +717,25 @@ def _current_positions_summary(ctx: StageContext) -> list[dict]:
     return rows
 
 
-def _recent_pnl_history(*, limit: int = 5) -> list[dict]:
+def _recent_pnl_history(*, limit: int = 5, mode: str = "paper") -> list[dict]:
     """Last N cycles' regime + portfolio + realized 4h PnL.
 
     Reads state/nav_history.jsonl in pairs to compute realized
     cycle-over-cycle NAV % change. Joins with the matching view.json
     in the run dir to get the regime classification per cycle.
 
+    Only rows of the given ``mode`` are paired (Codex P1 on PR #112):
+    paper rows are synthetic-scale (~$2.5k) and live rows are real-equity
+    scale, so a pair spanning the promotion boundary would report a
+    nonsense cycle-over-cycle % (e.g. +100% on a $5k deposit) to the
+    strategist for `limit` cycles.
+
     Returns oldest-first so the LLM reads a chronological tape.
     """
-    rows = state.read_nav_history(limit=limit + 1)
+    rows = [
+        r for r in state.read_nav_history(limit=1000)
+        if state.record_mode(r) == mode
+    ][-(limit + 1):]
     if len(rows) < 2:
         return []
     out: list[dict] = []
@@ -1008,10 +1017,18 @@ def _update_cycle_dedup_hash(
         pass
 
 
-def _peak_nav_30d() -> float:
+def _peak_nav_30d(*, mode: str = "paper") -> float:
     """Highest NAV observed in the last 30 calendar days from
     state.read_nav_history. Used by risk.adaptive_position_cap_pct
     to dial size down in drawdown.
+
+    Only rows of the given ``mode`` count (Codex P1 on PR #112): paper
+    rows are synthetic-scale and live rows are real-equity scale, so a
+    cross-era peak makes the drawdown-adaptive caps either never tighten
+    (live equity above the paper peak) or tighten spuriously for 30 days
+    (live funding below it). The live era cold-starts at peak 0.0, which
+    risk.adaptive_position_cap_pct already treats as "no history → full
+    base cap".
 
     Codex P2 on PR #69: an earlier version used ``limit=180`` (≈30d
     at 6 cycles/day) as a proxy for "last 30 days." But the orchestrator
@@ -1035,6 +1052,8 @@ def _peak_nav_30d() -> float:
 
     peak = 0.0
     for r in rows:
+        if state.record_mode(r) != mode:
+            continue
         nav = r.get("nav_usd") or 0.0
         if nav <= 0:
             continue
@@ -1372,12 +1391,23 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
             synthetic_nav = _dd.realized_synthetic_nav()
         except Exception:
             synthetic_nav = nav_portfolio.get("nav_usd", 0.0)
+        # Live rows must record the SAME live/capped NAV the agent sizes
+        # against (Codex P1 on PR #112): _peak_nav_30d + _recent_pnl_history
+        # compare these rows to _account_nav, so a live row written in
+        # paper-synthetic units would leave the drawdown-adaptive caps blind
+        # to live drawdowns. nav_source="live" keeps the legacy NAV-offset
+        # display path from touching them.
+        _nav_mode = live_gate.trading_mode(ctx.broker)
+        if _nav_mode == "live" and ctx.live_nav_usd is not None:
+            _nav_value, _nav_source = ctx.live_nav_usd, "live"
+        else:
+            _nav_value, _nav_source = synthetic_nav, "virtual"
         state.append_nav({
             "run_id": ctx.run_id,
             "at": state.utcnow_iso(),
-            "nav_usd": synthetic_nav,
-            "nav_source": "virtual",
-            "mode": live_gate.trading_mode(ctx.broker),
+            "nav_usd": _nav_value,
+            "nav_source": _nav_source,
+            "mode": _nav_mode,
             "cash_usd": nav_portfolio.get("cash_usd", 0.0),
             "positions_count": len(nav_portfolio.get("positions", [])),
             "all_cash": nav_portfolio.get("all_cash", False),
@@ -1460,7 +1490,7 @@ def _run_pipeline_review(*, ctx: StageContext, dry_run: bool) -> dict:
     # strategist's regime commentary is informed by what we currently
     # hold and how past calls actually performed.
     current_positions = _current_positions_summary(ctx)
-    pnl_history = _recent_pnl_history(limit=5)
+    pnl_history = _recent_pnl_history(limit=5, mode=live_gate.trading_mode(ctx.broker))
     performance_memo = feedback.build_performance_memo_safe()
 
     # ----- Stage 2: strategist → review.json (not view.json) -----
@@ -1618,10 +1648,20 @@ def run_pipeline(
     # market gate, and any LLM spend. On a live broker the cycle must know
     # the real equity it sizes against; if that read fails there is no safe
     # fallback (never 2500/synthetic on live), so skip the whole cycle and
-    # retry soon. Paper and dry-run are untouched: live_nav_usd stays None
-    # and _account_nav uses the synthetic path exactly as before.
-    if not dry_run and _broker_is_live(broker):
+    # retry soon. The env-only check catches the broker-construction-failed
+    # case (Codex P1 on PR #112): with the full triple lock raised but
+    # broker=None, the pipeline would otherwise run the no-broker paper path
+    # (market gate open, synthetic sizing, LLM spend) — that state is
+    # live-NAV-unavailable, not paper. Paper and dry-run are untouched:
+    # live_nav_usd stays None and _account_nav sizes synthetically as before.
+    if not dry_run and (_broker_is_live(broker) or live_gate.trading_mode() == "live"):
         try:
+            if not _broker_is_live(broker):
+                raise LiveNavUnavailable(
+                    "live env lock is fully raised but no live broker is "
+                    "available (broker construction failed or a paper broker "
+                    "was passed)"
+                )
             ctx.live_nav_usd = _live_account_nav(ctx)
         except LiveNavUnavailable as e:
             from datetime import timedelta
@@ -1768,7 +1808,7 @@ def run_pipeline(
     # Recent PnL feedback — last 5 cycles' regime + realized 4h PnL
     # so the strategist can self-correct drift across cycles. NOT part of
     # the dedup fingerprint — see _memo_fingerprint for why.
-    pnl_history = _recent_pnl_history(limit=5)
+    pnl_history = _recent_pnl_history(limit=5, mode=live_gate.trading_mode(ctx.broker))
 
     # ----- Stage 2: strategist (1 LLM call) -----
     view = _run_stage(
@@ -1789,7 +1829,7 @@ def run_pipeline(
     #   entry/add cap  → rule: entry_cap_on_adds
     #   hold ceiling   → rule: position_within_adaptive_cap
     _nav_now = _account_nav(ctx)
-    _peak_now = _peak_nav_30d()
+    _peak_now = _peak_nav_30d(mode=live_gate.trading_mode(ctx.broker))
     adaptive_cap = risk.adaptive_position_cap_pct(
         current_nav=_nav_now, peak_nav_30d=_peak_now,
     )

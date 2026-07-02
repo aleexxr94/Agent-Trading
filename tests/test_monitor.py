@@ -648,7 +648,9 @@ def test_dd_breaker_uses_real_equity_on_live_broker(tmp_state, monkeypatch):
     fake = _LiveBroker([])
     monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
     monitor.main([])
-    assert state.read_sod_nav_today() == 5000.0
+    assert state.read_sod_nav_today(mode="live") == 5000.0
+    # The live baseline must NOT read as a paper baseline.
+    assert state.read_sod_nav_today(mode="paper") is None
 
 
 def test_dd_breaker_skips_update_when_live_equity_read_fails(tmp_state, monkeypatch):
@@ -664,3 +666,26 @@ def test_dd_breaker_skips_update_when_live_equity_read_fails(tmp_state, monkeypa
     monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
     monitor.main([])
     assert state.read_sod_nav_today() is None
+
+def test_dd_breaker_rebaselines_on_same_day_mode_switch(tmp_state):
+    """Codex P2 (PR #112): a paper SOD baseline written earlier the same UTC
+    day must not be reused as the live baseline — promotion re-baselines
+    from the first live observation."""
+    state.set_sod_nav_today(2500.0, mode="paper")
+    info = monitor.run_dd_breaker(current_nav=5000.0, enabled=True, mode="live")
+    # Re-baselined at the live equity, not compared against the paper 2500
+    # (which would read as +100% and mask any live drawdown all day).
+    assert info["sod_nav_usd"] == 5000.0
+    assert info["tripped"] is False
+    assert state.read_sod_nav_today(mode="live") == 5000.0
+
+
+def test_dd_breaker_legacy_untagged_baseline_reads_as_paper(tmp_state):
+    """A pre-tagging sod_nav.json (no mode key) keeps working for paper."""
+    import json as _json
+    state.SOD_NAV_FILE.write_text(_json.dumps({
+        "date": state.utcnow().date().isoformat(),
+        "sod_nav_usd": 2500.0, "set_at": state.utcnow_iso(),
+    }), encoding="utf-8")
+    assert state.read_sod_nav_today(mode="paper") == 2500.0
+    assert state.read_sod_nav_today(mode="live") is None

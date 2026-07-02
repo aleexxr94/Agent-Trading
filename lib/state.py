@@ -174,9 +174,16 @@ def clear_halt() -> None:
 # --------- daily drawdown breaker (Phase 2) ---------
 
 
-def read_sod_nav_today() -> float | None:
-    """Start-of-day synthetic NAV for TODAY (UTC), or None if not set today.
-    A stale (prior-day) baseline reads as None so each UTC day re-baselines."""
+def read_sod_nav_today(*, mode: str = "paper") -> float | None:
+    """Start-of-day NAV baseline for TODAY (UTC), or None if not set today.
+    A stale (prior-day) baseline reads as None so each UTC day re-baselines.
+
+    The baseline is mode-scoped (Codex P2 on PR #112): a paper baseline is
+    synthetic-scale (~$2.5k) while a live baseline is real equity, so a
+    same-day paper→live promotion must re-baseline rather than compare live
+    equity against the paper number (which could mask an 8%+ live drawdown
+    until the next UTC day). A stored baseline without a mode key predates
+    tagging and reads as paper."""
     if not SOD_NAV_FILE.exists():
         return None
     try:
@@ -185,17 +192,20 @@ def read_sod_nav_today() -> float | None:
         return None
     if not isinstance(d, dict) or d.get("date") != utcnow().date().isoformat():
         return None
+    if record_mode(d) != mode:
+        return None
     v = d.get("sod_nav_usd")
     return float(v) if isinstance(v, (int, float)) else None
 
 
-def set_sod_nav_today(nav: float) -> None:
+def set_sod_nav_today(nav: float, *, mode: str = "paper") -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     SOD_NAV_FILE.write_text(
         json.dumps({
             "date": utcnow().date().isoformat(),
             "sod_nav_usd": float(nav),
             "set_at": utcnow_iso(),
+            "mode": mode,
         }, sort_keys=True),
         encoding="utf-8",
     )

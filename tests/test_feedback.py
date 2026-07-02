@@ -240,3 +240,31 @@ def test_memo_era_split_prefers_transition_marker(tmp_state):
     assert es["live_since"] == marker_at
     assert es["paper"]["trades"] == 1
     assert es["live"]["trades"] == 1
+
+
+def test_memo_exit_attribution_does_not_cross_eras(tmp_state):
+    """Codex P2 (PR #112): a live exit inside the 6h match window of a PAPER
+    kill event on the same symbol must not inherit its exit_kind."""
+    rows = [
+        {**_fill("TQQQ", "buy", 4, 70.0, run_id="r2", at="2026-07-01T13:00:00Z", aid="a3"),
+         "mode": "live"},
+        {**_fill("TQQQ", "sell", 4, 60.0, at="2026-07-01T15:00:00Z", aid="a4"),
+         "mode": "live"},
+    ]
+    kill_events = [
+        # Paper stop-out on the same symbol 1h before the live close —
+        # inside the 6h window, but from the other era.
+        {"at": "2026-07-01T14:00:00Z", "symbol": "TQQQ",
+         "reason": "loss cap", "exit_kind": "loss_cap", "mode": "paper"},
+    ]
+    memo = feedback.build_performance_memo(trade_rows=rows, cost_rows=[],
+                                           kill_events=kill_events)
+    (exit_row,) = memo["recent_exits"]
+    assert exit_row["mode"] == "live"
+    assert exit_row["exit_kind"] == "agent_decision"  # NOT loss_cap
+
+    # Same setup but the event is live too → attribution applies.
+    kill_events[0]["mode"] = "live"
+    memo = feedback.build_performance_memo(trade_rows=rows, cost_rows=[],
+                                           kill_events=kill_events)
+    assert memo["recent_exits"][0]["exit_kind"] == "loss_cap"

@@ -283,3 +283,48 @@ def test_run_pipeline_skips_cycle_when_live_nav_unavailable(tmp_state, monkeypat
     assert rows[-1]["status"] == "skipped_live_nav_unavailable"
     assert rows[-1]["stage"] == "live_nav_prefetch"
     assert rows[-1]["cost_usd"] == 0.0
+
+
+def test_run_pipeline_fails_closed_when_env_live_but_broker_missing(tmp_state, monkeypatch):
+    """Codex P1 (PR #112): full env lock raised (env flag + LIVE_VERSION +
+    live base URL) but broker construction failed (broker=None) must be
+    treated as live-NAV-unavailable — never the no-broker paper path."""
+    from lib import live_gate
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
+    monkeypatch.setattr(live_gate, "LIVE_VERSION", 1)
+    out = orchestrator.run_pipeline(dry_run=False, run_id="nobroker", broker=None)
+    assert out["live_nav_unavailable"] is True
+
+
+def test_peak_nav_30d_scoped_to_mode(tmp_state, monkeypatch):
+    """Codex P1 (PR #112): the 30d peak must not mix paper-scale and
+    live-scale rows — each era sees only its own peak (live cold-starts
+    at 0.0 → full base cap)."""
+    from datetime import datetime, timezone
+    monkeypatch.setattr(
+        state, "utcnow",
+        lambda: datetime(2026, 7, 2, 14, 0, 0, tzinfo=timezone.utc),
+    )
+    state.append_nav({"run_id": "p", "at": "2026-07-01T14:00:00Z",
+                      "nav_usd": 2800.0, "mode": "paper"})
+    state.append_nav({"run_id": "l", "at": "2026-07-02T10:00:00Z",
+                      "nav_usd": 5000.0, "mode": "live"})
+    assert orchestrator._peak_nav_30d(mode="paper") == 2800.0
+    assert orchestrator._peak_nav_30d(mode="live") == 5000.0
+    assert orchestrator._peak_nav_30d() == 2800.0  # default = paper
+
+
+def test_recent_pnl_history_scoped_to_mode(tmp_state):
+    """Codex P1 (PR #112): cycle-over-cycle PnL % must never pair a paper
+    row with a live row (a $2.5k→$5k boundary pair would read as +100%)."""
+    state.append_nav({"run_id": "p1", "at": "2026-07-01T14:00:00Z",
+                      "nav_usd": 2500.0, "mode": "paper"})
+    state.append_nav({"run_id": "p2", "at": "2026-07-01T18:00:00Z",
+                      "nav_usd": 2550.0, "mode": "paper"})
+    state.append_nav({"run_id": "l1", "at": "2026-07-02T14:00:00Z",
+                      "nav_usd": 5000.0, "mode": "live"})
+    paper = orchestrator._recent_pnl_history(limit=5, mode="paper")
+    assert len(paper) == 1 and paper[0]["realized_pnl_pct"] == 2.0
+    # One live row → no pair yet → empty, NOT a +96% paper→live jump.
+    assert orchestrator._recent_pnl_history(limit=5, mode="live") == []
