@@ -207,10 +207,15 @@ def _style_fig(
         )
 
 
-def _render_balance_chart(*, xs, ys, hover_texts, yaxis_title: str, caption: str) -> None:
+def _render_balance_chart(
+    *, xs, ys, hover_texts, yaxis_title: str, caption: str,
+    live_transition_at: str | None = None,
+) -> None:
     """CoinGecko-style balance chart: one smooth area line that flows into
     the current value at a labelled end dot. Direction-aware colour (green
-    up / red down over the visible window), tight y-axis, zoom disabled."""
+    up / red down over the visible window), tight y-axis, zoom disabled.
+    ``live_transition_at`` (ISO UTC) draws a dotted LIVE marker at the first
+    point of the live era, segmenting paper history from real-money cycles."""
     up = len(ys) < 2 or _fnum(ys[-1]) >= _fnum(ys[0])
     col = "#059669" if up else "#dc2626"
     shape = "spline" if len(ys) > 2 else "linear"
@@ -249,6 +254,18 @@ def _render_balance_chart(*, xs, ys, hover_texts, yaxis_title: str, caption: str
         font=dict(size=13, color=col),
         bgcolor=_rgba(col, 0.10), bordercolor=col, borderwidth=1, borderpad=4,
     )
+    if live_transition_at:
+        # Anchor the marker to the first plotted point inside the live era
+        # (works on both categorical and date x-axes; ISO strings compare
+        # chronologically). No point in range → transition predates/postdates
+        # the visible window, skip silently.
+        vx = next((x for x in xs if str(x) >= live_transition_at), None)
+        if vx is not None:
+            fig.add_vline(x=vx, line_width=1, line_dash="dot", line_color="#f59e0b")
+            fig.add_annotation(
+                x=vx, y=1.0, yref="paper", text="LIVE", showarrow=False,
+                yanchor="bottom", font=dict(size=10, color="#f59e0b"),
+            )
     fig.update_layout(
         template="plotly_white",
         paper_bgcolor="rgba(0,0,0,0)",
@@ -1612,6 +1629,7 @@ with tabs[3]:
             _render_balance_chart(
                 xs=xs, ys=ys, hover_texts=hover_texts,
                 yaxis_title="Portfolio NAV (USD)",
+                live_transition_at=(state.read_live_transition() or {}).get("at"),
                 caption=(
                     f"Line = portfolio NAV at the end of each orchestrator "
                     f"cycle from `state/nav_history.jsonl` ({len(nav_df)} of "
@@ -1671,6 +1689,7 @@ with tabs[3]:
             _render_balance_chart(
                 xs=xs, ys=ys, hover_texts=hover_texts,
                 yaxis_title="Synthetic balance (USD)",
+                live_transition_at=(state.read_live_transition() or {}).get("at"),
                 caption=(
                     "Line = historical realized balance reconstructed from "
                     "`state/trades.jsonl` + `state/costs.jsonl` (closed gross "
