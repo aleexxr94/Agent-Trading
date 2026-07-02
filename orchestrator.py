@@ -1919,6 +1919,7 @@ def run_pipeline(
         def _retry_with_critique() -> dict:
             cfg = stages.constructor()
             content = (
+                f"{_live_mode_context_line(ctx)}"
                 f"Signals: {json.dumps(signals.compact_for_llm(signals_out), sort_keys=True)}\n"
                 f"Strategist view: {json.dumps(view, sort_keys=True)}\n"
                 f"Current broker positions: {json.dumps(current_positions, sort_keys=True)}\n"

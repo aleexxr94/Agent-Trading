@@ -784,3 +784,16 @@ def test_sync_dedup_unchanged_by_mode_key(tmp_state):
     rows = state.read_trades()
     assert len(rows) == 1
     assert rows[0]["mode"] == "paper"
+
+
+def test_sync_live_mode_never_applies_modelled_costs(tmp_state):
+    """Codex P2 (PR #112): a live-tagged fill must not carry modelled paper
+    slippage/fees on top of real execution costs, even when the paper cost
+    model is otherwise active (env lock down in tests)."""
+    tc = _FakeTrading(responses={"/account/activities/FILL": [_fill()]})
+    trades_sync.sync_fills_from_alpaca(trading_client=tc, mode="live")
+    r = state.read_trades()[0]
+    assert r["mode"] == "live"
+    assert r["slippage_usd"] == 0.0
+    assert r["fees_usd"] == 0.0
+    assert r["fee_source"] == "none"  # no fee activity, no modelled fallback

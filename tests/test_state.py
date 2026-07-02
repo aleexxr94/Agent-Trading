@@ -658,3 +658,15 @@ def test_write_live_transition_once_atomic_create(tmp_state, monkeypatch):
     )
     assert out["run_id"] == "winner"          # loser adopted the winner's marker
     assert out["live_starting_equity_usd"] == 5000.0
+
+
+def test_write_live_transition_once_raises_on_corrupt_existing_file(tmp_state):
+    """Codex P2 (PR #112): an existing-but-unreadable marker must surface as
+    an error, not be silently replaced by a fresh in-memory marker that
+    would re-anchor the capped live allocation to current equity."""
+    state.LIVE_TRANSITION.write_text("{partial json", encoding="utf-8")
+    with pytest.raises(OSError, match="unreadable"):
+        state.write_live_transition_once(
+            live_starting_equity_usd=5000.0, nav_cap_usd=2500.0,
+            run_id="r1", live_version=1,
+        )

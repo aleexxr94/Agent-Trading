@@ -409,3 +409,15 @@ def test_run_pipeline_live_nav_skip_preserves_review_intent(tmp_state, monkeypat
     )
     assert out["live_nav_unavailable"] is True
     assert out["next_run"]["cycle_intent"] == "review"
+
+
+def test_live_nav_capped_fails_closed_on_corrupt_marker_file(tmp_state, monkeypatch):
+    """Corrupt marker file + cap set → LiveNavUnavailable (the capped
+    allocation cannot re-anchor to current equity); uncapped continues."""
+    from lib import live_nav
+    state.LIVE_TRANSITION.write_text("{partial json", encoding="utf-8")
+    monkeypatch.setenv("LIVE_NAV_CAP_USD", "2500")
+    with pytest.raises(live_nav.LiveNavUnavailable):
+        live_nav.live_allocated_nav(_LiveBroker(equity_usd=5000.0))
+    monkeypatch.delenv("LIVE_NAV_CAP_USD", raising=False)
+    assert live_nav.live_allocated_nav(_LiveBroker(equity_usd=5000.0)) == 5000.0

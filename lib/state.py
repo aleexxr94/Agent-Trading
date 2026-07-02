@@ -667,7 +667,19 @@ def write_live_transition_once(
         with LIVE_TRANSITION.open("x", encoding="utf-8") as f:
             f.write(json.dumps(marker, indent=2, sort_keys=False))
     except FileExistsError:
-        return read_live_transition() or marker
+        existing = read_live_transition()
+        if existing is None:
+            # The file exists but is unreadable/corrupt (e.g. a crashed
+            # first writer left partial JSON). Returning the fresh
+            # in-memory marker would let the capped live NAV re-anchor to
+            # CURRENT equity on every pass, masking drawdowns (Codex P2 on
+            # PR #112) — surface the problem instead so the capped path
+            # fails closed until the operator fixes or removes the file.
+            raise OSError(
+                f"{LIVE_TRANSITION} exists but is unreadable/corrupt — fix "
+                "or remove it (this re-anchors the live risk budget)."
+            )
+        return existing
     return marker
 
 

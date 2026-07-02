@@ -330,8 +330,12 @@ def sync_fills_from_alpaca(
         # for PR #58 / Phase 2.5.
         total_qty = sum(_to_float(r.get("qty")) for r in rows) or 0.0
         # Modelled costs are paper-only (live fills embed slippage in the
-        # price and report real fees via activities).
-        model_costs = alpaca_costs.cost_model_active()
+        # price and report real fees via activities). Belt and braces
+        # (Codex P2 on PR #112): cost_model_active() already turns off under
+        # the live env lock, but a caller-supplied live mode must also gate
+        # it so a live-tagged row can never carry modelled paper costs on
+        # top of real execution costs.
+        model_costs = alpaca_costs.cost_model_active() and mode != "live"
         # Model the regulatory fee ONCE per order (sells only) + per-fill
         # slippage, via the shared helper that the legacy backfill also uses
         # (so the two never diverge). Computing per-fill would re-apply the
