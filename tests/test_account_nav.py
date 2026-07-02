@@ -328,3 +328,29 @@ def test_recent_pnl_history_scoped_to_mode(tmp_state):
     assert len(paper) == 1 and paper[0]["realized_pnl_pct"] == 2.0
     # One live row → no pair yet → empty, NOT a +96% paper→live jump.
     assert orchestrator._recent_pnl_history(limit=5, mode="live") == []
+
+
+def test_live_nav_cap_debits_losses_since_transition(tmp_state, monkeypatch):
+    """Codex P1 (PR #112): with the account funded above the cap, losses
+    must debit the allocation immediately — min(equity, cap) would stay
+    pinned at the cap until total equity fell below it."""
+    monkeypatch.setenv("LIVE_NAV_CAP_USD", "2500")
+    state.write_live_transition_once(
+        live_starting_equity_usd=5000.0, nav_cap_usd=2500.0,
+        run_id="r0", live_version=1,
+    )
+    # $1k loss on a $5k account: allocation = 2500 − 1000 = 1500, NOT 2500.
+    assert orchestrator._account_nav(_live_ctx(_LiveBroker(equity_usd=4000.0))) == 1500.0
+    # Profits compound the allocation (like the paper synthetic balance).
+    assert orchestrator._account_nav(_live_ctx(_LiveBroker(equity_usd=6000.0))) == 3500.0
+
+
+def test_live_nav_cap_exhausted_allocation_fails_closed(tmp_state, monkeypatch):
+    monkeypatch.setenv("LIVE_NAV_CAP_USD", "2500")
+    state.write_live_transition_once(
+        live_starting_equity_usd=5000.0, nav_cap_usd=2500.0,
+        run_id="r0", live_version=1,
+    )
+    # Equity down to the deposit-minus-allocation floor: allocation ≤ 0.
+    with pytest.raises(orchestrator.LiveNavUnavailable):
+        orchestrator._account_nav(_live_ctx(_LiveBroker(equity_usd=2500.0)))

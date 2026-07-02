@@ -133,9 +133,10 @@ def _live_since(trade_rows: list[dict]) -> str | None:
 
 
 def _era_of(ct: trades.ClosedTrade, live_since: str) -> str:
-    """Era a closed trade belongs to: timestamp split on closed_at. A round
-    trip spanning the boundary (opened on paper, closed live) counts as a
-    live-era exit — the realized outcome landed in the live account."""
+    """Era a closed trade belongs to: timestamp split on closed_at. FIFO
+    matching is era-scoped (lib/trades.py keys lots by (mode, symbol)), so a
+    closed trade's legs are always from one account and the timestamp split
+    is consistent: paper pairs close before live_since, live pairs after."""
     c = trades._parse_iso_utc(ct.closed_at)
     ls = trades._parse_iso_utc(live_since)
     if c is not None and ls is not None:

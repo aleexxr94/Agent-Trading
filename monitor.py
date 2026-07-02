@@ -19,7 +19,7 @@ try:
 except ImportError:
     pass
 
-from lib import live_gate
+from lib import live_gate, live_nav
 from lib import marks as marks_lib
 from lib import risk, state
 from lib.broker import Broker
@@ -503,14 +503,21 @@ def main(argv: list[str] | None = None) -> int:
     dd_info = None
     try:
         dd_enabled = risk.dd_breaker_enabled()
-        if broker is not None and getattr(broker, "is_paper", True) is False:
-            # Live account: the breaker must denominate in REAL equity, not
-            # the paper-era synthetic units (2500 + all paper P&L), which
-            # drift from the live balance. On a failed read, None skips this
-            # pass's dd update (fail closed) rather than mixing baselines.
+        dd_mode = live_gate.trading_mode(broker)
+        if dd_mode == "live" or live_gate.trading_mode() == "live":
+            # Live era: the breaker must denominate in the SAME allocated
+            # NAV the orchestrator sizes against (capped scale when
+            # LIVE_NAV_CAP_USD is set — Codex P1 on PR #112: full equity
+            # dilutes a >8% drawdown of the risk budget with idle cash).
+            # Any failure — including env-live with a missing broker —
+            # yields None, which skips this pass's dd update entirely so a
+            # paper-synthetic number can never be written as a live
+            # baseline (Codex P1 on PR #112).
+            dd_mode = "live"
             try:
-                current_nav = float(broker.get_account().equity_usd)
-            except Exception:
+                current_nav = live_nav.live_allocated_nav(broker)
+            except live_nav.LiveNavUnavailable as e:
+                print(f"monitor: live NAV unavailable ({e}); dd update skipped")
                 current_nav = None
         else:
             current_nav = _live_synthetic_nav(
@@ -518,7 +525,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         dd_info = run_dd_breaker(
             current_nav=current_nav, enabled=dd_enabled, persist=not args.dry_run,
-            mode=live_gate.trading_mode(broker),
+            mode=dd_mode,
         )
         if dd_info.get("tripped"):
             print(

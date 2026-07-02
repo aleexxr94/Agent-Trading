@@ -265,8 +265,11 @@ checkout — the triple lock is designed to fail closed at every layer.
    hard-coded `2500.0` fallback (Phase 3 removed the broker-equity path so a missing var
    couldn't size ~40× too large). When the broker is **genuinely live** (`is_paper=False`,
    which itself requires the triple lock), `_account_nav` instead sizes against real
-   `Account.equity_usd`, optionally capped by `min(equity, LIVE_NAV_CAP_USD)` (env; lets the
-   account hold more cash than the agent may size against). **Fail-closed:** the live path has
+   `Account.equity_usd` — or, when `LIVE_NAV_CAP_USD` is set, the capped starting allocation
+   `min(starting_equity, cap)` plus live P&L since the transition (never more than equity;
+   losses debit the allocation immediately, profits compound it — shared with the monitor's
+   DD breaker via `lib/live_nav.py` so sizing and the breaker denominate identically).
+   **Fail-closed:** the live path has
    NO fallback — a failed/invalid equity read or a malformed cap raises `LiveNavUnavailable`,
    and `run_pipeline` prefetches the NAV before the market gate / any LLM spend, skipping the
    whole cycle (retry-soon `next_run.json` + `skipped_live_nav_unavailable` decision row) rather

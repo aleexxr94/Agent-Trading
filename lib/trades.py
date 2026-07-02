@@ -15,7 +15,11 @@ Attribution methodology (locked, per user decision on May 12 2026):
   - Trading fees: real, pulled from Alpaca fills. No modelled estimate.
 
 Match logic:
-  - FIFO per symbol. A sell consumes the oldest open buy lot first.
+  - FIFO per (mode, symbol). A sell consumes the oldest open buy lot of the
+    SAME account era first — paper and live Alpaca accounts do not share
+    inventory, so a live sell must never close a leftover paper lot (Codex
+    P1 on PR #112). Rows without a mode tag predate era-tagging and are all
+    paper, so paper-only history matches exactly as before.
   - Partial closes produce one CLOSED row per matched chunk; the
     remaining qty stays open.
   - ETF-only: gross PnL is (sell - buy) × qty, no multiplier.
@@ -216,8 +220,9 @@ def compute_trades_pnl(
         costs, positions_per_run=per_run_positions,
     )
 
-    # FIFO queues per symbol of open buy lots (with remaining qty + remaining fees).
-    open_lots: dict[str, deque[dict]] = defaultdict(deque)
+    # FIFO queues per (mode, symbol) of open buy lots (with remaining qty +
+    # remaining fees). Keyed by era so cross-account matching is impossible.
+    open_lots: dict[tuple[str, str], deque[dict]] = defaultdict(deque)
     closed: list[ClosedTrade] = []
     # Sells that couldn't FIFO-match against an open buy lot. Should
     # be empty in healthy operation (spec is "no broker shorts").
@@ -236,9 +241,10 @@ def compute_trades_pnl(
         run_id = t.get("run_id")
         filled_at = t.get("filled_at", "")
         activity_id = t.get("activity_id", "")
+        lot_key = (t.get("mode") or "paper", symbol)
 
         if side == "buy":
-            open_lots[symbol].append({
+            open_lots[lot_key].append({
                 "activity_id": activity_id,
                 "run_id": run_id,
                 "kind": kind,
@@ -256,8 +262,8 @@ def compute_trades_pnl(
         # Pro-rate the sell-side fees + slippage by qty as we consume lots.
         sell_fees_per_unit = (fees / qty) if qty > 0 else 0.0
         sell_slip_per_unit = (slippage / qty) if qty > 0 else 0.0
-        while remaining_sell_qty > 1e-9 and open_lots[symbol]:
-            lot = open_lots[symbol][0]
+        while remaining_sell_qty > 1e-9 and open_lots[lot_key]:
+            lot = open_lots[lot_key][0]
             matched = min(remaining_sell_qty, lot["remaining_qty"])
             # Pro-rate buy-side fees + slippage by matched fraction of the lot.
             buy_fees_share = (
@@ -311,7 +317,7 @@ def compute_trades_pnl(
             lot["remaining_slippage"] -= buy_slip_share
             remaining_sell_qty -= matched
             if lot["remaining_qty"] <= 1e-9:
-                open_lots[symbol].popleft()
+                open_lots[lot_key].popleft()
         # If remaining_sell_qty > 0 here, the sell fill couldn't be
         # FIFO-matched against any open buy lot. System spec is "no
         # broker shorts", so this should never happen in healthy
@@ -335,7 +341,7 @@ def compute_trades_pnl(
 
     # Flatten remaining open lots into OpenTradePnl rows.
     open_rows: list[OpenTradePnl] = []
-    for symbol, lots in open_lots.items():
+    for (_mode, symbol), lots in open_lots.items():
         for lot in lots:
             mark = marks.get(symbol)
             gross = (

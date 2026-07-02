@@ -1601,19 +1601,8 @@ with tabs[3]:
             # P2). The synthetic fallback is already in virtual units so
             # no offset applies.
             live_at = state.utcnow_iso()
-            # The persisted Actual-NAV rows are in synthetic units (the
-            # orchestrator stamps the synthetic balance), so the live tip must
-            # be too — otherwise the line jumps from ~$2.5k history to the
-            # broker's ~$100k equity at the tip (Codex P2 on PR #98). Use the
-            # mark-aware synthetic balance, the same figure as the hero card.
-            live_nav = float(_synth_live.synthetic_balance_usd)
-            live_label = "Live (synthetic balance)"
-            # Fold the live value into one continuous line so the curve
-            # flows into "now" and the y-axis fits the whole series tightly
-            # (the old floating diamond sat ~$100 above the line and blew
-            # the scale wide, flattening real cycle variation).
-            xs = list(nav_df["at"]) + [live_at]
-            ys = [_fnum(v) for v in nav_df["nav_usd"]] + [_fnum(live_nav)]
+            xs = list(nav_df["at"])
+            ys = [_fnum(v) for v in nav_df["nav_usd"]]
             hover_texts = [
                 (
                     f"{r['at']}<br>NAV: ${_fnum(r['nav_usd']):,.2f}"
@@ -1625,7 +1614,26 @@ with tabs[3]:
                 )
                 for _, r in nav_df.iterrows()
             ]
-            hover_texts.append(f"{live_label}<br>${_fnum(live_nav):,.2f}")
+            # Once the live era has begun, the persisted rows are in
+            # live/capped-allocation units — appending the paper-scale
+            # synthetic tip would end the line with a false jump/drop
+            # (Codex P2 on PR #112); the latest live row IS the current
+            # marker. On paper, the rows are synthetic units so the tip
+            # must be the mark-aware synthetic balance, the same figure as
+            # the hero card — not the broker's ~$100k equity (Codex P2 on
+            # PR #98). Fold the tip into one continuous line so the curve
+            # flows into "now" and the y-axis fits the whole series tightly.
+            _latest_is_live = bool(nav_rows) and state.record_mode(nav_rows[-1]) == "live"
+            if _latest_is_live:
+                tip_phrase = "the latest live cycle"
+            else:
+                synth_tip = float(_synth_live.synthetic_balance_usd)
+                xs.append(live_at)
+                ys.append(_fnum(synth_tip))
+                hover_texts.append(
+                    f"Live (synthetic balance)<br>${_fnum(synth_tip):,.2f}"
+                )
+                tip_phrase = "the current live (synthetic balance)"
             _render_balance_chart(
                 xs=xs, ys=ys, hover_texts=hover_texts,
                 yaxis_title="Portfolio NAV (USD)",
@@ -1633,8 +1641,8 @@ with tabs[3]:
                 caption=(
                     f"Line = portfolio NAV at the end of each orchestrator "
                     f"cycle from `state/nav_history.jsonl` ({len(nav_df)} of "
-                    f"{len(nav_rows)} cycles shown), flowing into the current "
-                    f"{live_label.lower()} at the labelled end point. Colour "
+                    f"{len(nav_rows)} cycles shown), flowing into "
+                    f"{tip_phrase} at the labelled end point. Colour "
                     f"is green when up over the window, red when down. Toggle "
                     f"Source → *Synthetic balance* for a broker-independent "
                     f"reconstruction from trades.jsonl + costs.jsonl."

@@ -689,3 +689,38 @@ def test_dd_breaker_legacy_untagged_baseline_reads_as_paper(tmp_state):
     }), encoding="utf-8")
     assert state.read_sod_nav_today(mode="paper") == 2500.0
     assert state.read_sod_nav_today(mode="live") is None
+
+def test_dd_breaker_uses_capped_allocation_scale(tmp_state, monkeypatch):
+    """Codex P1 (PR #112): with LIVE_NAV_CAP_USD set, the breaker must
+    denominate in the same capped allocation the orchestrator sizes
+    against, not full equity (idle cash would dilute a real drawdown)."""
+    from lib.broker import Account
+
+    class _LiveBroker(_FakeBroker):
+        is_paper = False
+
+        def get_account(self):
+            return Account(cash_usd=5000.0, equity_usd=5000.0,
+                           buying_power_usd=5000.0, is_paper=False)
+
+    monkeypatch.setenv("LIVE_NAV_CAP_USD", "2500")
+    _write_portfolio([])
+    fake = _LiveBroker([])
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: fake)
+    monitor.main([])
+    assert state.read_sod_nav_today(mode="live") == 2500.0  # allocation, not 5000
+
+
+def test_dd_breaker_env_live_without_broker_writes_no_baseline(tmp_state, monkeypatch):
+    """Codex P1 (PR #112): env lock fully raised but broker construction
+    failed — the monitor must NOT fall back to the paper synthetic NAV and
+    write it as a live-mode SOD baseline."""
+    from lib import live_gate
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("ALPACA_BASE_URL", "https://api.alpaca.markets")
+    monkeypatch.setattr(live_gate, "LIVE_VERSION", 1)
+    _write_portfolio([])
+    monkeypatch.setattr(monitor, "_try_load_broker", lambda: None)
+    monitor.main([])
+    assert state.read_sod_nav_today(mode="live") is None
+    assert state.read_sod_nav_today(mode="paper") is None

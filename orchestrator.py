@@ -43,7 +43,7 @@ except ImportError:
     pass
 from typing import Callable
 
-from lib import feedback, live_gate, llm, market_gate, risk, sanity, signals, stages, state, trades
+from lib import feedback, live_gate, live_nav, llm, market_gate, risk, sanity, signals, stages, state, trades
 from lib.broker import Broker
 
 ROOT = Path(__file__).resolve().parent
@@ -551,68 +551,20 @@ def _parsed_virtual_nav_override() -> float | None:
         return None
 
 
-class LiveNavUnavailable(RuntimeError):
-    """Live broker equity could not be read or validated. The live sizing
-    path NEVER falls back to the synthetic/$2,500 baseline — sizing a real
-    account against the wrong scale is worse than skipping the cycle, so
-    callers must fail closed (no orders, no LLM spend, retry later)."""
-
-
-def _broker_is_live(broker: Broker | None) -> bool:
-    """True iff the broker object is a genuinely live (non-paper) client.
-    Constructing one already requires the triple lock (AlpacaBroker refuses
-    non-paper without LIVE_TRADING_ENABLED=true); a broker without an
-    is_paper attribute is treated as paper."""
-    return broker is not None and getattr(broker, "is_paper", True) is False
-
-
-def _live_nav_cap_usd() -> float | None:
-    """Optional operator ceiling on the live sizing NAV (LIVE_NAV_CAP_USD).
-    Lets the account hold more cash than the agent is allowed to size
-    against. Unset/blank → no cap. A malformed or non-positive value raises
-    LiveNavUnavailable: a typo'd cap must halt the cycle loudly, never
-    silently size against the full deposit."""
-    raw = os.environ.get("LIVE_NAV_CAP_USD")
-    if raw is None or not raw.strip():
-        return None
-    try:
-        cap = float(raw)
-    except ValueError:
-        raise LiveNavUnavailable(f"LIVE_NAV_CAP_USD is not a number: {raw!r}")
-    if not (cap > 0) or cap != cap or cap == float("inf"):
-        raise LiveNavUnavailable(f"LIVE_NAV_CAP_USD must be a positive finite USD amount: {raw!r}")
-    return cap
+# Re-exported so call sites and tests have one import path; the shared
+# implementation lives in lib/live_nav.py because the monitor's DD breaker
+# must denominate in the SAME allocated-NAV scale as sizing (Codex P1s on
+# PR #112).
+LiveNavUnavailable = live_nav.LiveNavUnavailable
+_broker_is_live = live_nav.broker_is_live
 
 
 def _live_account_nav(ctx: StageContext) -> float:
-    """Live sizing NAV: real broker equity, optionally capped by
-    LIVE_NAV_CAP_USD. Raises LiveNavUnavailable on ANY problem — this path
-    has no fallback by design (see LiveNavUnavailable). On the first
-    successful read it records the write-once paper→live transition marker
-    with the real starting equity."""
-    cap = _live_nav_cap_usd()
-    try:
-        account = ctx.broker.get_account()
-    except Exception as e:
-        raise LiveNavUnavailable(f"broker.get_account failed: {type(e).__name__}: {e}")
-    if getattr(account, "is_paper", True):
-        raise LiveNavUnavailable("broker reports a paper account on the live NAV path")
-    try:
-        equity = float(account.equity_usd)
-    except (TypeError, ValueError, AttributeError) as e:
-        raise LiveNavUnavailable(f"live equity unreadable: {type(e).__name__}: {e}")
-    if not (equity > 0) or equity != equity or equity == float("inf"):
-        raise LiveNavUnavailable(f"live equity invalid: {equity!r}")
-    try:
-        state.write_live_transition_once(
-            live_starting_equity_usd=equity,
-            nav_cap_usd=cap,
-            run_id=ctx.run_id,
-            live_version=live_gate.LIVE_VERSION,
-        )
-    except Exception:
-        pass  # the marker is telemetry; recording it must never block sizing
-    return min(equity, cap) if cap is not None else equity
+    """Live sizing NAV via lib.live_nav.live_allocated_nav: real equity, or
+    — when LIVE_NAV_CAP_USD is set — the capped starting allocation plus
+    live P&L since the transition. Raises LiveNavUnavailable on ANY problem;
+    this path has no fallback by design."""
+    return live_nav.live_allocated_nav(ctx.broker, run_id=ctx.run_id)
 
 
 def _account_nav(ctx: StageContext) -> float:
@@ -1656,12 +1608,6 @@ def run_pipeline(
     # live_nav_usd stays None and _account_nav sizes synthetically as before.
     if not dry_run and (_broker_is_live(broker) or live_gate.trading_mode() == "live"):
         try:
-            if not _broker_is_live(broker):
-                raise LiveNavUnavailable(
-                    "live env lock is fully raised but no live broker is "
-                    "available (broker construction failed or a paper broker "
-                    "was passed)"
-                )
             ctx.live_nav_usd = _live_account_nav(ctx)
         except LiveNavUnavailable as e:
             from datetime import timedelta
