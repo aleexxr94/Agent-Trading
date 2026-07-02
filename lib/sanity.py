@@ -218,7 +218,7 @@ def _r_position_backed_by_strategist(portfolio: dict, view: dict | None) -> Rule
 
 
 def _r_symbol_in_universe(portfolio: dict, view: dict | None) -> RuleResult:
-    """Every position symbol must be in the 29-ticker ETF universe.
+    """Every position symbol must be in the tradable ETF universe.
 
     Defense-in-depth, advisory by default. The hard gate is in
     lib/orders.py (diff_portfolio + submit_plan refuse non-universe symbols
@@ -243,7 +243,7 @@ def _r_symbol_in_universe(portfolio: dict, view: dict | None) -> RuleResult:
     if bad:
         return RuleResult(
             name, severity, severity,
-            detail=f"{len(bad)} position(s) outside the 29-ticker ETF universe",
+            detail=f"{len(bad)} position(s) outside the tradable ETF universe",
             meta={"offenders": bad},
         )
     return RuleResult(name, severity, "pass")

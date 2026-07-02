@@ -578,7 +578,10 @@ def test_recent_pnl_history_returns_chronological_with_realized(tmp_state):
     assert rows[0]["realized_pnl_pct"] == 2.0  # (2550/2500 - 1) × 100
 
 
-def test_peak_nav_30d_returns_max_observed(tmp_state):
+def test_peak_nav_30d_returns_max_observed(tmp_state, monkeypatch):
+    from datetime import datetime, timezone
+    now = datetime(2026, 5, 13, 14, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(state, "utcnow", lambda: now)
     for nav in (2500.0, 2700.0, 2400.0):
         state.append_nav({"run_id": "r", "at": "2026-05-13T14:00:00Z",
                           "nav_usd": nav, "positions_count": 0, "all_cash": True,

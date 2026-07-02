@@ -254,7 +254,9 @@ checkout — the triple lock is designed to fail closed at every layer.
      `cancel_all` / `flatten` all work unchanged against the live account. `_try_load_broker()`
      needs no change — it already loads `AlpacaBroker`.
    - `is_paper` flips to `False` automatically because the base URL is no longer the paper URL
-     (`lib/alpaca_client.py`), which drives the dashboard PAPER→LIVE pill.
+     (`lib/alpaca_client.py`). The dashboard PAPER→LIVE pill is driven by the
+     `LIVE_TRADING_ENABLED` env var directly (`dashboard.py`), not by `is_paper` — it flips as
+     soon as the env half of the lock is set.
 
 3. **Sizing — replace the synthetic NAV pin (code change, not config).** Paper sizing is pinned to
    a synthetic balance (`VIRTUAL_NAV_USD=2500` + realized P&L, never the broker's $100k paper
