@@ -1,10 +1,11 @@
-"""Invariants on the static universe (lib.universe) — ETF-only (57 tickers).
+"""Invariants on the static universe (lib.universe) — ETF-only (71 tickers).
 
 The universe is leveraged/inverse ETFs only (options were removed). After
-the 2026-06-10 expansion it has 25 bull/bear pairs (incl. UVXY/SVIX on vol
-and the leveraged single-stock lines NVDA/TSLA/MSTR) + BITX/BITI (crypto)
-+ 5 solo bull ETFs = 57 tickers spanning 31 distinct factors. Bullish
-theses hold the bull ETF; bearish theses hold the inverse ETF.
+the 2026-07-02 expansion it has 29 bull/bear pairs (incl. UVXY/SVIX on vol
+and the leveraged single-stock lines NVDA/TSLA/MSTR/PLTR/AMZN/GOOGL/META)
++ BITX/BITI (crypto) + 11 solo bull ETFs = 71 tickers spanning 41 distinct
+factors. Bullish theses hold the bull ETF; bearish theses hold the inverse
+ETF.
 """
 from __future__ import annotations
 
@@ -12,8 +13,8 @@ import pytest
 
 from lib import universe
 
-# Every bull/bear pair in the universe. Solo entries (NAIL, DFEN, CURE,
-# DPST, CONL) are intentionally absent here.
+# Every bull/bear pair in the universe. Solo entries (SOLO_BULLS below)
+# are intentionally absent here.
 PAIRS = [
     ("TQQQ", "SQQQ"),
     ("UPRO", "SPXU"),
@@ -42,18 +43,27 @@ PAIRS = [
     ("NVDL", "NVD"),
     ("TSLL", "TSLZ"),
     ("MSTU", "MSTZ"),
+    # 2026-07-02 expansion: single-stock +2x bull / -1x bear lines.
+    ("PLTU", "PLTD"),
+    ("AMZU", "AMZD"),
+    ("GGLL", "GGLS"),
+    ("METU", "METD"),
 ]
 
-SOLO_BULLS = ["NAIL", "DFEN", "CURE", "DPST", "CONL"]
+SOLO_BULLS = [
+    "NAIL", "DFEN", "CURE", "DPST", "CONL",
+    # 2026-07-02 expansion solo bulls.
+    "UTSL", "RETL", "BRZU", "INDL", "EURL", "KORU",
+]
 
 
-def test_universe_size_is_57():
-    """ETF-only universe has exactly 57 tickers: 25 bull/bear leveraged
-    pairs (50) + BITX/BITI (crypto) + 5 solo bull ETFs. If you change
+def test_universe_size_is_71():
+    """ETF-only universe has exactly 71 tickers: 29 bull/bear leveraged
+    pairs (58) + BITX/BITI (crypto) + 11 solo bull ETFs. If you change
     this, update the factor-count floor below and the strategist
     prompt's universe section."""
-    assert len(universe.UNIVERSE) == 57, (
-        f"universe size {len(universe.UNIVERSE)} != 57 (ETF-only)."
+    assert len(universe.UNIVERSE) == 71, (
+        f"universe size {len(universe.UNIVERSE)} != 71 (ETF-only)."
     )
 
 
@@ -73,14 +83,14 @@ def test_no_option_underlyings_present():
 
 
 def test_universe_covers_multiple_uncorrelated_factors():
-    """Universe must span ≥29 distinct factors after the 2026-06-10
+    """Universe must span ≥39 distinct factors after the 2026-07-02
     expansion (commodities, geographies, style, sectors, second crypto,
     leveraged single-stock lines). Several equity factors are correlated
     risk-on beta — the constructor de-dupes by factor and now sees live
     factor correlations in signals.json — but the factor *labels* stay
     distinct."""
     factors = {e.factor for e in universe.UNIVERSE}
-    assert len(factors) >= 29, (
+    assert len(factors) >= 39, (
         f"universe spans only {len(factors)} factors: {sorted(factors)}."
     )
 
