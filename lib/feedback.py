@@ -139,16 +139,12 @@ def _live_since(trade_rows: list[dict]) -> str | None:
     return min(candidates) if candidates else None
 
 
-def _era_of(ct: trades.ClosedTrade, live_since: str) -> str:
-    """Era a closed trade belongs to: timestamp split on closed_at. FIFO
-    matching is era-scoped (lib/trades.py keys lots by (mode, symbol)), so a
-    closed trade's legs are always from one account and the timestamp split
-    is consistent: paper pairs close before live_since, live pairs after."""
-    c = trades._parse_iso_utc(ct.closed_at)
-    ls = trades._parse_iso_utc(live_since)
-    if c is not None and ls is not None:
-        return "live" if c >= ls else "paper"
-    return "live" if (ct.closed_at or "") >= live_since else "paper"
+def _era_of(ct: trades.ClosedTrade) -> str:
+    """Era a closed trade belongs to. FIFO matching is era-scoped
+    (lib/trades.py keys lots by (mode, symbol)) and stamps the shared era
+    onto the ClosedTrade, so this is exact — no timestamp heuristics.
+    Trades matched from pre-tagging rows read as paper."""
+    return getattr(ct, "mode", None) or "paper"
 
 
 def _record(rows: list[trades.ClosedTrade]) -> dict:
@@ -245,7 +241,7 @@ def build_performance_memo(
     def _era_events(ct: trades.ClosedTrade) -> list[dict]:
         if live_since is None:
             return kill_events
-        era = _era_of(ct, live_since)
+        era = _era_of(ct)
         return [ev for ev in kill_events if state.record_mode(ev) == era]
 
     recent = sorted(closed, key=lambda t: t.closed_at)[-recent_exits_limit:]
@@ -258,7 +254,7 @@ def build_performance_memo(
             "exit_kind": _exit_kind_for(ct, _era_events(ct)),
         }
         if live_since is not None:
-            row["mode"] = _era_of(ct, live_since)
+            row["mode"] = _era_of(ct)
         recent_exits.append(row)
 
     overall = _record(closed)
@@ -300,7 +296,7 @@ def build_performance_memo(
     if live_since is not None:
         eras: dict[str, list[trades.ClosedTrade]] = {"paper": [], "live": []}
         for ct in closed:
-            eras[_era_of(ct, live_since)].append(ct)
+            eras[_era_of(ct)].append(ct)
         paper_rec = _record(eras["paper"])
         if eras["paper"]:
             paper_rec["through"] = max(t.closed_at for t in eras["paper"])

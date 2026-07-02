@@ -643,7 +643,14 @@ def write_live_transition_once(
 ) -> dict:
     """Record the moment the live era began. Write-once: if the marker
     already exists it is returned unchanged, so the starting equity stays
-    the real number from the FIRST successful live equity read."""
+    the real number from the FIRST successful live equity read.
+
+    Atomic against concurrent first writes (Codex P2 on PR #112): the
+    orchestrator cycle and a monitor pass can race on the first live read,
+    and under LIVE_NAV_CAP_USD a second write would re-anchor the risk
+    budget away from the first observation. Open with mode "x" (O_EXCL) so
+    exactly one process creates the file; the loser reads the winner's
+    marker back."""
     existing = read_live_transition()
     if existing is not None:
         return existing
@@ -656,9 +663,11 @@ def write_live_transition_once(
         "note": "first successful live equity read",
     }
     LIVE_TRANSITION.parent.mkdir(parents=True, exist_ok=True)
-    LIVE_TRANSITION.write_text(
-        json.dumps(marker, indent=2, sort_keys=False), encoding="utf-8"
-    )
+    try:
+        with LIVE_TRANSITION.open("x", encoding="utf-8") as f:
+            f.write(json.dumps(marker, indent=2, sort_keys=False))
+    except FileExistsError:
+        return read_live_transition() or marker
     return marker
 
 

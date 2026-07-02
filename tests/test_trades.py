@@ -539,3 +539,33 @@ def test_open_lots_carry_mode():
     res = trades.compute_trades_pnl(rows)
     modes = {lot.buy_activity_id: lot.mode for lot in res.open}
     assert modes == {"pb": "paper", "lb": "live"}
+
+
+def test_cooldown_partial_paper_close_does_not_block_live():
+    """Codex P2 (PR #112): a PARTIAL paper close (rest of the paper lot
+    still open) was never a full exit — it must not put the symbol in
+    cooldown for the live era."""
+    rows = [
+        _trade(activity_id="pb", side="buy", qty=10, fill_price=50.0,
+               filled_at="2026-05-10T15:00:00Z"),
+        _trade(activity_id="ps", side="sell", qty=4, fill_price=55.0,
+               filled_at="2026-05-24T15:00:00Z"),  # partial — 6 remain open
+    ]
+    rows[0]["mode"] = "paper"
+    rows[1]["mode"] = "paper"
+    now = _now("2026-05-26T15:00:00Z")
+    assert trades.symbols_in_cooldown(rows, now=now, window_days=7, mode="live") == {}
+    assert trades.symbols_in_cooldown(rows, now=now, window_days=7, mode="paper") == {}
+
+
+def test_closed_trades_carry_mode():
+    rows = [
+        _trade(activity_id="lb", side="buy", qty=8, fill_price=80.0,
+               filled_at="2026-07-01T15:00:00Z"),
+        _trade(activity_id="ls", side="sell", qty=8, fill_price=90.0,
+               filled_at="2026-07-02T15:00:00Z"),
+    ]
+    rows[0]["mode"] = "live"
+    rows[1]["mode"] = "live"
+    res = trades.compute_trades_pnl(rows)
+    assert res.closed[0].mode == "live"

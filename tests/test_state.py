@@ -628,3 +628,33 @@ def test_dd_halt_legacy_untagged_reads_as_paper(tmp_state):
     }), encoding="utf-8")
     assert state.dd_halt_active(mode="paper") is True
     assert state.dd_halt_active(mode="live") is False
+
+
+def test_write_live_transition_once_atomic_create(tmp_state, monkeypatch):
+    """Codex P2 (PR #112): two processes racing on the first live read must
+    not both write — O_EXCL create means the loser reads the winner's
+    marker. Simulate the race by making the pre-check miss an existing
+    file that appears before our exclusive create."""
+    winner = {"at": "2026-07-02T06:00:00Z", "live_starting_equity_usd": 5000.0,
+              "nav_cap_usd": 2500.0, "run_id": "winner", "live_version": 1,
+              "note": "first successful live equity read"}
+    real_read = state.read_live_transition
+    calls = {"n": 0}
+
+    def racy_read():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # First pre-check: pretend the file doesn't exist yet, then the
+            # "winner" process creates it before our open("x").
+            import json as _json
+            state.LIVE_TRANSITION.write_text(_json.dumps(winner), encoding="utf-8")
+            return None
+        return real_read()
+
+    monkeypatch.setattr(state, "read_live_transition", racy_read)
+    out = state.write_live_transition_once(
+        live_starting_equity_usd=4000.0, nav_cap_usd=2500.0,
+        run_id="loser", live_version=1,
+    )
+    assert out["run_id"] == "winner"          # loser adopted the winner's marker
+    assert out["live_starting_equity_usd"] == 5000.0

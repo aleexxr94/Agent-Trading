@@ -80,6 +80,7 @@ class ClosedTrade:
     attributed_llm_cost_usd: float
     net_pnl_usd: float
     slippage_usd: float = 0.0
+    mode: str = "paper"   # account era; both legs share it (era-split FIFO)
 
 
 @dataclass(frozen=True)
@@ -312,6 +313,7 @@ def compute_trades_pnl(
                 attributed_llm_cost_usd=llm_share,
                 net_pnl_usd=net,
                 slippage_usd=total_slippage,
+                mode=lot_key[0],
             ))
             lot["remaining_qty"] -= matched
             lot["remaining_fees"] -= buy_fees_share
@@ -420,19 +422,27 @@ def symbols_in_cooldown(
     which would otherwise leave the buy as a phantom open lot and wrongly
     exclude a just-exited symbol from cooldown.
 
-    ``mode`` is the CURRENT account era: "currently open" only counts lots
-    from that era (Codex P2 on PR #112 — a leftover paper lot must not make
-    a fully-exited live symbol look like a continuing hold), while exits
-    from ANY era still start the cooldown clock (the 7-day window
-    deliberately spans the paper→live boundary).
+    ``mode`` is the CURRENT account era. Exits from ANY era start the
+    cooldown clock (the 7-day window deliberately spans the paper→live
+    boundary), but a close only counts as an exit when it FULLY closed its
+    own era's inventory — a partial paper sell with the rest of the paper
+    lot still open was never a full exit and must not block live entries
+    (Codex P2 on PR #112). "Currently open" is judged against the CURRENT
+    era only, so a leftover paper lot can't make a fully-exited live symbol
+    look like a continuing hold (also Codex P2 on PR #112).
     """
     rows = sorted(trades, key=lambda r: r.get("filled_at") or "")
     pnl = compute_trades_pnl(rows)
-    open_symbols = {lot.symbol for lot in pnl.open if lot.mode == mode}
+    open_by_era: dict[str, set[str]] = defaultdict(set)
+    for lot in pnl.open:
+        open_by_era[lot.mode].add(lot.symbol)
+    open_symbols = open_by_era.get(mode, set())
     last_exit: dict[str, str] = {}
     for ct in pnl.closed:
+        if ct.symbol in open_by_era.get(ct.mode, set()):
+            continue  # not a full exit within the close's own era
         if ct.symbol in open_symbols:
-            continue
+            continue  # currently held in the trading era — a continuing hold
         prev = last_exit.get(ct.symbol)
         if prev is None or ct.closed_at > prev:
             last_exit[ct.symbol] = ct.closed_at

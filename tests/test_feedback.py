@@ -219,27 +219,34 @@ def test_memo_era_split_from_live_tagged_fills(tmp_state):
     assert modes == {"TQQQ": "paper", "SOXL": "live"}
 
 
-def test_memo_era_split_prefers_transition_marker(tmp_state):
-    """The write-once marker is authoritative over fill tags: a boundary-
-    spanning round trip (opened paper, closed live) counts as a live exit."""
+def test_memo_era_split_activates_from_marker_and_uses_trade_modes(tmp_state):
+    """The write-once marker activates the era split even before any live
+    fill exists, and era assignment comes from each closed trade's own mode
+    (exact — stamped by the era-split FIFO matcher), not timestamps.
+    Untagged rows predate tagging and are paper by construction."""
     state.write_live_transition_once(
         live_starting_equity_usd=2600.0, nav_cap_usd=2500.0,
         run_id="r9", live_version=1,
     )
     marker_at = state.read_live_transition()["at"]
     rows = [
-        # Closed well before any plausible marker date → paper.
+        # Untagged legacy fills → paper.
         _fill("TQQQ", "buy", 4, 70.0, run_id="r1", at="2020-01-01T14:00:00Z", aid="a1"),
         _fill("TQQQ", "sell", 4, 80.0, at="2020-01-03T14:00:00Z", aid="a2"),
-        # Untagged fills closing after the marker → live by timestamp split.
-        _fill("SOXL", "buy", 10, 30.0, run_id="r2", at="2999-01-01T14:00:00Z", aid="a3"),
-        _fill("SOXL", "sell", 10, 27.0, at="2999-01-02T14:00:00Z", aid="a4"),
+        # Live-tagged fills → live, regardless of any timestamp heuristics.
+        {**_fill("SOXL", "buy", 10, 30.0, run_id="r2", at="2026-07-02T14:00:00Z", aid="a3"),
+         "mode": "live"},
+        {**_fill("SOXL", "sell", 10, 27.0, at="2026-07-02T18:00:00Z", aid="a4"),
+         "mode": "live"},
     ]
     memo = feedback.build_performance_memo(trade_rows=rows, cost_rows=[], kill_events=[])
     es = memo["era_split"]
-    assert es["live_since"] == marker_at
+    # live_since = earlier of marker vs first live fill.
+    assert es["live_since"] == min(marker_at, "2026-07-02T14:00:00Z")
     assert es["paper"]["trades"] == 1
     assert es["live"]["trades"] == 1
+    modes = {r["symbol"]: r["mode"] for r in memo["recent_exits"]}
+    assert modes == {"TQQQ": "paper", "SOXL": "live"}
 
 
 def test_memo_exit_attribution_does_not_cross_eras(tmp_state):
