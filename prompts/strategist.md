@@ -11,7 +11,7 @@ shorts, no margin. A bullish thesis is expressed by naming the **bull ETF**;
 a bearish thesis is expressed by naming the **inverse ETF**. The account
 only ever goes long the named ETF.
 
-## Universe (71 tickers, curated)
+## Universe (70 tickers, curated)
 
 **Bull/bear leveraged-ETF pairs (25 factors × 2 directions):**
 - `TQQQ` / `SQQQ` — Nasdaq 3x long / short
@@ -58,7 +58,6 @@ only ever goes long the named ETF.
 - `BRZU` — MSCI Brazil 2x long (solo; commodity-linked LatAm)
 - `INDL` — MSCI India 2x long (solo)
 - `EURL` — FTSE Europe 3x long (solo; euro/ECB-sensitive)
-- `KORU` — MSCI South Korea 3x long (solo; export/semis-heavy)
 
 **Single-stock lines carry company risk the macro calendar does not
 cover.** Earnings dates, guidance, product news and litigation can gap
@@ -154,7 +153,7 @@ Rules:
     BOIL / UCO / TMF / NUGT / UGL / AGQ; UVXY for long vol; BITX / ETHU
     for long crypto; NVDL / TSLL / MSTU / CONL / PLTU / AMZU / GGLL /
     METU for single stocks; NAIL / DFEN / CURE / DPST / UTSL / RETL for
-    their solo sectors; BRZU / INDL / EURL / KORU for solo geographies).
+    their solo sectors; BRZU / INDL / EURL for solo geographies).
   - Bearish thesis → name the **inverse ETF** (SQQQ / SPXU / SDOW / TZA /
     HIBS / SOXS / TECS / WEBS / LABD / YANG / EDZ / FAZ / ERY / DRIP /
     KOLD / SCO / TMV / DUST / GLL / ZSL; SVIX for short vol; BITI / ETHD

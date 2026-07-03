@@ -1,4 +1,4 @@
-"""Static universe of tradeable instruments — ETF-only (71 tickers).
+"""Static universe of tradeable instruments — ETF-only (70 tickers).
 
 The system trades **only** leveraged and inverse ETFs. Bullish theses are
 expressed by holding a bull (positively-leveraged) ETF; bearish theses are
@@ -32,18 +32,22 @@ the same caps/kill rails as every other position. They carry
 single-company event risk (earnings, guidance) that the macro calendar
 does not cover — the prompts call this out.
 
-Expansion note (2026-07-02, user-authorized): widened from 57 to 71
-tickers. Six solo sector/geography bulls (UTSL utilities, RETL retail,
-BRZU Brazil, INDL India, EURL Europe, KORU South Korea) add defensive,
-consumer and single-country factors with genuinely distinct macro
-drivers; four Direxion single-stock lines (PLTU/PLTD on PLTR, AMZU/AMZD
-on AMZN, GGLL/GGLS on GOOGL, METU/METD on META) follow the asymmetric
-+2x bull / -1x bear pattern BITX/BITI already established. Cost impact
-is negligible (~+500-600 tokens in the compacted signals block per
-cycle); every addition clears the ≤1%-of-ADV sanity rule with wide
-margin at this account's position sizes.
+Expansion note (2026-07-02, user-authorized): widened from 57 to 70
+tickers. Five solo sector/geography bulls (UTSL utilities, RETL retail,
+BRZU Brazil, INDL India, EURL Europe) add defensive, consumer and
+single-country factors with genuinely distinct macro drivers; four
+Direxion single-stock lines (PLTU/PLTD on PLTR, AMZU/AMZD on AMZN,
+GGLL/GGLS on GOOGL, METU/METD on META) follow the asymmetric +2x bull /
+-1x bear pattern BITX/BITI already established. Cost impact is
+negligible (~+500-600 tokens in the compacted signals block per cycle);
+every addition clears the ≤1%-of-ADV sanity rule with wide margin at
+this account's position sizes. KORU (South Korea 3x) was considered and
+REJECTED: it trades around $500-600/share, above the 15%-NAV entry cap
+(~$375 on $2,500), so with integer shares one share can never clear the
+cap — do not re-add a ticker whose single-share price exceeds the entry
+cap, the constructor must refuse it every cycle (Codex review, PR #113).
 
-Universe composition (71):
+Universe composition (70):
   - 25 bull/bear leveraged-ETF pairs (50): Nasdaq, S&P 500, Dow,
     small-caps, high-beta, semis, technology, internet, biotech, China,
     emerging markets, financials, energy, oil & gas E&P, natural gas,
@@ -53,12 +57,11 @@ Universe composition (71):
   - 10 asymmetric +2x bull / -1x bear single-stock/crypto lines: BITX/
     BITI (crypto-btc), PLTU/PLTD (pltr), AMZU/AMZD (amzn), GGLL/GGLS
     (googl), METU/METD (meta).
-  - 11 solo bull ETFs with no liquid inverse counterpart (NAIL
+  - 10 solo bull ETFs with no liquid inverse counterpart (NAIL
     homebuilders, DFEN defense, CURE healthcare, DPST regional banks,
     CONL coin, UTSL utilities, RETL retail, BRZU Brazil, INDL India,
-    EURL Europe, KORU South Korea) — bearish views on those factors
-    are expressed by not holding them (or via a correlated inverse,
-    the agent's call).
+    EURL Europe) — bearish views on those factors are expressed by
+    not holding them (or via a correlated inverse, the agent's call).
 
 `factor` is the short factor identifier, shared across bull/bear pairs
 (e.g. TQQQ + SQQQ both → "nasdaq"). Used by:
@@ -130,7 +133,6 @@ F_RETAIL       = "retail"
 F_BRAZIL       = "brazil"
 F_INDIA        = "india"
 F_EUROPE       = "europe"
-F_KOREA        = "korea"
 F_PLTR         = "pltr"
 F_AMZN         = "amzn"
 F_GOOGL        = "googl"
@@ -304,8 +306,6 @@ _LEVERAGED_ETFS: tuple[UniverseEntry, ...] = (
        "Direxion Daily MSCI India Bull 2x — 2x daily long MSCI India", F_INDIA),
     _e("EURL", "etf",  3.0, "Europe 3x long",
        "Direxion Daily FTSE Europe Bull 3x — 3x daily long FTSE Developed Europe", F_EUROPE),
-    _e("KORU", "etf",  3.0, "South Korea 3x long",
-       "Direxion Daily MSCI South Korea Bull 3x — 3x daily long MSCI Korea 25/50", F_KOREA),
     # ---- Single-stock lines (asymmetric +2x bull / -1x bear, like BITX/BITI).
     # Same single-COMPANY event-risk caveat as the 2026-06-10 lines.
     _e("PLTU", "etf",  2.0, "PLTR 2x long",

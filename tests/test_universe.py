@@ -1,9 +1,9 @@
-"""Invariants on the static universe (lib.universe) — ETF-only (71 tickers).
+"""Invariants on the static universe (lib.universe) — ETF-only (70 tickers).
 
 The universe is leveraged/inverse ETFs only (options were removed). After
 the 2026-07-02 expansion it has 29 bull/bear pairs (incl. UVXY/SVIX on vol
 and the leveraged single-stock lines NVDA/TSLA/MSTR/PLTR/AMZN/GOOGL/META)
-+ BITX/BITI (crypto) + 11 solo bull ETFs = 71 tickers spanning 41 distinct
++ BITX/BITI (crypto) + 10 solo bull ETFs = 70 tickers spanning 40 distinct
 factors. Bullish theses hold the bull ETF; bearish theses hold the inverse
 ETF.
 """
@@ -52,18 +52,19 @@ PAIRS = [
 
 SOLO_BULLS = [
     "NAIL", "DFEN", "CURE", "DPST", "CONL",
-    # 2026-07-02 expansion solo bulls.
-    "UTSL", "RETL", "BRZU", "INDL", "EURL", "KORU",
+    # 2026-07-02 expansion solo bulls. (KORU was rejected: one share
+    # ~$500-600 exceeds the 15%-NAV entry cap on a $2,500 account.)
+    "UTSL", "RETL", "BRZU", "INDL", "EURL",
 ]
 
 
-def test_universe_size_is_71():
-    """ETF-only universe has exactly 71 tickers: 29 bull/bear leveraged
-    pairs (58) + BITX/BITI (crypto) + 11 solo bull ETFs. If you change
+def test_universe_size_is_70():
+    """ETF-only universe has exactly 70 tickers: 29 bull/bear leveraged
+    pairs (58) + BITX/BITI (crypto) + 10 solo bull ETFs. If you change
     this, update the factor-count floor below and the strategist
     prompt's universe section."""
-    assert len(universe.UNIVERSE) == 71, (
-        f"universe size {len(universe.UNIVERSE)} != 71 (ETF-only)."
+    assert len(universe.UNIVERSE) == 70, (
+        f"universe size {len(universe.UNIVERSE)} != 70 (ETF-only)."
     )
 
 
@@ -211,6 +212,7 @@ def test_etf_universe_symbols_present(expected):
     "URTY", "SRTY",  # Russell alts (TNA/TZA cover the factor)
     "BITU", "SBIT",  # Crypto-btc alts (BITX/BITI cover the factor)
     "DIA",           # former option underlying (UDOW/SDOW cover Dow with leverage)
+    "KORU",          # rejected 2026-07-02: one share > 15%-NAV entry cap on $2,500
 ])
 def test_dropped_symbols_absent(dropped):
     """Lock the trim: symbols intentionally excluded must NOT come back

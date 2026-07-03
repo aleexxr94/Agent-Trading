@@ -24,8 +24,8 @@ You are a senior quant systems engineer. Build a complete, **paper-trading-only*
 > real leveraged ETF pairs (TMF/TMV, ERX/ERY). This section supersedes the
 > earlier options-bearing spec.
 
-- Universe (ETF-only, 71 tickers; widened from 29 on 2026-06-10 and from 57
-  to 71 on 2026-07-02, each with explicit user authorization, for
+- Universe (ETF-only, 70 tickers; widened from 29 on 2026-06-10 and from 57
+  to 70 on 2026-07-02, each with explicit user authorization, for
   diversification + more tradeable factors): 25 bull/bear leveraged-ETF
   pairs — TQQQ/SQQQ (nasdaq), UPRO/SPXU (sp500),
   UDOW/SDOW (dow), TNA/TZA (small-caps), HIBL/HIBS (high-beta), SOXL/SOXS
@@ -37,12 +37,14 @@ You are a senior quant systems engineer. Build a complete, **paper-trading-only*
   and leveraged single-stock lines NVDL/NVD (nvda), TSLL/TSLZ (tsla),
   MSTU/MSTZ (mstr) — plus asymmetric +2x bull / -1x inverse lines BITX/BITI
   (crypto-btc), PLTU/PLTD (pltr), AMZU/AMZD (amzn), GGLL/GGLS (googl),
-  METU/METD (meta), and 11 solo bull ETFs with no liquid inverse
+  METU/METD (meta), and 10 solo bull ETFs with no liquid inverse
   counterpart: NAIL (homebuilders), DFEN (defense), CURE (healthcare), DPST
   (regional-banks), CONL (coin, 2x Coinbase), UTSL (utilities), RETL
-  (retail), BRZU (brazil, 2x), INDL (india, 2x), EURL (europe), KORU
-  (korea). Bearish views on solo-bull factors are expressed by not holding
-  them.
+  (retail), BRZU (brazil, 2x), INDL (india, 2x), EURL (europe). Bearish
+  views on solo-bull factors are expressed by not holding them. Do not add
+  a ticker whose single-share price exceeds the 15%-NAV entry cap (~$375):
+  shares are integer, so the constructor could never open it (this is why
+  KORU, ~$500-600/share, was rejected from the 2026-07-02 expansion).
 - **No options. No spot single-name equities. No unleveraged broad-market
   ETFs as core positions.** Every position is a long leveraged/inverse ETF.
   (Clarified 2026-06-10, user decision: liquid **leveraged single-stock
@@ -95,7 +97,7 @@ Sub-agents are separate Anthropic API calls with role-specific system prompts an
 Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-failed LLM outputs are retried once with the validation error fed back; second failure aborts the run and logs.
 
 0. **Market Gate** (Python, $0) — Alpaca `/v2/clock` query. If markets are closed → write `market_gate.json` + closed-market `next_run.json` and exit. No LLM calls billed on closed-market cycles.
-1. **Signals** (Python, $0) — For each of the 71 universe tickers, compute deterministic features from yfinance daily history: momentum (30/60d), HV (30/90d), distance from 50/200d MAs, ADV, last close, RSI-14, relative strength vs SPY (30d), trend-quality R² (trend vs chop — the leveraged-ETF decay axis), plus a universe-level `factor_correlations` block (pairs of factors whose bull ETFs' 30d returns correlate ≥ |0.7|, so the LLM stages can see which factors are currently one bet). Includes per-ticker `upcoming_macro_events_7d` (FOMC/CPI/NFP/PCE within 7 days). Output: `signals.json`. The LLM stages read a compact factor-grouped rendering (`lib.signals.compact_for_llm`) rather than the raw table — the compaction pays for the wider universe + the performance memo, keeping per-cycle cost at or below the prior baseline. Replaces the v1 screener + bull/bear research + scenarios chain entirely.
+1. **Signals** (Python, $0) — For each of the 70 universe tickers, compute deterministic features from yfinance daily history: momentum (30/60d), HV (30/90d), distance from 50/200d MAs, ADV, last close, RSI-14, relative strength vs SPY (30d), trend-quality R² (trend vs chop — the leveraged-ETF decay axis), plus a universe-level `factor_correlations` block (pairs of factors whose bull ETFs' 30d returns correlate ≥ |0.7|, so the LLM stages can see which factors are currently one bet). Includes per-ticker `upcoming_macro_events_7d` (FOMC/CPI/NFP/PCE within 7 days). Output: `signals.json`. The LLM stages read a compact factor-grouped rendering (`lib.signals.compact_for_llm`) rather than the raw table — the compaction pays for the wider universe + the performance memo, keeping per-cycle cost at or below the prior baseline. Replaces the v1 screener + bull/bear research + scenarios chain entirely.
 1b. **Cycle dedup** (Python, $0) — If the signals fingerprint AND broker-position fingerprint both match the prior cycle's, skip strategist + construct + execute and reuse the cached portfolio. Stored in `state/last_cycle_hash.json`.
 2. **Strategist** (Sonnet 4.6 medium effort, ~$0.05) — Reads compact signals + current broker positions (with unrealized P&L %) + recent PnL history (last 5 cycles) + the **performance memo** (`lib/feedback.py`, $0: the agent's own realized win/loss record by factor, confidence-bucket calibration joined from each opening run's `view.json`, and recent exits tagged with what killed them via `state/kill_events.jsonl`); emits a regime classification + up to 6 candidate ideas with `instrument_kind` (always `etf`), `thesis` (signal-citing), `confidence` ∈ [0, 1]. The memo is framed in the prompts as calibration EVIDENCE for the agent's judgment — explicitly not an instruction to trade less. Bullish theses name the bull ETF; bearish theses name the inverse ETF. Output: `view.json`.
 3. **Portfolio Construction** (Opus 4.7 high effort, ~$0.20) — Converge on 1–12 positions (or all-cash). Reads compact signals + view + current positions + PnL history + performance memo + adaptive per-position cap + universe-median HV30 context. May choose `trailing_stop_pct` per position as an alternative/complement to fixed stops. Output: `portfolio.json`.
@@ -141,7 +143,7 @@ Each stage emits a validated JSON artifact under `state/runs/{run_id}/`. Schema-
 │   ├── stages.py               # StageConfig per LLM stage
 │   ├── llm.py                  # Anthropic client + prompt caching + cost tracking
 │   ├── risk.py                 # sizing, caps, kill checks, circuit breakers, cooldown
-│   ├── universe.py             # 71-ticker leveraged/inverse ETF universe metadata
+│   ├── universe.py             # 70-ticker leveraged/inverse ETF universe metadata
 │   ├── marks.py                # mark-price helpers (ETF symbols)
 │   ├── pnl.py                  # portfolio P&L computation (wraps alpaca_costs)
 │   ├── alpaca_costs.py         # Alpaca live-cost model (slippage + SEC/TAF; commission $0)
