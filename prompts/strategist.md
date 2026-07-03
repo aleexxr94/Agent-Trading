@@ -152,12 +152,14 @@ Rules:
   - Bullish thesis → name the **bull ETF** (TQQQ / UPRO / UDOW / TNA /
     HIBL / SOXL / TECL / WEBL / LABU / YINN / EDC / FAS / ERX / GUSH /
     BOIL / UCO / TMF / NUGT / UGL / AGQ; UVXY for long vol; BITX / ETHU
-    for long crypto; NVDL / TSLL / MSTU / CONL for single stocks;
-    NAIL / DFEN / CURE / DPST for their solo sectors).
+    for long crypto; NVDL / TSLL / MSTU / CONL / PLTU / AMZU / GGLL /
+    METU for single stocks; NAIL / DFEN / CURE / DPST / UTSL / RETL for
+    their solo sectors; BRZU / INDL / EURL / KORU for solo geographies).
   - Bearish thesis → name the **inverse ETF** (SQQQ / SPXU / SDOW / TZA /
     HIBS / SOXS / TECS / WEBS / LABD / YANG / EDZ / FAZ / ERY / DRIP /
     KOLD / SCO / TMV / DUST / GLL / ZSL; SVIX for short vol; BITI / ETHD
-    for inverse crypto; NVD / TSLZ / MSTZ for single stocks).
+    for inverse crypto; NVD / TSLZ / MSTZ / PLTD / AMZD / GGLS / METD
+    for single stocks).
 - `confidence` ∈ [0, 1]. Threshold guidance:
   - ≥0.7: strong signal, multiple corroborating features
   - 0.5–0.7: moderate
