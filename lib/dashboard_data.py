@@ -1814,6 +1814,168 @@ def allocation_pie(portfolio: dict) -> list[dict]:
     return rows
 
 
+# ---------- Portfolio tab: universe reference table ----------
+
+# Presentation-only factor metadata for the dashboard's universe reference
+# table. Deliberately NOT part of universe.metadata_block() — that block
+# feeds signals.json, the cycle-dedup fingerprint and the cached LLM
+# prompts, all of which must stay byte-stable. test_dashboard_data has a
+# completeness guard: every factor in universe.UNIVERSE must appear in
+# BOTH maps, so universe expansions can't silently ship without blurbs.
+
+FACTOR_LABELS: dict[str, str] = {
+    "nasdaq": "Nasdaq-100",
+    "sp500": "S&P 500",
+    "dow": "Dow 30",
+    "small-caps": "Small caps",
+    "high-beta": "S&P 500 High Beta",
+    "semis": "Semiconductors",
+    "technology": "Technology",
+    "internet": "Internet",
+    "biotech": "Biotech",
+    "china": "China",
+    "emerging-markets": "Emerging markets",
+    "financials-broad": "Financials",
+    "energy": "Energy",
+    "oil-gas-ep": "Oil & Gas E&P",
+    "natural-gas": "Natural gas",
+    "crude-oil": "Crude oil",
+    "rates": "Long-dated Treasuries",
+    "gold-miners": "Gold miners",
+    "gold-bullion": "Gold",
+    "silver": "Silver",
+    "vol": "Volatility (VIX)",
+    "crypto-btc": "Bitcoin",
+    "crypto-eth": "Ether",
+    "homebuilders": "Homebuilders",
+    "defense": "Aerospace & Defense",
+    "healthcare": "Healthcare",
+    "regional-banks": "Regional banks",
+    "utilities": "Utilities",
+    "retail": "Retail",
+    "brazil": "Brazil",
+    "india": "India",
+    "europe": "Europe",
+    "nvda": "NVIDIA (single stock)",
+    "tsla": "Tesla (single stock)",
+    "mstr": "Strategy/MSTR (single stock)",
+    "coin": "Coinbase (single stock)",
+    "pltr": "Palantir (single stock)",
+    "amzn": "Amazon (single stock)",
+    "googl": "Alphabet (single stock)",
+    "meta": "Meta (single stock)",
+}
+
+FACTOR_BLURBS: dict[str, str] = {
+    "nasdaq": "The Nasdaq-100 index — the 100 largest non-financial US companies, dominated by mega-cap tech.",
+    "sp500": "The S&P 500 index — the 500 largest US companies, the broadest 'US stock market' benchmark.",
+    "dow": "The Dow Jones Industrial Average — 30 US blue chips, tilted to industrials and financials.",
+    "small-caps": "The Russell 2000 index of US small-cap stocks — more domestic and rate-sensitive than large caps.",
+    "high-beta": "The most volatile (highest-beta) stocks inside the S&P 500 — an amplified risk-on/risk-off expression.",
+    "semis": "Semiconductor companies — chip designers and manufacturers (NVDA, AMD, Broadcom and the supply chain).",
+    "technology": "The broad US technology sector — software, hardware and IT services.",
+    "internet": "Internet companies — e-commerce, search, social media and cloud platforms.",
+    "biotech": "Biotechnology companies — drug developers whose stocks hinge on trial and FDA outcomes; very volatile.",
+    "china": "The FTSE China 50 — the largest Chinese companies listed in Hong Kong (Tencent, Alibaba, Meituan).",
+    "emerging-markets": "The MSCI Emerging Markets index — China, India, Taiwan, Korea, Brazil and other developing markets.",
+    "financials-broad": "Large US financial companies — banks, brokers, insurers and asset managers.",
+    "energy": "The S&P energy sector — integrated oil & gas majors such as Exxon and Chevron.",
+    "oil-gas-ep": "Oil & gas exploration-and-production companies — drillers whose earnings track crude and natgas prices.",
+    "natural-gas": "Natural gas futures — the commodity itself; notoriously volatile and weather-driven.",
+    "crude-oil": "WTI crude-oil futures — the oil price itself, not oil company shares.",
+    "rates": "20+ year US Treasury bonds — a bet on interest rates (bond prices rise when yields fall).",
+    "gold-miners": "Gold-mining companies — operationally levered to the gold price, so they swing harder than bullion.",
+    "gold-bullion": "Gold bullion — the metal itself, the classic inflation and crisis hedge.",
+    "silver": "Silver bullion — part precious metal, part industrial metal; more volatile than gold.",
+    "vol": "VIX short-term futures — the market's 'fear gauge'; spikes in sell-offs and decays in calm markets.",
+    "crypto-btc": "Bitcoin, held via BTC futures.",
+    "crypto-eth": "Ether (Ethereum's token), held via ETH futures — tracks BTC loosely but regularly decouples.",
+    "homebuilders": "US homebuilders and building-supply companies — sensitive to mortgage rates and housing demand.",
+    "defense": "Aerospace & defense contractors — Boeing, Lockheed, RTX and peers.",
+    "healthcare": "The US healthcare sector — pharma, insurers and medical-device makers; classically defensive.",
+    "regional-banks": "US regional banks — smaller lenders sensitive to rates, deposits and credit conditions.",
+    "utilities": "US utility companies — regulated power, gas and water providers; defensive and rate-sensitive.",
+    "retail": "US retailers — big-box, e-commerce and specialty stores; a read on consumer spending.",
+    "brazil": "The MSCI Brazil index — a commodity-heavy Latin American market (Petrobras, Vale, big banks).",
+    "india": "The MSCI India index — the largest Indian companies (Reliance, Infosys, HDFC).",
+    "europe": "Developed-Europe large caps (FTSE Europe) — a euro/ECB-sensitive regional bet.",
+    "nvda": "NVIDIA — the dominant AI-chip maker; carries single-company earnings and guidance risk.",
+    "tsla": "Tesla — EVs, energy storage and autonomy; a high-volatility single-company bet.",
+    "mstr": "Strategy (MicroStrategy) — effectively a leveraged Bitcoin proxy via its large BTC treasury.",
+    "coin": "Coinbase — the largest US crypto exchange; tracks crypto prices and trading volumes.",
+    "pltr": "Palantir — government and commercial AI/data-analytics software; single-company event risk.",
+    "amzn": "Amazon — e-commerce plus the AWS cloud business; single-company event risk.",
+    "googl": "Alphabet (Google) — search advertising, YouTube and Google Cloud; single-company event risk.",
+    "meta": "Meta — Facebook/Instagram advertising and heavy AI spend; single-company event risk.",
+}
+
+
+def universe_explainer_rows(
+    open_pnl_by_symbol: dict[str, float | None] | None = None,
+) -> list[dict]:
+    """One row per universe ticker for the Portfolio tab's reference table.
+
+    `open_pnl_by_symbol` maps currently-open symbols to their Net P&L (None
+    when the position is open but unmarked). Open symbols sort to the top —
+    winners first, then losers, unmarked-open last within the group — and
+    carry `_status` ("win" / "loss" / "open"); everything else sorts by
+    factor label A→Z with the bull leg ahead of the bear leg. `_status` is
+    presentation metadata for row highlighting — the dashboard drops it
+    before render.
+    """
+    open_pnl_by_symbol = open_pnl_by_symbol or {}
+    rows: list[dict] = []
+    for e in universe_lib.UNIVERSE:
+        label = FACTOR_LABELS.get(e.factor, e.factor)
+        blurb = FACTOR_BLURBS.get(e.factor, e.description)
+        lev = f"{abs(e.leverage_factor):g}x"
+        is_bull = e.leverage_factor > 0
+        bull, bear = universe_lib.factor_pair(e.symbol)
+        pair = bear if is_bull else bull
+        if pair == e.symbol:
+            pair = None
+        if is_bull:
+            direction_note = f"Holding it is a leveraged ({lev} daily) bullish bet."
+        else:
+            direction_note = (
+                f"Inverse: it gains ~{lev} of what the factor loses each day "
+                f"— holding it is a bearish bet."
+            )
+        pnl = open_pnl_by_symbol.get(e.symbol)
+        if e.symbol in open_pnl_by_symbol:
+            if pnl is not None and pnl > 0:
+                status = "win"
+            elif pnl is not None and pnl < 0:
+                status = "loss"
+            else:
+                status = "open"
+        else:
+            status = ""
+        rows.append({
+            "Symbol": e.symbol,
+            "Factor": label,
+            "Direction": "Bull" if is_bull else "Bear",
+            "Leverage": lev,
+            "Pair": pair or "—",
+            "Explainer": f"{blurb} {direction_note}",
+            "Open P&L": pnl if status else None,
+            "_status": status,
+        })
+
+    def _key(r: dict):
+        if r["_status"]:
+            pnl = r["Open P&L"]
+            # Open group first; marked rows by P&L descending, unmarked last.
+            return (0, 0 if pnl is not None else 1, -(pnl or 0.0), r["Factor"], r["Symbol"])
+        return (1, 0, 0.0, r["Factor"], 0 if r["Direction"] == "Bull" else 1, r["Symbol"])
+
+    # Keys are same-length within each group but differ across groups —
+    # Python compares tuples lazily, and the group flag (element 0) always
+    # differs before the shapes diverge, so the mixed shapes never collide.
+    rows.sort(key=_key)
+    return rows
+
+
 # ---------- Calibration tab: self-knowledge + activity + readiness ----------
 
 

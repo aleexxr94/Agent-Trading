@@ -302,6 +302,70 @@ def test_allocation_pie_includes_cash(tmp_state):
     assert sum(r["value"] for r in pie) == pytest.approx(100.0, abs=0.5)
 
 
+# ---------- universe reference table ----------
+
+
+def test_universe_explainer_rows_covers_whole_universe():
+    from lib import universe
+
+    rows = dd.universe_explainer_rows()
+    assert len(rows) == len(universe.UNIVERSE)
+    assert {r["Symbol"] for r in rows} == set(universe.all_symbols())
+    for r in rows:
+        # 1-2 sentence plain-English explainer, never empty or a bare id.
+        assert len(r["Explainer"]) > 40
+        assert r["Direction"] in ("Bull", "Bear")
+        assert r["Leverage"].endswith("x")
+        assert r["_status"] == ""
+        assert r["Open P&L"] is None
+
+
+def test_universe_explainer_every_factor_has_label_and_blurb():
+    """Completeness guard: a universe expansion cannot ship without the
+    dashboard reference-table copy for its new factors."""
+    from lib import universe
+
+    factors = {e.factor for e in universe.UNIVERSE}
+    missing_labels = factors - set(dd.FACTOR_LABELS)
+    missing_blurbs = factors - set(dd.FACTOR_BLURBS)
+    assert not missing_labels, f"FACTOR_LABELS missing: {sorted(missing_labels)}"
+    assert not missing_blurbs, f"FACTOR_BLURBS missing: {sorted(missing_blurbs)}"
+
+
+def test_universe_explainer_rows_open_positions_sort_first():
+    rows = dd.universe_explainer_rows({
+        "SOXL": 12.5,        # open, winning
+        "TMV": -4.2,         # open, losing
+        "YINN": None,        # open, no mark yet
+    })
+    # Open group leads: winners (P&L desc), losers, then unmarked-open.
+    assert [r["Symbol"] for r in rows[:3]] == ["SOXL", "TMV", "YINN"]
+    assert [r["_status"] for r in rows[:3]] == ["win", "loss", "open"]
+    assert rows[0]["Open P&L"] == 12.5
+    assert rows[2]["Open P&L"] is None
+    # Everything after the open block is unheld and unhighlighted.
+    assert all(r["_status"] == "" for r in rows[3:])
+    assert all(r["Open P&L"] is None for r in rows[3:])
+
+
+def test_universe_explainer_rows_closed_group_bull_before_bear():
+    rows = dd.universe_explainer_rows()
+    by_symbol = {r["Symbol"]: i for i, r in enumerate(rows)}
+    # Same factor: the bull leg renders directly above the bear leg.
+    assert by_symbol["TQQQ"] + 1 == by_symbol["SQQQ"]
+    assert by_symbol["SOXL"] + 1 == by_symbol["SOXS"]
+
+
+def test_universe_explainer_rows_pair_column():
+    rows = dd.universe_explainer_rows()
+    by_symbol = {r["Symbol"]: r for r in rows}
+    assert by_symbol["TQQQ"]["Pair"] == "SQQQ"
+    assert by_symbol["SQQQ"]["Pair"] == "TQQQ"
+    # Solo bull lines have no counterpart.
+    assert by_symbol["NAIL"]["Pair"] == "—"
+    assert by_symbol["CONL"]["Pair"] == "—"
+
+
 def test_position_pnl_etf_uses_broker_cost_basis_when_provided(tmp_state):
     """Same broker-truth principle for ETFs: prefer the broker's filled
     avg_cost over the portfolio's intended avg_cost."""

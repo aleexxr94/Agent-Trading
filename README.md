@@ -2,7 +2,7 @@
 
 > **PAPER TRADING — Experimental autonomous AI agent. Leveraged & inverse ETFs on a small account are high-risk. Not financial advice.**
 
-Autonomous multi-agent trading system that runs a deterministic-signals scan over a 57-ticker **leveraged/inverse ETF** universe, asks a strategist agent for a regime call + ranked candidate ideas, and asks a constructor agent to build a **1–12 position portfolio (or all-cash)** that's then executed via **Alpaca paper**. The LLM stages also read the system's **own realized track record** (win rates by factor, confidence calibration, what killed each exit) as evidence for sizing and conviction. Bullish theses are expressed by holding bull ETFs; bearish theses by holding inverse ETFs — never short selling, never options. Runs unattended on a Linux VPS under systemd, with a Streamlit dashboard.
+Autonomous multi-agent trading system that runs a deterministic-signals scan over a 70-ticker **leveraged/inverse ETF** universe, asks a strategist agent for a regime call + ranked candidate ideas, and asks a constructor agent to build a **1–12 position portfolio (or all-cash)** that's then executed via **Alpaca paper**. The LLM stages also read the system's **own realized track record** (win rates by factor, confidence calibration, what killed each exit) as evidence for sizing and conviction. Bullish theses are expressed by holding bull ETFs; bearish theses by holding inverse ETFs — never short selling, never options. Runs unattended on a Linux VPS under systemd, with a Streamlit dashboard.
 
 The canonical build spec is [CLAUDE.md](./CLAUDE.md). This README is the operator's manual.
 
@@ -45,7 +45,7 @@ Per-stage model assignment matches the cost/quality demand of each decision. All
 | Stage | Model | Why |
 |---|---|---|
 | **market_gate** | n/a (deterministic) | Alpaca clock query — free, zero LLM call. |
-| **signals** | n/a (deterministic) | yfinance + universe metadata. 57 ticker rows out (the LLM stages read a compact factor-grouped rendering), zero LLM cost. |
+| **signals** | n/a (deterministic) | yfinance + universe metadata. 70 ticker rows out (the LLM stages read a compact factor-grouped rendering), zero LLM cost. |
 | **strategist** | `claude-sonnet-4-6` (effort `medium`) | Reads the signals table → emits a regime call + 0–6 candidate ideas with thesis + confidence. Medium effort caps thinking-budget allocation. |
 | **construct** | `claude-opus-4-7` (effort `high`) | **The actual trade decision** — picks positions, sizing, kill conditions. On a $2,500 leveraged/inverse-ETF account, position-selection quality has direct PnL impact: multi-position correlation reasoning + sizing math under a 15%/position cap + per-row kill-condition tailoring. Override with `MODEL_CONSTRUCTOR=claude-sonnet-4-6` if cost dominates. |
 | **critic** | `claude-sonnet-4-6` (effort `low`) | Adversarial second pass over the portfolio. Accept/reject with suggested changes; a reject reruns the constructor once. |
@@ -57,11 +57,14 @@ Per-run cost cap defaults to $3; daily cap defaults to $12.
 
 ## What we scan & trade
 
-**Universe: 57 leveraged/inverse ETFs** across 31 factor groups — 25 bull/bear
-pairs plus BITX/BITI (crypto) and 5 solo bulls (widened from 29 tickers on
-2026-06-10). Curated; entries that fail liquidity filters at signals time
-still appear in the table with their numeric features, but the strategist
-learns to ignore low-ADV rows.
+**Universe: 70 leveraged/inverse ETFs** across 40 factor groups — 25 bull/bear
+pairs plus 5 asymmetric +2x bull / -1x inverse lines (BITX/BITI crypto,
+PLTU/PLTD, AMZU/AMZD, GGLL/GGLS, METU/METD) and 10 solo bulls (widened from
+29 tickers on 2026-06-10 and from 57 on 2026-07-02). Curated; entries that
+fail liquidity filters at signals time still appear in the table with their
+numeric features, but the strategist learns to ignore low-ADV rows. Tickers
+whose single-share price exceeds the 15%-NAV entry cap are excluded outright
+(integer shares — the constructor could never open them).
 
 Every position is a **long holding of a leveraged or inverse ETF**. A bullish
 thesis holds the bull ETF; a bearish thesis holds the inverse ETF. Bearish
@@ -97,24 +100,33 @@ and **25% loss kill condition**.
 | NVIDIA (2x, single-stock) | NVDL | NVD |
 | Tesla (2x, single-stock) | TSLL | TSLZ |
 | MicroStrategy (2x, single-stock) | MSTU | MSTZ |
+| Palantir (single-stock) | PLTU (2x) | PLTD (1x inverse) |
+| Amazon (single-stock) | AMZU (2x) | AMZD (1x inverse) |
+| Alphabet (single-stock) | GGLL (2x) | GGLS (1x inverse) |
+| Meta (single-stock) | METU (2x) | METD (1x inverse) |
 | Homebuilders (3x) | NAIL | — |
 | Aerospace & defense (3x) | DFEN | — |
 | Healthcare (3x) | CURE | — |
 | Regional banks (3x) | DPST | — |
 | Coinbase (2x, single-stock) | CONL | — |
+| Utilities (3x) | UTSL | — |
+| Retail (3x) | RETL | — |
+| MSCI Brazil (2x) | BRZU | — |
+| MSCI India (2x) | INDL | — |
+| FTSE Europe (3x) | EURL | — |
 
 ### What we explicitly don't trade
 
 - **Options** — no calls, puts, spreads, or straddles
-- **Spot single-name equities** (no buying AAPL or NVDA stock directly). *Leveraged single-stock ETFs* (NVDL/NVD, TSLL/TSLZ, MSTU/MSTZ, CONL) **are** in the universe as of 2026-06-10 — they're listed ETFs riding the same caps and kill rails, but they carry company event risk (earnings, guidance) outside the macro calendar, which the strategist prompt explicitly flags.
+- **Spot single-name equities** (no buying AAPL or NVDA stock directly). *Leveraged single-stock ETFs* (NVDL/NVD, TSLL/TSLZ, MSTU/MSTZ, CONL as of 2026-06-10; PLTU/PLTD, AMZU/AMZD, GGLL/GGLS, METU/METD as of 2026-07-02) **are** in the universe — they're listed ETFs riding the same caps and kill rails, but they carry company event risk (earnings, guidance) outside the macro calendar, which the strategist prompt explicitly flags.
 - **Unleveraged broad-market ETFs as core positions** — exposure is always via a leveraged/inverse ETF
 - **Actual short-selling** — bearish theses are expressed as long inverse ETFs (SQQQ, SPXU, etc.). Cash account, no margin.
 - **Live trading** — gate hard-disabled until §"Promotion to live" in [CLAUDE.md](./CLAUDE.md) is met
 
 ### Factor coverage
 
-The 25 paired factors give the strategist a directional expression on both
-sides of each theme; the 5 solo bulls are long-only expressions (bearish view
+The 29 paired factors give the strategist a directional expression on both
+sides of each theme; the 10 solo bulls are long-only expressions (bearish view
 = don't hold them). Several equity factors (Nasdaq / S&P / Dow / tech / semis /
 high-beta / internet) are correlated risk-on beta — the constructor
 de-duplicates by `factor`, and the signals stage now emits a live
@@ -135,7 +147,7 @@ Each cycle runs as the sequence of stages below. The LLM agents read role-specif
 Queries `/v2/clock`. If markets are closed (weekend, holiday, after-hours), writes `market_gate.json` + a closed-market `next_run.json` pointing at the broker-reported next open, and exits. No LLM calls billed on a closed-market **trade** cycle. (A **review** cycle deliberately skips this stage — it's designed to run after close — so an after-hours review still runs signals + strategist + meta and bills ~$0.05; it just never opens orders. See "Cycle intents" below.)
 
 ### 1. Signals — deterministic Python, $0
-For each of the 57 universe tickers, computes from yfinance daily history:
+For each of the 70 universe tickers, computes from yfinance daily history:
 - `last_close`, `adv_30d` (liquidity)
 - `momentum_30d_pct` / `momentum_60d_pct` (trailing returns)
 - `hv_30d_annualised` / `hv_90d_annualised` (close-to-close vol)
@@ -221,7 +233,7 @@ Most cycles run the full pipeline (a **trade** cycle). The meta-scheduler can in
 
 On a $2,500 paper account in a leveraged/inverse-ETF universe, **the edge isn't sector picking — it's discipline**: positive-EV only, hard 15% per-position NAV entry cap, 25% loss kill condition, no options, no broker shorts (bearish views go via inverse ETFs).
 
-The pipeline reads deterministic signals (momentum, vol, MA distance, RSI, relative strength, trend quality, live factor correlations) for 57 curated tickers and feeds them — together with the system's own realized track record — to a Sonnet strategist that picks ≤6 high-conviction ideas; an Opus constructor then sizes 1–12 positions and chooses each position's stop style (fixed, trailing, or time). The meta-scheduler sets the next-run window per cycle (1–24h); the market gate skips weekends and holidays automatically.
+The pipeline reads deterministic signals (momentum, vol, MA distance, RSI, relative strength, trend quality, live factor correlations) for 70 curated tickers and feeds them — together with the system's own realized track record — to a Sonnet strategist that picks ≤6 high-conviction ideas; an Opus constructor then sizes 1–12 positions and chooses each position's stop style (fixed, trailing, or time). The meta-scheduler sets the next-run window per cycle (1–24h); the market gate skips weekends and holidays automatically.
 
 **Losses are expected** — the experiment is whether prompt + schema discipline produces an honest Sharpe across many cycles, not whether it picks individual winners. Per-cycle LLM cost is ~$0.30, which keeps experimentation affordable.
 

@@ -11,7 +11,7 @@ shorts, no margin. A bullish thesis is expressed by naming the **bull ETF**;
 a bearish thesis is expressed by naming the **inverse ETF**. The account
 only ever goes long the named ETF.
 
-## Universe (57 tickers, curated)
+## Universe (70 tickers, curated)
 
 **Bull/bear leveraged-ETF pairs (25 factors × 2 directions):**
 - `TQQQ` / `SQQQ` — Nasdaq 3x long / short
@@ -44,18 +44,30 @@ only ever goes long the named ETF.
 
 **Solo / asymmetric entries:**
 - `BITX` — Bitcoin 2x long / `BITI` — Bitcoin 1x inverse (crypto-btc)
+- `PLTU` — Palantir 2x long / `PLTD` — Palantir 1x inverse (single-stock)
+- `AMZU` — Amazon 2x long / `AMZD` — Amazon 1x inverse (single-stock)
+- `GGLL` — Alphabet 2x long / `GGLS` — Alphabet 1x inverse (single-stock)
+- `METU` — Meta 2x long / `METD` — Meta 1x inverse (single-stock)
 - `NAIL` — Homebuilders 3x long (solo; no liquid inverse)
 - `DFEN` — Aerospace & defense 3x long (solo)
 - `CURE` — Healthcare 3x long (solo)
 - `DPST` — Regional banks 3x long (solo)
 - `CONL` — Coinbase 2x long (solo single-stock; crypto-correlated)
+- `UTSL` — Utilities 3x long (solo; defensive, rate-sensitive)
+- `RETL` — Retail 3x long (solo; consumer spending)
+- `BRZU` — MSCI Brazil 2x long (solo; commodity-linked LatAm)
+- `INDL` — MSCI India 2x long (solo)
+- `EURL` — FTSE Europe 3x long (solo; euro/ECB-sensitive)
 
 **Single-stock lines carry company risk the macro calendar does not
 cover.** Earnings dates, guidance, product news and litigation can gap
-NVDL/TSLL/MSTU/CONL far beyond what `events_7d` shows — if you surface a
-single-stock candidate near its earnings date, say so in the thesis and
-score confidence accordingly. MSTR and COIN trade as crypto beta:
-holding MSTU and BITX together is closer to one bet than two.
+NVDL/TSLL/MSTU/CONL/PLTU/AMZU/GGLL/METU far beyond what `events_7d`
+shows — if you surface a single-stock candidate near its earnings date,
+say so in the thesis and score confidence accordingly. MSTR and COIN
+trade as crypto beta: holding MSTU and BITX together is closer to one
+bet than two. The mega-cap lines (AMZN, GOOGL, META) plus PLTR are all
+heavy Nasdaq constituents — stacking them alongside TQQQ/TECL/WEBL
+concentrates one risk-on tech bet, not diversification.
 
 There are no short positions and no options — a bearish thesis on Nasdaq is
 expressed as **long SQQQ**, never a broker short of TQQQ and never a put.
@@ -139,12 +151,14 @@ Rules:
   - Bullish thesis → name the **bull ETF** (TQQQ / UPRO / UDOW / TNA /
     HIBL / SOXL / TECL / WEBL / LABU / YINN / EDC / FAS / ERX / GUSH /
     BOIL / UCO / TMF / NUGT / UGL / AGQ; UVXY for long vol; BITX / ETHU
-    for long crypto; NVDL / TSLL / MSTU / CONL for single stocks;
-    NAIL / DFEN / CURE / DPST for their solo sectors).
+    for long crypto; NVDL / TSLL / MSTU / CONL / PLTU / AMZU / GGLL /
+    METU for single stocks; NAIL / DFEN / CURE / DPST / UTSL / RETL for
+    their solo sectors; BRZU / INDL / EURL for solo geographies).
   - Bearish thesis → name the **inverse ETF** (SQQQ / SPXU / SDOW / TZA /
     HIBS / SOXS / TECS / WEBS / LABD / YANG / EDZ / FAZ / ERY / DRIP /
     KOLD / SCO / TMV / DUST / GLL / ZSL; SVIX for short vol; BITI / ETHD
-    for inverse crypto; NVD / TSLZ / MSTZ for single stocks).
+    for inverse crypto; NVD / TSLZ / MSTZ / PLTD / AMZD / GGLS / METD
+    for single stocks).
 - `confidence` ∈ [0, 1]. Threshold guidance:
   - ≥0.7: strong signal, multiple corroborating features
   - 0.5–0.7: moderate

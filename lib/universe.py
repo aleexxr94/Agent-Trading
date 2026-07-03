@@ -1,4 +1,4 @@
-"""Static universe of tradeable instruments — ETF-only (57 tickers).
+"""Static universe of tradeable instruments — ETF-only (70 tickers).
 
 The system trades **only** leveraged and inverse ETFs. Bullish theses are
 expressed by holding a bull (positively-leveraged) ETF; bearish theses are
@@ -32,19 +32,36 @@ the same caps/kill rails as every other position. They carry
 single-company event risk (earnings, guidance) that the macro calendar
 does not cover — the prompts call this out.
 
-Universe composition (57):
+Expansion note (2026-07-02, user-authorized): widened from 57 to 70
+tickers. Five solo sector/geography bulls (UTSL utilities, RETL retail,
+BRZU Brazil, INDL India, EURL Europe) add defensive, consumer and
+single-country factors with genuinely distinct macro drivers; four
+Direxion single-stock lines (PLTU/PLTD on PLTR, AMZU/AMZD on AMZN,
+GGLL/GGLS on GOOGL, METU/METD on META) follow the asymmetric +2x bull /
+-1x bear pattern BITX/BITI already established. Cost impact is
+negligible (~+500-600 tokens in the compacted signals block per cycle);
+every addition clears the ≤1%-of-ADV sanity rule with wide margin at
+this account's position sizes. KORU (South Korea 3x) was considered and
+REJECTED: it trades around $500-600/share, above the 15%-NAV entry cap
+(~$375 on $2,500), so with integer shares one share can never clear the
+cap — do not re-add a ticker whose single-share price exceeds the entry
+cap, the constructor must refuse it every cycle (Codex review, PR #113).
+
+Universe composition (70):
   - 25 bull/bear leveraged-ETF pairs (50): Nasdaq, S&P 500, Dow,
     small-caps, high-beta, semis, technology, internet, biotech, China,
     emerging markets, financials, energy, oil & gas E&P, natural gas,
     crude oil, rates, gold miners, gold bullion, silver, ether, vol
     (UVXY/SVIX), NVDA, TSLA, MSTR. Each pair covers one factor in both
     directions.
-  - 7 solo/asymmetric entries: BITX (+2x bull) paired with BITI (-1x
-    inverse) on crypto-btc; and 5 solo bull ETFs with no liquid inverse
-    counterpart (NAIL homebuilders, DFEN defense, CURE healthcare,
-    DPST regional banks, CONL coin) — bearish views on those factors
-    are expressed by not holding them (or via a correlated inverse,
-    the agent's call).
+  - 10 asymmetric +2x bull / -1x bear single-stock/crypto lines: BITX/
+    BITI (crypto-btc), PLTU/PLTD (pltr), AMZU/AMZD (amzn), GGLL/GGLS
+    (googl), METU/METD (meta).
+  - 10 solo bull ETFs with no liquid inverse counterpart (NAIL
+    homebuilders, DFEN defense, CURE healthcare, DPST regional banks,
+    CONL coin, UTSL utilities, RETL retail, BRZU Brazil, INDL India,
+    EURL Europe) — bearish views on those factors are expressed by
+    not holding them (or via a correlated inverse, the agent's call).
 
 `factor` is the short factor identifier, shared across bull/bear pairs
 (e.g. TQQQ + SQQQ both → "nasdaq"). Used by:
@@ -110,6 +127,16 @@ F_NVDA         = "nvda"
 F_TSLA         = "tsla"
 F_MSTR         = "mstr"
 F_COIN         = "coin"
+# 2026-07-02 expansion factors (user-authorized).
+F_UTILITIES    = "utilities"
+F_RETAIL       = "retail"
+F_BRAZIL       = "brazil"
+F_INDIA        = "india"
+F_EUROPE       = "europe"
+F_PLTR         = "pltr"
+F_AMZN         = "amzn"
+F_GOOGL        = "googl"
+F_META         = "meta"
 
 
 def _e(symbol: str, kind: InstrumentKind, lev: float, family: str,
@@ -266,6 +293,37 @@ _LEVERAGED_ETFS: tuple[UniverseEntry, ...] = (
        "T-Rex 2x Inverse MSTR Daily Target ETF — 2x daily inverse MicroStrategy", F_MSTR),
     _e("CONL", "etf",  2.0, "COIN 2x long",
        "GraniteShares 2x Long COIN Daily ETF — 2x daily long Coinbase (solo; no liquid inverse)", F_COIN),
+
+    # ==== 2026-07-02 expansion (user-authorized): 6 solo bulls + 4 pairs ====
+    # ---- Solo bull sector/geography ETFs (no liquid inverse counterpart) ----
+    _e("UTSL", "etf",  3.0, "Utilities 3x long",
+       "Direxion Daily Utilities Bull 3x — 3x daily long Utilities Select Sector", F_UTILITIES),
+    _e("RETL", "etf",  3.0, "Retail 3x long",
+       "Direxion Daily Retail Bull 3x — 3x daily long S&P Retail Select", F_RETAIL),
+    _e("BRZU", "etf",  2.0, "Brazil 2x long",
+       "Direxion Daily MSCI Brazil Bull 2x — 2x daily long MSCI Brazil 25/50", F_BRAZIL),
+    _e("INDL", "etf",  2.0, "India 2x long",
+       "Direxion Daily MSCI India Bull 2x — 2x daily long MSCI India", F_INDIA),
+    _e("EURL", "etf",  3.0, "Europe 3x long",
+       "Direxion Daily FTSE Europe Bull 3x — 3x daily long FTSE Developed Europe", F_EUROPE),
+    # ---- Single-stock lines (asymmetric +2x bull / -1x bear, like BITX/BITI).
+    # Same single-COMPANY event-risk caveat as the 2026-06-10 lines.
+    _e("PLTU", "etf",  2.0, "PLTR 2x long",
+       "Direxion Daily PLTR Bull 2x — 2x daily long Palantir", F_PLTR),
+    _e("PLTD", "etf", -1.0, "PLTR 1x short",
+       "Direxion Daily PLTR Bear 1x — 1x daily inverse Palantir", F_PLTR),
+    _e("AMZU", "etf",  2.0, "AMZN 2x long",
+       "Direxion Daily AMZN Bull 2x — 2x daily long Amazon", F_AMZN),
+    _e("AMZD", "etf", -1.0, "AMZN 1x short",
+       "Direxion Daily AMZN Bear 1x — 1x daily inverse Amazon", F_AMZN),
+    _e("GGLL", "etf",  2.0, "GOOGL 2x long",
+       "Direxion Daily GOOGL Bull 2x — 2x daily long Alphabet", F_GOOGL),
+    _e("GGLS", "etf", -1.0, "GOOGL 1x short",
+       "Direxion Daily GOOGL Bear 1x — 1x daily inverse Alphabet", F_GOOGL),
+    _e("METU", "etf",  2.0, "META 2x long",
+       "Direxion Daily META Bull 2x — 2x daily long Meta Platforms", F_META),
+    _e("METD", "etf", -1.0, "META 1x short",
+       "Direxion Daily META Bear 1x — 1x daily inverse Meta Platforms", F_META),
 )
 
 
