@@ -55,6 +55,19 @@ def test_slippage_default_and_override():
     assert alpaca_costs.slippage_bps_for("hibl") == alpaca_costs.slippage_bps_for("HIBL")
 
 
+def test_slippage_overrides_cover_2026_07_expansion_thin_names():
+    """The 2026-07-02 additions that trade thin must not fall through to
+    the liquid default — that would flatter paper Net P&L and the
+    promote-to-live Sharpe (Codex review, PR #113). Bull single-stock
+    legs (PLTU/AMZU/GGLL/METU) are deliberately on the default, matching
+    the NVDL/TSLL/MSTU convention."""
+    for sym in ("UTSL", "RETL", "BRZU", "INDL", "EURL",
+                "PLTD", "AMZD", "GGLS", "METD"):
+        assert alpaca_costs.slippage_bps_for(sym) > alpaca_costs.SLIPPAGE_BPS_PER_SIDE, sym
+    for sym in ("PLTU", "AMZU", "GGLL", "METU"):
+        assert alpaca_costs.slippage_bps_for(sym) == alpaca_costs.SLIPPAGE_BPS_PER_SIDE, sym
+
+
 def test_slippage_cost_scales_with_notional():
     cost = alpaca_costs.slippage_cost(symbol="TQQQ", notional=10_000.0)
     assert cost == pytest.approx(10_000.0 * alpaca_costs.SLIPPAGE_BPS_PER_SIDE / 10_000)

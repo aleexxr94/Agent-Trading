@@ -65,6 +65,14 @@ SLIPPAGE_OVERRIDES: dict[str, float] = {
     "CURE": 12.0, "DFEN": 12.0,
     "NVD": 12.0, "TSLZ": 12.0, "MSTZ": 12.0,
     "ETHD": 12.0, "BITI": 12.0,
+    # 2026-07-02 expansion. Solo sector/geography lines trade far thinner
+    # than the TQQQ-class names, so the liquid 2 bps default would flatter
+    # paper fills and the promote-to-live Sharpe. Inverse single-stock legs
+    # follow the NVD/TSLZ/MSTZ convention; the bull legs (PLTU/AMZU/GGLL/
+    # METU) are liquid enough for the default, like NVDL/TSLL/MSTU.
+    "UTSL": 12.0, "RETL": 15.0,
+    "BRZU": 12.0, "INDL": 15.0, "EURL": 15.0,
+    "PLTD": 12.0, "AMZD": 12.0, "GGLS": 12.0, "METD": 12.0,
 }
 
 BPS = 10_000
