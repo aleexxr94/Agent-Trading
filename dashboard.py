@@ -1200,6 +1200,98 @@ with tabs[0]:
                 "configured — see README §Setup."
             )
 
+        # ---------- Manual close ----------
+        # Operator override: flatten a single position on demand via
+        # lib.manual_actions (broker.flatten + manual_close kill event +
+        # trailing-peak cleanup + fill sync). Deliberately available while
+        # halted — halt.flag stops the agents, not the human reducing risk.
+        with st.expander("⚡ Close a position manually", expanded=False):
+            # Render-and-clear the result of the previous confirm click —
+            # stashed in session_state so it survives the st.rerun().
+            _mc_result = st.session_state.pop("manual_close_result", None)
+            if _mc_result is not None:
+                if _mc_result["ok"]:
+                    st.success(_mc_result["message"])
+                else:
+                    st.error(_mc_result["message"])
+
+            if not broker_view.available:
+                st.caption("Broker unreachable — manual close disabled.")
+            else:
+                st.caption(
+                    "Submits a market order to flatten the position NOW and "
+                    "records a `manual_close` kill event, so the agents see "
+                    "the exit was yours (not theirs) and the 7-day re-entry "
+                    "cooldown engages once the fill syncs. Outside market "
+                    "hours Alpaca queues the close for the next open. If an "
+                    "orchestrator cycle is running right now, it may act on "
+                    "pre-close state; the next cycle self-corrects."
+                )
+                if halted:
+                    st.caption(
+                        "🛑 Halted — closes are still allowed: halt.flag "
+                        "stops the agents, not your risk reduction."
+                    )
+                for r in rows:
+                    sym = r["Symbol"]
+                    c_label, c_btn, c_cancel = st.columns([3, 1, 1])
+                    _net = r.get("Net P&L")
+                    c_label.markdown(
+                        f"**{sym}** · {r.get('Shares', '—')} shares · Net P&L "
+                        f"{'—' if _net is None else f'${_net:+,.2f}'}"
+                    )
+                    pending_key = f"close_pending_{sym}"
+                    if not st.session_state.get(pending_key):
+                        if c_btn.button("Close", key=f"close-{sym}"):
+                            st.session_state[pending_key] = True
+                            st.rerun()
+                    else:
+                        if c_btn.button(
+                            f"✅ Confirm", key=f"close-confirm-{sym}", type="primary",
+                        ):
+                            # Pop the arm-key BEFORE the broker call so a
+                            # mid-flight rerun re-renders unarmed (double-
+                            # submit protection; a stray second confirm hits
+                            # the already-closed path harmlessly).
+                            st.session_state.pop(pending_key, None)
+                            from lib import manual_actions
+                            res = manual_actions.close_position_manually(sym)
+                            if res.ok:
+                                msg = (
+                                    f"Close accepted for **{sym}** (order "
+                                    f"`{res.order.broker_order_id}`, status "
+                                    f"{res.order.status}). The SELL appears in "
+                                    "the Trades tab after sync; the 7-day "
+                                    "re-entry cooldown engages once synced."
+                                )
+                                if res.sync_error:
+                                    msg += (
+                                        " Fill sync deferred "
+                                        f"(`{res.sync_error}`) — the "
+                                        "orchestrator resyncs before its next "
+                                        "cycle."
+                                    )
+                                st.session_state["manual_close_result"] = {
+                                    "ok": True, "message": msg,
+                                }
+                            else:
+                                st.session_state["manual_close_result"] = {
+                                    "ok": False,
+                                    "message": (
+                                        f"Close FAILED for **{sym}**: "
+                                        f"{res.error}. No kill event recorded; "
+                                        "position unchanged."
+                                    ),
+                                }
+                            st.rerun()
+                        if c_cancel.button("↩ Cancel", key=f"close-cancel-{sym}"):
+                            st.session_state.pop(pending_key, None)
+                            st.rerun()
+                        st.warning(
+                            f"⚠️ Press **Confirm** to market-close {sym} at "
+                            "the broker."
+                        )
+
         col_pie, col_bar = st.columns([1, 1])
         with col_pie:
             pie_data = dd.allocation_pie(portfolio)
@@ -1335,6 +1427,58 @@ with tabs[0]:
         "Green = open position currently winning · red = losing · grey = "
         "open but no live mark. Open positions sort to the top."
     )
+
+    # ---------- Note to agents ----------
+    # $0 operator channel: free text appended to state/user_notes.jsonl and
+    # injected VERBATIM into the next trade cycle's strategist + constructor
+    # user messages (no LLM call happens here, nothing is interpreted).
+    st.markdown('<div class="at-section-label">Note to agents</div>', unsafe_allow_html=True)
+    st.caption(
+        "Injected verbatim into the next trade cycle's strategist + "
+        "constructor prompts, then marked consumed. Guidance, not an order — "
+        "the agents weigh it against the signals. Unconsumed notes expire "
+        f"after {int(state.USER_NOTES_MAX_AGE_DAYS)} days."
+    )
+    _note_text = st.text_area(
+        "Note to agents",
+        max_chars=state.USER_NOTE_MAX_CHARS,
+        placeholder="e.g. I'm wary of adding semis exposure into NVDA earnings this week.",
+        label_visibility="collapsed",
+        key="user_note_text",
+    )
+    if st.button("📨 Send note to agents"):
+        # No st.rerun() — the pending table below is built AFTER this block
+        # in the same script run, so the fresh note already shows, and the
+        # success message survives the render.
+        try:
+            state.append_user_note(_note_text)
+            st.success("Note recorded — it will inject into the next trade cycle.")
+        except ValueError as e:
+            st.warning(f"Note not recorded: {e}")
+
+    _notes_view = dd.user_notes_view()
+    if _notes_view["pending"]:
+        st.markdown("**Pending** (awaiting next trade cycle)")
+        st.dataframe(
+            pd.DataFrame(
+                [{"At (UTC)": n.get("at"), "Note": n.get("text")}
+                 for n in _notes_view["pending"]],
+            ),
+            width="stretch", hide_index=True,
+        )
+    if _notes_view["consumed"]:
+        st.markdown("**Consumed / expired**")
+        st.dataframe(
+            pd.DataFrame(
+                [{
+                    "At (UTC)": n.get("at"),
+                    "Note": n.get("text"),
+                    "Consumed at": n.get("consumed_at") or "— (expired)",
+                    "Run": n.get("consumed_run_id") or "—",
+                } for n in _notes_view["consumed"]],
+            ),
+            width="stretch", hide_index=True,
+        )
 
 
 # ===== Tab 2: Cycles =====
@@ -2846,7 +2990,7 @@ with tabs[7]:
     if cal["kill_events"]:
         st.dataframe(cal["kill_events"], use_container_width=True, hide_index=True)
     else:
-        st.info("No monitor-driven flattens recorded yet (state/kill_events.jsonl).")
+        st.info("No flattens (monitor or manual) recorded yet (state/kill_events.jsonl).")
 
     # --- live-readiness scorecard ---
     st.markdown('<div class="at-section-label">Promotion scorecard (informational)</div>', unsafe_allow_html=True)
