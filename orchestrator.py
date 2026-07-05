@@ -977,10 +977,12 @@ def _notes_fingerprint(pending_notes: list[dict] | None) -> str:
 
     A note typed into the dashboard between two otherwise-identical cycles
     is new LLM-visible context — dedup must NOT reuse the cached portfolio
-    over it. The stored value is recomputed AFTER consumption at the end of
-    the cycle (normally hashing an empty set), so the next unchanged-market
-    cycle can dedup again once the note has been injected; contrast with
-    memo_fp, which is deliberately stored pre-dedup."""
+    over it. The publish block stores the EMPTY-set fingerprint (the cached
+    portfolio's reference state is "every injected note consumed, none
+    pending"), so an unchanged-market cycle can dedup again once a note has
+    been injected, while any pending note — even one typed mid-cycle after
+    pending_notes was captured — mismatches and forces a real run; contrast
+    with memo_fp, which is deliberately stored pre-dedup."""
     ids = sorted(n.get("id") or "" for n in (pending_notes or []))
     return _hash_inputs(json.dumps(ids, sort_keys=True))
 
@@ -2225,12 +2227,14 @@ def run_pipeline(
         # hash) so the next quiet cycle can dedup once the note is injected.
         _update_cycle_dedup_hash(
             signals_out, current_positions, cooldown_symbols, memo_fp,
-            # Same mode filter as the pre-dedup read — an unconsumed
-            # cross-era note must hash identically on both sides or dedup
-            # would never match again.
-            notes_fp=_notes_fingerprint(state.pending_user_notes(
-                mode=live_gate.trading_mode(ctx.broker),
-            )),
+            # Empty-set fingerprint, NOT a re-read of pending notes from
+            # disk (Codex P2, PR #114): the cached portfolio reflects
+            # "every injected note consumed, none pending", so ANY pending
+            # note at the next cycle — including one typed mid-cycle after
+            # this cycle captured pending_notes — must mismatch and force
+            # a real run. A disk re-read here would absorb the mid-cycle
+            # note into the stored hash and dedup would skip right past it.
+            notes_fp=_notes_fingerprint([]),
             manual_closes_fp=manual_closes_fp,
         )
 

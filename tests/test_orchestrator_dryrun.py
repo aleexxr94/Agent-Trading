@@ -1159,3 +1159,39 @@ def test_manual_close_prompt_line_filters_and_formats(tmp_state):
     assert "SOXL (2026-07-03)" in line
     assert "strong NEW justification" in line
     assert orchestrator._manual_close_prompt_line([]) == ""
+
+
+def test_mid_cycle_note_not_absorbed_by_stored_dedup_hash(tmp_state):
+    """Codex P2 (PR #114, round 3): the publish block stores the EMPTY-set
+    notes fingerprint — a note typed mid-cycle (after pending_notes was
+    captured, before publish) must mismatch on the next cycle and force a
+    real run instead of being dedup-skipped until it expires."""
+    signals_out = {"tickers": [{"symbol": "TQQQ", "last_close": 72.0}]}
+    positions = [{"symbol": "TQQQ", "qty": 4.0}]
+    mc_fp = orchestrator._manual_closes_fingerprint([])
+    state.write_json(state.CURRENT_PORTFOLIO, {"positions": [], "all_cash": True})
+    # What the publish block stores: empty-set notes fp, regardless of any
+    # note that landed on disk mid-cycle.
+    orchestrator._update_cycle_dedup_hash(
+        signals_out, positions, None, None,
+        notes_fp=orchestrator._notes_fingerprint([]),
+        manual_closes_fp=mc_fp,
+    )
+    # Mid-cycle note is pending at the NEXT cycle's pre-dedup read.
+    note = state.append_user_note("typed while the cycle was mid-flight")
+    next_notes_fp = orchestrator._notes_fingerprint(
+        state.pending_user_notes(mode="paper"),
+    )
+    assert orchestrator._check_cycle_dedup(
+        signals_out, positions, None, None,
+        notes_fp=next_notes_fp, manual_closes_fp=mc_fp,
+    ) is None
+    # Once consumed, the quiet-market cycle can dedup again.
+    state.append_user_notes_consumed([note["id"]], run_id="r2")
+    assert orchestrator._check_cycle_dedup(
+        signals_out, positions, None, None,
+        notes_fp=orchestrator._notes_fingerprint(
+            state.pending_user_notes(mode="paper"),
+        ),
+        manual_closes_fp=mc_fp,
+    ) is not None
