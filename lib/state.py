@@ -999,6 +999,9 @@ def wipe_run_history(*, include_costs: bool = True, backup: bool = True) -> dict
       - state/decisions.jsonl (decision log)
       - state/nav_history.jsonl (NAV-per-cycle history)
       - state/trades.jsonl (Alpaca fill log)
+      - state/kill_events.jsonl (exit-outcome audit — read standalone by the
+        manual-close prompt line, so it must not outlive the experiment)
+      - state/user_notes.jsonl + user_notes_consumed.jsonl (operator notes)
       - state/current_portfolio.json (last portfolio snapshot)
       - state/next_run.json (last scheduler target)
       - state/last_cycle_hash.json (cycle-dedup fingerprint)
@@ -1070,11 +1073,19 @@ def wipe_run_history(*, include_costs: bool = True, backup: bool = True) -> dict
 
     # Truncate (don't unlink) the JSONL audit logs so anything that holds
     # a file handle keeps writing without recreating mode/owner issues.
-    # User notes are wiped too: stale operator guidance must not leak into a
-    # "start fresh" experiment (the backup dir preserves them regardless).
+    # User notes and kill events are wiped too: stale operator guidance and
+    # a wiped experiment's exit history must not leak into a "start fresh"
+    # one (the backup dir preserves both regardless). Kill events matter
+    # since PR #114: orchestrator._recent_manual_closes reads
+    # kill_events.jsonl STANDALONE (not joined against the also-wiped trade
+    # log), so leaving it would keep injecting "operator manually closed X —
+    # don't re-open" prompt lines for up to 7 days into the fresh experiment
+    # (Codex P2 on PR #114). position_peaks.json deliberately stays: broker
+    # positions survive a wipe, and their trailing-stop ratchets must
+    # survive with them.
     jsonl_files = [
         DECISIONS_LOG, TRADES_LOG, NAV_HISTORY_LOG, MONITOR_SHADOW_LOG,
-        USER_NOTES_LOG, USER_NOTES_CONSUMED_LOG,
+        USER_NOTES_LOG, USER_NOTES_CONSUMED_LOG, KILL_EVENTS_LOG,
     ]
     if include_costs:
         jsonl_files.append(COSTS_LOG)

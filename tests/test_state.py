@@ -737,3 +737,16 @@ def test_wipe_run_history_truncates_user_notes(tmp_state):
     state.wipe_run_history(backup=False)
     assert state.read_user_notes() == []
     assert state.read_user_notes_consumed() == []
+
+
+def test_wipe_run_history_truncates_kill_events(tmp_state):
+    """Codex P2 (PR #114): kill_events.jsonl is read STANDALONE by the
+    manual-close prompt line, so a wiped experiment's exits must not keep
+    telling the fresh experiment's agents not to re-open a symbol."""
+    state.append_kill_event({
+        "at": state.utcnow_iso(), "symbol": "SOXL",
+        "reason": "manual close from dashboard",
+        "exit_kind": "manual_close", "source": "dashboard", "mode": "paper",
+    })
+    state.wipe_run_history(backup=False)
+    assert state.read_kill_events() == []
