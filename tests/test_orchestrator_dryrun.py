@@ -1044,3 +1044,118 @@ def test_portfolio_is_noop_all_cash_with_empty_account():
     """No positions on either side → no stops in play, no prior needed."""
     import orchestrator as orch
     assert orch._portfolio_is_noop({"positions": [], "all_cash": True}, []) is True
+
+
+# ---- operator context: user notes + manual closes ----
+
+
+def test_notes_fingerprint_pending_vs_empty_and_order_insensitive(tmp_state):
+    empty = orchestrator._notes_fingerprint([])
+    assert orchestrator._notes_fingerprint(None) == empty
+    one = orchestrator._notes_fingerprint([{"id": "n1"}])
+    assert one != empty
+    # Order-insensitive: same id set → same fingerprint.
+    ab = orchestrator._notes_fingerprint([{"id": "a"}, {"id": "b"}])
+    ba = orchestrator._notes_fingerprint([{"id": "b"}, {"id": "a"}])
+    assert ab == ba
+
+
+def test_manual_closes_fingerprint_changes_when_close_ages_out(tmp_state):
+    """Manual-close membership decays with time alone (same bug class as
+    cooldown expiry) — the fingerprint must differ so dedup can't reuse a
+    portfolio held flat because of an operator close past the window."""
+    with_close = orchestrator._manual_closes_fingerprint(
+        [{"symbol": "SOXL", "at": "2026-07-01T14:00:00Z"}]
+    )
+    aged_out = orchestrator._manual_closes_fingerprint([])
+    assert with_close != aged_out
+
+
+def test_cycle_dedup_does_not_skip_on_new_pending_note(tmp_state):
+    """A note typed between two otherwise-identical cycles is new
+    LLM-visible context — dedup must NOT reuse the cached portfolio."""
+    signals_out = {"tickers": [{"symbol": "TQQQ", "last_close": 72.0}]}
+    positions = [{"symbol": "TQQQ", "qty": 4.0}]
+    empty_notes_fp = orchestrator._notes_fingerprint([])
+    mc_fp = orchestrator._manual_closes_fingerprint([])
+    state.write_json(state.CURRENT_PORTFOLIO, {"positions": [], "all_cash": True})
+    state.write_json(state.LAST_CYCLE_HASH, {
+        "signals_fingerprint": orchestrator._signals_fingerprint(signals_out),
+        "positions_fingerprint": orchestrator._positions_fingerprint(positions),
+        "cooldown_fingerprint": orchestrator._cooldown_fingerprint(None),
+        "memo_fingerprint": None,
+        "notes_fingerprint": empty_notes_fp,
+        "manual_closes_fingerprint": mc_fp,
+        "updated_at": state.utcnow_iso(),
+    })
+    # No pending note → everything matches → dedup fires.
+    assert orchestrator._check_cycle_dedup(
+        signals_out, positions, None, None,
+        notes_fp=empty_notes_fp, manual_closes_fp=mc_fp,
+    ) is not None
+    # A fresh pending note → notes fingerprint differs → no dedup.
+    new_fp = orchestrator._notes_fingerprint([{"id": "n1"}])
+    assert orchestrator._check_cycle_dedup(
+        signals_out, positions, None, None,
+        notes_fp=new_fp, manual_closes_fp=mc_fp,
+    ) is None
+    # Legacy hash file without the new keys vs real fingerprints → miss
+    # (one fresh cycle, then self-heals).
+    state.write_json(state.LAST_CYCLE_HASH, {
+        "signals_fingerprint": orchestrator._signals_fingerprint(signals_out),
+        "positions_fingerprint": orchestrator._positions_fingerprint(positions),
+        "cooldown_fingerprint": orchestrator._cooldown_fingerprint(None),
+        "memo_fingerprint": None,
+        "updated_at": state.utcnow_iso(),
+    })
+    assert orchestrator._check_cycle_dedup(
+        signals_out, positions, None, None,
+        notes_fp=empty_notes_fp, manual_closes_fp=mc_fp,
+    ) is None
+
+
+def test_user_notes_block_verbatim_and_empty(tmp_state):
+    assert orchestrator._user_notes_block(None) == ""
+    assert orchestrator._user_notes_block([]) == ""
+    block = orchestrator._user_notes_block([
+        {"id": "n1", "at": "2026-07-05T14:02:00Z",
+         "text": "wary of semis into NVDA earnings"},
+    ])
+    assert "USER NOTES" in block
+    assert "wary of semis into NVDA earnings" in block  # verbatim
+    assert "2026-07-05T14:02:00Z" in block
+    assert "not an order" in block
+
+
+def test_manual_close_prompt_line_filters_and_formats(tmp_state):
+    from datetime import datetime, timezone
+    now = datetime(2026, 7, 5, 12, 0, tzinfo=timezone.utc)
+    state.append_kill_event({
+        "at": "2026-07-03T15:00:00Z", "symbol": "SOXL",
+        "reason": "manual close from dashboard",
+        "exit_kind": "manual_close", "source": "dashboard", "mode": "paper",
+    })
+    # Monitor-sourced event — excluded (not an operator action).
+    state.append_kill_event({
+        "at": "2026-07-03T15:00:00Z", "symbol": "TQQQ",
+        "reason": "loss cap", "exit_kind": "loss_cap", "source": "monitor",
+        "mode": "paper",
+    })
+    # Live-mode manual close — excluded from the paper-era prompt.
+    state.append_kill_event({
+        "at": "2026-07-03T15:00:00Z", "symbol": "TNA",
+        "reason": "manual close from dashboard",
+        "exit_kind": "manual_close", "source": "dashboard", "mode": "live",
+    })
+    # Aged out (>7 days) — excluded.
+    state.append_kill_event({
+        "at": "2026-06-20T15:00:00Z", "symbol": "FAS",
+        "reason": "manual close from dashboard",
+        "exit_kind": "manual_close", "source": "dashboard", "mode": "paper",
+    })
+    closes = orchestrator._recent_manual_closes(now=now, mode="paper")
+    assert [c["symbol"] for c in closes] == ["SOXL"]
+    line = orchestrator._manual_close_prompt_line(closes)
+    assert "SOXL (2026-07-03)" in line
+    assert "strong NEW justification" in line
+    assert orchestrator._manual_close_prompt_line([]) == ""

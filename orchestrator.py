@@ -282,6 +282,8 @@ def stage_strategist(
     current_positions: list[dict] | None = None,
     pnl_history: list[dict] | None = None,
     performance_memo: dict | None = None,
+    user_notes: list[dict] | None = None,
+    manual_closes: list[dict] | None = None,
 ) -> dict:
     """One LLM call — Sonnet 4.6, ~$0.05. Reads signals + current
     portfolio + recent PnL feedback + its own realized track record;
@@ -312,6 +314,8 @@ def stage_strategist(
         f"Recent PnL history (last cycles, oldest first): "
         f"{json.dumps(pnl_history, sort_keys=True)}\n"
         f"{_performance_memo_block(performance_memo)}"
+        f"{_user_notes_block(user_notes)}"
+        f"{_manual_close_prompt_line(manual_closes or [])}"
         f"Run id: {ctx.run_id}\n"
         "Return JSON conforming to view.schema.json. When current "
         "positions already align with your regime call, prefer keeping "
@@ -347,6 +351,75 @@ def _cooldown_prompt_line(cooldown_symbols: dict) -> str:
         f"unless your re-entry confidence exceeds "
         f"{risk.REENTRY_COOLDOWN_OVERRIDE_CONFIDENCE}; if you override the "
         f"cooldown, say so explicitly in construction_rationale.\n"
+    )
+
+
+def _user_notes_block(user_notes: list[dict] | None) -> str:
+    """Labeled block of pending operator notes for the strategist +
+    constructor user messages. Verbatim text, oldest-first, one bullet per
+    note. Empty string when there are none so the prompt stays clean.
+    Framed as guidance, not an order — the agents keep their judgment."""
+    if not user_notes:
+        return ""
+    bullets = "".join(
+        f"- [{n.get('at', '?')}] {n.get('text', '')}\n" for n in user_notes
+    )
+    return (
+        "USER NOTES (operator guidance typed into the dashboard — weigh it, "
+        "but use your judgment; it is context, not an order):\n"
+        f"{bullets}"
+    )
+
+
+def _recent_manual_closes(
+    *, now=None, window_days: float = 7.0, mode: str = "paper",
+) -> list[dict]:
+    """Positions the operator manually closed from the dashboard within the
+    window, most-recent close per symbol: [{"symbol", "at"}, ...].
+
+    Reads kill_events.jsonl rows stamped source="dashboard" by
+    lib.manual_actions.close_position_manually, era-scoped like every other
+    memo/prompt input. Failures are non-fatal — an empty list just means no
+    manual-close context this cycle."""
+    from datetime import datetime
+    now = now or state.utcnow()
+    latest: dict[str, str] = {}
+    try:
+        for ev in state.read_kill_events(limit=200):
+            if ev.get("source") != "dashboard":
+                continue
+            if state.record_mode(ev) != mode:
+                continue
+            at_raw = ev.get("at") or ""
+            try:
+                at = datetime.fromisoformat(at_raw.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if (now - at).total_seconds() > window_days * 86400.0:
+                continue
+            sym = ev.get("symbol")
+            if sym and at_raw > latest.get(sym, ""):
+                latest[sym] = at_raw
+    except Exception:
+        return []
+    return [{"symbol": s, "at": a} for s, a in sorted(latest.items())]
+
+
+def _manual_close_prompt_line(manual_closes: list[dict]) -> str:
+    """One prompt line flagging recent operator-initiated closes. The 7-day
+    re-entry cooldown already discourages re-opening; this line adds the
+    WHY — the operator deliberately exited — so an override is a conscious,
+    justified act rather than a signal-chasing reflex."""
+    if not manual_closes:
+        return ""
+    entries = ", ".join(
+        f"{mc['symbol']} ({mc['at'][:10]})" for mc in manual_closes
+    )
+    return (
+        f"Operator manually closed from the dashboard within the last 7 "
+        f"days: {entries}. The operator deliberately exited these — re-open "
+        f"one only with a strong NEW justification, and say so explicitly "
+        f"in your rationale.\n"
     )
 
 
@@ -447,6 +520,8 @@ def stage_construct(
     hold_ceiling_pct: float = 25.0,
     cooldown_symbols: dict | None = None,
     performance_memo: dict | None = None,
+    user_notes: list[dict] | None = None,
+    manual_closes: list[dict] | None = None,
 ) -> dict:
     """One LLM call — Opus 4.7, ~$0.20. Reads signals + view + current
     positions + recent PnL feedback + the agent's own track record; emits
@@ -477,6 +552,8 @@ def stage_construct(
         f"or add a position above the entry cap.\n"
         f"{_vol_context_line(signals_out)}"
         f"{_cooldown_prompt_line(cooldown_symbols)}"
+        f"{_user_notes_block(user_notes)}"
+        f"{_manual_close_prompt_line(manual_closes or [])}"
         f"Run id: {ctx.run_id}\n"
         "Return JSON conforming to portfolio.schema.json. All positions are "
         "leveraged/inverse ETFs (bullish → bull ETF, bearish → inverse ETF). "
@@ -895,11 +972,41 @@ def _memo_fingerprint(performance_memo: dict | None) -> str:
     return _hash_inputs(json.dumps(performance_memo, sort_keys=True, default=str))
 
 
+def _notes_fingerprint(pending_notes: list[dict] | None) -> str:
+    """Stable hash of the pending user-note id set, used as a dedup key.
+
+    A note typed into the dashboard between two otherwise-identical cycles
+    is new LLM-visible context — dedup must NOT reuse the cached portfolio
+    over it. The stored value is recomputed AFTER consumption at the end of
+    the cycle (normally hashing an empty set), so the next unchanged-market
+    cycle can dedup again once the note has been injected; contrast with
+    memo_fp, which is deliberately stored pre-dedup."""
+    ids = sorted(n.get("id") or "" for n in (pending_notes or []))
+    return _hash_inputs(json.dumps(ids, sort_keys=True))
+
+
+def _manual_closes_fingerprint(manual_closes: list[dict] | None) -> str:
+    """Stable hash of the recent-manual-close set fed to the prompts.
+
+    Membership decays with time alone (a close ages out of the 7-day window
+    with no signal/position/fill change) — the same bug class
+    _cooldown_fingerprint fixed (Codex P2, PR #99). Without this key, a
+    portfolio held flat *because* the operator closed a symbol could be
+    dedup-reused past the window's expiry, suppressing a now-fair re-entry."""
+    rows = sorted(
+        (mc.get("symbol") or "", (mc.get("at") or "")[:10])
+        for mc in (manual_closes or [])
+    )
+    return _hash_inputs(json.dumps(rows, sort_keys=True))
+
+
 def _check_cycle_dedup(
     signals_out: dict,
     current_positions: list[dict],
     cooldown_symbols: dict | None = None,
     memo_fp: str | None = None,
+    notes_fp: str | None = None,
+    manual_closes_fp: str | None = None,
 ) -> dict | None:
     """Return the cached portfolio dict if dedup applies; None otherwise.
 
@@ -911,6 +1018,9 @@ def _check_cycle_dedup(
       - memo_fingerprint matches the prior cycle's (when provided; a hash
         file written before this key existed fails the match, which just
         costs one fresh cycle)
+      - notes_fingerprint + manual_closes_fingerprint match the prior
+        cycle's (same migration semantics: a legacy hash file without the
+        keys fails the match once, then self-heals)
       - state/current_portfolio.json exists (the cached portfolio
         to reuse)
     """
@@ -928,6 +1038,8 @@ def _check_cycle_dedup(
         or last.get("positions_fingerprint") != positions_fp
         or last.get("cooldown_fingerprint") != cooldown_fp
         or last.get("memo_fingerprint") != memo_fp
+        or last.get("notes_fingerprint") != notes_fp
+        or last.get("manual_closes_fingerprint") != manual_closes_fp
     ):
         return None
     try:
@@ -981,18 +1093,25 @@ def _update_cycle_dedup_hash(
     current_positions: list[dict],
     cooldown_symbols: dict | None = None,
     memo_fp: str | None = None,
+    notes_fp: str | None = None,
+    manual_closes_fp: str | None = None,
 ) -> None:
     """Called at the END of a successful cycle to record the fingerprints
     for the NEXT cycle's dedup check. ``memo_fp`` is the fingerprint of
     the memo THIS cycle's LLM stages actually read (computed pre-dedup),
     so the next cycle's freshly built memo is compared against the
-    evidence that produced the cached portfolio. Failures are non-fatal."""
+    evidence that produced the cached portfolio. ``notes_fp`` is the
+    opposite: recomputed by the caller AFTER marking this cycle's notes
+    consumed (normally an empty-set hash), so an unchanged-market cycle
+    right after a consumed note can still dedup. Failures are non-fatal."""
     try:
         state.write_json(state.LAST_CYCLE_HASH, {
             "signals_fingerprint": _signals_fingerprint(signals_out),
             "positions_fingerprint": _positions_fingerprint(current_positions),
             "cooldown_fingerprint": _cooldown_fingerprint(cooldown_symbols),
             "memo_fingerprint": memo_fp,
+            "notes_fingerprint": notes_fp,
+            "manual_closes_fingerprint": manual_closes_fp,
             "updated_at": state.utcnow_iso(),
         })
     except Exception:
@@ -1770,6 +1889,18 @@ def run_pipeline(
     performance_memo = feedback.build_performance_memo_safe()
     memo_fp = _memo_fingerprint(performance_memo)
 
+    # Operator context: pending dashboard notes (injected verbatim into the
+    # strategist + constructor, consumed at end-of-cycle) and recent manual
+    # closes (source=dashboard kill events → explicit prompt line). Both are
+    # $0 and computed pre-dedup so they participate in the fingerprint — a
+    # fresh note or an expiring manual-close entry must force a real cycle.
+    pending_notes = [] if dry_run else state.pending_user_notes()
+    manual_closes = [] if dry_run else _recent_manual_closes(
+        mode=live_gate.trading_mode(ctx.broker),
+    )
+    notes_fp = _notes_fingerprint(pending_notes)
+    manual_closes_fp = _manual_closes_fingerprint(manual_closes)
+
     # ----- Cycle dedup -----
     # Skip strategist + construct + execute and reuse the last portfolio
     # when the signals fingerprint, broker position set, cooldown set, AND
@@ -1778,6 +1909,7 @@ def run_pipeline(
     if not dry_run:
         dedup = _check_cycle_dedup(
             signals_out, current_positions, cooldown_symbols, memo_fp,
+            notes_fp=notes_fp, manual_closes_fp=manual_closes_fp,
         )
         if dedup is not None:
             next_run = _write_dedup_next_run(rid, portfolio=dedup["portfolio"], ctx=ctx)
@@ -1802,6 +1934,8 @@ def run_pipeline(
             current_positions=current_positions,
             pnl_history=pnl_history,
             performance_memo=performance_memo,
+            user_notes=pending_notes,
+            manual_closes=manual_closes,
         ),
         inputs_hash_parts=(rid, json.dumps(signals_out, sort_keys=True)),
         model=strat_model,
@@ -1835,6 +1969,8 @@ def run_pipeline(
             hold_ceiling_pct=hold_ceiling,
             cooldown_symbols=cooldown_symbols,
             performance_memo=performance_memo,
+            user_notes=pending_notes,
+            manual_closes=manual_closes,
         ),
         inputs_hash_parts=(
             rid,
@@ -1930,6 +2066,8 @@ def run_pipeline(
                 f"hold ceiling %: {hold_ceiling:.2f} (a drifted winner may be "
                 f"kept up to this; don't trim back to the entry cap)\n"
                 f"{_cooldown_prompt_line(cooldown_symbols)}"
+                f"{_user_notes_block(pending_notes)}"
+                f"{_manual_close_prompt_line(manual_closes)}"
                 f"Run id: {ctx.run_id}\n"
                 f"Critic rejected your first attempt: {critique.get('critique')}. "
                 f"Suggested changes: {json.dumps(critique.get('suggested_changes', []))}. "
@@ -2066,13 +2204,27 @@ def run_pipeline(
         # Publish only the tradable subset — never record an option-shaped or
         # non-universe position the order layer refused (it was never held).
         state.write_json(state.CURRENT_PORTFOLIO, _publishable_portfolio(portfolio))
+        # Mark this cycle's injected notes consumed ONLY on the published
+        # path — a failed/blocked cycle leaves them pending so they
+        # re-inject next cycle (worst case the agent reads a note twice).
+        if pending_notes:
+            try:
+                state.append_user_notes_consumed(
+                    [n["id"] for n in pending_notes if n.get("id")], run_id=rid,
+                )
+            except Exception:
+                pass
         # Update the cycle-dedup fingerprints so the next cycle can
         # short-circuit cleanly if nothing material changed. memo_fp is the
         # pre-dedup fingerprint — the memo this cycle's LLM stages read; a
         # fill or kill event recorded since (e.g. by this cycle's execute)
         # changes the next cycle's freshly built memo and invalidates dedup.
+        # notes_fp is recomputed POST-consumption (normally an empty-set
+        # hash) so the next quiet cycle can dedup once the note is injected.
         _update_cycle_dedup_hash(
             signals_out, current_positions, cooldown_symbols, memo_fp,
+            notes_fp=_notes_fingerprint(state.pending_user_notes()),
+            manual_closes_fp=manual_closes_fp,
         )
 
     return {

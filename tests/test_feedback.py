@@ -298,3 +298,33 @@ def test_live_since_uses_earlier_of_marker_and_first_live_fill(tmp_state):
     assert es["live"]["trades"] == 1
     assert es["paper"]["trades"] == 0
     assert memo["recent_exits"][0]["mode"] == "live"
+
+
+def test_memo_recent_exits_tag_manual_close(tmp_state):
+    """A dashboard manual close (source=dashboard kill event within 6h of
+    the closing fill) is attributed to the operator; the same event >6h
+    away degrades to agent_decision — documents the after-hours gap where
+    Alpaca queues the close for next open."""
+    rows = [
+        _fill("TQQQ", "buy", 4, 70.0, run_id="r1", at="2026-06-01T14:00:00Z", aid="a1"),
+        _fill("TQQQ", "sell", 4, 80.0, at="2026-06-03T14:00:00Z", aid="a2"),
+        _fill("SOXL", "buy", 10, 30.0, run_id="r1", at="2026-06-01T14:00:00Z", aid="a3"),
+        _fill("SOXL", "sell", 10, 40.0, at="2026-06-04T14:00:00Z", aid="a4"),
+    ]
+    kill_events = [
+        # 30 min before TQQQ's close → attributed to the operator.
+        {"at": "2026-06-03T13:30:00Z", "symbol": "TQQQ",
+         "reason": "manual close from dashboard",
+         "exit_kind": "manual_close", "source": "dashboard"},
+        # SOXL manual-close event 20h before the fill → outside the 6h
+        # window, falls back to agent_decision.
+        {"at": "2026-06-03T18:00:00Z", "symbol": "SOXL",
+         "reason": "manual close from dashboard",
+         "exit_kind": "manual_close", "source": "dashboard"},
+    ]
+    memo = feedback.build_performance_memo(
+        trade_rows=rows, cost_rows=[], kill_events=kill_events,
+    )
+    exits = {r["symbol"]: r for r in memo["recent_exits"]}
+    assert exits["TQQQ"]["exit_kind"] == "manual_close"
+    assert exits["SOXL"]["exit_kind"] == "agent_decision"
