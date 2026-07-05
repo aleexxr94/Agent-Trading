@@ -2248,14 +2248,23 @@ def user_notes_view(limit: int = 50) -> dict:
     consumed_run_id so the operator can see exactly which cycle read them.
     Notes that fell out of the age window without ever being consumed are
     shown as consumed with run_id None ("expired") rather than hidden.
+    "Pending" is era-scoped to the active trading mode (Codex P2, PR #114),
+    matching exactly what the pipeline will inject — a cross-era leftover
+    shows as consumed/expired instead of promising an injection that will
+    never happen.
     """
+    from . import live_gate
+
     notes = state.read_user_notes(limit=limit)
     markers = {
         m["note_id"]: m
         for m in state.read_user_notes_consumed()
         if m.get("note_id")
     }
-    pending_ids = {n.get("id") for n in state.pending_user_notes()}
+    pending_ids = {
+        n.get("id")
+        for n in state.pending_user_notes(mode=live_gate.trading_mode())
+    }
     pending, consumed = [], []
     for n in reversed(notes):
         if n.get("id") in pending_ids:

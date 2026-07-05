@@ -750,3 +750,21 @@ def test_wipe_run_history_truncates_kill_events(tmp_state):
     })
     state.wipe_run_history(backup=False)
     assert state.read_kill_events() == []
+
+
+def test_pending_user_notes_mode_filter(tmp_state):
+    """Codex P2 (PR #114): a paper-era note that was never consumed must
+    not inject into live-mode prompts after promotion (and vice versa).
+    mode=None keeps returning all eras for display surfaces."""
+    paper = state.append_user_note("paper-era guidance")
+    rows = state.read_user_notes()
+    rows.append({**rows[0], "id": "live-note", "text": "live-era guidance",
+                 "mode": "live"})
+    state.USER_NOTES_LOG.write_text(
+        "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8",
+    )
+    assert {n["id"] for n in state.pending_user_notes()} == {
+        paper["id"], "live-note",
+    }
+    assert [n["id"] for n in state.pending_user_notes(mode="paper")] == [paper["id"]]
+    assert [n["id"] for n in state.pending_user_notes(mode="live")] == ["live-note"]

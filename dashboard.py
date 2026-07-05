@@ -1200,98 +1200,6 @@ with tabs[0]:
                 "configured — see README §Setup."
             )
 
-        # ---------- Manual close ----------
-        # Operator override: flatten a single position on demand via
-        # lib.manual_actions (broker.flatten + manual_close kill event +
-        # trailing-peak cleanup + fill sync). Deliberately available while
-        # halted — halt.flag stops the agents, not the human reducing risk.
-        with st.expander("⚡ Close a position manually", expanded=False):
-            # Render-and-clear the result of the previous confirm click —
-            # stashed in session_state so it survives the st.rerun().
-            _mc_result = st.session_state.pop("manual_close_result", None)
-            if _mc_result is not None:
-                if _mc_result["ok"]:
-                    st.success(_mc_result["message"])
-                else:
-                    st.error(_mc_result["message"])
-
-            if not broker_view.available:
-                st.caption("Broker unreachable — manual close disabled.")
-            else:
-                st.caption(
-                    "Submits a market order to flatten the position NOW and "
-                    "records a `manual_close` kill event, so the agents see "
-                    "the exit was yours (not theirs) and the 7-day re-entry "
-                    "cooldown engages once the fill syncs. Outside market "
-                    "hours Alpaca queues the close for the next open. If an "
-                    "orchestrator cycle is running right now, it may act on "
-                    "pre-close state; the next cycle self-corrects."
-                )
-                if halted:
-                    st.caption(
-                        "🛑 Halted — closes are still allowed: halt.flag "
-                        "stops the agents, not your risk reduction."
-                    )
-                for r in rows:
-                    sym = r["Symbol"]
-                    c_label, c_btn, c_cancel = st.columns([3, 1, 1])
-                    _net = r.get("Net P&L")
-                    c_label.markdown(
-                        f"**{sym}** · {r.get('Shares', '—')} shares · Net P&L "
-                        f"{'—' if _net is None else f'${_net:+,.2f}'}"
-                    )
-                    pending_key = f"close_pending_{sym}"
-                    if not st.session_state.get(pending_key):
-                        if c_btn.button("Close", key=f"close-{sym}"):
-                            st.session_state[pending_key] = True
-                            st.rerun()
-                    else:
-                        if c_btn.button(
-                            f"✅ Confirm", key=f"close-confirm-{sym}", type="primary",
-                        ):
-                            # Pop the arm-key BEFORE the broker call so a
-                            # mid-flight rerun re-renders unarmed (double-
-                            # submit protection; a stray second confirm hits
-                            # the already-closed path harmlessly).
-                            st.session_state.pop(pending_key, None)
-                            from lib import manual_actions
-                            res = manual_actions.close_position_manually(sym)
-                            if res.ok:
-                                msg = (
-                                    f"Close accepted for **{sym}** (order "
-                                    f"`{res.order.broker_order_id}`, status "
-                                    f"{res.order.status}). The SELL appears in "
-                                    "the Trades tab after sync; the 7-day "
-                                    "re-entry cooldown engages once synced."
-                                )
-                                if res.sync_error:
-                                    msg += (
-                                        " Fill sync deferred "
-                                        f"(`{res.sync_error}`) — the "
-                                        "orchestrator resyncs before its next "
-                                        "cycle."
-                                    )
-                                st.session_state["manual_close_result"] = {
-                                    "ok": True, "message": msg,
-                                }
-                            else:
-                                st.session_state["manual_close_result"] = {
-                                    "ok": False,
-                                    "message": (
-                                        f"Close FAILED for **{sym}**: "
-                                        f"{res.error}. No kill event recorded; "
-                                        "position unchanged."
-                                    ),
-                                }
-                            st.rerun()
-                        if c_cancel.button("↩ Cancel", key=f"close-cancel-{sym}"):
-                            st.session_state.pop(pending_key, None)
-                            st.rerun()
-                        st.warning(
-                            f"⚠️ Press **Confirm** to market-close {sym} at "
-                            "the broker."
-                        )
-
         col_pie, col_bar = st.columns([1, 1])
         with col_pie:
             pie_data = dd.allocation_pie(portfolio)
@@ -1360,6 +1268,113 @@ with tabs[0]:
                 st.info("Per-position P&L bar populates once marks are available.")
     elif not is_all_cash:
         st.write("No open positions.")
+
+    # ---------- Manual close ----------
+    # Operator override: flatten a single position on demand via
+    # lib.manual_actions (broker.flatten + manual_close kill event +
+    # trailing-peak cleanup + fill sync). Deliberately available while
+    # halted — halt.flag stops the agents, not the human reducing risk.
+    #
+    # The symbol list comes from BROKER holdings, not portfolio.json rows
+    # (Codex P2, PR #114): after a history wipe, an unreconciled cycle, or
+    # an external open, the broker can hold a position the snapshot doesn't
+    # know about — exactly the holding an operator most needs to flatten —
+    # so the close list must never be gated on the snapshot. Sits outside
+    # the `if rows:` block for the same reason.
+    _close_symbols = sorted(broker_view.held_keys) if broker_view.available else []
+    _row_by_symbol = {r["Symbol"]: r for r in rows}
+    if broker_view.available and _close_symbols:
+        with st.expander("⚡ Close a position manually", expanded=False):
+            # Render-and-clear the result of the previous confirm click —
+            # stashed in session_state so it survives the st.rerun().
+            _mc_result = st.session_state.pop("manual_close_result", None)
+            if _mc_result is not None:
+                if _mc_result["ok"]:
+                    st.success(_mc_result["message"])
+                else:
+                    st.error(_mc_result["message"])
+
+            st.caption(
+                "Submits a market order to flatten the position NOW and "
+                "records a `manual_close` kill event, so the agents see "
+                "the exit was yours (not theirs) and the 7-day re-entry "
+                "cooldown engages once the fill syncs. Outside market "
+                "hours Alpaca queues the close for the next open. If an "
+                "orchestrator cycle is running right now, it may act on "
+                "pre-close state; the next cycle self-corrects."
+            )
+            if halted:
+                st.caption(
+                    "🛑 Halted — closes are still allowed: halt.flag "
+                    "stops the agents, not your risk reduction."
+                )
+            for sym in _close_symbols:
+                r = _row_by_symbol.get(sym)
+                c_label, c_btn, c_cancel = st.columns([3, 1, 1])
+                if r is not None:
+                    _net = r.get("Net P&L")
+                    c_label.markdown(
+                        f"**{sym}** · {r.get('Shares', '—')} shares · Net P&L "
+                        f"{'—' if _net is None else f'${_net:+,.2f}'}"
+                    )
+                else:
+                    c_label.markdown(
+                        f"**{sym}** · broker-only holding (not in the "
+                        "agent's last portfolio)"
+                    )
+                pending_key = f"close_pending_{sym}"
+                if not st.session_state.get(pending_key):
+                    if c_btn.button("Close", key=f"close-{sym}"):
+                        st.session_state[pending_key] = True
+                        st.rerun()
+                else:
+                    if c_btn.button(
+                        "✅ Confirm", key=f"close-confirm-{sym}", type="primary",
+                    ):
+                        # Pop the arm-key BEFORE the broker call so a
+                        # mid-flight rerun re-renders unarmed (double-
+                        # submit protection; a stray second confirm hits
+                        # the already-closed path harmlessly).
+                        st.session_state.pop(pending_key, None)
+                        from lib import manual_actions
+                        res = manual_actions.close_position_manually(sym)
+                        if res.ok:
+                            msg = (
+                                f"Close accepted for **{sym}** (order "
+                                f"`{res.order.broker_order_id}`, status "
+                                f"{res.order.status}). The SELL appears in "
+                                "the Trades tab after sync; the 7-day "
+                                "re-entry cooldown engages once synced."
+                            )
+                            if res.sync_error:
+                                msg += (
+                                    " Fill sync deferred "
+                                    f"(`{res.sync_error}`) — the "
+                                    "orchestrator resyncs before its next "
+                                    "cycle."
+                                )
+                            st.session_state["manual_close_result"] = {
+                                "ok": True, "message": msg,
+                            }
+                        else:
+                            st.session_state["manual_close_result"] = {
+                                "ok": False,
+                                "message": (
+                                    f"Close FAILED for **{sym}**: "
+                                    f"{res.error}. No kill event recorded; "
+                                    "position unchanged."
+                                ),
+                            }
+                        st.rerun()
+                    if c_cancel.button("↩ Cancel", key=f"close-cancel-{sym}"):
+                        st.session_state.pop(pending_key, None)
+                        st.rerun()
+                    st.warning(
+                        f"⚠️ Press **Confirm** to market-close {sym} at "
+                        "the broker."
+                    )
+    elif not broker_view.available:
+        st.caption("⚡ Manual close unavailable — broker unreachable.")
 
     # ---------- Universe reference ----------
     # Plain-English explainer for every ticker the agent may trade, below

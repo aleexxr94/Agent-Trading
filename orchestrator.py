@@ -1894,7 +1894,9 @@ def run_pipeline(
     # closes (source=dashboard kill events → explicit prompt line). Both are
     # $0 and computed pre-dedup so they participate in the fingerprint — a
     # fresh note or an expiring manual-close entry must force a real cycle.
-    pending_notes = [] if dry_run else state.pending_user_notes()
+    pending_notes = [] if dry_run else state.pending_user_notes(
+        mode=live_gate.trading_mode(ctx.broker),
+    )
     manual_closes = [] if dry_run else _recent_manual_closes(
         mode=live_gate.trading_mode(ctx.broker),
     )
@@ -2223,7 +2225,12 @@ def run_pipeline(
         # hash) so the next quiet cycle can dedup once the note is injected.
         _update_cycle_dedup_hash(
             signals_out, current_positions, cooldown_symbols, memo_fp,
-            notes_fp=_notes_fingerprint(state.pending_user_notes()),
+            # Same mode filter as the pre-dedup read — an unconsumed
+            # cross-era note must hash identically on both sides or dedup
+            # would never match again.
+            notes_fp=_notes_fingerprint(state.pending_user_notes(
+                mode=live_gate.trading_mode(ctx.broker),
+            )),
             manual_closes_fp=manual_closes_fp,
         )
 

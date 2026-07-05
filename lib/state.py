@@ -930,17 +930,25 @@ def read_consumed_note_ids() -> set[str]:
 def pending_user_notes(
     *, now: datetime | None = None,
     max_age_days: float = USER_NOTES_MAX_AGE_DAYS,
+    mode: str | None = None,
 ) -> list[dict]:
     """Notes awaiting injection: unconsumed and younger than max_age_days.
 
     Oldest-first (injection order). The age window is a defensive expiry so
     a note whose consumption marker never got written can't inject forever.
+
+    ``mode`` era-scopes the result like every other prompt input (Codex P2,
+    PR #114): a paper-era note that was never consumed before promotion must
+    not steer real-money prompts — pass the active trading mode to filter.
+    None (default) returns all eras, for display surfaces.
     """
     now = now or utcnow()
     consumed = read_consumed_note_ids()
     pending = []
     for row in read_user_notes():
         if row.get("id") in consumed:
+            continue
+        if mode is not None and record_mode(row) != mode:
             continue
         try:
             at = datetime.fromisoformat((row.get("at") or "").replace("Z", "+00:00"))
