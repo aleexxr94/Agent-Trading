@@ -2578,3 +2578,17 @@ def test_position_table_rows_gross_when_cost_model_disabled(tmp_state, monkeypat
     on = dd.position_table_rows(portfolio, marks=marks, held_keys=frozenset({"TQQQ"}))[0]
     assert on["Fees"] > 0.0
     assert on["Net P&L"] == pytest.approx(on["Gross P&L"] - on["Fees"])
+
+
+def test_user_notes_view_partitions_pending_and_consumed(tmp_state):
+    from lib import dashboard_data as dd
+
+    a = state.append_user_note("consumed note")
+    b = state.append_user_note("pending note")
+    state.append_user_notes_consumed([a["id"]], run_id="r42")
+    view = dd.user_notes_view()
+    assert [n["text"] for n in view["pending"]] == ["pending note"]
+    assert [n["text"] for n in view["consumed"]] == ["consumed note"]
+    assert view["consumed"][0]["consumed_run_id"] == "r42"
+    assert view["consumed"][0]["consumed_at"]
+    assert b["id"] == view["pending"][0]["id"]

@@ -2237,3 +2237,43 @@ def readiness_scorecard(nav_rows: list[dict] | None = None) -> list[dict]:
         "met": failures == 0,
     })
     return rows
+
+
+def user_notes_view(limit: int = 50) -> dict:
+    """Join user notes with their consumption markers for the dashboard.
+
+    Returns {"pending": [...], "consumed": [...]}, both newest-first.
+    Pending rows are the notes the next trade cycle will inject (same
+    filter as state.pending_user_notes); consumed rows carry consumed_at +
+    consumed_run_id so the operator can see exactly which cycle read them.
+    Notes that fell out of the age window without ever being consumed are
+    shown as consumed with run_id None ("expired") rather than hidden.
+    "Pending" is era-scoped to the active trading mode (Codex P2, PR #114),
+    matching exactly what the pipeline will inject — a cross-era leftover
+    shows as consumed/expired instead of promising an injection that will
+    never happen.
+    """
+    from . import live_gate
+
+    notes = state.read_user_notes(limit=limit)
+    markers = {
+        m["note_id"]: m
+        for m in state.read_user_notes_consumed()
+        if m.get("note_id")
+    }
+    pending_ids = {
+        n.get("id")
+        for n in state.pending_user_notes(mode=live_gate.trading_mode())
+    }
+    pending, consumed = [], []
+    for n in reversed(notes):
+        if n.get("id") in pending_ids:
+            pending.append(n)
+            continue
+        m = markers.get(n.get("id"), {})
+        consumed.append({
+            **n,
+            "consumed_at": m.get("at"),
+            "consumed_run_id": m.get("run_id"),
+        })
+    return {"pending": pending, "consumed": consumed}

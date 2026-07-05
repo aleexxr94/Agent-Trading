@@ -670,3 +670,101 @@ def test_write_live_transition_once_raises_on_corrupt_existing_file(tmp_state):
             live_starting_equity_usd=5000.0, nav_cap_usd=2500.0,
             run_id="r1", live_version=1,
         )
+
+
+# --------- user notes (dashboard "Note to agents" box) ---------
+
+
+def test_user_note_append_read_pending_roundtrip(tmp_state):
+    row = state.append_user_note("  wary of semis into NVDA earnings  ")
+    assert row["text"] == "wary of semis into NVDA earnings"  # stripped
+    assert row["id"] and row["at"]
+    assert row["mode"] == "paper"
+    notes = state.read_user_notes()
+    assert len(notes) == 1 and notes[0]["id"] == row["id"]
+    pending = state.pending_user_notes()
+    assert [n["id"] for n in pending] == [row["id"]]
+
+
+def test_user_note_rejects_empty_and_oversized(tmp_state):
+    with pytest.raises(ValueError):
+        state.append_user_note("   ")
+    with pytest.raises(ValueError):
+        state.append_user_note("x" * (state.USER_NOTE_MAX_CHARS + 1))
+    assert state.read_user_notes() == []
+
+
+def test_user_notes_missing_files_read_empty(tmp_state):
+    assert state.read_user_notes() == []
+    assert state.read_user_notes_consumed() == []
+    assert state.read_consumed_note_ids() == set()
+    assert state.pending_user_notes() == []
+
+
+def test_user_notes_consumed_removes_from_pending_not_log(tmp_state):
+    a = state.append_user_note("note a")
+    b = state.append_user_note("note b")
+    state.append_user_notes_consumed([a["id"]], run_id="r1")
+    # Log keeps both rows — append-only, never mutated.
+    assert len(state.read_user_notes()) == 2
+    pending = state.pending_user_notes()
+    assert [n["id"] for n in pending] == [b["id"]]
+    markers = state.read_user_notes_consumed()
+    assert markers[0]["note_id"] == a["id"]
+    assert markers[0]["run_id"] == "r1"
+
+
+def test_user_notes_age_window_expires_unconsumed(tmp_state):
+    old = state.append_user_note("stale guidance")
+    fresh = state.append_user_note("fresh guidance")
+    # Rewrite the old row with a 15-day-old timestamp (test-only surgery on
+    # the log file; production rows are always stamped at append time).
+    rows = state.read_user_notes()
+    rows[0]["at"] = "2026-06-20T00:00:00Z"
+    state.USER_NOTES_LOG.write_text(
+        "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8",
+    )
+    from datetime import datetime, timezone
+    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    pending = state.pending_user_notes(now=now)
+    assert [n["id"] for n in pending] == [fresh["id"]]
+    assert old["id"] not in {n["id"] for n in pending}
+
+
+def test_wipe_run_history_truncates_user_notes(tmp_state):
+    state.append_user_note("note before wipe")
+    state.append_user_notes_consumed(["x"], run_id="r1")
+    state.wipe_run_history(backup=False)
+    assert state.read_user_notes() == []
+    assert state.read_user_notes_consumed() == []
+
+
+def test_wipe_run_history_truncates_kill_events(tmp_state):
+    """Codex P2 (PR #114): kill_events.jsonl is read STANDALONE by the
+    manual-close prompt line, so a wiped experiment's exits must not keep
+    telling the fresh experiment's agents not to re-open a symbol."""
+    state.append_kill_event({
+        "at": state.utcnow_iso(), "symbol": "SOXL",
+        "reason": "manual close from dashboard",
+        "exit_kind": "manual_close", "source": "dashboard", "mode": "paper",
+    })
+    state.wipe_run_history(backup=False)
+    assert state.read_kill_events() == []
+
+
+def test_pending_user_notes_mode_filter(tmp_state):
+    """Codex P2 (PR #114): a paper-era note that was never consumed must
+    not inject into live-mode prompts after promotion (and vice versa).
+    mode=None keeps returning all eras for display surfaces."""
+    paper = state.append_user_note("paper-era guidance")
+    rows = state.read_user_notes()
+    rows.append({**rows[0], "id": "live-note", "text": "live-era guidance",
+                 "mode": "live"})
+    state.USER_NOTES_LOG.write_text(
+        "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8",
+    )
+    assert {n["id"] for n in state.pending_user_notes()} == {
+        paper["id"], "live-note",
+    }
+    assert [n["id"] for n in state.pending_user_notes(mode="paper")] == [paper["id"]]
+    assert [n["id"] for n in state.pending_user_notes(mode="live")] == ["live-note"]
