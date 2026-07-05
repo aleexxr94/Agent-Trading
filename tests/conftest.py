@@ -31,6 +31,8 @@ def tmp_state(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setattr(state_mod, "NAV_OFFSET_FLAG", sd / "nav_offset.json")
     monkeypatch.setattr(state_mod, "NAV_MANUAL_BASELINE_FLAG", sd / "nav_manual_baseline.json")
     monkeypatch.setattr(state_mod, "KILL_EVENTS_LOG", sd / "kill_events.jsonl")
+    monkeypatch.setattr(state_mod, "USER_NOTES_LOG", sd / "user_notes.jsonl")
+    monkeypatch.setattr(state_mod, "USER_NOTES_CONSUMED_LOG", sd / "user_notes_consumed.jsonl")
     monkeypatch.setattr(state_mod, "POSITION_PEAKS", sd / "position_peaks.json")
     monkeypatch.setattr(state_mod, "LIVE_TRANSITION", sd / "live_transition.json")
     return sd

@@ -66,6 +66,21 @@ MONITOR_SHADOW_LOG = STATE_DIR / "monitor_shadow.jsonl"
 # dashboard's calibration view attribute closed trades to the exit machinery
 # that fired them — without this the AI can never see WHY positions died.
 KILL_EVENTS_LOG = STATE_DIR / "kill_events.jsonl"
+# Operator notes typed into the dashboard's "Note to agents" box. Append-only;
+# each row is injected VERBATIM into the next trade cycle's strategist +
+# constructor user messages (labeled as guidance, not an order), then marked
+# consumed via USER_NOTES_CONSUMED_LOG. No schema file — helper-enforced
+# shape, kill_events.jsonl precedent.
+USER_NOTES_LOG = STATE_DIR / "user_notes.jsonl"
+# Sidecar consumption markers: one row per (note_id, run_id) when a completed
+# trade cycle injected the note. Kept separate so BOTH files stay append-only
+# (no in-place consumed_at stamping) and a note appended mid-cycle can't be
+# swallowed by a timestamp-cursor comparison.
+USER_NOTES_CONSUMED_LOG = STATE_DIR / "user_notes_consumed.jsonl"
+# Belt-and-braces expiry: a note that somehow never gets a consumption marker
+# (e.g. every cycle since it was written failed before the publish block)
+# still stops injecting after this many days.
+USER_NOTES_MAX_AGE_DAYS = 14.0
 # Per-position peak marks for trailing stops the constructor chose to set:
 # {symbol: {"peak_mark": float, "updated_at": iso}}. Maintained by monitor.py;
 # entries are dropped when the position is no longer held so a re-entry
@@ -819,6 +834,124 @@ def read_kill_events(limit: int | None = None) -> list[dict]:
     return rows
 
 
+# --------- user notes (dashboard "Note to agents" box) ---------
+
+# Bounds prompt cost: notes are injected verbatim into two LLM stages'
+# user messages, so an unbounded paste could bloat every cycle.
+USER_NOTE_MAX_CHARS = 2000
+
+
+def append_user_note(text: str, *, source: str = "dashboard") -> dict:
+    """Append one operator note to state/user_notes.jsonl and return the row.
+
+    Raises ValueError on empty/whitespace-only text or text longer than
+    USER_NOTE_MAX_CHARS. The row carries a unique id (run_id format) that
+    the consumption log references.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        raise ValueError("user note is empty")
+    if len(cleaned) > USER_NOTE_MAX_CHARS:
+        raise ValueError(
+            f"user note exceeds {USER_NOTE_MAX_CHARS} chars ({len(cleaned)})"
+        )
+    row = {
+        "id": new_run_id(),
+        "at": utcnow_iso(),
+        "text": cleaned,
+        "source": source,
+        "mode": _default_record_mode(),
+    }
+    USER_NOTES_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with USER_NOTES_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, sort_keys=False) + "\n")
+    return row
+
+
+def read_user_notes(limit: int | None = None) -> list[dict]:
+    """Return user-note rows (oldest first). Pass `limit` to cap."""
+    if not USER_NOTES_LOG.exists():
+        return []
+    rows = []
+    for line in USER_NOTES_LOG.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    if limit is not None:
+        return rows[-limit:]
+    return rows
+
+
+def append_user_notes_consumed(
+    note_ids: list[str], *, run_id: str | None, reason: str = "cycle",
+) -> None:
+    """Mark notes as consumed (injected into a completed cycle's prompts).
+
+    One row per id in state/user_notes_consumed.jsonl. The notes log itself
+    is never mutated.
+    """
+    if not note_ids:
+        return
+    USER_NOTES_CONSUMED_LOG.parent.mkdir(parents=True, exist_ok=True)
+    at = utcnow_iso()
+    with USER_NOTES_CONSUMED_LOG.open("a", encoding="utf-8") as f:
+        for nid in note_ids:
+            f.write(json.dumps(
+                {"note_id": nid, "run_id": run_id, "reason": reason, "at": at},
+                sort_keys=False,
+            ) + "\n")
+
+
+def read_user_notes_consumed() -> list[dict]:
+    """Return consumption-marker rows (oldest first)."""
+    if not USER_NOTES_CONSUMED_LOG.exists():
+        return []
+    rows = []
+    for line in USER_NOTES_CONSUMED_LOG.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def read_consumed_note_ids() -> set[str]:
+    """Ids of every note a completed cycle has already injected."""
+    return {
+        r["note_id"] for r in read_user_notes_consumed() if r.get("note_id")
+    }
+
+
+def pending_user_notes(
+    *, now: datetime | None = None,
+    max_age_days: float = USER_NOTES_MAX_AGE_DAYS,
+) -> list[dict]:
+    """Notes awaiting injection: unconsumed and younger than max_age_days.
+
+    Oldest-first (injection order). The age window is a defensive expiry so
+    a note whose consumption marker never got written can't inject forever.
+    """
+    now = now or utcnow()
+    consumed = read_consumed_note_ids()
+    pending = []
+    for row in read_user_notes():
+        if row.get("id") in consumed:
+            continue
+        try:
+            at = datetime.fromisoformat((row.get("at") or "").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if (now - at).total_seconds() > max_age_days * 86400.0:
+            continue
+        pending.append(row)
+    return pending
+
+
 def read_position_peaks() -> dict:
     """Return the trailing-stop peak-mark map ({symbol: {peak_mark,
     updated_at}}). Empty dict when missing or unreadable — a lost peak
@@ -937,7 +1070,12 @@ def wipe_run_history(*, include_costs: bool = True, backup: bool = True) -> dict
 
     # Truncate (don't unlink) the JSONL audit logs so anything that holds
     # a file handle keeps writing without recreating mode/owner issues.
-    jsonl_files = [DECISIONS_LOG, TRADES_LOG, NAV_HISTORY_LOG, MONITOR_SHADOW_LOG]
+    # User notes are wiped too: stale operator guidance must not leak into a
+    # "start fresh" experiment (the backup dir preserves them regardless).
+    jsonl_files = [
+        DECISIONS_LOG, TRADES_LOG, NAV_HISTORY_LOG, MONITOR_SHADOW_LOG,
+        USER_NOTES_LOG, USER_NOTES_CONSUMED_LOG,
+    ]
     if include_costs:
         jsonl_files.append(COSTS_LOG)
     for f in jsonl_files:
