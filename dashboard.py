@@ -516,6 +516,46 @@ st.markdown(
 
       /* slightly larger body type for readability */
       .stMarkdown, .stCaption, p { font-size: 0.95rem; }
+
+      /* Universe reference table — custom HTML instead of st.dataframe so
+         the "What it is" column WRAPS (grid cells are single-line +
+         ellipsis, unreadable on phones). The wrapper scrolls both ways as
+         a fallback on very narrow screens; momentum scrolling for iOS. */
+      .at-uni-wrap {
+        overflow-x: auto; overflow-y: auto; max-height: 460px;
+        -webkit-overflow-scrolling: touch;
+        border: 1px solid var(--border); border-radius: 8px;
+      }
+      .at-uni-table {
+        width: 100%; border-collapse: collapse; font-size: 0.88rem;
+      }
+      .at-uni-table th {
+        position: sticky; top: 0; z-index: 1;
+        background: var(--bg-2); color: var(--text-1);
+        text-align: left; font-weight: 600; white-space: nowrap;
+        padding: 0.45rem 0.6rem; border-bottom: 2px solid var(--border);
+      }
+      .at-uni-table td {
+        padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border);
+        vertical-align: top; white-space: nowrap; color: var(--text-0);
+      }
+      /* the explainer column wraps and gets the leftover width */
+      .at-uni-table td.at-uni-explainer {
+        white-space: normal; min-width: 14rem; max-width: 34rem;
+        line-height: 1.45; color: var(--text-1);
+      }
+      .at-uni-table tr.at-uni-win  td { background-color: #d1fae5; color: #065f46; }
+      .at-uni-table tr.at-uni-loss td { background-color: #fee2e2; color: #991b1b; }
+      .at-uni-table tr.at-uni-open td { background-color: #e2e8f0; color: #0f172a; }
+      /* Phones: drop the columns whose content the explainer already
+         restates (direction, leverage, pair) and the P&L column (the row
+         tint carries win/loss), so Symbol · Factor · What-it-is fit the
+         screen with no horizontal scrolling. */
+      @media (max-width: 640px) {
+        .at-uni-table .at-uni-hide-sm { display: none; }
+        .at-uni-table td { white-space: normal; }
+        .at-uni-table td.at-uni-explainer { min-width: 0; }
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1384,59 +1424,46 @@ with tabs[0]:
     st.markdown('<div class="at-section-label">Universe reference</div>', unsafe_allow_html=True)
     open_pnl_by_symbol = {r["Symbol"]: r.get("Net P&L") for r in rows}
     uni_rows = dd.universe_explainer_rows(open_pnl_by_symbol)
-    df_uni = pd.DataFrame(uni_rows)
-    uni_status = df_uni.pop("_status")
-    # Pre-format to strings: the data grid formats NumberColumn cells from
-    # the raw value (styler display text is ignored there), and a raw None
-    # renders as the literal "None" — a string column renders verbatim.
-    df_uni["Open P&L"] = [
-        "—" if pd.isna(v) else f"${v:+,.2f}" for v in df_uni["Open P&L"]
-    ]
 
-    def _universe_row_style(row: "pd.Series") -> list[str]:
-        status = uni_status.loc[row.name]
-        if status == "win":
-            css = "background-color: #d1fae5; color: #065f46"
-        elif status == "loss":
-            css = "background-color: #fee2e2; color: #991b1b"
-        elif status == "open":
-            css = "background-color: #e2e8f0; color: #0f172a"
-        else:
-            return [""] * len(row)
-        return [css] * len(row)
-
-    styled_uni = (
-        df_uni.style
-        .format(na_rep="—", precision=None)
-        .apply(_universe_row_style, axis=1)
-    )
-    st.dataframe(
-        styled_uni,
-        width="stretch",
-        hide_index=True,
-        height=430,
-        column_config={
-            "Symbol":    st.column_config.Column("Symbol", width="small"),
-            "Factor":    st.column_config.Column("Factor", width="small"),
-            "Direction": st.column_config.Column(
-                "Direction", width="small",
-                help="Bull = rises with the factor; Bear = inverse ETF that "
-                     "rises when the factor falls (the system never shorts).",
-            ),
-            "Leverage":  st.column_config.Column("Leverage", width="small"),
-            "Pair":      st.column_config.Column(
-                "Pair", width="small",
-                help="Opposite-direction ETF on the same factor; — for solo "
-                     "lines with no liquid counterpart.",
-            ),
-            "Explainer": st.column_config.Column("What it is", width="large"),
-            "Open P&L":  st.column_config.Column(
-                "Open P&L",
-                width="small",
-                help="Net P&L of the currently-open position in this ticker "
-                     "(— when not held, or held but unmarked).",
-            ),
-        },
+    # Custom HTML table instead of st.dataframe: grid cells are single-line
+    # + ellipsis, which made the "What it is" column unreadable on phones.
+    # Here the explainer wraps to the available width and the .at-uni-wrap
+    # container scrolls (both axes) as a fallback on very narrow screens.
+    _uni_cells_html = []
+    for u in uni_rows:
+        status = u.get("_status") or ""
+        row_cls = f' class="at-uni-{status}"' if status else ""
+        pnl = u.get("Open P&L")
+        pnl_txt = "—" if pnl is None else f"${pnl:+,.2f}"
+        _uni_cells_html.append(
+            f"<tr{row_cls}>"
+            f"<td><strong>{html.escape(str(u['Symbol']))}</strong></td>"
+            f"<td>{html.escape(str(u['Factor']))}</td>"
+            f"<td class=\"at-uni-hide-sm\">{html.escape(str(u['Direction']))}</td>"
+            f"<td class=\"at-uni-hide-sm\">{html.escape(str(u['Leverage']))}</td>"
+            f"<td class=\"at-uni-hide-sm\">{html.escape(str(u.get('Pair') or '—'))}</td>"
+            f"<td class=\"at-uni-explainer\">{html.escape(str(u['Explainer']))}</td>"
+            f"<td class=\"at-uni-hide-sm\">{html.escape(pnl_txt)}</td>"
+            f"</tr>"
+        )
+    st.markdown(
+        '<div class="at-uni-wrap"><table class="at-uni-table">'
+        "<thead><tr>"
+        "<th>Symbol</th><th>Factor</th>"
+        '<th class="at-uni-hide-sm" title="Bull = rises with the factor; '
+        "Bear = inverse ETF that rises when the factor falls (the system "
+        'never shorts).">Direction</th>'
+        '<th class="at-uni-hide-sm">Leverage</th>'
+        '<th class="at-uni-hide-sm" title="Opposite-direction ETF on the '
+        'same factor; — for solo lines with no liquid counterpart.">Pair</th>'
+        "<th>What it is</th>"
+        '<th class="at-uni-hide-sm" title="Net P&amp;L of the currently-open '
+        'position in this ticker (— when not held, or held but '
+        'unmarked).">Open P&amp;L</th>'
+        "</tr></thead>"
+        f"<tbody>{''.join(_uni_cells_html)}</tbody>"
+        "</table></div>",
+        unsafe_allow_html=True,
     )
     st.caption(
         "Green = open position currently winning · red = losing · grey = "
