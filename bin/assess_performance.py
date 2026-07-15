@@ -134,13 +134,60 @@ def _cost_health() -> dict:
     }
 
 
+def _incomplete_cycles(*, lookback_days: int = 7, min_age_hours: int = 3) -> dict:
+    """Count crashed / never-finished cycles from run artifacts.
+
+    The 7-day ``failures`` decision-log count (and the promotion gate it
+    mirrors) has a blind spot: ``orchestrator._run_stage`` appends a
+    decision row only AFTER the runner + schema validation succeed, and
+    no path ever writes an ``error``/``fail`` status — so a
+    ``SchemaRetryFailed`` or other unhandled crash leaves NO failure row
+    at all, and ``failures_last_7d`` reads 0. A completed cycle always
+    writes ``next_run.json`` last, so a started run dir (has a stage
+    artifact) with no ``next_run.json`` — and old enough not to be the
+    in-flight cycle — is a crashed cycle the decision log never recorded.
+    Read-only; the fix for the gate itself would live in the pipeline's
+    error handling, out of this tool's scope."""
+    from datetime import timedelta
+
+    now = state.utcnow()
+    cutoff = (now - timedelta(days=lookback_days)).strftime("%Y%m%dT%H%M%SZ")
+    age_cutoff = (now - timedelta(hours=min_age_hours)).strftime("%Y%m%dT%H%M%SZ")
+    incomplete: list[str] = []
+    runs_dir = state.RUNS_DIR
+    if runs_dir.exists():
+        # Run ids start with a sortable UTC timestamp — reverse walk +
+        # lexicographic compare against the cutoff prunes old runs cheaply
+        # (same trick as dashboard_data.trade_sync_gaps).
+        for run_dir in sorted(runs_dir.iterdir(), reverse=True):
+            name = run_dir.name
+            if name < cutoff:
+                break
+            if name >= age_cutoff or not run_dir.is_dir():
+                continue  # too fresh to judge (may be in-flight), or not a dir
+            if (run_dir / "next_run.json").exists():
+                continue  # completed — every terminal path writes this last
+            started = any(
+                (run_dir / f).exists() for f in ("market_gate.json", "signals.json")
+            )
+            if started:
+                incomplete.append(name)
+    return {
+        "count": len(incomplete),
+        "run_ids": incomplete[:20],
+        "lookback_days": lookback_days,
+    }
+
+
 def _operational() -> dict:
     """Cycle deployment + failure/status counts over the last 7 days.
 
     The 7-day failure count uses the SAME rule as
     ``readiness_scorecard`` (status startswith ``error`` or contains
     ``fail``); the status histogram adds visibility into schema_retry /
-    aborted / skipped that the single gate number hides."""
+    aborted / skipped that the single gate number hides. ``incomplete``
+    catches crashed cycles that the decision log never recorded at all —
+    see ``_incomplete_cycles``."""
     from datetime import timedelta
 
     from lib import dashboard_data
@@ -158,6 +205,7 @@ def _operational() -> dict:
     return {
         "activity": dashboard_data.activity_metrics(),
         "failures_last_7d": failures_7d,
+        "incomplete_cycles_last_7d": _incomplete_cycles(),
         "status_counts_last_7d": dict(sorted(status_counts.items())),
         "trade_sync_gaps": dashboard_data.trade_sync_gaps(),
     }
@@ -398,8 +446,17 @@ def _render(report: dict) -> str:
           f"Cycles with orders: {_fmt(act.get('pct_cycles_with_orders'), '.0f')}% · "
           f"Avg positions: {_fmt(act.get('avg_positions'))} · "
           f"Avg cash: {_fmt(act.get('avg_cash_pct'), '.0f')}%")
+        inc = op.get("incomplete_cycles_last_7d") or {}
+        inc_n = inc.get("count", 0)
+        caveat = (
+            f" — ⚠️ but {inc_n} cycle(s) crashed without logging a decision "
+            f"row, so this under-reports; see incomplete cycles below"
+            if inc_n else ""
+        )
         p(f"- Failures (last 7d): **{op.get('failures_last_7d', 0)}** "
-          f"(target 0)")
+          f"(target 0){caveat}")
+        p(f"- Incomplete/crashed cycles (last 7d): **{inc_n}** "
+          f"(started a stage but never wrote next_run.json)")
         sc_counts = op.get("status_counts_last_7d") or {}
         if sc_counts:
             pretty = ", ".join(f"{k}={v}" for k, v in sc_counts.items())

@@ -152,6 +152,37 @@ def test_json_output_is_serialisable_and_stable(tmp_state, tmp_path):
     }
 
 
+def test_incomplete_cycle_detected_when_next_run_missing(tmp_state):
+    """A started run dir with no next_run.json, old enough not to be
+    in-flight, is a crashed cycle the decision log never recorded."""
+    now = state.utcnow()
+    # crashed run ~5h ago: has signals.json but no next_run.json
+    from datetime import timedelta
+    crashed = (now - timedelta(hours=5)).strftime("%Y%m%dT%H%M%SZ") + "-crash1"
+    (state.RUNS_DIR / crashed).mkdir(parents=True)
+    (state.RUNS_DIR / crashed / "signals.json").write_text("{}")
+    # completed run ~6h ago: has next_run.json -> not flagged
+    done = (now - timedelta(hours=6)).strftime("%Y%m%dT%H%M%SZ") + "-done01"
+    (state.RUNS_DIR / done).mkdir(parents=True)
+    (state.RUNS_DIR / done / "signals.json").write_text("{}")
+    (state.RUNS_DIR / done / "next_run.json").write_text("{}")
+    # in-flight run ~5min ago: no next_run.json but too fresh -> not flagged
+    fresh = (now - timedelta(minutes=5)).strftime("%Y%m%dT%H%M%SZ") + "-fresh1"
+    (state.RUNS_DIR / fresh).mkdir(parents=True)
+    (state.RUNS_DIR / fresh / "market_gate.json").write_text("{}")
+
+    inc = assess_performance._incomplete_cycles()
+    assert inc["count"] == 1
+    assert inc["run_ids"] == [crashed]
+
+    # Surfaced in the report + failures caveat present.
+    report = assess_performance.gather()
+    assert report["operational"]["incomplete_cycles_last_7d"]["count"] == 1
+    md = assess_performance._render(report)
+    assert "Incomplete/crashed cycles (last 7d): **1**" in md
+    assert "under-reports" in md
+
+
 def test_low_sample_clears_with_enough_history(tmp_state, monkeypatch):
     # 30 closed trades over a >28-day span should clear the low-sample gate.
     base_day = 1
