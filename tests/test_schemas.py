@@ -348,6 +348,26 @@ def test_decision_log_accepts_skipped_market_closed(registry):
     _validator("decision_log.schema.json", registry).validate(d)
 
 
+def test_decision_log_accepts_pipeline_crash_row(registry):
+    """The crash handler writes a synthetic stage="pipeline" row with
+    status="error" (or "aborted" for cost-cap stops) and a short error
+    string — the §Promotion failure gate counts "error" rows."""
+    d = _decision()
+    d["stage"] = "pipeline"
+    d["status"] = "error"
+    d["error"] = "RuntimeError: boom"
+    _validator("decision_log.schema.json", registry).validate(d)
+    d["status"] = "aborted"
+    _validator("decision_log.schema.json", registry).validate(d)
+
+
+def test_decision_log_rejects_unknown_status(registry):
+    d = _decision()
+    d["status"] = "exploded"
+    with pytest.raises(Exception):
+        _validator("decision_log.schema.json", registry).validate(d)
+
+
 def test_decision_log_rejects_v1_stage(registry):
     """v1 stages (screen, research, chains, scenarios) and the removed
     chain_lookup stage are gone from the enum — no decision rows with

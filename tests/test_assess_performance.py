@@ -126,6 +126,7 @@ def test_populated_gather_and_render(tmp_state):
     # Cost + cycle sections populated.
     assert report["cost_health"]["token_totals"]["cost_usd"] == pytest.approx(0.20)
     assert len(report["cycles"]) == 1
+    assert report["cycles"][0]["kind"] == "trade"
 
     md = assess_performance._render(report)
     assert "TQQQ" in md
@@ -170,6 +171,17 @@ def test_incomplete_cycle_detected_when_next_run_missing(tmp_state):
     fresh = (now - timedelta(minutes=5)).strftime("%Y%m%dT%H%M%SZ") + "-fresh1"
     (state.RUNS_DIR / fresh).mkdir(parents=True)
     (state.RUNS_DIR / fresh / "market_gate.json").write_text("{}")
+    # legacy closed-market run ~7h ago: predates the run-dir next_run.json
+    # write, but market_gate.json says is_open=false -> completed, not a crash
+    legacy = (now - timedelta(hours=7)).strftime("%Y%m%dT%H%M%SZ") + "-legacy"
+    (state.RUNS_DIR / legacy).mkdir(parents=True)
+    (state.RUNS_DIR / legacy / "market_gate.json").write_text('{"is_open": false}')
+    # handled crash ~8h ago: error.json means the crash handler already
+    # appended a decision row -> excluded here to avoid double counting
+    handled = (now - timedelta(hours=8)).strftime("%Y%m%dT%H%M%SZ") + "-handld"
+    (state.RUNS_DIR / handled).mkdir(parents=True)
+    (state.RUNS_DIR / handled / "signals.json").write_text("{}")
+    (state.RUNS_DIR / handled / "error.json").write_text("{}")
 
     inc = assess_performance._incomplete_cycles()
     assert inc["count"] == 1

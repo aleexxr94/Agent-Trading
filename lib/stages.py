@@ -150,5 +150,10 @@ def orchestrator_meta() -> StageConfig:
         schema_filename=None,
         max_tokens=2048,
         thinking={"type": "adaptive"},
-        output_config_extras={"effort": "high"},
+        # medium, not high: this is a bounded scheduling pick with a
+        # deterministic fallback, and high effort against a 2k token
+        # budget mostly bought thinking tokens (~85% of a review cycle's
+        # cost was output/thinking). (2026-08-31 cost lever,
+        # user-authorized.)
+        output_config_extras={"effort": "medium"},
     )

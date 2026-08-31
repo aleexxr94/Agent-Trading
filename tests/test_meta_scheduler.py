@@ -225,3 +225,64 @@ def test_stage_execute_uses_meta_decision(tmp_state, monkeypatch):
     )
     assert out["next_run_at"] == iso
     assert "orchestrator-meta" in out["rationale"]
+
+
+# ---------- review staleness downgrade (weekend/holiday guard) ----------
+
+
+def _closed_market_broker(next_open_iso: str):
+    """Broker stub reporting a closed market with a known next open."""
+    from lib.broker import MarketClock
+
+    class _B:
+        def get_clock(self):
+            return MarketClock(
+                is_open=False, next_open=next_open_iso,
+                next_close="", timestamp="2026-08-28T21:00:00Z",
+            )
+    return _B()
+
+
+def _review_pick(monkeypatch, hours_from_now: float) -> str:
+    iso = (state.utcnow() + timedelta(hours=hours_from_now)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    monkeypatch.setattr(
+        orchestrator.llm, "structured_call",
+        _fake_call_factory({
+            "next_run_at": iso, "rationale": "post-close reflection",
+            "cycle_intent": "review",
+        }),
+    )
+    return iso
+
+
+def test_weekend_review_pick_downgraded_to_trade(tmp_state, monkeypatch):
+    """A review scheduled ~54h before the next open (Friday night → Monday
+    bell) is stale reflection — downgrade so the gate $0-skips it."""
+    _review_pick(monkeypatch, hours_from_now=6)
+    next_open = (state.utcnow() + timedelta(hours=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ctx = orchestrator.StageContext(
+        run_id="test-run", dry_run=False,
+        broker=_closed_market_broker(next_open),
+    )
+    at, why, intent = orchestrator._compute_next_run_at(
+        ctx=ctx, portfolio=_portfolio(),
+        view={"candidates": [], "regime": "neutral", "regime_rationale": "x"},
+    )
+    assert intent == "trade"
+    assert "downgraded to trade" in why
+
+
+def test_evening_review_pick_kept_when_open_is_near(tmp_state, monkeypatch):
+    """A weekday-evening review ~10h before the next open stays a review."""
+    _review_pick(monkeypatch, hours_from_now=6)
+    next_open = (state.utcnow() + timedelta(hours=16)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ctx = orchestrator.StageContext(
+        run_id="test-run", dry_run=False,
+        broker=_closed_market_broker(next_open),
+    )
+    _, why, intent = orchestrator._compute_next_run_at(
+        ctx=ctx, portfolio=_portfolio(),
+        view={"candidates": [], "regime": "neutral", "regime_rationale": "x"},
+    )
+    assert intent == "review"
+    assert "downgraded" not in why

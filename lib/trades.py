@@ -203,9 +203,13 @@ def compute_trades_pnl(
 ) -> TradesPnl:
     """Turn trades.jsonl + costs.jsonl into (closed_trades, open_lots) PnL.
 
-    ``trades`` must be ordered chronologically (caller passes them
-    straight from ``state.read_trades()``, which preserves file order).
-    Within each symbol we FIFO-match sells against buy lots.
+    ``trades`` must be ordered chronologically — callers sort by
+    ``filled_at`` first (see feedback.build_performance_memo,
+    trades.recent_exit_cooldowns, dashboard_data.trades_pnl_view). File
+    order is NOT chronological: trades_sync appends fills grouped by
+    order_id, so raw ``state.read_trades()`` output can interleave a
+    sell before its earlier-filled buy and produce spurious unmatched
+    sells. Within each symbol we FIFO-match sells against buy lots.
 
     ``costs`` defaults to [] (no LLM attribution at all — useful for
     pure unit tests).

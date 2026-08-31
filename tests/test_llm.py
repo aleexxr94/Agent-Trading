@@ -428,6 +428,7 @@ def test_per_run_cap_aborts_before_call(tmp_state, monkeypatch):
     with pytest.raises(llm.CostCapExceeded) as ei:
         llm.structured_call(_call(), client_factory=lambda: _fake_client(fm))
     assert "per-run" in str(ei.value)
+    assert ei.value.cap == "per_run"
     assert fm.calls == 0
 
 
@@ -441,6 +442,7 @@ def test_daily_cap_aborts_across_runs(tmp_state, monkeypatch):
     with pytest.raises(llm.CostCapExceeded) as ei:
         llm.structured_call(_call(), client_factory=lambda: _fake_client(fm))
     assert "daily" in str(ei.value)
+    assert ei.value.cap == "daily"
 
 
 def test_default_cost_caps_are_three_and_twelve(monkeypatch):

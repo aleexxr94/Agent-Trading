@@ -52,8 +52,18 @@ def _load_run(run_dir: Path) -> dict:
         "next_run_at": None,
         "dedup_skipped": False,
         "market_closed": False,
+        "crashed": False,
+        "has_review_artifact": False,
     }
+    # Trade cycles write view.json; review cycles write review.json (same
+    # schema, different name so review regimes stay out of the trade-cycle
+    # drift loop). Read either so review rows aren't blank.
     view_path = run_dir / "view.json"
+    if not view_path.exists():
+        review_path = run_dir / "review.json"
+        if review_path.exists():
+            view_path = review_path
+            summary["has_review_artifact"] = True
     if view_path.exists():
         try:
             view = json.loads(view_path.read_text())
@@ -64,6 +74,7 @@ def _load_run(run_dir: Path) -> dict:
             summary["top_confidence"] = max(confs) if confs else None
         except (json.JSONDecodeError, OSError):
             pass
+    summary["crashed"] = (run_dir / "error.json").exists()
     p_path = run_dir / "portfolio.json"
     if p_path.exists():
         try:
@@ -121,8 +132,24 @@ def _per_run_cost(run_id: str) -> float:
     return total
 
 
+def _cycle_kind(row: dict, intent: str | None) -> str:
+    """Single display label per cycle, precedence crash → closed → dedup
+    → review/trade — so a blank-looking row always says WHY it's blank."""
+    if row.get("crashed"):
+        return "crash"
+    if row.get("market_closed"):
+        return "closed"
+    if row.get("dedup_skipped"):
+        return "dedup"
+    if intent:
+        return intent
+    return "review" if row.get("has_review_artifact") else "trade"
+
+
 def collect(limit: int | None = None) -> list[dict]:
     """Walk state/runs/ and return summarized rows, oldest first."""
+    from lib import dashboard_data  # light module import (no pandas/streamlit)
+
     if not state.RUNS_DIR.exists():
         return []
     run_dirs = sorted(
@@ -133,30 +160,39 @@ def collect(limit: int | None = None) -> list[dict]:
         run_dirs = run_dirs[-limit:]
     rows = [_load_run(d) for d in run_dirs]
     rows = _attach_realized_pnl(rows)
+    intents = dashboard_data.intent_by_run()
     for r in rows:
         r["cost_usd"] = round(_per_run_cost(r["run_id"]), 4)
+        intent = intents.get(r["run_id"])
+        r["cycle_intent"] = intent or (
+            "review" if r.get("has_review_artifact") else "trade"
+        )
+        r["kind"] = _cycle_kind(r, r["cycle_intent"])
     return rows
 
 
 def _print_markdown(rows: list[dict]) -> None:
     header = (
-        "| run_id | regime | top_conf | positions | all_cash | "
+        "| run_id | intent | regime | top_conf | positions | all_cash | "
         "sanity | nav_usd | realized_pnl_% | cost_$ |"
     )
-    sep = "|---|---|---|---|---|---|---|---|---|"
+    sep = "|---|---|---|---|---|---|---|---|---|---|"
     print(header)
     print(sep)
     for r in rows:
+        # `is not None` checks throughout: a legitimate 0.0 (confidence,
+        # NAV, cost) must render as a number, not be mistaken for missing.
         print(
             f"| {r['run_id'][:26]} "
+            f"| {r.get('kind') or '—'} "
             f"| {r.get('regime') or '—'} "
-            f"| {('%.2f' % r['top_confidence']) if r.get('top_confidence') else '—'} "
+            f"| {('%.2f' % r['top_confidence']) if r.get('top_confidence') is not None else '—'} "
             f"| {r.get('position_count', 0)} "
             f"| {'Y' if r.get('all_cash') else 'N'} "
             f"| {r.get('sanity_status') or '—'} "
-            f"| {('%.2f' % r['nav_usd']) if r.get('nav_usd') else '—'} "
+            f"| {('%.2f' % r['nav_usd']) if r.get('nav_usd') is not None else '—'} "
             f"| {('%+.3f' % r['realized_pnl_pct']) if r.get('realized_pnl_pct') is not None else '—'} "
-            f"| {('%.4f' % r['cost_usd']) if r.get('cost_usd') else '—'} |"
+            f"| {('%.4f' % r['cost_usd']) if r.get('cost_usd') is not None else '—'} |"
         )
 
 

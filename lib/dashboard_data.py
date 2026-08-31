@@ -231,9 +231,9 @@ class SyntheticBalance:
                                              #   (conservative retail friction)
                                              #   for currently-open positions
 
-        Rationale: Alpaca paper reports \$0 fees on equity fills
+        Rationale: Alpaca paper reports $0 fees on equity fills
         (``lib/trades_sync.py``), so a real-only definition would leave
-        the headline showing "\$0.00 fees" while the per-position table
+        the headline showing "$0.00 fees" while the per-position table
         prominently displays modelled fees that the Aggregate Net P&L
         already subtracts. Hybrid keeps the headline aligned with what
         the operator sees in the positions table. On a future live
@@ -243,7 +243,7 @@ class SyntheticBalance:
         and its real fees land in the realised side).
 
       - ``real_trading_fees_usd``: sum of ``fees_usd`` across EVERY fill
-        in trades.jsonl. On paper ETFs this is \$0; on live trading it
+        in trades.jsonl. On paper ETFs this is $0; on live trading it
         populates from the SEC/TAF schedules.
       - ``modelled_open_fees_usd``: sum of
         the projected EXIT-leg regulatory fees over the broker-held
@@ -838,6 +838,18 @@ def total_token_cost() -> dict:
         + sums["cache_creation_input_tokens"]
         + sums["cache_read_input_tokens"]
     )
+    # Cache hit rate is an INPUT-side ratio (same definition as
+    # cost_by_stage / cache_hit_trend / llm.CallUsage.cache_hit_pct);
+    # dividing reads by total_tokens would dilute it with output tokens.
+    sums["input_side_tokens"] = (
+        sums["input_tokens"]
+        + sums["cache_creation_input_tokens"]
+        + sums["cache_read_input_tokens"]
+    )
+    sums["cache_hit_pct"] = (
+        100.0 * sums["cache_read_input_tokens"] / sums["input_side_tokens"]
+        if sums["input_side_tokens"] > 0 else 0.0
+    )
     return sums
 
 
@@ -906,9 +918,10 @@ def cache_hit_trend(limit: int = 200) -> list[dict]:
     ``100 * cache_read / (input + cache_creation + cache_read)`` over
     each run's summed token counters — same definition as
     ``cost_by_stage``. Sourced from cost rows, NOT the decision log:
-    the orchestrator writes every decision row with a hard-coded
-    ``prompt_cache_hit_pct: 0.0``, while lib/llm.py records the real
-    cache token counters in costs.jsonl (codex P2 on PR #108).
+    costs.jsonl carries the per-call token counters (decision rows now
+    also carry a real per-stage hit% via the orchestrator's cost-delta
+    computation, but the ledger stays the single source of truth here —
+    codex P2 on PR #108).
 
     Returns ``[{run_id, at, cache_hit_pct}]`` oldest→newest, one row
     per run. Runs whose cost rows carry no token counters are skipped.
@@ -1106,7 +1119,14 @@ def trades_pnl_view(marks: dict[str, float] | None = None) -> dict:
     """
     from . import trades as trades_lib
 
-    trade_rows = state.read_trades()
+    # Sort by fill time before FIFO matching — same as
+    # feedback.build_performance_memo and trades.recent_exit_cooldowns.
+    # trades.jsonl is appended grouped by order_id (lib/trades_sync.py),
+    # not chronologically, so raw file order can put a sell ahead of its
+    # earlier-filled buy and report it as an unmatched sell.
+    trade_rows = sorted(
+        state.read_trades(), key=lambda r: r.get("filled_at") or ""
+    )
     cost_rows = state.filter_costs_post_reset(
         [json.loads(line) for line in (
             state.COSTS_LOG.read_text(encoding="utf-8").splitlines()
@@ -1429,6 +1449,29 @@ def latest_run_id() -> str | None:
     return rows[-1]["run_id"] if rows else None
 
 
+def intent_by_run() -> dict[str, str]:
+    """Map run_id → cycle_intent ("trade" | "review"), read from
+    decisions.jsonl (one row per stage; all rows for a run carry the same
+    intent, so the first seen wins). Legacy runs written before the field
+    existed simply don't appear — callers default missing ids to "trade".
+    Shared by the dashboard Cycles tab and the bin/ CLIs so every surface
+    labels cycles identically."""
+    intents: dict[str, str] = {}
+    if state.DECISIONS_LOG.exists():
+        for line in state.DECISIONS_LOG.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rid = row.get("run_id")
+            intent = row.get("cycle_intent")
+            if rid and intent and rid not in intents:
+                intents[rid] = intent
+    return intents
+
+
 def load_run_summaries(limit: int = 20) -> list[dict]:
     """Return one human-readable summary per recent orchestrator run, newest first.
 
@@ -1462,22 +1505,7 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
         if rid:
             cost_by_run[rid] = cost_by_run.get(rid, 0.0) + (r.get("cost_usd") or 0.0)
 
-    # cycle_intent per run, read from decisions.jsonl (one row per stage,
-    # all rows for a run carry the same intent). Default "trade" handles
-    # legacy runs written before the field existed.
-    intent_by_run: dict[str, str] = {}
-    if state.DECISIONS_LOG.exists():
-        for line in state.DECISIONS_LOG.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            rid = row.get("run_id")
-            intent = row.get("cycle_intent")
-            if rid and intent and rid not in intent_by_run:
-                intent_by_run[rid] = intent
+    intents = intent_by_run()
 
     summaries: list[dict] = []
     for run_dir in run_dirs:
@@ -1517,7 +1545,7 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
             "next_run_at": "",
             "next_run_rationale": "",
             "cost_usd": cost_by_run.get(rid, 0.0),
-            "cycle_intent": intent_by_run.get(rid, "trade"),
+            "cycle_intent": intents.get(rid, "trade"),
         }
 
         # portfolio.json — the headline result + rationales.
@@ -2137,7 +2165,97 @@ def trade_sync_gaps(*, lookback_days: int = 7) -> dict:
     }
 
 
-def readiness_scorecard(nav_rows: list[dict] | None = None) -> list[dict]:
+def incomplete_cycles(*, lookback_days: int = 7, min_age_hours: int = 3) -> dict:
+    """Count crashed / never-finished cycles from run artifacts.
+
+    A completed cycle always writes ``next_run.json`` into its run dir
+    last, so a started run dir (has a stage artifact) with no
+    ``next_run.json`` — and old enough not to be the in-flight cycle — is
+    a crashed cycle. Two carve-outs keep this honest:
+
+    - A dir whose ``market_gate.json`` parses with ``is_open == false``
+      counts as complete: closed-market cycles predating the run-dir
+      next_run.json write (fix in the same release as this helper) would
+      otherwise read as false-positive crashes forever.
+    - A dir containing ``error.json`` is not counted: the crash handler's
+      decision row (status="error"/"aborted") already represents it, and
+      counting both would double-book one crash in ``failure_summary``.
+
+    Shared by the dashboard and ``bin/assess_performance.py`` so the
+    promotion gate and the CLI report count identically.
+    """
+    from datetime import timedelta
+
+    now = state.utcnow()
+    cutoff = (now - timedelta(days=lookback_days)).strftime("%Y%m%dT%H%M%SZ")
+    age_cutoff = (now - timedelta(hours=min_age_hours)).strftime("%Y%m%dT%H%M%SZ")
+    incomplete: list[str] = []
+    runs_dir = state.RUNS_DIR
+    if runs_dir.exists():
+        # Run ids start with a sortable UTC timestamp — reverse walk +
+        # lexicographic compare against the cutoff prunes old runs cheaply
+        # (same trick as trade_sync_gaps).
+        for run_dir in sorted(runs_dir.iterdir(), reverse=True):
+            name = run_dir.name
+            if name < cutoff:
+                break
+            if name >= age_cutoff or not run_dir.is_dir():
+                continue  # too fresh to judge (may be in-flight), or not a dir
+            if (run_dir / "next_run.json").exists():
+                continue  # completed — every terminal path writes this last
+            if (run_dir / "error.json").exists():
+                continue  # crash already recorded by the pipeline handler
+            gate_path = run_dir / "market_gate.json"
+            if gate_path.exists():
+                try:
+                    if json.loads(gate_path.read_text()).get("is_open") is False:
+                        continue  # legacy closed-market cycle (pre run-dir write)
+                except (json.JSONDecodeError, OSError):
+                    pass
+            started = gate_path.exists() or (run_dir / "signals.json").exists()
+            if started:
+                incomplete.append(name)
+    return {
+        "count": len(incomplete),
+        "run_ids": incomplete[:20],
+        "lookback_days": lookback_days,
+    }
+
+
+def failure_summary(days: int = 7) -> dict:
+    """Failure evidence for the §Promotion "no unresolved failures" gate.
+
+    ``failures`` counts decision rows whose status starts with "error" or
+    contains "fail" — since the pipeline crash handler exists, that
+    catches status="error" rows. Cost-cap stops write status="aborted",
+    which deliberately does NOT count: a cap stop is a designed guardrail
+    doing its job. ``incomplete`` adds crashes so early or so broken that
+    no row was written at all.
+    """
+    from datetime import timedelta
+
+    cutoff_iso = (state.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    status_counts: dict[str, int] = {}
+    failures = 0
+    for d in load_decisions(limit=2000):
+        if (d.get("started_at") or "") < cutoff_iso:
+            continue
+        status = str(d.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if status.startswith("error") or "fail" in status:
+            failures += 1
+    return {
+        "failures": failures,
+        "status_counts": dict(sorted(status_counts.items())),
+        "incomplete": incomplete_cycles(lookback_days=days),
+    }
+
+
+def readiness_scorecard(
+    nav_rows: list[dict] | None = None,
+    *,
+    bundle: object = "auto",
+) -> list[dict]:
     """Auto-tracked promotion-to-live criteria (CLAUDE.md §Promotion).
 
     Each row: {criterion, target, value, met} with met in {True, False,
@@ -2146,6 +2264,17 @@ def readiness_scorecard(nav_rows: list[dict] | None = None) -> list[dict]:
     weekdays elapsed" since the scheduler's intended cadence isn't
     persisted. Purely informational — promotion remains a manual,
     triple-locked decision.
+
+    ``bundle`` feeds the Sharpe / max-drawdown gate rows:
+      - "auto" (default): build ``benchmark_view()`` here (needs
+        yfinance/network; falls back on any error),
+      - a prebuilt MetricsBundle: use as-is, no fetch (callers that
+        already built one, e.g. bin/assess_performance),
+      - None: force the offline EOD-sampled fallback.
+    The dense bundle is the honest gate series — the EOD-sampled
+    nav_history variant collapses calendar gaps into single "daily"
+    returns before √252-annualising (inflating Sharpe) and lacks the
+    $2,500 inception anchor; it stays visible as labeled secondary rows.
     """
     from datetime import timedelta
 
@@ -2197,44 +2326,94 @@ def readiness_scorecard(nav_rows: list[dict] | None = None) -> list[dict]:
         "met": (completion >= 80.0) if completion is not None else None,
     })
 
-    # --- Sharpe >= 0.5 and max DD <= 25% from the EOD equity curve ---
-    sharpe_v = dd_pct = None
+    # --- Sharpe >= 0.5 and max DD <= 25% ---
+    # Secondary (EOD-sampled) numbers first: also the offline fallback.
+    eod_sharpe = eod_dd_pct = None
     try:
         eod = benchmark.align_to_eod(nav_rows)
         if len(eod) >= 10:
             returns = eod["nav"].pct_change().dropna()
-            sharpe_v = benchmark.sharpe(returns)
+            eod_sharpe = benchmark.sharpe(returns)
             dd, _, _ = benchmark.max_drawdown(eod["nav"])
-            dd_pct = abs(dd) * 100.0
+            eod_dd_pct = abs(dd) * 100.0
     except Exception:
         pass
+
+    b = None
+    if isinstance(bundle, str) and bundle == "auto":
+        try:
+            b = benchmark_view()
+        except Exception:
+            b = None
+    elif bundle is not None:
+        b = bundle
+
+    if b is not None and getattr(b, "sharpe_strategy", None) is not None:
+        sharpe_v = float(b.sharpe_strategy)
+        dd_v = abs(float(b.max_dd_strategy[0])) * 100.0
+        method = (
+            f"dense trading-day calendar, ${b.starting_balance_usd:,.0f} anchor, "
+            f"{b.inception} → {b.as_of}"
+        )
+        sharpe_value = f"{sharpe_v:.2f} · {method}"
+        dd_value = f"{dd_v:.1f}% · {method}"
+    else:
+        sharpe_v, dd_v = eod_sharpe, eod_dd_pct
+        tag = "EOD-sampled fallback (SPY calendar unavailable)"
+        sharpe_value = (
+            f"{sharpe_v:.2f} · {tag}" if sharpe_v is not None
+            else "— (need >= 10 EOD points)"
+        )
+        dd_value = f"{dd_v:.1f}% · {tag}" if dd_v is not None else "—"
+
     rows.append({
-        "criterion": "Sharpe (rf=0, EOD synthetic NAV)",
+        "criterion": "Sharpe (rf=0)",
         "target": ">= 0.5",
-        "value": f"{sharpe_v:.2f}" if sharpe_v is not None else "— (need >= 10 EOD points)",
+        "value": sharpe_value,
         "met": (sharpe_v >= 0.5) if sharpe_v is not None else None,
     })
     rows.append({
         "criterion": "Max drawdown",
         "target": "<= 25%",
-        "value": f"{dd_pct:.1f}%" if dd_pct is not None else "—",
-        "met": (dd_pct <= 25.0) if dd_pct is not None else None,
+        "value": dd_value,
+        "met": (dd_v <= 25.0) if dd_v is not None else None,
+    })
+    # The two methodologies sit side by side, labeled, instead of
+    # silently conflicting across report sections (met=None renders as
+    # an informational badge in both consumers).
+    rows.append({
+        "criterion": "Sharpe (secondary, EOD-sampled nav_history)",
+        "target": "(informational)",
+        "value": f"{eod_sharpe:.2f}" if eod_sharpe is not None else "— (need >= 10 EOD points)",
+        "met": None,
+    })
+    rows.append({
+        "criterion": "Max drawdown (secondary, EOD-sampled)",
+        "target": "(informational)",
+        "value": f"{eod_dd_pct:.1f}%" if eod_dd_pct is not None else "—",
+        "met": None,
     })
 
     # --- no failures in the last 7 days ---
-    cutoff_iso = (state.utcnow() - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    failures = 0
-    for d in load_decisions(limit=2000):
-        if (d.get("started_at") or "") < cutoff_iso:
-            continue
-        status = str(d.get("status") or "")
-        if status.startswith("error") or "fail" in status:
-            failures += 1
+    # Logged failure rows (status="error") PLUS crashed cycles that never
+    # wrote any row — the gate must see both or it can't fail when the
+    # system does.
+    try:
+        fs = failure_summary(days=7)
+        logged = fs["failures"]
+        crashed = fs["incomplete"]["count"]
+    except Exception:
+        logged, crashed = 0, 0
+    total_failures = logged + crashed
+    if crashed:
+        fail_value = f"{total_failures} ({logged} logged, {crashed} crashed with no record)"
+    else:
+        fail_value = str(total_failures)
     rows.append({
         "criterion": "Unresolved failures (last 7 days)",
         "target": "0",
-        "value": str(failures),
-        "met": failures == 0,
+        "value": fail_value,
+        "met": total_failures == 0,
     })
     return rows
 

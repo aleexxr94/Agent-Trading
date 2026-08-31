@@ -60,6 +60,12 @@ RISK_WARNING = (
     "chasing on a $2.5k experimental account. Not financial advice."
 )
 
+# Reschedule delay after an unhandled pipeline crash. Mirrors
+# market_gate.CLOCK_ERROR_RETRY_MINUTES: without a fresh next_run.json the
+# scheduler pins on the stale timestamp (LAST_FIRED == NEXT_AT) and nothing
+# fires until the daily 13:30 UTC fallback timer.
+CRASH_RETRY_MINUTES = 30
+
 
 # ----- helpers -----
 
@@ -1227,6 +1233,14 @@ META_MIN_HOURS = 1.0
 META_MAX_HOURS = 24.0
 # Tolerance absorbs second-precision rounding + LLM round-trip latency.
 META_BOUND_TOLERANCE_SECONDS = 30.0
+# A review fired more than this far before the next market open is
+# analysing a regime nothing can act on until the open — e.g. a Saturday
+# review ~48h before Monday's bell. Such picks are downgraded to "trade"
+# so the market gate $0-skips them and rolls next_run to the open,
+# instead of billing ~$0.13 for stale reflection. Weekday-evening
+# reviews (next open ~12-16h away) are unaffected. (2026-08-31 cost
+# lever, user-authorized.)
+REVIEW_STALENESS_MAX_HOURS = 24.0
 
 
 def _compute_next_run_at(
@@ -1285,9 +1299,12 @@ def _compute_next_run_at(
             f"Recent NAV history (last {len(nav_history)} rows):\n"
             f"  {json.dumps(nav_history, separators=(',', ':'))}\n\n"
             "Choose the next-run window AND the cycle_intent for it. "
-            "review = signals + strategist only, no orders, ~$0.05 cost; "
+            "review = signals + strategist only, no orders, ~$0.13 cost; "
             "use for post-close reflection. trade = full pipeline. "
-            "Return JSON only."
+            "Note: a review scheduled more than 24h before the next market "
+            "open (e.g. on a weekend) is auto-downgraded to trade, so don't "
+            "pick review when the market won't open within a day of the "
+            "chosen time. Return JSON only."
         ),
     }
     try:
@@ -1333,6 +1350,25 @@ def _compute_next_run_at(
         rationale_suffix = " (meta picked review but daily cap exhausted; downgraded to trade)"
     else:
         rationale_suffix = ""
+    # Weekend/holiday staleness guard: a review that would fire more than
+    # REVIEW_STALENESS_MAX_HOURS before the next open can't inform any
+    # trade — downgrade so the gate $0-skips it at fire time.
+    if next_intent == "review" and not market_is_open and next_open:
+        try:
+            open_dt = datetime.fromisoformat(
+                str(next_open).replace("Z", "+00:00")
+            )
+            if open_dt.tzinfo is None:
+                open_dt = open_dt.replace(tzinfo=timezone.utc)
+            gap_hours = (open_dt - at).total_seconds() / 3600.0
+            if gap_hours > REVIEW_STALENESS_MAX_HOURS:
+                next_intent = "trade"
+                rationale_suffix += (
+                    f" (review pick was {gap_hours:.0f}h before next open; "
+                    "downgraded to trade — the market gate will roll it to the open)"
+                )
+        except (ValueError, TypeError):
+            pass
     rationale = (payload.get("rationale") or "")[:300] + rationale_suffix
     return payload["next_run_at"], f"orchestrator-meta: {rationale}", next_intent
 
@@ -1527,6 +1563,29 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
 # ----- pipeline driver -----
 
 
+def _stage_cost_from_delta(run_id: str, n_before: int) -> tuple[float, float]:
+    """Real (cost_usd, prompt_cache_hit_pct) for the cost rows a stage just
+    appended. lib/llm.py records every call to costs.jsonl synchronously
+    (schema retries included), so the rows past ``n_before`` are exactly
+    this stage's spend. Hit% is the input-side ratio — identical semantics
+    to llm.CallUsage.cache_hit_pct. Reporting must never break the
+    pipeline: any read error degrades to (0.0, 0.0), the values every
+    decision row carried before this existed. Deterministic and dry-run
+    stages append nothing → (0.0, 0.0) exactly as before.
+    """
+    try:
+        delta = state.read_costs_for_run(run_id)[n_before:]
+        cost = sum(float(r.get("cost_usd") or 0.0) for r in delta)
+        inp = sum(int(r.get("input_tokens") or 0) for r in delta)
+        creation = sum(int(r.get("cache_creation_input_tokens") or 0) for r in delta)
+        read = sum(int(r.get("cache_read_input_tokens") or 0) for r in delta)
+        denom = inp + creation + read
+        hit = (100.0 * read / denom) if denom > 0 else 0.0
+        return max(0.0, round(cost, 6)), min(100.0, max(0.0, hit))
+    except Exception:
+        return 0.0, 0.0
+
+
 def _run_stage(
     *,
     ctx: StageContext,
@@ -1541,6 +1600,15 @@ def _run_stage(
         raise llm.HaltFlagSet(f"halt.flag set before stage={stage_id}")
 
     started_at = state.utcnow_iso()
+    # Snapshot the cost ledger so the decision row can carry this stage's
+    # REAL spend + cache hit rather than the historical hard-coded 0.0.
+    # Note: stage_execute's runner also fires the nested meta call, whose
+    # cost rows land in this stage's delta — deliberately attributed to
+    # the "execute" decision row (costs.jsonl keeps the per-call truth).
+    try:
+        n_costs_before = len(state.read_costs_for_run(ctx.run_id))
+    except Exception:
+        n_costs_before = 0
     output = runner()
     if schema:
         state.validate(output, schema)
@@ -1548,14 +1616,15 @@ def _run_stage(
     out_path = state.run_dir(ctx.run_id) / output_filename
     state.write_json(out_path, output)
 
+    cost_usd, cache_hit_pct = _stage_cost_from_delta(ctx.run_id, n_costs_before)
     state.append_decision({
         "run_id": ctx.run_id,
         "stage": stage_id,
         "model": model,
         "inputs_hash": _hash_inputs(*inputs_hash_parts),
         "output_ref": output_filename,
-        "prompt_cache_hit_pct": 0.0,
-        "cost_usd": 0.0,
+        "prompt_cache_hit_pct": cache_hit_pct,
+        "cost_usd": cost_usd,
         "started_at": started_at,
         "ended_at": state.utcnow_iso(),
         "status": "ok",
@@ -1579,7 +1648,7 @@ def _run_pipeline_review(*, ctx: StageContext, dry_run: bool) -> dict:
     state. This keeps a review followed by an unchanged-signals trade
     cycle from dedup-skipping into a stale portfolio.
 
-    Cost: ~$0.05 (strategist + meta).
+    Cost: ~$0.13 (strategist + meta; ~85% of it output/thinking tokens).
     """
     rid = ctx.run_id
 
@@ -2248,6 +2317,111 @@ def run_pipeline(
     }
 
 
+def _record_pipeline_crash(
+    *, run_id: str, exc: Exception, dry_run: bool, cli_intent: str | None,
+) -> None:
+    """Best-effort crash bookkeeping for an unhandled pipeline exception.
+
+    Three independent steps — error.json artifact, decision-log row,
+    conservative reschedule — each in its own try/except so a broken
+    state/ dir can never mask the original traceback (main() re-raises
+    it after this returns). Never called on a healthy cycle.
+    """
+    import traceback as _traceback
+    from datetime import timedelta
+
+    short = f"{type(exc).__name__}: {exc}"[:500]
+
+    # 1) error.json — even a crash before signals.json leaves an artifact,
+    #    so incomplete-cycle detection has something to key on.
+    try:
+        state.write_json(state.run_dir(run_id) / "error.json", {
+            "run_id": run_id,
+            "failed_at": state.utcnow_iso(),
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "traceback": _traceback.format_exc(),
+        })
+    except Exception:
+        pass
+
+    # 2) Decision row. A cost-cap stop is a designed guardrail, not an
+    #    unresolved failure — it reuses the schema's "aborted" status,
+    #    which the §Promotion failure gate deliberately does not count.
+    #    Everything else is "error" and does count.
+    try:
+        is_cap = isinstance(exc, llm.CostCapExceeded)
+        cycle_intent, intent_source = _load_cycle_intent(
+            cli_intent=cli_intent, ignore_cap=False,
+        )
+        now = state.utcnow_iso()
+        state.append_decision({
+            "run_id": run_id,
+            "stage": "pipeline",
+            "model": "local-deterministic",
+            "inputs_hash": _hash_inputs(run_id),
+            "output_ref": "error.json",
+            "prompt_cache_hit_pct": 0.0,
+            "cost_usd": 0.0,  # real spend is authoritative in costs.jsonl
+            "started_at": now,
+            "ended_at": now,
+            "status": "aborted" if is_cap else "error",
+            "error": short,
+            "risk_warning": RISK_WARNING,
+            "cycle_intent": cycle_intent,
+            "intent_source": intent_source,
+        })
+    except Exception:
+        pass
+
+    # 3) Conservative reschedule so the scheduler doesn't pin on a stale
+    #    next_run.json until the daily fallback timer. Skipped when the
+    #    operator has halted, and when this run already scheduled itself
+    #    (crash after stage_execute wrote NEXT_RUN — never override the
+    #    meta-scheduler's pick).
+    try:
+        if state.is_halted():
+            return
+        try:
+            existing = json.loads(state.NEXT_RUN.read_text(encoding="utf-8"))
+            if existing.get("run_id") == run_id:
+                return
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        if isinstance(exc, llm.CostCapExceeded) and getattr(exc, "cap", "") == "daily":
+            # Mirror the documented daily-cap behaviour: refuse until next UTC day.
+            next_day = (state.utcnow() + timedelta(days=1)).replace(
+                hour=0, minute=5, second=0, microsecond=0,
+            )
+            next_at = next_day.strftime("%Y-%m-%dT%H:%M:%SZ")
+            why = "daily cost cap reached; next cycle after UTC midnight"
+        elif isinstance(exc, llm.CostCapExceeded):
+            # A fresh run gets a fresh per-run budget; 4h avoids hot-looping
+            # spend while the daily cap still bounds the day.
+            next_at = (state.utcnow() + timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            why = "per-run cost cap reached; retry with a fresh run budget"
+        else:
+            next_at = (
+                state.utcnow() + timedelta(minutes=CRASH_RETRY_MINUTES)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            why = f"pipeline crashed ({type(exc).__name__}); near-future retry"
+
+        next_run = {
+            "run_id": run_id,
+            "next_run_at": next_at,
+            "rationale": f"crash handler: {why}",
+            "cycle_intent": "trade",
+            "crash": True,
+            "error": short,
+        }
+        state.write_json(state.run_dir(run_id) / "next_run.json", next_run)
+        if not dry_run:
+            state.write_json(state.NEXT_RUN, next_run)
+    except Exception:
+        pass
+
+
 def _try_load_broker() -> Broker | None:
     """Best-effort AlpacaBroker construction. Returns None if creds are
     missing or the SDK isn't installed — orchestrator still runs (writes
@@ -2295,14 +2469,27 @@ def main(argv: list[str] | None = None) -> int:
 
     broker = None if args.dry_run else _try_load_broker()
 
+    # run_id is resolved here (not inside run_pipeline) so the crash
+    # handler can attribute artifacts to the run that actually raised.
+    rid = args.run_id or state.new_run_id()
+
     t0 = time.time()
-    result = run_pipeline(
-        dry_run=args.dry_run,
-        run_id=args.run_id,
-        broker=broker,
-        cli_intent=args.intent,
-        ignore_cap=args.ignore_cap,
-    )
+    try:
+        result = run_pipeline(
+            dry_run=args.dry_run,
+            run_id=rid,
+            broker=broker,
+            cli_intent=args.intent,
+            ignore_cap=args.ignore_cap,
+        )
+    except llm.HaltFlagSet:
+        # Operator stop: no error row, no reschedule — halt means halt.
+        raise
+    except Exception as exc:  # KeyboardInterrupt/SystemExit are BaseException
+        _record_pipeline_crash(
+            run_id=rid, exc=exc, dry_run=args.dry_run, cli_intent=args.intent,
+        )
+        raise  # non-zero exit for systemd; original traceback preserved
     dt = time.time() - t0
     stage_count = 6 if result.get("market_gate", {}).get("is_open", True) else 1
     intent_tag = f" intent={result.get('cycle_intent', 'trade')}" if result.get("cycle_intent") else ""

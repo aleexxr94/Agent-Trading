@@ -870,7 +870,7 @@ def test_synthetic_balance_partial_unmatched_sell(tmp_state):
 
 
 def test_synthetic_balance_hybrid_fees_paper_etf_no_real(tmp_state):
-    """On Alpaca paper ETFs, real fees are \$0. The hybrid fees model
+    """On Alpaca paper ETFs, real fees are $0. The hybrid fees model
     surfaces the modelled round-trip estimate (conservative retail friction) as the
     headline fees so the synthetic balance reflects what the
     per-position table already shows. Without this fix the operator
@@ -1717,6 +1717,10 @@ def test_total_token_cost_aggregates(tmp_state):
     assert t["cache_read_input_tokens"] == 800
     assert t["total_tokens"] == 1500 + 1700 + 200 + 800
     assert t["cost_usd"] == pytest.approx(0.22)
+    # Cache hit rate is input-side: reads / (input + creation + reads).
+    # Dividing by total_tokens (output included) would report 19.0%.
+    assert t["input_side_tokens"] == 1500 + 200 + 800
+    assert t["cache_hit_pct"] == pytest.approx(100.0 * 800 / 2500)
 
 
 def test_cost_by_month_buckets_correctly(tmp_state):
@@ -2285,8 +2289,9 @@ def test_cost_by_stage_empty_state_returns_empty(tmp_state):
 
 def test_cache_hit_trend_token_weighted_per_run(tmp_state):
     """Sourced from costs.jsonl token counters, NOT the decision log —
-    the orchestrator hard-codes prompt_cache_hit_pct=0.0 in every
-    decision row, so decisions would always trend at 0% (codex P2)."""
+    the ledger carries the per-call truth (decision rows historically
+    hard-coded prompt_cache_hit_pct=0.0; they now carry a per-stage
+    aggregate, but the trend keeps reading the ledger) (codex P2)."""
     state.append_cost({
         "run_id": "20260601T120000Z-a", "stage": "strategist", "model": "m",
         "cost_usd": 0.05, "at": "2026-06-01T12:00:00Z",
@@ -2349,6 +2354,20 @@ def _fill_row(symbol, side, qty, price, *, run_id=None, at, aid):
         "symbol": symbol, "kind": "etf", "side": side, "qty": qty,
         "fill_price": price, "fees_usd": 0.0, "filled_at": at,
     }
+
+
+def test_trades_pnl_view_sorts_by_fill_time_before_matching(tmp_state):
+    """trades_sync appends fills grouped by order_id, so the file can
+    hold a sell BEFORE its earlier-filled buy. FIFO must run on fill
+    time, or the sell reports as unmatched and the round trip is lost."""
+    state.append_trade(_fill_row("SOXL", "sell", 3, 30.0,
+                                 at="2026-06-02T14:00:00Z", aid="s1"))
+    state.append_trade(_fill_row("SOXL", "buy", 3, 25.0,
+                                 at="2026-06-01T14:00:00Z", aid="b1"))
+    view = dd.trades_pnl_view()
+    assert view["totals"]["unmatched_sell_count"] == 0
+    assert view["totals"]["closed_count"] == 1
+    assert view["closed"][0]["gross_pnl_usd"] == pytest.approx(15.0)
 
 
 def test_calibration_view_mirrors_memo(tmp_state):
@@ -2425,15 +2444,96 @@ def test_trade_sync_gaps_flags_orders_without_fills(tmp_state, monkeypatch):
     assert out2["stale"] is False
 
 
-def test_readiness_scorecard_shapes_and_insufficient_data(tmp_state):
+def test_intent_by_run_first_row_wins_and_skips_legacy(tmp_state):
+    state.append_decision(_crash_row(status="ok", stage="strategist") | {
+        "run_id": "r-review", "cycle_intent": "review", "intent_source": "file",
+    })
+    state.append_decision(_crash_row(status="ok", stage="strategist") | {
+        "run_id": "r-legacy",  # no cycle_intent field (legacy row)
+    })
+    intents = dd.intent_by_run()
+    assert intents == {"r-review": "review"}
+
+
+def _crash_row(status="error", started_at=None, stage="pipeline"):
+    """A schema-valid decision row for failure-gate tests."""
+    at = started_at or state.utcnow_iso()
+    row = {
+        "run_id": "gate-test", "stage": stage, "model": "local-deterministic",
+        "inputs_hash": "deadbeefcafebabe", "output_ref": "error.json",
+        "prompt_cache_hit_pct": 0.0, "cost_usd": 0.0,
+        "started_at": at, "ended_at": at, "status": status,
+        "risk_warning": "PAPER TRADING — leveraged & inverse ETFs are high-risk.",
+    }
+    if status in ("error", "aborted"):
+        row["error"] = "RuntimeError: boom"
+    return row
+
+
+def test_failure_summary_counts_error_not_aborted(tmp_state):
+    import datetime as _dt
+    state.append_decision(_crash_row(status="error"))
+    state.append_decision(_crash_row(status="aborted"))  # cap stop: not a failure
+    old = (state.utcnow() - _dt.timedelta(days=9)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state.append_decision(_crash_row(status="error", started_at=old))  # outside window
+    fs = dd.failure_summary(days=7)
+    assert fs["failures"] == 1
+    assert fs["status_counts"]["error"] == 1
+    assert fs["status_counts"]["aborted"] == 1
+    assert fs["incomplete"]["count"] == 0
+
+
+def test_incomplete_cycles_skips_closed_market_and_handled_crashes(tmp_state):
+    import datetime as _dt
+    now = state.utcnow()
+
+    def _mk(suffix, hours, files):
+        name = (now - _dt.timedelta(hours=hours)).strftime("%Y%m%dT%H%M%SZ") + suffix
+        d = state.RUNS_DIR / name
+        d.mkdir(parents=True)
+        for fname, content in files.items():
+            (d / fname).write_text(content)
+        return name
+
+    crashed = _mk("-crash", 5, {"signals.json": "{}"})
+    _mk("-closed", 6, {"market_gate.json": '{"is_open": false}'})
+    _mk("-handled", 7, {"signals.json": "{}", "error.json": "{}"})
+    _mk("-done", 8, {"signals.json": "{}", "next_run.json": "{}"})
+    out = dd.incomplete_cycles()
+    assert out["count"] == 1
+    assert out["run_ids"] == [crashed]
+
+
+def test_readiness_scorecard_failure_gate_sees_crashes(tmp_state):
+    """The gate counts logged status=error rows AND unrecorded crashed
+    run dirs — previously it could never be non-zero."""
+    import datetime as _dt
+    state.append_decision(_crash_row(status="error"))
+    name = (state.utcnow() - _dt.timedelta(hours=5)).strftime("%Y%m%dT%H%M%SZ") + "-crash"
+    (state.RUNS_DIR / name).mkdir(parents=True)
+    (state.RUNS_DIR / name / "signals.json").write_text("{}")
+
     rows = dd.readiness_scorecard(nav_rows=[])
-    assert len(rows) == 5
+    by_name = {r["criterion"]: r for r in rows}
+    gate = by_name["Unresolved failures (last 7 days)"]
+    assert gate["met"] is False
+    assert gate["value"] == "2 (1 logged, 1 crashed with no record)"
+
+
+def test_readiness_scorecard_shapes_and_insufficient_data(tmp_state):
+    rows = dd.readiness_scorecard(nav_rows=[], bundle=None)
+    assert len(rows) == 7
     by_name = {r["criterion"]: r for r in rows}
     assert by_name["Continuous paper running"]["met"] is None
     assert by_name["Unresolved failures (last 7 days)"]["met"] is True
+    # Secondary methodology rows are informational only.
+    assert by_name["Sharpe (secondary, EOD-sampled nav_history)"]["met"] is None
+    assert by_name["Max drawdown (secondary, EOD-sampled)"]["met"] is None
 
 
 def test_readiness_scorecard_with_long_profitable_history(tmp_state):
+    """Offline (bundle=None): the gate is still evaluated, from the
+    EOD-sampled fallback, and says so in the value label."""
     import datetime as _dt
     nav_rows = []
     start = _dt.datetime(2026, 4, 1, 20, 0, tzinfo=_dt.timezone.utc)
@@ -2445,11 +2545,41 @@ def test_readiness_scorecard_with_long_profitable_history(tmp_state):
             "at": at.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "nav_usd": round(nav, 2), "cash_usd": 0.0, "positions_count": 2,
         })
-    rows = dd.readiness_scorecard(nav_rows=nav_rows)
+    rows = dd.readiness_scorecard(nav_rows=nav_rows, bundle=None)
     by_name = {r["criterion"]: r for r in rows}
     assert by_name["Continuous paper running"]["met"] is True
-    assert by_name["Sharpe (rf=0, EOD synthetic NAV)"]["met"] is True
+    assert by_name["Sharpe (rf=0)"]["met"] is True
+    assert "EOD-sampled fallback" in by_name["Sharpe (rf=0)"]["value"]
     assert by_name["Max drawdown"]["met"] is True
+
+
+def test_readiness_scorecard_prefers_dense_bundle(tmp_state, monkeypatch):
+    """An explicitly passed MetricsBundle drives the primary gate rows
+    (labeled with method + window) and triggers no fetch of its own."""
+    import datetime as _dt
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        dd, "benchmark_view",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fetch")),
+    )
+    bundle = SimpleNamespace(
+        sharpe_strategy=1.21,
+        max_dd_strategy=(-0.089, _dt.date(2026, 7, 6), _dt.date(2026, 8, 31)),
+        starting_balance_usd=2500.0,
+        inception=_dt.date(2026, 5, 12),
+        as_of=_dt.date(2026, 8, 31),
+    )
+    rows = dd.readiness_scorecard(nav_rows=[], bundle=bundle)
+    by_name = {r["criterion"]: r for r in rows}
+    sharpe = by_name["Sharpe (rf=0)"]
+    assert sharpe["met"] is True
+    assert sharpe["value"].startswith("1.21 · dense trading-day calendar")
+    ddrow = by_name["Max drawdown"]
+    assert ddrow["met"] is True
+    assert ddrow["value"].startswith("8.9% · dense trading-day calendar")
+    # Secondary EOD rows still present (no nav history here → placeholder).
+    assert by_name["Sharpe (secondary, EOD-sampled nav_history)"]["met"] is None
 
 
 # ---------- Codex P2: slippage in risk NAV + unlogged-entry handling ----------

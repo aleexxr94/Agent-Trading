@@ -916,8 +916,7 @@ sg[2].markdown(
 sg[3].markdown(
     _stat_card(
         "Cache hit rate",
-        f"{100.0 * totals['cache_read_input_tokens'] / max(1, totals['total_tokens']):.1f}%"
-        if totals['total_tokens'] else "—",
+        f"{totals['cache_hit_pct']:.1f}%" if totals['input_side_tokens'] else "—",
         sub=f"{totals['total_tokens']:,} tokens lifetime",
     ),
     unsafe_allow_html=True,
@@ -2142,6 +2141,15 @@ def _benchmark_cached(starting: float, live_nav: float | None, mtimes: tuple):
     return dd.benchmark_view(starting, live_nav_usd=live_nav)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _scorecard_cached(mtimes: tuple):
+    """readiness_scorecard's primary Sharpe/DD rows build the SPY-dense
+    bundle (network); cache like _benchmark_cached so a rerun doesn't
+    re-fetch. Keyed on _benchmark_mtimes() — the same inputs invalidate
+    both."""
+    return dd.readiness_scorecard()
+
+
 def _month_row_tone(row: "pd.Series") -> list[str]:
     delta = float(row.get("delta_pct", 0.0) or 0.0)
     if delta > 0:
@@ -3041,7 +3049,7 @@ with tabs[7]:
         "manual, triple-locked decision — this just shows distance to the bar."
     )
     try:
-        score = dd.readiness_scorecard()
+        score = _scorecard_cached(_benchmark_mtimes())
     except Exception:
         score = []
     score_rows = [
@@ -3092,8 +3100,7 @@ with tabs[8]:
                      unsafe_allow_html=True)
     cc2[2].markdown(_stat_card(
         "Cache hit rate",
-        (f"{100.0 * totals['cache_read_input_tokens'] / max(1, totals['total_tokens']):.1f}%"
-         if totals['total_tokens'] else "—"),
+        (f"{totals['cache_hit_pct']:.1f}%" if totals['input_side_tokens'] else "—"),
     ), unsafe_allow_html=True)
     st.caption(
         "All-time totals scoped to **this project** — aggregates `state/costs.jsonl` only."
