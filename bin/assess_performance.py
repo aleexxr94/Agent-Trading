@@ -77,16 +77,15 @@ def _era() -> dict:
     return {"mode": "live", "live_since": lt.get("at") or lt.get("transitioned_at")}
 
 
-def _returns_risk() -> dict:
+def _returns_risk(bundle) -> dict:
     """Scalar slice of the SPY-comparison MetricsBundle (JSON-safe).
 
-    Needs yfinance/network — degrades to ``available: false`` when the
-    bundle can't be built (too little history, or offline)."""
-    from lib import dashboard_data
-
-    bundle = dashboard_data.benchmark_view()
+    Takes the bundle prebuilt by ``gather()`` (one yfinance fetch per
+    report, shared with the promotion scorecard) — degrades to
+    ``available: false`` when it couldn't be built (too little history,
+    or offline)."""
     if bundle is None:
-        return {"available": False, "reason": "fewer than 2 trading-day points"}
+        return {"available": False, "reason": "bundle unavailable (too little history or offline)"}
     dd_pct, dd_peak, dd_trough = bundle.max_dd_strategy
     return {
         "available": True,
@@ -176,6 +175,13 @@ def gather(limit: int | None = None) -> dict:
 
     nav_rows = state.read_nav_history()
     span = _span_days(nav_rows)
+    # One SPY-dense bundle per report, shared by the scorecard's primary
+    # Sharpe/DD gate rows and the returns_risk section (single fetch;
+    # None → both degrade to their labeled offline fallbacks).
+    try:
+        bench_bundle = dashboard_data.benchmark_view()
+    except Exception:
+        bench_bundle = None
     memo = _safe(feedback.build_performance_memo)
     closed_trades = (
         memo.get("closed_trades", 0) if isinstance(memo, dict) else 0
@@ -196,9 +202,9 @@ def gather(limit: int | None = None) -> dict:
             },
         },
         "promotion_scorecard": _safe(
-            lambda: dashboard_data.readiness_scorecard(nav_rows)
+            lambda: dashboard_data.readiness_scorecard(nav_rows, bundle=bench_bundle)
         ),
-        "returns_risk": _safe(_returns_risk),
+        "returns_risk": _safe(lambda: _returns_risk(bench_bundle)),
         "trade_record": _safe(_trade_record),
         "calibration": memo,
         "cost_health": _safe(_cost_health),

@@ -2491,14 +2491,19 @@ def test_readiness_scorecard_failure_gate_sees_crashes(tmp_state):
 
 
 def test_readiness_scorecard_shapes_and_insufficient_data(tmp_state):
-    rows = dd.readiness_scorecard(nav_rows=[])
-    assert len(rows) == 5
+    rows = dd.readiness_scorecard(nav_rows=[], bundle=None)
+    assert len(rows) == 7
     by_name = {r["criterion"]: r for r in rows}
     assert by_name["Continuous paper running"]["met"] is None
     assert by_name["Unresolved failures (last 7 days)"]["met"] is True
+    # Secondary methodology rows are informational only.
+    assert by_name["Sharpe (secondary, EOD-sampled nav_history)"]["met"] is None
+    assert by_name["Max drawdown (secondary, EOD-sampled)"]["met"] is None
 
 
 def test_readiness_scorecard_with_long_profitable_history(tmp_state):
+    """Offline (bundle=None): the gate is still evaluated, from the
+    EOD-sampled fallback, and says so in the value label."""
     import datetime as _dt
     nav_rows = []
     start = _dt.datetime(2026, 4, 1, 20, 0, tzinfo=_dt.timezone.utc)
@@ -2510,11 +2515,41 @@ def test_readiness_scorecard_with_long_profitable_history(tmp_state):
             "at": at.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "nav_usd": round(nav, 2), "cash_usd": 0.0, "positions_count": 2,
         })
-    rows = dd.readiness_scorecard(nav_rows=nav_rows)
+    rows = dd.readiness_scorecard(nav_rows=nav_rows, bundle=None)
     by_name = {r["criterion"]: r for r in rows}
     assert by_name["Continuous paper running"]["met"] is True
-    assert by_name["Sharpe (rf=0, EOD synthetic NAV)"]["met"] is True
+    assert by_name["Sharpe (rf=0)"]["met"] is True
+    assert "EOD-sampled fallback" in by_name["Sharpe (rf=0)"]["value"]
     assert by_name["Max drawdown"]["met"] is True
+
+
+def test_readiness_scorecard_prefers_dense_bundle(tmp_state, monkeypatch):
+    """An explicitly passed MetricsBundle drives the primary gate rows
+    (labeled with method + window) and triggers no fetch of its own."""
+    import datetime as _dt
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        dd, "benchmark_view",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fetch")),
+    )
+    bundle = SimpleNamespace(
+        sharpe_strategy=1.21,
+        max_dd_strategy=(-0.089, _dt.date(2026, 7, 6), _dt.date(2026, 8, 31)),
+        starting_balance_usd=2500.0,
+        inception=_dt.date(2026, 5, 12),
+        as_of=_dt.date(2026, 8, 31),
+    )
+    rows = dd.readiness_scorecard(nav_rows=[], bundle=bundle)
+    by_name = {r["criterion"]: r for r in rows}
+    sharpe = by_name["Sharpe (rf=0)"]
+    assert sharpe["met"] is True
+    assert sharpe["value"].startswith("1.21 · dense trading-day calendar")
+    ddrow = by_name["Max drawdown"]
+    assert ddrow["met"] is True
+    assert ddrow["value"].startswith("8.9% · dense trading-day calendar")
+    # Secondary EOD rows still present (no nav history here → placeholder).
+    assert by_name["Sharpe (secondary, EOD-sampled nav_history)"]["met"] is None
 
 
 # ---------- Codex P2: slippage in risk NAV + unlogged-entry handling ----------

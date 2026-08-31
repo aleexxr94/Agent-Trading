@@ -2223,7 +2223,11 @@ def failure_summary(days: int = 7) -> dict:
     }
 
 
-def readiness_scorecard(nav_rows: list[dict] | None = None) -> list[dict]:
+def readiness_scorecard(
+    nav_rows: list[dict] | None = None,
+    *,
+    bundle: object = "auto",
+) -> list[dict]:
     """Auto-tracked promotion-to-live criteria (CLAUDE.md §Promotion).
 
     Each row: {criterion, target, value, met} with met in {True, False,
@@ -2232,6 +2236,17 @@ def readiness_scorecard(nav_rows: list[dict] | None = None) -> list[dict]:
     weekdays elapsed" since the scheduler's intended cadence isn't
     persisted. Purely informational — promotion remains a manual,
     triple-locked decision.
+
+    ``bundle`` feeds the Sharpe / max-drawdown gate rows:
+      - "auto" (default): build ``benchmark_view()`` here (needs
+        yfinance/network; falls back on any error),
+      - a prebuilt MetricsBundle: use as-is, no fetch (callers that
+        already built one, e.g. bin/assess_performance),
+      - None: force the offline EOD-sampled fallback.
+    The dense bundle is the honest gate series — the EOD-sampled
+    nav_history variant collapses calendar gaps into single "daily"
+    returns before √252-annualising (inflating Sharpe) and lacks the
+    $2,500 inception anchor; it stays visible as labeled secondary rows.
     """
     from datetime import timedelta
 
@@ -2283,28 +2298,72 @@ def readiness_scorecard(nav_rows: list[dict] | None = None) -> list[dict]:
         "met": (completion >= 80.0) if completion is not None else None,
     })
 
-    # --- Sharpe >= 0.5 and max DD <= 25% from the EOD equity curve ---
-    sharpe_v = dd_pct = None
+    # --- Sharpe >= 0.5 and max DD <= 25% ---
+    # Secondary (EOD-sampled) numbers first: also the offline fallback.
+    eod_sharpe = eod_dd_pct = None
     try:
         eod = benchmark.align_to_eod(nav_rows)
         if len(eod) >= 10:
             returns = eod["nav"].pct_change().dropna()
-            sharpe_v = benchmark.sharpe(returns)
+            eod_sharpe = benchmark.sharpe(returns)
             dd, _, _ = benchmark.max_drawdown(eod["nav"])
-            dd_pct = abs(dd) * 100.0
+            eod_dd_pct = abs(dd) * 100.0
     except Exception:
         pass
+
+    b = None
+    if isinstance(bundle, str) and bundle == "auto":
+        try:
+            b = benchmark_view()
+        except Exception:
+            b = None
+    elif bundle is not None:
+        b = bundle
+
+    if b is not None and getattr(b, "sharpe_strategy", None) is not None:
+        sharpe_v = float(b.sharpe_strategy)
+        dd_v = abs(float(b.max_dd_strategy[0])) * 100.0
+        method = (
+            f"dense trading-day calendar, ${b.starting_balance_usd:,.0f} anchor, "
+            f"{b.inception} → {b.as_of}"
+        )
+        sharpe_value = f"{sharpe_v:.2f} · {method}"
+        dd_value = f"{dd_v:.1f}% · {method}"
+    else:
+        sharpe_v, dd_v = eod_sharpe, eod_dd_pct
+        tag = "EOD-sampled fallback (SPY calendar unavailable)"
+        sharpe_value = (
+            f"{sharpe_v:.2f} · {tag}" if sharpe_v is not None
+            else "— (need >= 10 EOD points)"
+        )
+        dd_value = f"{dd_v:.1f}% · {tag}" if dd_v is not None else "—"
+
     rows.append({
-        "criterion": "Sharpe (rf=0, EOD synthetic NAV)",
+        "criterion": "Sharpe (rf=0)",
         "target": ">= 0.5",
-        "value": f"{sharpe_v:.2f}" if sharpe_v is not None else "— (need >= 10 EOD points)",
+        "value": sharpe_value,
         "met": (sharpe_v >= 0.5) if sharpe_v is not None else None,
     })
     rows.append({
         "criterion": "Max drawdown",
         "target": "<= 25%",
-        "value": f"{dd_pct:.1f}%" if dd_pct is not None else "—",
-        "met": (dd_pct <= 25.0) if dd_pct is not None else None,
+        "value": dd_value,
+        "met": (dd_v <= 25.0) if dd_v is not None else None,
+    })
+    # The two methodologies sit side by side, labeled, instead of
+    # silently conflicting across report sections (met=None renders as
+    # an informational badge in both consumers).
+    rows.append({
+        "criterion": "Sharpe (secondary, EOD-sampled nav_history)",
+        "target": "(informational)",
+        "value": f"{eod_sharpe:.2f}" if eod_sharpe is not None else "— (need >= 10 EOD points)",
+        "met": None,
+    })
+    rows.append({
+        "criterion": "Max drawdown (secondary, EOD-sampled)",
+        "target": "(informational)",
+        "value": f"{eod_dd_pct:.1f}%" if eod_dd_pct is not None else "—",
+        "met": None,
     })
 
     # --- no failures in the last 7 days ---
