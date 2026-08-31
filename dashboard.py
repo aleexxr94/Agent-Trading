@@ -916,8 +916,7 @@ sg[2].markdown(
 sg[3].markdown(
     _stat_card(
         "Cache hit rate",
-        f"{100.0 * totals['cache_read_input_tokens'] / max(1, totals['total_tokens']):.1f}%"
-        if totals['total_tokens'] else "—",
+        f"{totals['cache_hit_pct']:.1f}%" if totals['input_side_tokens'] else "—",
         sub=f"{totals['total_tokens']:,} tokens lifetime",
     ),
     unsafe_allow_html=True,
@@ -3101,8 +3100,7 @@ with tabs[8]:
                      unsafe_allow_html=True)
     cc2[2].markdown(_stat_card(
         "Cache hit rate",
-        (f"{100.0 * totals['cache_read_input_tokens'] / max(1, totals['total_tokens']):.1f}%"
-         if totals['total_tokens'] else "—"),
+        (f"{totals['cache_hit_pct']:.1f}%" if totals['input_side_tokens'] else "—"),
     ), unsafe_allow_html=True)
     st.caption(
         "All-time totals scoped to **this project** — aggregates `state/costs.jsonl` only."

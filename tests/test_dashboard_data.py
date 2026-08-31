@@ -1717,6 +1717,10 @@ def test_total_token_cost_aggregates(tmp_state):
     assert t["cache_read_input_tokens"] == 800
     assert t["total_tokens"] == 1500 + 1700 + 200 + 800
     assert t["cost_usd"] == pytest.approx(0.22)
+    # Cache hit rate is input-side: reads / (input + creation + reads).
+    # Dividing by total_tokens (output included) would report 19.0%.
+    assert t["input_side_tokens"] == 1500 + 200 + 800
+    assert t["cache_hit_pct"] == pytest.approx(100.0 * 800 / 2500)
 
 
 def test_cost_by_month_buckets_correctly(tmp_state):
@@ -2285,8 +2289,9 @@ def test_cost_by_stage_empty_state_returns_empty(tmp_state):
 
 def test_cache_hit_trend_token_weighted_per_run(tmp_state):
     """Sourced from costs.jsonl token counters, NOT the decision log —
-    the orchestrator hard-codes prompt_cache_hit_pct=0.0 in every
-    decision row, so decisions would always trend at 0% (codex P2)."""
+    the ledger carries the per-call truth (decision rows historically
+    hard-coded prompt_cache_hit_pct=0.0; they now carry a per-stage
+    aggregate, but the trend keeps reading the ledger) (codex P2)."""
     state.append_cost({
         "run_id": "20260601T120000Z-a", "stage": "strategist", "model": "m",
         "cost_usd": 0.05, "at": "2026-06-01T12:00:00Z",

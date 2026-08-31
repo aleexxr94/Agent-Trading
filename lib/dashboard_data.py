@@ -838,6 +838,18 @@ def total_token_cost() -> dict:
         + sums["cache_creation_input_tokens"]
         + sums["cache_read_input_tokens"]
     )
+    # Cache hit rate is an INPUT-side ratio (same definition as
+    # cost_by_stage / cache_hit_trend / llm.CallUsage.cache_hit_pct);
+    # dividing reads by total_tokens would dilute it with output tokens.
+    sums["input_side_tokens"] = (
+        sums["input_tokens"]
+        + sums["cache_creation_input_tokens"]
+        + sums["cache_read_input_tokens"]
+    )
+    sums["cache_hit_pct"] = (
+        100.0 * sums["cache_read_input_tokens"] / sums["input_side_tokens"]
+        if sums["input_side_tokens"] > 0 else 0.0
+    )
     return sums
 
 
@@ -906,9 +918,10 @@ def cache_hit_trend(limit: int = 200) -> list[dict]:
     ``100 * cache_read / (input + cache_creation + cache_read)`` over
     each run's summed token counters — same definition as
     ``cost_by_stage``. Sourced from cost rows, NOT the decision log:
-    the orchestrator writes every decision row with a hard-coded
-    ``prompt_cache_hit_pct: 0.0``, while lib/llm.py records the real
-    cache token counters in costs.jsonl (codex P2 on PR #108).
+    costs.jsonl carries the per-call token counters (decision rows now
+    also carry a real per-stage hit% via the orchestrator's cost-delta
+    computation, but the ledger stays the single source of truth here —
+    codex P2 on PR #108).
 
     Returns ``[{run_id, at, cache_hit_pct}]`` oldest→newest, one row
     per run. Runs whose cost rows carry no token counters are skipped.

@@ -1533,6 +1533,29 @@ def stage_execute(ctx: StageContext, portfolio: dict, view: dict | None = None) 
 # ----- pipeline driver -----
 
 
+def _stage_cost_from_delta(run_id: str, n_before: int) -> tuple[float, float]:
+    """Real (cost_usd, prompt_cache_hit_pct) for the cost rows a stage just
+    appended. lib/llm.py records every call to costs.jsonl synchronously
+    (schema retries included), so the rows past ``n_before`` are exactly
+    this stage's spend. Hit% is the input-side ratio — identical semantics
+    to llm.CallUsage.cache_hit_pct. Reporting must never break the
+    pipeline: any read error degrades to (0.0, 0.0), the values every
+    decision row carried before this existed. Deterministic and dry-run
+    stages append nothing → (0.0, 0.0) exactly as before.
+    """
+    try:
+        delta = state.read_costs_for_run(run_id)[n_before:]
+        cost = sum(float(r.get("cost_usd") or 0.0) for r in delta)
+        inp = sum(int(r.get("input_tokens") or 0) for r in delta)
+        creation = sum(int(r.get("cache_creation_input_tokens") or 0) for r in delta)
+        read = sum(int(r.get("cache_read_input_tokens") or 0) for r in delta)
+        denom = inp + creation + read
+        hit = (100.0 * read / denom) if denom > 0 else 0.0
+        return max(0.0, round(cost, 6)), min(100.0, max(0.0, hit))
+    except Exception:
+        return 0.0, 0.0
+
+
 def _run_stage(
     *,
     ctx: StageContext,
@@ -1547,6 +1570,15 @@ def _run_stage(
         raise llm.HaltFlagSet(f"halt.flag set before stage={stage_id}")
 
     started_at = state.utcnow_iso()
+    # Snapshot the cost ledger so the decision row can carry this stage's
+    # REAL spend + cache hit rather than the historical hard-coded 0.0.
+    # Note: stage_execute's runner also fires the nested meta call, whose
+    # cost rows land in this stage's delta — deliberately attributed to
+    # the "execute" decision row (costs.jsonl keeps the per-call truth).
+    try:
+        n_costs_before = len(state.read_costs_for_run(ctx.run_id))
+    except Exception:
+        n_costs_before = 0
     output = runner()
     if schema:
         state.validate(output, schema)
@@ -1554,14 +1586,15 @@ def _run_stage(
     out_path = state.run_dir(ctx.run_id) / output_filename
     state.write_json(out_path, output)
 
+    cost_usd, cache_hit_pct = _stage_cost_from_delta(ctx.run_id, n_costs_before)
     state.append_decision({
         "run_id": ctx.run_id,
         "stage": stage_id,
         "model": model,
         "inputs_hash": _hash_inputs(*inputs_hash_parts),
         "output_ref": output_filename,
-        "prompt_cache_hit_pct": 0.0,
-        "cost_usd": 0.0,
+        "prompt_cache_hit_pct": cache_hit_pct,
+        "cost_usd": cost_usd,
         "started_at": started_at,
         "ended_at": state.utcnow_iso(),
         "status": "ok",
