@@ -129,6 +129,13 @@ def test_write_closed_artifacts_creates_market_gate_and_next_run(tmp_state):
     assert next_run["next_run_at"] == "2026-05-14T13:30:00Z"
     assert next_run["market_closed"] is True
 
+    # The run dir carries its own copy so a closed-market cycle leaves the
+    # same terminal artifact trail as every other path (incomplete-cycle
+    # detection keys on run_dir/next_run.json).
+    nr_path = state.run_dir(rid) / "next_run.json"
+    assert nr_path.exists()
+    assert json.loads(nr_path.read_text()) == next_run
+
 
 def test_write_closed_artifacts_handles_missing_next_open(tmp_state):
     """If next_open is None, next_run_at is empty string (not None);
@@ -140,6 +147,7 @@ def test_write_closed_artifacts_handles_missing_next_open(tmp_state):
     )
     next_run = market_gate.write_closed_artifacts(rid, ms)
     assert next_run["next_run_at"] == ""
+    assert json.loads((state.run_dir(rid) / "next_run.json").read_text()) == next_run
 
 
 def test_write_closed_artifacts_marks_clock_error(tmp_state):
@@ -166,4 +174,5 @@ def test_write_closed_artifacts_marks_clock_error(tmp_state):
 
     gate = json.loads((state.run_dir(rid) / "market_gate.json").read_text())
     assert gate["clock_error"] is True
+    assert json.loads((state.run_dir(rid) / "next_run.json").read_text()) == next_run
     assert gate["is_open"] is False

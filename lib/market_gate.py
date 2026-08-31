@@ -133,10 +133,14 @@ def check(broker: Broker | None) -> MarketState:
 
 def write_closed_artifacts(run_id: str, ms: MarketState) -> dict:
     """Write the minimum artifacts a closed-market cycle needs:
-    market_gate.json next to the run dir, next_run.json pointing at the
-    broker-reported next open (or empty if unknown so the daily fallback
-    timer covers us). Returns the next_run dict so the caller can also
-    persist it to state.NEXT_RUN.
+    market_gate.json AND next_run.json inside the run dir, the latter
+    pointing at the broker-reported next open (or empty if unknown so the
+    daily fallback timer covers us). Returns the next_run dict so the
+    caller can also persist it to state.NEXT_RUN.
+
+    The run-dir next_run.json matters beyond bookkeeping: every terminal
+    pipeline path leaves one, and crash detection (incomplete-cycle
+    counting) treats a started run dir without it as a crashed cycle.
     """
     gate_payload = {
         "run_id": run_id,
@@ -180,4 +184,5 @@ def write_closed_artifacts(run_id: str, ms: MarketState) -> dict:
         # the meta-scheduler, not from market-closed bypasses.
         "cycle_intent": "trade",
     }
+    state.write_json(state.run_dir(run_id) / "next_run.json", next_run)
     return next_run
