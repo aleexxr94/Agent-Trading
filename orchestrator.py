@@ -1233,6 +1233,14 @@ META_MIN_HOURS = 1.0
 META_MAX_HOURS = 24.0
 # Tolerance absorbs second-precision rounding + LLM round-trip latency.
 META_BOUND_TOLERANCE_SECONDS = 30.0
+# A review fired more than this far before the next market open is
+# analysing a regime nothing can act on until the open — e.g. a Saturday
+# review ~48h before Monday's bell. Such picks are downgraded to "trade"
+# so the market gate $0-skips them and rolls next_run to the open,
+# instead of billing ~$0.13 for stale reflection. Weekday-evening
+# reviews (next open ~12-16h away) are unaffected. (2026-08-31 cost
+# lever, user-authorized.)
+REVIEW_STALENESS_MAX_HOURS = 24.0
 
 
 def _compute_next_run_at(
@@ -1293,7 +1301,10 @@ def _compute_next_run_at(
             "Choose the next-run window AND the cycle_intent for it. "
             "review = signals + strategist only, no orders, ~$0.13 cost; "
             "use for post-close reflection. trade = full pipeline. "
-            "Return JSON only."
+            "Note: a review scheduled more than 24h before the next market "
+            "open (e.g. on a weekend) is auto-downgraded to trade, so don't "
+            "pick review when the market won't open within a day of the "
+            "chosen time. Return JSON only."
         ),
     }
     try:
@@ -1339,6 +1350,25 @@ def _compute_next_run_at(
         rationale_suffix = " (meta picked review but daily cap exhausted; downgraded to trade)"
     else:
         rationale_suffix = ""
+    # Weekend/holiday staleness guard: a review that would fire more than
+    # REVIEW_STALENESS_MAX_HOURS before the next open can't inform any
+    # trade — downgrade so the gate $0-skips it at fire time.
+    if next_intent == "review" and not market_is_open and next_open:
+        try:
+            open_dt = datetime.fromisoformat(
+                str(next_open).replace("Z", "+00:00")
+            )
+            if open_dt.tzinfo is None:
+                open_dt = open_dt.replace(tzinfo=timezone.utc)
+            gap_hours = (open_dt - at).total_seconds() / 3600.0
+            if gap_hours > REVIEW_STALENESS_MAX_HOURS:
+                next_intent = "trade"
+                rationale_suffix += (
+                    f" (review pick was {gap_hours:.0f}h before next open; "
+                    "downgraded to trade — the market gate will roll it to the open)"
+                )
+        except (ValueError, TypeError):
+            pass
     rationale = (payload.get("rationale") or "")[:300] + rationale_suffix
     return payload["next_run_at"], f"orchestrator-meta: {rationale}", next_intent
 

@@ -216,7 +216,7 @@ Output: `sanity.json`.
 - **meta** — Sonnet 4.6: given the freshly-built portfolio + recent NAV trend + time of day + strategist regime, decides when the **next cycle fires** (bounded 1–24h, falls back to a 4h/6h heuristic if the LLM output is unusable) and which intent it runs (trade vs review — see below). Writes `state/next_run.json`.
 
 ### Cycle intents — trade vs review
-Most cycles run the full pipeline (a **trade** cycle). The meta-scheduler can instead schedule a lightweight **review** cycle — signals + strategist + meta only, no construct/critic/execute and no orders — to re-check the regime cheaply between trade cycles. Autonomous review cycles are capped by `MAX_REVIEW_CYCLES_PER_DAY` (default 2). The intent is read from the prior `next_run.json` by default; `--intent {trade,review}` forces it for a manual run.
+Most cycles run the full pipeline (a **trade** cycle). The meta-scheduler can instead schedule a lightweight **review** cycle — signals + strategist + meta only, no construct/critic/execute and no orders — to re-check the regime cheaply between trade cycles. Autonomous review cycles are capped by `MAX_REVIEW_CYCLES_PER_DAY` (default 2), and a review pick scheduled more than 24h before the next market open (a weekend or long holiday) is deterministically downgraded to trade so the market gate $0-skips it instead of billing ~$0.13 for a regime nothing can act on until the bell. The intent is read from the prior `next_run.json` by default; `--intent {trade,review}` forces it for a manual run.
 
 ### Risk controls (always-on)
 
