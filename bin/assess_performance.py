@@ -135,78 +135,36 @@ def _cost_health() -> dict:
 
 
 def _incomplete_cycles(*, lookback_days: int = 7, min_age_hours: int = 3) -> dict:
-    """Count crashed / never-finished cycles from run artifacts.
+    """Crashed / never-finished cycles — delegates to the shared
+    ``dashboard_data.incomplete_cycles`` so this CLI, the dashboard, and
+    the ``readiness_scorecard`` failure gate all count identically
+    (closed-market cycles excluded, crash-handler ``error.json`` dirs
+    excluded to avoid double counting their decision rows)."""
+    from lib import dashboard_data
 
-    The 7-day ``failures`` decision-log count (and the promotion gate it
-    mirrors) has a blind spot: ``orchestrator._run_stage`` appends a
-    decision row only AFTER the runner + schema validation succeed, and
-    no path ever writes an ``error``/``fail`` status — so a
-    ``SchemaRetryFailed`` or other unhandled crash leaves NO failure row
-    at all, and ``failures_last_7d`` reads 0. A completed cycle always
-    writes ``next_run.json`` last, so a started run dir (has a stage
-    artifact) with no ``next_run.json`` — and old enough not to be the
-    in-flight cycle — is a crashed cycle the decision log never recorded.
-    Read-only; the fix for the gate itself would live in the pipeline's
-    error handling, out of this tool's scope."""
-    from datetime import timedelta
-
-    now = state.utcnow()
-    cutoff = (now - timedelta(days=lookback_days)).strftime("%Y%m%dT%H%M%SZ")
-    age_cutoff = (now - timedelta(hours=min_age_hours)).strftime("%Y%m%dT%H%M%SZ")
-    incomplete: list[str] = []
-    runs_dir = state.RUNS_DIR
-    if runs_dir.exists():
-        # Run ids start with a sortable UTC timestamp — reverse walk +
-        # lexicographic compare against the cutoff prunes old runs cheaply
-        # (same trick as dashboard_data.trade_sync_gaps).
-        for run_dir in sorted(runs_dir.iterdir(), reverse=True):
-            name = run_dir.name
-            if name < cutoff:
-                break
-            if name >= age_cutoff or not run_dir.is_dir():
-                continue  # too fresh to judge (may be in-flight), or not a dir
-            if (run_dir / "next_run.json").exists():
-                continue  # completed — every terminal path writes this last
-            started = any(
-                (run_dir / f).exists() for f in ("market_gate.json", "signals.json")
-            )
-            if started:
-                incomplete.append(name)
-    return {
-        "count": len(incomplete),
-        "run_ids": incomplete[:20],
-        "lookback_days": lookback_days,
-    }
+    return dashboard_data.incomplete_cycles(
+        lookback_days=lookback_days, min_age_hours=min_age_hours,
+    )
 
 
 def _operational() -> dict:
     """Cycle deployment + failure/status counts over the last 7 days.
 
-    The 7-day failure count uses the SAME rule as
-    ``readiness_scorecard`` (status startswith ``error`` or contains
-    ``fail``); the status histogram adds visibility into schema_retry /
-    aborted / skipped that the single gate number hides. ``incomplete``
-    catches crashed cycles that the decision log never recorded at all —
-    see ``_incomplete_cycles``."""
-    from datetime import timedelta
-
+    The failure count and status histogram come from the shared
+    ``dashboard_data.failure_summary`` — the same evidence the
+    ``readiness_scorecard`` failure gate uses, so this report can never
+    show a green gate while counting failures differently. Since the
+    pipeline crash handler exists, unhandled crashes appear here as
+    status="error" rows; cost-cap stops appear as "aborted" (a designed
+    guardrail, deliberately not a gate failure)."""
     from lib import dashboard_data
 
-    cutoff_iso = (state.utcnow() - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    status_counts: dict[str, int] = {}
-    failures_7d = 0
-    for d in dashboard_data.load_decisions(limit=2000):
-        if (d.get("started_at") or "") < cutoff_iso:
-            continue
-        status = str(d.get("status") or "unknown")
-        status_counts[status] = status_counts.get(status, 0) + 1
-        if status.startswith("error") or "fail" in status:
-            failures_7d += 1
+    fs = dashboard_data.failure_summary(days=7)
     return {
         "activity": dashboard_data.activity_metrics(),
-        "failures_last_7d": failures_7d,
-        "incomplete_cycles_last_7d": _incomplete_cycles(),
-        "status_counts_last_7d": dict(sorted(status_counts.items())),
+        "failures_last_7d": fs["failures"],
+        "incomplete_cycles_last_7d": fs["incomplete"],
+        "status_counts_last_7d": fs["status_counts"],
         "trade_sync_gaps": dashboard_data.trade_sync_gaps(),
     }
 

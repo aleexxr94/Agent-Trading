@@ -2137,6 +2137,92 @@ def trade_sync_gaps(*, lookback_days: int = 7) -> dict:
     }
 
 
+def incomplete_cycles(*, lookback_days: int = 7, min_age_hours: int = 3) -> dict:
+    """Count crashed / never-finished cycles from run artifacts.
+
+    A completed cycle always writes ``next_run.json`` into its run dir
+    last, so a started run dir (has a stage artifact) with no
+    ``next_run.json`` — and old enough not to be the in-flight cycle — is
+    a crashed cycle. Two carve-outs keep this honest:
+
+    - A dir whose ``market_gate.json`` parses with ``is_open == false``
+      counts as complete: closed-market cycles predating the run-dir
+      next_run.json write (fix in the same release as this helper) would
+      otherwise read as false-positive crashes forever.
+    - A dir containing ``error.json`` is not counted: the crash handler's
+      decision row (status="error"/"aborted") already represents it, and
+      counting both would double-book one crash in ``failure_summary``.
+
+    Shared by the dashboard and ``bin/assess_performance.py`` so the
+    promotion gate and the CLI report count identically.
+    """
+    from datetime import timedelta
+
+    now = state.utcnow()
+    cutoff = (now - timedelta(days=lookback_days)).strftime("%Y%m%dT%H%M%SZ")
+    age_cutoff = (now - timedelta(hours=min_age_hours)).strftime("%Y%m%dT%H%M%SZ")
+    incomplete: list[str] = []
+    runs_dir = state.RUNS_DIR
+    if runs_dir.exists():
+        # Run ids start with a sortable UTC timestamp — reverse walk +
+        # lexicographic compare against the cutoff prunes old runs cheaply
+        # (same trick as trade_sync_gaps).
+        for run_dir in sorted(runs_dir.iterdir(), reverse=True):
+            name = run_dir.name
+            if name < cutoff:
+                break
+            if name >= age_cutoff or not run_dir.is_dir():
+                continue  # too fresh to judge (may be in-flight), or not a dir
+            if (run_dir / "next_run.json").exists():
+                continue  # completed — every terminal path writes this last
+            if (run_dir / "error.json").exists():
+                continue  # crash already recorded by the pipeline handler
+            gate_path = run_dir / "market_gate.json"
+            if gate_path.exists():
+                try:
+                    if json.loads(gate_path.read_text()).get("is_open") is False:
+                        continue  # legacy closed-market cycle (pre run-dir write)
+                except (json.JSONDecodeError, OSError):
+                    pass
+            started = gate_path.exists() or (run_dir / "signals.json").exists()
+            if started:
+                incomplete.append(name)
+    return {
+        "count": len(incomplete),
+        "run_ids": incomplete[:20],
+        "lookback_days": lookback_days,
+    }
+
+
+def failure_summary(days: int = 7) -> dict:
+    """Failure evidence for the §Promotion "no unresolved failures" gate.
+
+    ``failures`` counts decision rows whose status starts with "error" or
+    contains "fail" — since the pipeline crash handler exists, that
+    catches status="error" rows. Cost-cap stops write status="aborted",
+    which deliberately does NOT count: a cap stop is a designed guardrail
+    doing its job. ``incomplete`` adds crashes so early or so broken that
+    no row was written at all.
+    """
+    from datetime import timedelta
+
+    cutoff_iso = (state.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    status_counts: dict[str, int] = {}
+    failures = 0
+    for d in load_decisions(limit=2000):
+        if (d.get("started_at") or "") < cutoff_iso:
+            continue
+        status = str(d.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if status.startswith("error") or "fail" in status:
+            failures += 1
+    return {
+        "failures": failures,
+        "status_counts": dict(sorted(status_counts.items())),
+        "incomplete": incomplete_cycles(lookback_days=days),
+    }
+
+
 def readiness_scorecard(nav_rows: list[dict] | None = None) -> list[dict]:
     """Auto-tracked promotion-to-live criteria (CLAUDE.md §Promotion).
 
@@ -2222,19 +2308,25 @@ def readiness_scorecard(nav_rows: list[dict] | None = None) -> list[dict]:
     })
 
     # --- no failures in the last 7 days ---
-    cutoff_iso = (state.utcnow() - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    failures = 0
-    for d in load_decisions(limit=2000):
-        if (d.get("started_at") or "") < cutoff_iso:
-            continue
-        status = str(d.get("status") or "")
-        if status.startswith("error") or "fail" in status:
-            failures += 1
+    # Logged failure rows (status="error") PLUS crashed cycles that never
+    # wrote any row — the gate must see both or it can't fail when the
+    # system does.
+    try:
+        fs = failure_summary(days=7)
+        logged = fs["failures"]
+        crashed = fs["incomplete"]["count"]
+    except Exception:
+        logged, crashed = 0, 0
+    total_failures = logged + crashed
+    if crashed:
+        fail_value = f"{total_failures} ({logged} logged, {crashed} crashed with no record)"
+    else:
+        fail_value = str(total_failures)
     rows.append({
         "criterion": "Unresolved failures (last 7 days)",
         "target": "0",
-        "value": str(failures),
-        "met": failures == 0,
+        "value": fail_value,
+        "met": total_failures == 0,
     })
     return rows
 

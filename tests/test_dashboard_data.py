@@ -2425,6 +2425,71 @@ def test_trade_sync_gaps_flags_orders_without_fills(tmp_state, monkeypatch):
     assert out2["stale"] is False
 
 
+def _crash_row(status="error", started_at=None, stage="pipeline"):
+    """A schema-valid decision row for failure-gate tests."""
+    at = started_at or state.utcnow_iso()
+    row = {
+        "run_id": "gate-test", "stage": stage, "model": "local-deterministic",
+        "inputs_hash": "deadbeefcafebabe", "output_ref": "error.json",
+        "prompt_cache_hit_pct": 0.0, "cost_usd": 0.0,
+        "started_at": at, "ended_at": at, "status": status,
+        "risk_warning": "PAPER TRADING — leveraged & inverse ETFs are high-risk.",
+    }
+    if status in ("error", "aborted"):
+        row["error"] = "RuntimeError: boom"
+    return row
+
+
+def test_failure_summary_counts_error_not_aborted(tmp_state):
+    import datetime as _dt
+    state.append_decision(_crash_row(status="error"))
+    state.append_decision(_crash_row(status="aborted"))  # cap stop: not a failure
+    old = (state.utcnow() - _dt.timedelta(days=9)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state.append_decision(_crash_row(status="error", started_at=old))  # outside window
+    fs = dd.failure_summary(days=7)
+    assert fs["failures"] == 1
+    assert fs["status_counts"]["error"] == 1
+    assert fs["status_counts"]["aborted"] == 1
+    assert fs["incomplete"]["count"] == 0
+
+
+def test_incomplete_cycles_skips_closed_market_and_handled_crashes(tmp_state):
+    import datetime as _dt
+    now = state.utcnow()
+
+    def _mk(suffix, hours, files):
+        name = (now - _dt.timedelta(hours=hours)).strftime("%Y%m%dT%H%M%SZ") + suffix
+        d = state.RUNS_DIR / name
+        d.mkdir(parents=True)
+        for fname, content in files.items():
+            (d / fname).write_text(content)
+        return name
+
+    crashed = _mk("-crash", 5, {"signals.json": "{}"})
+    _mk("-closed", 6, {"market_gate.json": '{"is_open": false}'})
+    _mk("-handled", 7, {"signals.json": "{}", "error.json": "{}"})
+    _mk("-done", 8, {"signals.json": "{}", "next_run.json": "{}"})
+    out = dd.incomplete_cycles()
+    assert out["count"] == 1
+    assert out["run_ids"] == [crashed]
+
+
+def test_readiness_scorecard_failure_gate_sees_crashes(tmp_state):
+    """The gate counts logged status=error rows AND unrecorded crashed
+    run dirs — previously it could never be non-zero."""
+    import datetime as _dt
+    state.append_decision(_crash_row(status="error"))
+    name = (state.utcnow() - _dt.timedelta(hours=5)).strftime("%Y%m%dT%H%M%SZ") + "-crash"
+    (state.RUNS_DIR / name).mkdir(parents=True)
+    (state.RUNS_DIR / name / "signals.json").write_text("{}")
+
+    rows = dd.readiness_scorecard(nav_rows=[])
+    by_name = {r["criterion"]: r for r in rows}
+    gate = by_name["Unresolved failures (last 7 days)"]
+    assert gate["met"] is False
+    assert gate["value"] == "2 (1 logged, 1 crashed with no record)"
+
+
 def test_readiness_scorecard_shapes_and_insufficient_data(tmp_state):
     rows = dd.readiness_scorecard(nav_rows=[])
     assert len(rows) == 5
