@@ -347,7 +347,16 @@ def strip_markdown_fences(text: str) -> str:
 
 
 class CostCapExceeded(RuntimeError):
-    """Raised between calls when per-run or daily caps would be breached."""
+    """Raised between calls when per-run or daily caps would be breached.
+
+    ``cap`` is machine-readable ("per_run" | "daily") so the pipeline crash
+    handler can pick the right reschedule (fresh run soon vs next UTC day)
+    without parsing the human-readable message.
+    """
+
+    def __init__(self, message: str, *, cap: str = "per_run"):
+        super().__init__(message)
+        self.cap = cap
 
 
 class HaltFlagSet(RuntimeError):
@@ -397,10 +406,16 @@ def check_caps_or_raise(run_id: str) -> None:
     or beyond limit (mid-call enforcement happens between stages, per spec)."""
     run_total = sum(r["cost_usd"] for r in state.read_costs_for_run(run_id))
     if run_total >= _per_run_cap():
-        raise CostCapExceeded(f"per-run cap ${_per_run_cap():.2f} reached (run_total=${run_total:.4f})")
+        raise CostCapExceeded(
+            f"per-run cap ${_per_run_cap():.2f} reached (run_total=${run_total:.4f})",
+            cap="per_run",
+        )
     day_total = sum(r["cost_usd"] for r in state.read_costs_today())
     if day_total >= _daily_cap():
-        raise CostCapExceeded(f"daily cap ${_daily_cap():.2f} reached (day_total=${day_total:.4f})")
+        raise CostCapExceeded(
+            f"daily cap ${_daily_cap():.2f} reached (day_total=${day_total:.4f})",
+            cap="daily",
+        )
 
 
 def _client():

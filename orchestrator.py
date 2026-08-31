@@ -60,6 +60,12 @@ RISK_WARNING = (
     "chasing on a $2.5k experimental account. Not financial advice."
 )
 
+# Reschedule delay after an unhandled pipeline crash. Mirrors
+# market_gate.CLOCK_ERROR_RETRY_MINUTES: without a fresh next_run.json the
+# scheduler pins on the stale timestamp (LAST_FIRED == NEXT_AT) and nothing
+# fires until the daily 13:30 UTC fallback timer.
+CRASH_RETRY_MINUTES = 30
+
 
 # ----- helpers -----
 
@@ -2248,6 +2254,111 @@ def run_pipeline(
     }
 
 
+def _record_pipeline_crash(
+    *, run_id: str, exc: Exception, dry_run: bool, cli_intent: str | None,
+) -> None:
+    """Best-effort crash bookkeeping for an unhandled pipeline exception.
+
+    Three independent steps — error.json artifact, decision-log row,
+    conservative reschedule — each in its own try/except so a broken
+    state/ dir can never mask the original traceback (main() re-raises
+    it after this returns). Never called on a healthy cycle.
+    """
+    import traceback as _traceback
+    from datetime import timedelta
+
+    short = f"{type(exc).__name__}: {exc}"[:500]
+
+    # 1) error.json — even a crash before signals.json leaves an artifact,
+    #    so incomplete-cycle detection has something to key on.
+    try:
+        state.write_json(state.run_dir(run_id) / "error.json", {
+            "run_id": run_id,
+            "failed_at": state.utcnow_iso(),
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "traceback": _traceback.format_exc(),
+        })
+    except Exception:
+        pass
+
+    # 2) Decision row. A cost-cap stop is a designed guardrail, not an
+    #    unresolved failure — it reuses the schema's "aborted" status,
+    #    which the §Promotion failure gate deliberately does not count.
+    #    Everything else is "error" and does count.
+    try:
+        is_cap = isinstance(exc, llm.CostCapExceeded)
+        cycle_intent, intent_source = _load_cycle_intent(
+            cli_intent=cli_intent, ignore_cap=False,
+        )
+        now = state.utcnow_iso()
+        state.append_decision({
+            "run_id": run_id,
+            "stage": "pipeline",
+            "model": "local-deterministic",
+            "inputs_hash": _hash_inputs(run_id),
+            "output_ref": "error.json",
+            "prompt_cache_hit_pct": 0.0,
+            "cost_usd": 0.0,  # real spend is authoritative in costs.jsonl
+            "started_at": now,
+            "ended_at": now,
+            "status": "aborted" if is_cap else "error",
+            "error": short,
+            "risk_warning": RISK_WARNING,
+            "cycle_intent": cycle_intent,
+            "intent_source": intent_source,
+        })
+    except Exception:
+        pass
+
+    # 3) Conservative reschedule so the scheduler doesn't pin on a stale
+    #    next_run.json until the daily fallback timer. Skipped when the
+    #    operator has halted, and when this run already scheduled itself
+    #    (crash after stage_execute wrote NEXT_RUN — never override the
+    #    meta-scheduler's pick).
+    try:
+        if state.is_halted():
+            return
+        try:
+            existing = json.loads(state.NEXT_RUN.read_text(encoding="utf-8"))
+            if existing.get("run_id") == run_id:
+                return
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        if isinstance(exc, llm.CostCapExceeded) and getattr(exc, "cap", "") == "daily":
+            # Mirror the documented daily-cap behaviour: refuse until next UTC day.
+            next_day = (state.utcnow() + timedelta(days=1)).replace(
+                hour=0, minute=5, second=0, microsecond=0,
+            )
+            next_at = next_day.strftime("%Y-%m-%dT%H:%M:%SZ")
+            why = "daily cost cap reached; next cycle after UTC midnight"
+        elif isinstance(exc, llm.CostCapExceeded):
+            # A fresh run gets a fresh per-run budget; 4h avoids hot-looping
+            # spend while the daily cap still bounds the day.
+            next_at = (state.utcnow() + timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            why = "per-run cost cap reached; retry with a fresh run budget"
+        else:
+            next_at = (
+                state.utcnow() + timedelta(minutes=CRASH_RETRY_MINUTES)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            why = f"pipeline crashed ({type(exc).__name__}); near-future retry"
+
+        next_run = {
+            "run_id": run_id,
+            "next_run_at": next_at,
+            "rationale": f"crash handler: {why}",
+            "cycle_intent": "trade",
+            "crash": True,
+            "error": short,
+        }
+        state.write_json(state.run_dir(run_id) / "next_run.json", next_run)
+        if not dry_run:
+            state.write_json(state.NEXT_RUN, next_run)
+    except Exception:
+        pass
+
+
 def _try_load_broker() -> Broker | None:
     """Best-effort AlpacaBroker construction. Returns None if creds are
     missing or the SDK isn't installed — orchestrator still runs (writes
@@ -2295,14 +2406,27 @@ def main(argv: list[str] | None = None) -> int:
 
     broker = None if args.dry_run else _try_load_broker()
 
+    # run_id is resolved here (not inside run_pipeline) so the crash
+    # handler can attribute artifacts to the run that actually raised.
+    rid = args.run_id or state.new_run_id()
+
     t0 = time.time()
-    result = run_pipeline(
-        dry_run=args.dry_run,
-        run_id=args.run_id,
-        broker=broker,
-        cli_intent=args.intent,
-        ignore_cap=args.ignore_cap,
-    )
+    try:
+        result = run_pipeline(
+            dry_run=args.dry_run,
+            run_id=rid,
+            broker=broker,
+            cli_intent=args.intent,
+            ignore_cap=args.ignore_cap,
+        )
+    except llm.HaltFlagSet:
+        # Operator stop: no error row, no reschedule — halt means halt.
+        raise
+    except Exception as exc:  # KeyboardInterrupt/SystemExit are BaseException
+        _record_pipeline_crash(
+            run_id=rid, exc=exc, dry_run=args.dry_run, cli_intent=args.intent,
+        )
+        raise  # non-zero exit for systemd; original traceback preserved
     dt = time.time() - t0
     stage_count = 6 if result.get("market_gate", {}).get("is_open", True) else 1
     intent_tag = f" intent={result.get('cycle_intent', 'trade')}" if result.get("cycle_intent") else ""
