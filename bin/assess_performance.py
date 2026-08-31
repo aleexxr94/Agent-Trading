@@ -441,10 +441,11 @@ def _render(report: dict) -> str:
         p(f"_unavailable: {cy['error']}_")
     elif cy:
         p("")
-        p("| run_id | regime | top_conf | positions | all_cash | sanity | nav_$ | cost_$ |")
-        p("|---|---|---|---|---|---|---|---|")
+        p("| run_id | intent | regime | top_conf | positions | all_cash | sanity | nav_$ | cost_$ |")
+        p("|---|---|---|---|---|---|---|---|---|")
         for r in cy[-15:]:
-            p(f"| {r['run_id'][:20]} | {r.get('regime') or '—'} | "
+            p(f"| {r['run_id'][:20]} | {r.get('kind') or '—'} | "
+              f"{r.get('regime') or '—'} | "
               f"{_fmt(r.get('top_confidence'), '.2f')} | "
               f"{r.get('position_count', 0)} | "
               f"{'Y' if r.get('all_cash') else 'N'} | "

@@ -2430,6 +2430,17 @@ def test_trade_sync_gaps_flags_orders_without_fills(tmp_state, monkeypatch):
     assert out2["stale"] is False
 
 
+def test_intent_by_run_first_row_wins_and_skips_legacy(tmp_state):
+    state.append_decision(_crash_row(status="ok", stage="strategist") | {
+        "run_id": "r-review", "cycle_intent": "review", "intent_source": "file",
+    })
+    state.append_decision(_crash_row(status="ok", stage="strategist") | {
+        "run_id": "r-legacy",  # no cycle_intent field (legacy row)
+    })
+    intents = dd.intent_by_run()
+    assert intents == {"r-review": "review"}
+
+
 def _crash_row(status="error", started_at=None, stage="pipeline"):
     """A schema-valid decision row for failure-gate tests."""
     at = started_at or state.utcnow_iso()

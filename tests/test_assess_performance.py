@@ -126,6 +126,7 @@ def test_populated_gather_and_render(tmp_state):
     # Cost + cycle sections populated.
     assert report["cost_health"]["token_totals"]["cost_usd"] == pytest.approx(0.20)
     assert len(report["cycles"]) == 1
+    assert report["cycles"][0]["kind"] == "trade"
 
     md = assess_performance._render(report)
     assert "TQQQ" in md

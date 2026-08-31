@@ -1442,6 +1442,29 @@ def latest_run_id() -> str | None:
     return rows[-1]["run_id"] if rows else None
 
 
+def intent_by_run() -> dict[str, str]:
+    """Map run_id → cycle_intent ("trade" | "review"), read from
+    decisions.jsonl (one row per stage; all rows for a run carry the same
+    intent, so the first seen wins). Legacy runs written before the field
+    existed simply don't appear — callers default missing ids to "trade".
+    Shared by the dashboard Cycles tab and the bin/ CLIs so every surface
+    labels cycles identically."""
+    intents: dict[str, str] = {}
+    if state.DECISIONS_LOG.exists():
+        for line in state.DECISIONS_LOG.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rid = row.get("run_id")
+            intent = row.get("cycle_intent")
+            if rid and intent and rid not in intents:
+                intents[rid] = intent
+    return intents
+
+
 def load_run_summaries(limit: int = 20) -> list[dict]:
     """Return one human-readable summary per recent orchestrator run, newest first.
 
@@ -1475,22 +1498,7 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
         if rid:
             cost_by_run[rid] = cost_by_run.get(rid, 0.0) + (r.get("cost_usd") or 0.0)
 
-    # cycle_intent per run, read from decisions.jsonl (one row per stage,
-    # all rows for a run carry the same intent). Default "trade" handles
-    # legacy runs written before the field existed.
-    intent_by_run: dict[str, str] = {}
-    if state.DECISIONS_LOG.exists():
-        for line in state.DECISIONS_LOG.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            rid = row.get("run_id")
-            intent = row.get("cycle_intent")
-            if rid and intent and rid not in intent_by_run:
-                intent_by_run[rid] = intent
+    intents = intent_by_run()
 
     summaries: list[dict] = []
     for run_dir in run_dirs:
@@ -1530,7 +1538,7 @@ def load_run_summaries(limit: int = 20) -> list[dict]:
             "next_run_at": "",
             "next_run_rationale": "",
             "cost_usd": cost_by_run.get(rid, 0.0),
-            "cycle_intent": intent_by_run.get(rid, "trade"),
+            "cycle_intent": intents.get(rid, "trade"),
         }
 
         # portfolio.json — the headline result + rationales.
