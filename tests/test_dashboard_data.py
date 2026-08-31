@@ -870,7 +870,7 @@ def test_synthetic_balance_partial_unmatched_sell(tmp_state):
 
 
 def test_synthetic_balance_hybrid_fees_paper_etf_no_real(tmp_state):
-    """On Alpaca paper ETFs, real fees are \$0. The hybrid fees model
+    """On Alpaca paper ETFs, real fees are $0. The hybrid fees model
     surfaces the modelled round-trip estimate (conservative retail friction) as the
     headline fees so the synthetic balance reflects what the
     per-position table already shows. Without this fix the operator
@@ -2354,6 +2354,20 @@ def _fill_row(symbol, side, qty, price, *, run_id=None, at, aid):
         "symbol": symbol, "kind": "etf", "side": side, "qty": qty,
         "fill_price": price, "fees_usd": 0.0, "filled_at": at,
     }
+
+
+def test_trades_pnl_view_sorts_by_fill_time_before_matching(tmp_state):
+    """trades_sync appends fills grouped by order_id, so the file can
+    hold a sell BEFORE its earlier-filled buy. FIFO must run on fill
+    time, or the sell reports as unmatched and the round trip is lost."""
+    state.append_trade(_fill_row("SOXL", "sell", 3, 30.0,
+                                 at="2026-06-02T14:00:00Z", aid="s1"))
+    state.append_trade(_fill_row("SOXL", "buy", 3, 25.0,
+                                 at="2026-06-01T14:00:00Z", aid="b1"))
+    view = dd.trades_pnl_view()
+    assert view["totals"]["unmatched_sell_count"] == 0
+    assert view["totals"]["closed_count"] == 1
+    assert view["closed"][0]["gross_pnl_usd"] == pytest.approx(15.0)
 
 
 def test_calibration_view_mirrors_memo(tmp_state):

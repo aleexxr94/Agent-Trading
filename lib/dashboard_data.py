@@ -231,9 +231,9 @@ class SyntheticBalance:
                                              #   (conservative retail friction)
                                              #   for currently-open positions
 
-        Rationale: Alpaca paper reports \$0 fees on equity fills
+        Rationale: Alpaca paper reports $0 fees on equity fills
         (``lib/trades_sync.py``), so a real-only definition would leave
-        the headline showing "\$0.00 fees" while the per-position table
+        the headline showing "$0.00 fees" while the per-position table
         prominently displays modelled fees that the Aggregate Net P&L
         already subtracts. Hybrid keeps the headline aligned with what
         the operator sees in the positions table. On a future live
@@ -243,7 +243,7 @@ class SyntheticBalance:
         and its real fees land in the realised side).
 
       - ``real_trading_fees_usd``: sum of ``fees_usd`` across EVERY fill
-        in trades.jsonl. On paper ETFs this is \$0; on live trading it
+        in trades.jsonl. On paper ETFs this is $0; on live trading it
         populates from the SEC/TAF schedules.
       - ``modelled_open_fees_usd``: sum of
         the projected EXIT-leg regulatory fees over the broker-held
@@ -1119,7 +1119,14 @@ def trades_pnl_view(marks: dict[str, float] | None = None) -> dict:
     """
     from . import trades as trades_lib
 
-    trade_rows = state.read_trades()
+    # Sort by fill time before FIFO matching — same as
+    # feedback.build_performance_memo and trades.recent_exit_cooldowns.
+    # trades.jsonl is appended grouped by order_id (lib/trades_sync.py),
+    # not chronologically, so raw file order can put a sell ahead of its
+    # earlier-filled buy and report it as an unmatched sell.
+    trade_rows = sorted(
+        state.read_trades(), key=lambda r: r.get("filled_at") or ""
+    )
     cost_rows = state.filter_costs_post_reset(
         [json.loads(line) for line in (
             state.COSTS_LOG.read_text(encoding="utf-8").splitlines()

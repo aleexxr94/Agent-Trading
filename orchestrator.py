@@ -1291,7 +1291,7 @@ def _compute_next_run_at(
             f"Recent NAV history (last {len(nav_history)} rows):\n"
             f"  {json.dumps(nav_history, separators=(',', ':'))}\n\n"
             "Choose the next-run window AND the cycle_intent for it. "
-            "review = signals + strategist only, no orders, ~$0.05 cost; "
+            "review = signals + strategist only, no orders, ~$0.13 cost; "
             "use for post-close reflection. trade = full pipeline. "
             "Return JSON only."
         ),
@@ -1618,7 +1618,7 @@ def _run_pipeline_review(*, ctx: StageContext, dry_run: bool) -> dict:
     state. This keeps a review followed by an unchanged-signals trade
     cycle from dedup-skipping into a stale portfolio.
 
-    Cost: ~$0.05 (strategist + meta).
+    Cost: ~$0.13 (strategist + meta; ~85% of it output/thinking tokens).
     """
     rid = ctx.run_id
 
